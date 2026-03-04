@@ -32,10 +32,14 @@ Most non-trivial software tasks require coordinated phases: understanding requir
 - QA cycles repeat up to 5 times; if the same error persists 3 times, stop and report the fundamental issue
 - Validation requires approval from all reviewers; rejected items get fixed and re-validated
 - Cancel with `/cancel` at any time; progress is preserved for resume
+- If a deep-interview spec exists, use it as high-clarity phase input instead of re-expanding from scratch
+- If input is too vague for reliable expansion, offer/trigger `$deep-interview` first
 </Execution_Policy>
 
 <Steps>
 1. **Phase 0 - Expansion**: Turn the user's idea into a detailed spec
+   - If `.omx/specs/deep-interview-*.md` exists for this task: reuse it and skip redundant expansion work
+   - If prompt is highly vague: route to `$deep-interview` for Socratic ambiguity-gated clarification
    - Analyst (Opus): Extract requirements
    - Architect (Opus): Create technical specification
    - Output: `.omx/plans/autopilot-spec.md`
@@ -121,7 +125,7 @@ Why bad: This is an exploration/brainstorming request. Respond conversationally 
 - Stop and report when the same QA error persists across 3 cycles (fundamental issue requiring human input)
 - Stop and report when validation keeps failing after 3 re-validation rounds
 - Stop when the user says "stop", "cancel", or "abort"
-- If requirements were too vague and expansion produces an unclear spec, pause and ask the user for clarification before proceeding
+- If requirements were too vague and expansion produces an unclear spec, pause and redirect to `$deep-interview` before proceeding
 </Escalation_And_Stop_Conditions>
 
 <Final_Checklist>
@@ -152,6 +156,18 @@ skipValidation = false
 ## Resume
 
 If autopilot was cancelled or failed, run `/autopilot` again to resume from where it stopped.
+
+## Recommended Clarity Pipeline
+
+For ambiguous requests, prefer:
+
+```
+deep-interview -> ralplan -> autopilot
+```
+
+- `deep-interview`: ambiguity-gated Socratic requirements
+- `ralplan`: consensus planning (planner/architect/critic)
+- `autopilot`: execution + QA + validation
 
 ## Best Practices for Input
 

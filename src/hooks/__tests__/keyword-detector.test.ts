@@ -98,6 +98,30 @@ describe('keyword detector swarm/team compatibility', () => {
     assert.equal(match.keyword.toLowerCase(), 'gather requirements');
   });
 
+  it('maps "ouroboros" to deep-interview skill', () => {
+    const match = detectPrimaryKeyword('please run ouroboros before planning');
+
+    assert.ok(match);
+    assert.equal(match.skill, 'deep-interview');
+    assert.equal(match.keyword.toLowerCase(), 'ouroboros');
+  });
+
+  it('maps "interview me" to deep-interview skill', () => {
+    const match = detectPrimaryKeyword('interview me before we start implementation');
+
+    assert.ok(match);
+    assert.equal(match.skill, 'deep-interview');
+    assert.equal(match.keyword.toLowerCase(), 'interview me');
+  });
+
+  it('maps "don\'t assume" to deep-interview skill', () => {
+    const match = detectPrimaryKeyword("don't assume anything yet");
+
+    assert.ok(match);
+    assert.equal(match.skill, 'deep-interview');
+    assert.equal(match.keyword.toLowerCase(), "don't assume");
+  });
+
   it('prefers "deep interview" over "interview" for deterministic longest-match behavior', () => {
     const match = detectPrimaryKeyword('deep interview this request first');
 
@@ -113,6 +137,9 @@ describe('keyword registry coverage', () => {
     assert.ok(registryKeywords.has('coordinated team'));
     assert.ok(registryKeywords.has('swarm'));
     assert.ok(registryKeywords.has('coordinated swarm'));
+    assert.ok(registryKeywords.has('ouroboros'));
+    assert.ok(registryKeywords.has("don't assume"));
+    assert.ok(registryKeywords.has('interview me'));
   });
 });
 
