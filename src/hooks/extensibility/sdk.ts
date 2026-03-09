@@ -192,6 +192,10 @@ async function sendTmuxKeys(
   }
 
   if (options.submit !== false) {
+    // Codex CLI's alternate-screen TUI can swallow an immediate C-m that lands
+    // in the same tmux send-keys burst as literal text. Give the raw-mode input
+    // buffer a brief moment to settle before the first submit.
+    sleepFractionalSeconds(0.12);
     const submitA = runTmux(['send-keys', '-t', targetResolution.target, 'C-m']);
     sleepFractionalSeconds(0.1);
     const submitB = runTmux(['send-keys', '-t', targetResolution.target, 'C-m']);

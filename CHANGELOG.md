@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.8.10] - 2026-03-09
+
+5 non-merge commits from `v0.8.9..dev`. Contributors: [@Yeachan-Heo](https://github.com/Yeachan-Heo), [@HaD0Yun](https://github.com/HaD0Yun).
+
+### Added
+- **Release-critical regression coverage and test-environment isolation** — expanded CLI auto-update regression coverage across success, decline, failure, and already-up-to-date paths, and hardened CLI/OpenClaw integration suites against ambient `CODEX_HOME` leakage so release validation stays deterministic. (direct commit `aedd068` — @Yeachan-Heo)
+
+### Changed
+- **Root prompt contracts now bias more explicitly toward direct execution and evidence-backed verification** — tightened the top-level `AGENTS.md` / template contracts and simplified core prompt surfaces while preserving workflow, team, and verification guarantees. (PR [#646](https://github.com/Yeachan-Heo/oh-my-codex/pull/646) — @HaD0Yun)
+- **Local development artifacts are now ignored by git** — `.codex/`, `.agents/`, and `coverage/` are ignored to avoid committing local session state and generated coverage data. (direct commit `3149747` — @Yeachan-Heo)
+
+### Fixed
+- **Auto-update now refreshes OMX setup immediately after a successful global install** — successful `omx` self-updates now force a setup refresh so prompts, skills, and `AGENTS.md` stay in sync without a separate manual refresh. (PR [#648](https://github.com/Yeachan-Heo/oh-my-codex/pull/648) — @Yeachan-Heo)
+- **tmux Enter submission is more reliable in alternate-screen UIs** — added a settle delay before the first `C-m` submit and mirrored that protection in the hook extensibility tmux submission path. (PR [#649](https://github.com/Yeachan-Heo/oh-my-codex/pull/649) — @Yeachan-Heo, fixes [#647](https://github.com/Yeachan-Heo/oh-my-codex/issues/647))
+
 ## [0.8.9] - 2026-03-08
 
 2 non-merge commits from `v0.8.8..dev`. Contributor: [@Yeachan-Heo](https://github.com/Yeachan-Heo).

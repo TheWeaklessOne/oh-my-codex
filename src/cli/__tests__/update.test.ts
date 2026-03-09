@@ -89,13 +89,9 @@ describe('shouldCheckForUpdates', () => {
 });
 
 describe('maybeCheckAndPromptUpdate', () => {
-  it('runs setup refresh after a successful auto-update', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-update-'));
+  async function withInteractiveTty(run: () => Promise<void>): Promise<void> {
     const originalStdinTty = process.stdin.isTTY;
     const originalStdoutTty = process.stdout.isTTY;
-    const originalLog = console.log;
-    const prompts: string[] = [];
-    const setupCalls: Array<{ force?: boolean }> = [];
 
     Object.defineProperty(process.stdin, 'isTTY', {
       configurable: true,
@@ -105,25 +101,10 @@ describe('maybeCheckAndPromptUpdate', () => {
       configurable: true,
       value: true,
     });
-    console.log = (...args: unknown[]) => {
-      prompts.push(args.map((arg) => String(arg)).join(' '));
-    };
 
     try {
-      await maybeCheckAndPromptUpdate(cwd, {
-        getCurrentVersion: async () => '0.8.9',
-        fetchLatestVersion: async () => '0.9.0',
-        askYesNo: async () => true,
-        runGlobalUpdate: () => ({ ok: true, stderr: '' }),
-        setup: async (options) => {
-          setupCalls.push(options ?? {});
-        },
-      });
-
-      assert.deepEqual(setupCalls, [{ force: true }]);
-      assert.match(prompts.join('\n'), /Updated to v0\.9\.0/);
+      await run();
     } finally {
-      console.log = originalLog;
       Object.defineProperty(process.stdin, 'isTTY', {
         configurable: true,
         value: originalStdinTty,
@@ -132,6 +113,125 @@ describe('maybeCheckAndPromptUpdate', () => {
         configurable: true,
         value: originalStdoutTty,
       });
+    }
+  }
+
+  it('runs setup refresh after a successful auto-update', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-update-'));
+    const originalLog = console.log;
+    const prompts: string[] = [];
+    const setupCalls: Array<{ force?: boolean }> = [];
+    console.log = (...args: unknown[]) => {
+      prompts.push(args.map((arg) => String(arg)).join(' '));
+    };
+
+    try {
+      await withInteractiveTty(async () => {
+        await maybeCheckAndPromptUpdate(cwd, {
+          getCurrentVersion: async () => '0.8.9',
+          fetchLatestVersion: async () => '0.9.0',
+          askYesNo: async () => true,
+          runGlobalUpdate: () => ({ ok: true, stderr: '' }),
+          setup: async (options) => {
+            setupCalls.push(options ?? {});
+          },
+        });
+      });
+
+      assert.deepEqual(setupCalls, [{ force: true }]);
+      assert.match(prompts.join('\n'), /Updated to v0\.9\.0/);
+    } finally {
+      console.log = originalLog;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not update or refresh setup when the prompt is declined', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-update-'));
+    let updateAttempts = 0;
+    let setupCalls = 0;
+
+    try {
+      await withInteractiveTty(async () => {
+        await maybeCheckAndPromptUpdate(cwd, {
+          getCurrentVersion: async () => '0.8.9',
+          fetchLatestVersion: async () => '0.9.0',
+          askYesNo: async () => false,
+          runGlobalUpdate: () => {
+            updateAttempts += 1;
+            return { ok: true, stderr: '' };
+          },
+          setup: async () => {
+            setupCalls += 1;
+          },
+        });
+      });
+
+      assert.equal(updateAttempts, 0);
+      assert.equal(setupCalls, 0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not refresh setup when the global update fails', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-update-'));
+    const originalLog = console.log;
+    const logs: string[] = [];
+    let setupCalls = 0;
+
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map((arg) => String(arg)).join(' '));
+    };
+
+    try {
+      await withInteractiveTty(async () => {
+        await maybeCheckAndPromptUpdate(cwd, {
+          getCurrentVersion: async () => '0.8.9',
+          fetchLatestVersion: async () => '0.9.0',
+          askYesNo: async () => true,
+          runGlobalUpdate: () => ({ ok: false, stderr: 'npm exited 1' }),
+          setup: async () => {
+            setupCalls += 1;
+          },
+        });
+      });
+
+      assert.equal(setupCalls, 0);
+      assert.match(logs.join('\n'), /Update failed\. Run manually: npm install -g oh-my-codex@latest/);
+    } finally {
+      console.log = originalLog;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('skips the update flow when the fetched version is not newer', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-update-'));
+    let promptCalls = 0;
+    let updateAttempts = 0;
+
+    try {
+      await withInteractiveTty(async () => {
+        await maybeCheckAndPromptUpdate(cwd, {
+          getCurrentVersion: async () => '0.8.9',
+          fetchLatestVersion: async () => '0.8.9',
+          askYesNo: async () => {
+            promptCalls += 1;
+            return true;
+          },
+          runGlobalUpdate: () => {
+            updateAttempts += 1;
+            return { ok: true, stderr: '' };
+          },
+          setup: async () => {
+            throw new Error('setup should not run when already up to date');
+          },
+        });
+      });
+
+      assert.equal(promptCalls, 0);
+      assert.equal(updateAttempts, 0);
+    } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });

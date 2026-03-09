@@ -6,6 +6,7 @@
  */
 
 import { execSync, execFileSync, spawnSync } from 'child_process';
+import { sleepSync } from '../utils/sleep.js';
 
 export function isTmuxAvailable(): boolean {
   try {
@@ -113,14 +114,46 @@ export function buildSendPaneArgvs(
   return argvs;
 }
 
-export function sendToPane(paneId: string, text: string, pressEnter: boolean = true): boolean {
-  for (const argv of buildSendPaneArgvs(paneId, text, pressEnter)) {
-    const result = spawnSync('tmux', argv, {
+const TMUX_TEXT_SETTLE_MS = 120;
+const TMUX_SUBMIT_REPEAT_DELAY_MS = 100;
+
+type SpawnSyncImpl = (
+  command: string,
+  args: ReadonlyArray<string>,
+  options?: {
+    timeout?: number;
+    stdio?: ['pipe', 'pipe', 'pipe'];
+    encoding?: 'utf-8';
+  },
+) => { error?: Error; status: number | null };
+
+interface SendToPaneDeps {
+  spawnSyncImpl?: SpawnSyncImpl;
+  sleepImpl?: (ms: number) => void;
+}
+
+export function sendToPane(
+  paneId: string,
+  text: string,
+  pressEnter: boolean = true,
+  deps: SendToPaneDeps = {},
+): boolean {
+  const spawnSyncImpl = deps.spawnSyncImpl ?? spawnSync;
+  const sleepImpl = deps.sleepImpl ?? sleepSync;
+  const argvs = buildSendPaneArgvs(paneId, text, pressEnter);
+
+  for (const [index, argv] of argvs.entries()) {
+    const result = spawnSyncImpl('tmux', argv, {
       timeout: 3000,
       stdio: ['pipe', 'pipe', 'pipe'],
       encoding: 'utf-8',
     });
     if (result.error || result.status !== 0) return false;
+
+    const hasNextArgv = index < argvs.length - 1;
+    if (!hasNextArgv) continue;
+
+    sleepImpl(index === 0 ? TMUX_TEXT_SETTLE_MS : TMUX_SUBMIT_REPEAT_DELAY_MS);
   }
   return true;
 }

@@ -19,6 +19,7 @@ describe("getOpenClawConfig", () => {
     originalEnv = { ...process.env };
     tmpDir = join(tmpdir(), `omx-openclaw-test-${Date.now()}`);
     mkdirSync(tmpDir, { recursive: true });
+    process.env.CODEX_HOME = join(tmpDir, ".codex");
   });
 
   afterEach(() => {
@@ -196,6 +197,7 @@ describe("getOpenClawConfig generic alias normalization", () => {
     mkdirSync(tmpDir, { recursive: true });
     process.env.OMX_OPENCLAW = "1";
     process.env.HOME = tmpDir;
+    process.env.CODEX_HOME = join(tmpDir, ".codex");
     delete process.env.OMX_OPENCLAW_CONFIG;
   });
 

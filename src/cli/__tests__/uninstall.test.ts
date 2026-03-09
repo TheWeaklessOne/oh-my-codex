@@ -15,10 +15,15 @@ function runOmx(
   const testDir = dirname(fileURLToPath(import.meta.url));
   const repoRoot = join(testDir, '..', '..', '..');
   const omxBin = join(repoRoot, 'bin', 'omx.js');
+  const resolvedHome = envOverrides.HOME ?? process.env.HOME;
   const result = spawnSync(process.execPath, [omxBin, ...argv], {
     cwd,
     encoding: 'utf-8',
-    env: { ...process.env, ...envOverrides },
+    env: {
+      ...process.env,
+      ...(resolvedHome && !envOverrides.CODEX_HOME ? { CODEX_HOME: join(resolvedHome, '.codex') } : {}),
+      ...envOverrides,
+    },
   });
   return {
     status: result.status,

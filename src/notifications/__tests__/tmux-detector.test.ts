@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { analyzePaneContent, buildSendPaneArgvs, buildCapturePaneArgv } from '../tmux-detector.js';
+import { analyzePaneContent, buildSendPaneArgvs, buildCapturePaneArgv, sendToPane } from '../tmux-detector.js';
 import type { PaneAnalysis } from '../tmux-detector.js';
 
 describe('analyzePaneContent', () => {
@@ -167,6 +167,29 @@ describe('buildSendPaneArgvs', () => {
       ['send-keys', '-t', '%5', 'C-m'],
       ['send-keys', '-t', '%5', 'C-m'],
     ]);
+  });
+
+  it('delays the first C-m submit so tmux send-keys text is visible to the alternate-screen TUI', () => {
+    const calls: string[][] = [];
+    const sleeps: number[] = [];
+    const fakeSpawnSync = (command: string, argv: readonly string[]) => {
+      assert.equal(command, 'tmux');
+      calls.push([...argv]);
+      return { status: 0 };
+    };
+
+    const ok = sendToPane('%5', 'continue', true, {
+      spawnSyncImpl: fakeSpawnSync,
+      sleepImpl: (ms) => sleeps.push(ms),
+    });
+
+    assert.equal(ok, true);
+    assert.deepEqual(calls, [
+      ['send-keys', '-t', '%5', '-l', '--', 'continue'],
+      ['send-keys', '-t', '%5', 'C-m'],
+      ['send-keys', '-t', '%5', 'C-m'],
+    ]);
+    assert.deepEqual(sleeps, [120, 100]);
   });
 });
 
