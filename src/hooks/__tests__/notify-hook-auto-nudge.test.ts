@@ -31,7 +31,7 @@ function escapeRegex(value: string): string {
  * Build a fake tmux binary that logs all invocations and optionally returns
  * capture-pane content from OMX_TEST_CAPTURE_FILE.
  */
-function buildFakeTmux(tmuxLogPath: string): string {
+function buildFakeTmux(tmuxLogPath: string, paneInMode: '0' | '1' = '0'): string {
   return `#!/usr/bin/env bash
 set -eu
 echo "$@" >> "${tmuxLogPath}"
@@ -47,6 +47,18 @@ if [[ "\$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "\$cmd" == "display-message" ]]; then
+  format=""
+  while [[ "\$#" -gt 0 ]]; do
+    case "\$1" in
+      -p) shift ;;
+      -t) shift 2 ;;
+      *) format="\$1"; shift ;;
+    esac
+  done
+  if [[ "\$format" == "#{pane_in_mode}" ]]; then
+    echo "${paneInMode}"
+    exit 0
+  fi
   exit 0
 fi
 if [[ "\$cmd" == "list-panes" ]]; then
@@ -326,51 +338,17 @@ exit 0
         autoNudge: { enabled: true, delaySec: 0 },
       });
 
-      const fakeTmux = `#!/usr/bin/env bash
-set -eu
-echo "$@" >> "${tmuxLogPath}"
-cmd="$1"
-shift || true
-if [[ "$cmd" == "display-message" ]]; then
-  target=""
-  format=""
-  while (($#)); do
-    case "$1" in
-      -p) shift ;;
-      -t) target="$2"; shift 2 ;;
-      *) format="$1"; shift ;;
-    esac
-  done
-  if [[ "$format" == "#{pane_in_mode}" && "$target" == "%99" ]]; then
-    echo "1"
-    exit 0
-  fi
-  exit 0
-fi
-if [[ "$cmd" == "capture-pane" ]]; then
-  printf "Would you like me to continue?\\n"
-  exit 0
-fi
-if [[ "$cmd" == "send-keys" ]]; then
-  exit 0
-fi
-if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
-  exit 0
-fi
-exit 0
-`;
-      await writeFile(join(fakeBinDir, 'tmux'), fakeTmux);
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath, '1'));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
       const result = runNotifyHook(cwd, fakeBinDir, codexHome, {
-        'last-assistant-message': 'Would you like me to continue?',
+        'last-assistant-message': 'If you want, I can keep going from here.',
       });
       assert.equal(result.status, 0, `hook failed: ${result.stderr || result.stdout}`);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, /display-message -p -t %99 #\{pane_in_mode\}/);
-      assert.doesNotMatch(tmuxLog, /send-keys -t %99/, 'should not inject while pane is scrolling');
+      assert.doesNotMatch(tmuxLog, /send-keys -t %99 -l yes, proceed/, 'should not inject while pane is in copy-mode');
 
       const logPath = join(logsDir, `tmux-hook-${new Date().toISOString().slice(0, 10)}.jsonl`);
       const entries = (await readFile(logPath, 'utf-8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));

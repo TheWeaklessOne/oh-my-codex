@@ -29,6 +29,7 @@ import {
 } from "../utils/paths.js";
 import { buildMergedConfig, getRootModelName } from "../config/generator.js";
 import {
+  getUnifiedMcpRegistryCandidates,
   loadUnifiedMcpRegistry,
   planClaudeCodeMcpSettingsSync,
   type UnifiedMcpRegistryLoadResult,
@@ -501,9 +502,22 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 
   // Step 5: Update config.toml
   console.log("[5/8] Updating config.toml...");
+  const registryCandidates = getUnifiedMcpRegistryCandidates();
+  const defaultRegistryCandidates = registryCandidates.slice(0, 1);
   const sharedMcpRegistry = await loadUnifiedMcpRegistry({
-    candidates: options.mcpRegistryCandidates,
+    candidates: options.mcpRegistryCandidates ?? defaultRegistryCandidates,
   });
+  if (
+    !options.mcpRegistryCandidates &&
+    !sharedMcpRegistry.sourcePath &&
+    registryCandidates.length > 1 &&
+    existsSync(registryCandidates[1]) &&
+    !existsSync(registryCandidates[0])
+  ) {
+    console.log(
+      `  warning: legacy shared MCP registry detected at ${registryCandidates[1]} but ignored by default; move it to ${registryCandidates[0]} if you still want setup to sync those servers`,
+    );
+  }
   if (verbose && sharedMcpRegistry.sourcePath) {
     console.log(
       `  shared MCP registry: ${sharedMcpRegistry.sourcePath} (${sharedMcpRegistry.servers.length} servers)`,

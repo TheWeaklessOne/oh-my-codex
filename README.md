@@ -536,7 +536,7 @@ Notes:
   - `model_context_window = 1000000` and `model_auto_compact_token_limit = 900000` only when the effective root model matches `OMX_DEFAULT_FRONTIER_MODEL` and both context keys are absent
   - `[features] multi_agent = true, child_agents_md = true`
   - MCP server entries (`omx_state`, `omx_memory`, `omx_code_intel`, `omx_trace`)
-  - If a shared MCP registry exists at `~/.omx/mcp-registry.json` (fallback: `~/.omc/mcp-registry.json`), setup syncs those entries into a dedicated managed block in `config.toml` (skipping names already defined elsewhere to avoid duplicate TOML tables)
+  - If a shared MCP registry exists at `~/.omx/mcp-registry.json`, setup syncs those entries into a dedicated managed block in `config.toml` (skipping names already defined elsewhere to avoid duplicate TOML tables)
   - User-scoped setup also syncs missing shared MCP entries into `~/.claude/settings.json` without overwriting existing Claude Code MCP server definitions
   - `[tui] status_line`
 - Scope-specific `AGENTS.md`

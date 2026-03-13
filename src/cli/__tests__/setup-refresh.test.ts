@@ -328,4 +328,39 @@ describe("omx setup refresh summary and dry-run behavior", () => {
       await rm(wd, { recursive: true, force: true });
     }
   });
+
+  it("ignores legacy ~/.omc/mcp-registry.json during setup unless candidates are passed explicitly", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-setup-refresh-"));
+    const previousHome = process.env.HOME;
+    const previousCodexHome = process.env.CODEX_HOME;
+    try {
+      process.env.HOME = wd;
+      delete process.env.CODEX_HOME;
+
+      await mkdir(join(wd, ".omx", "state"), { recursive: true });
+      await mkdir(join(wd, ".omc"), { recursive: true });
+      await writeFile(
+        join(wd, ".omc", "mcp-registry.json"),
+        JSON.stringify({
+          gitnexus: { command: "gitnexus", args: ["mcp"] },
+        }),
+      );
+
+      await runSetupInTempDir(wd, { scope: "project" });
+
+      const config = await readFile(join(wd, ".codex", "config.toml"), "utf-8");
+      assert.doesNotMatch(config, /^\[mcp_servers\.gitnexus\]$/m);
+      assert.doesNotMatch(config, /Shared MCP Server: gitnexus/);
+
+      const output = await runSetupWithCapturedLogs(wd, { scope: "project" });
+      assert.match(output, /legacy shared MCP registry detected at .*\.omc\/mcp-registry\.json but ignored by default/i);
+      assert.match(output, /move it to .*\.omx\/mcp-registry\.json/i);
+    } finally {
+      if (typeof previousHome === "string") process.env.HOME = previousHome;
+      else delete process.env.HOME;
+      if (typeof previousCodexHome === "string") process.env.CODEX_HOME = previousCodexHome;
+      else delete process.env.CODEX_HOME;
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
 });

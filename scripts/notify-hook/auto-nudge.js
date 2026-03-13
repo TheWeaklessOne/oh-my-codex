@@ -220,6 +220,16 @@ function normalizeStallDetectionText(text) {
     .replace(/[’‘`]/g, '\'');
 }
 
+function summarizePaneCaptureForLog(captured, maxLines = 6) {
+  const lines = safeString(captured)
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim() !== '');
+  if (lines.length === 0) return '';
+  return lines.slice(-maxLines).join('\n').slice(0, 600);
+}
+
 export function normalizeAutoNudgeConfig(raw) {
   if (!raw || typeof raw !== 'object') {
     return {
@@ -354,6 +364,7 @@ export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload }) {
         reason: mapPaneInjectionReadinessReason(paneGuard.reason),
         source,
         pane_current_command: paneGuard.paneCurrentCommand || undefined,
+        pane_excerpt: summarizePaneCaptureForLog(paneGuard.paneCapture),
       }).catch(() => {});
       return;
     }
