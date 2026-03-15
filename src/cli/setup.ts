@@ -104,6 +104,11 @@ interface SetupBackupContext {
   baseRoot: string;
 }
 
+export interface SkillFrontmatterMetadata {
+  name: string;
+  description: string;
+}
+
 const PROJECT_OMX_GITIGNORE_ENTRY = ".omx/";
 
 function applyScopePathRewritesToAgentsTemplate(
@@ -215,6 +220,89 @@ async function filesDiffer(src: string, dst: string): Promise<boolean> {
     readFile(dst, "utf-8"),
   ]);
   return srcContent !== dstContent;
+}
+
+function parseSkillFrontmatterScalar(
+  value: string,
+  key: string,
+  filePath: string,
+): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new Error(`${filePath} frontmatter "${key}" must not be empty`);
+  }
+  if (trimmed === "|" || trimmed === ">") {
+    throw new Error(`${filePath} frontmatter "${key}" must be a single-line string`);
+  }
+
+  const quote = trimmed[0];
+  if (quote === '"' || quote === "'") {
+    if (trimmed.length < 2 || trimmed.at(-1) !== quote) {
+      throw new Error(`${filePath} frontmatter "${key}" has an unterminated quoted string`);
+    }
+    const unquoted = trimmed.slice(1, -1).trim();
+    if (!unquoted) {
+      throw new Error(`${filePath} frontmatter "${key}" must not be empty`);
+    }
+    return unquoted;
+  }
+
+  const unquoted = trimmed.replace(/\s+#.*$/, "").trim();
+  if (!unquoted) {
+    throw new Error(`${filePath} frontmatter "${key}" must not be empty`);
+  }
+  return unquoted;
+}
+
+export function parseSkillFrontmatter(
+  content: string,
+  filePath = "SKILL.md",
+): SkillFrontmatterMetadata {
+  const frontmatterMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!frontmatterMatch) {
+    throw new Error(
+      `${filePath} must start with YAML frontmatter containing non-empty name and description fields`,
+    );
+  }
+
+  let name: string | undefined;
+  let description: string | undefined;
+  const lines = frontmatterMatch[1].split(/\r?\n/);
+
+  for (const [index, rawLine] of lines.entries()) {
+    const line = rawLine.trimEnd();
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    if (/^\s/.test(rawLine)) continue;
+
+    const match = line.match(/^([A-Za-z0-9_-]+):(.*)$/);
+    if (!match) {
+      throw new Error(
+        `${filePath} has invalid YAML frontmatter on line ${index + 2}: ${trimmed}`,
+      );
+    }
+
+    const [, key, rawValue] = match;
+    if (!rawValue.trim()) continue;
+
+    const parsedValue = parseSkillFrontmatterScalar(rawValue, key, filePath);
+    if (key === "name") name = parsedValue;
+    if (key === "description") description = parsedValue;
+  }
+
+  if (!name) {
+    throw new Error(`${filePath} is missing a non-empty frontmatter "name"`);
+  }
+  if (!description) {
+    throw new Error(`${filePath} is missing a non-empty frontmatter "description"`);
+  }
+
+  return { name, description };
+}
+
+export async function validateSkillFile(skillMdPath: string): Promise<void> {
+  const content = await readFile(skillMdPath, "utf-8");
+  parseSkillFrontmatter(content, skillMdPath);
 }
 
 function logCategorySummary(name: string, summary: SetupCategorySummary): void {
@@ -1149,7 +1237,7 @@ async function refreshNativeAgentConfigs(
   return summary;
 }
 
-async function installSkills(
+export async function installSkills(
   srcDir: string,
   dstDir: string,
   backupContext: SetupBackupContext,
@@ -1157,6 +1245,11 @@ async function installSkills(
 ): Promise<SetupCategorySummary> {
   const summary = createEmptyCategorySummary();
   if (!existsSync(srcDir)) return summary;
+  const installableSkills: Array<{
+    name: string;
+    sourceDir: string;
+    destinationDir: string;
+  }> = [];
   const manifest = tryReadCatalogManifest();
   const skillStatusByName = manifest
     ? new Map(manifest.skills.map((skill) => [skill.name, skill.status]))
@@ -1185,6 +1278,22 @@ async function installSkills(
     const skillMd = join(skillSrc, "SKILL.md");
     if (!existsSync(skillMd)) continue;
 
+    installableSkills.push({
+      name: entry.name,
+      sourceDir: skillSrc,
+      destinationDir: skillDst,
+    });
+  }
+
+  for (const skill of installableSkills) {
+    await validateSkillFile(join(skill.sourceDir, "SKILL.md"));
+  }
+
+  for (const skill of installableSkills) {
+    const skillName = skill.name;
+    const skillSrc = skill.sourceDir;
+    const skillDst = skill.destinationDir;
+
     if (!options.dryRun) {
       await mkdir(skillDst, { recursive: true });
     }
@@ -1201,7 +1310,7 @@ async function installSkills(
         summary,
         backupContext,
         options,
-        `skill ${entry.name}/${sf}`,
+        `skill ${skillName}/${sf}`,
       );
     }
   }
