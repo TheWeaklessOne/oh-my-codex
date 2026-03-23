@@ -6,7 +6,7 @@ import { spawnSync } from 'child_process';
 import { dirname, join, resolve } from 'path';
 import { homedir } from 'os';
 import { drainPendingTeamDispatch } from './notify-hook/team-dispatch.js';
-import { resolveNudgePaneTarget } from './notify-hook/auto-nudge.js';
+import { maybeAutoNudge, resolveNudgePaneTarget } from './notify-hook/auto-nudge.js';
 import { checkPaneReadyForTeamSendKeys } from './notify-hook/team-tmux-guard.js';
 import {
   isLeaderStale,
@@ -155,6 +155,19 @@ interface ParentGuardState {
   current_phase: string;
 }
 
+interface FallbackAutoNudgeState {
+  enabled: boolean;
+  stall_ms: number;
+  last_tick_at: string | null;
+  last_turn_at: string;
+  last_turn_count: number | null;
+  last_message: string;
+  last_reason: string;
+  last_error: string | null;
+  last_nudged_signature: string;
+  last_nudged_at: string;
+}
+
 const fileState = new Map<string, WatcherFileMeta>();
 const seenTurnKeys = new Set<string>();
 let stopping = false;
@@ -199,6 +212,22 @@ let lastParentGuard: ParentGuardState = {
   state_path: '',
   current_phase: '',
 };
+const AUTO_NUDGE_STALL_MS = Math.max(
+  pollMs,
+  asNumber(process.env.OMX_NOTIFY_FALLBACK_AUTO_NUDGE_STALL_MS || '5000', 5000),
+);
+let lastFallbackAutoNudge: FallbackAutoNudgeState = {
+  enabled: true,
+  stall_ms: AUTO_NUDGE_STALL_MS,
+  last_tick_at: null,
+  last_turn_at: '',
+  last_turn_count: null,
+  last_message: '',
+  last_reason: 'init',
+  last_error: null,
+  last_nudged_signature: '',
+  last_nudged_at: '',
+};
 function eventLog(event: Record<string, unknown>): Promise<void> {
   return appendFile(logPath, `${JSON.stringify({ timestamp: new Date().toISOString(), ...event })}\n`).catch(() => {});
 }
@@ -239,6 +268,23 @@ async function loadPersistedWatcherState(): Promise<void> {
     .then((content) => JSON.parse(content) as Record<string, unknown>)
     .catch(() => null);
   lastRalphContinueSteer = normalizeRalphContinueSteerState(persisted?.ralph_continue_steer as Record<string, unknown> | null | undefined);
+  const persistedAutoNudge = persisted?.fallback_auto_nudge as Record<string, unknown> | null | undefined;
+  if (persistedAutoNudge && typeof persistedAutoNudge === 'object') {
+    lastFallbackAutoNudge = {
+      enabled: persistedAutoNudge.enabled !== false,
+      stall_ms: Number.isFinite(persistedAutoNudge.stall_ms) && (persistedAutoNudge.stall_ms as number) > 0
+        ? persistedAutoNudge.stall_ms as number
+        : AUTO_NUDGE_STALL_MS,
+      last_tick_at: safeString(persistedAutoNudge.last_tick_at) || null,
+      last_turn_at: safeString(persistedAutoNudge.last_turn_at),
+      last_turn_count: Number.isFinite(persistedAutoNudge.last_turn_count) ? persistedAutoNudge.last_turn_count as number : null,
+      last_message: safeString(persistedAutoNudge.last_message),
+      last_reason: safeString(persistedAutoNudge.last_reason) || 'init',
+      last_error: safeString(persistedAutoNudge.last_error) || null,
+      last_nudged_signature: safeString(persistedAutoNudge.last_nudged_signature),
+      last_nudged_at: safeString(persistedAutoNudge.last_nudged_at),
+    };
+  }
 }
 
 interface ActiveModeResult {
@@ -620,9 +666,106 @@ async function writeState(extra: Record<string, unknown> = {}): Promise<void> {
       cadence_ms: RALPH_CONTINUE_CADENCE_MS,
       message: RALPH_CONTINUE_TEXT,
     },
+    fallback_auto_nudge: {
+      ...lastFallbackAutoNudge,
+      enabled: true,
+      stall_ms: AUTO_NUDGE_STALL_MS,
+    },
     ...extra,
   };
   await writeFile(statePath, JSON.stringify(state, null, 2)).catch(() => {});
+}
+
+async function readJsonObject(path: string): Promise<Record<string, unknown> | null> {
+  return readFile(path, 'utf-8')
+    .then((content) => JSON.parse(content) as Record<string, unknown>)
+    .catch(() => null);
+}
+
+async function readAutoNudgeCount(): Promise<number> {
+  const parsed = await readJsonObject(join(stateDir, 'auto-nudge-state.json'));
+  return Math.max(0, Math.trunc(asNumber(parsed?.nudgeCount as string | number | undefined, 0)));
+}
+
+async function runFallbackAutoNudgeTick(): Promise<void> {
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const hudStatePath = join(stateDir, 'hud-state.json');
+  const hudState = await readJsonObject(hudStatePath);
+
+  lastFallbackAutoNudge = {
+    ...lastFallbackAutoNudge,
+    enabled: true,
+    stall_ms: AUTO_NUDGE_STALL_MS,
+    last_tick_at: nowIso,
+    last_error: null,
+  };
+
+  if (!hudState) {
+    lastFallbackAutoNudge.last_reason = 'hud_state_missing';
+    return;
+  }
+
+  const lastTurnAt = safeString(hudState.last_turn_at);
+  const turnCount = Number.isFinite(hudState.turn_count) ? hudState.turn_count as number : null;
+  const lastMessage = safeString(hudState.last_agent_output || hudState.last_agent_message || '');
+  const lastTurnMs = parseIsoMillis(lastTurnAt);
+
+  lastFallbackAutoNudge.last_turn_at = lastTurnAt;
+  lastFallbackAutoNudge.last_turn_count = turnCount;
+  lastFallbackAutoNudge.last_message = lastMessage.slice(0, 400);
+
+  if (!lastTurnAt || lastTurnMs === null || turnCount === null || turnCount < 1) {
+    lastFallbackAutoNudge.last_reason = 'hud_state_incomplete';
+    return;
+  }
+  if (!lastMessage.trim()) {
+    lastFallbackAutoNudge.last_reason = 'no_last_message';
+    return;
+  }
+  if (now - lastTurnMs < AUTO_NUDGE_STALL_MS) {
+    lastFallbackAutoNudge.last_reason = 'recent_turn_activity';
+    return;
+  }
+
+  const signature = `${turnCount}|${lastTurnAt}|${lastMessage}`;
+  if (lastFallbackAutoNudge.last_nudged_signature === signature) {
+    lastFallbackAutoNudge.last_reason = 'duplicate_stall_signature';
+    return;
+  }
+
+  const beforeCount = await readAutoNudgeCount();
+  await maybeAutoNudge({
+    cwd,
+    stateDir,
+    logsDir,
+    payload: {
+      type: 'agent-turn-complete',
+      cwd,
+      source: 'notify-fallback-watcher-stall',
+      'thread-id': 'notify-fallback-watcher-stall',
+      'turn-id': `stalled-turn-${turnCount}`,
+      'input-messages': ['[notify-fallback] synthesized from stalled hud-state'],
+      'last-assistant-message': lastMessage,
+    },
+  });
+  const afterCount = await readAutoNudgeCount();
+
+  if (afterCount > beforeCount) {
+    lastFallbackAutoNudge.last_nudged_signature = signature;
+    lastFallbackAutoNudge.last_nudged_at = nowIso;
+    lastFallbackAutoNudge.last_reason = 'sent';
+    await eventLog({
+      type: 'fallback_auto_nudge_tick',
+      reason: 'sent',
+      turn_count: turnCount,
+      last_turn_at: lastTurnAt,
+      stall_ms: AUTO_NUDGE_STALL_MS,
+    });
+    return;
+  }
+
+  lastFallbackAutoNudge.last_reason = 'eligible_but_not_sent';
 }
 
 async function requestShutdown(reason: string, signal: string | null = null): Promise<void> {
@@ -939,6 +1082,7 @@ async function runDispatchDrainTick(): Promise<void> {
 async function pumpTeamControlPlaneTick(): Promise<void> {
   await runDispatchDrainTick();
   await runLeaderNudgeTick();
+  await runFallbackAutoNudgeTick();
 }
 
 

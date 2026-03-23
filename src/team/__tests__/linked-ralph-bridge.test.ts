@@ -92,4 +92,35 @@ describe('runLinkedRalphBridge', () => {
       'expected event log while bridge is active',
     );
   });
+
+  it('finalizes linked Ralph when team state disappears unexpectedly', async () => {
+    const updates: Array<Record<string, unknown>> = [];
+    let finalizeCalls = 0;
+
+    const result = await runLinkedRalphBridge(
+      {
+        teamName: 'alpha',
+        task: 'ship linked bridge fix',
+        cwd: '/tmp/demo',
+        waitTimeoutMs: 1_000,
+      },
+      {
+        ensureLinkedRalphModeState: async () => {},
+        updateLinkedRalphHeartbeat: async () => {},
+        finalizeLinkedRalph: async (_teamName, _cwd, terminalPhase, patch) => {
+          finalizeCalls += 1;
+          updates.push({ terminalPhase, ...patch });
+        },
+        monitorTeam: async () => null,
+        waitForTeamEvent: async () => ({ status: 'timeout', cursor: '' }),
+      },
+    );
+
+    assert.equal(result.status, 'missing');
+    assert.equal(finalizeCalls, 1);
+    assert.ok(
+      updates.some((patch) => patch.terminalPhase === 'failed' && patch.linked_team_missing === true),
+      'expected missing team state to finalize linked Ralph as failed',
+    );
+  });
 });

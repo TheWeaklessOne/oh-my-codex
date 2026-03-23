@@ -3308,7 +3308,8 @@ export async function sendWorkerMessage(
       ),
     });
     let finalOutcome = outcome;
-    if (leaderTransportPreference === 'hook_preferred_with_fallback' && !config.leader_pane_id) {
+    const mailboxAlreadyNotified = outcome.ok && outcome.reason === 'existing_message_already_notified';
+    if (!mailboxAlreadyNotified && leaderTransportPreference === 'hook_preferred_with_fallback' && !config.leader_pane_id) {
       if (outcome.request_id) {
         await markDispatchRequestLeaderPaneMissingDeferred({
           teamName: sanitized,
@@ -3325,7 +3326,7 @@ export async function sendWorkerMessage(
       };
     }
     const canLeaderFallbackDirectly = Boolean(config.leader_pane_id) && isTmuxAvailable();
-    if (leaderTransportPreference === 'hook_preferred_with_fallback' && canLeaderFallbackDirectly) {
+    if (!mailboxAlreadyNotified && leaderTransportPreference === 'hook_preferred_with_fallback' && canLeaderFallbackDirectly) {
       if (!outcome.request_id || !outcome.message_id) {
         throw new Error('mailbox_notify_failed:dispatch_request_missing_id');
       }
@@ -3376,7 +3377,8 @@ export async function sendWorkerMessage(
     ),
   });
   let finalOutcome = outcome;
-  if (transportPreference === 'hook_preferred_with_fallback') {
+  const mailboxAlreadyNotified = outcome.ok && outcome.reason === 'existing_message_already_notified';
+  if (!mailboxAlreadyNotified && transportPreference === 'hook_preferred_with_fallback') {
     if (!outcome.request_id || !outcome.message_id) {
       throw new Error('mailbox_notify_failed:dispatch_request_missing_id');
     }

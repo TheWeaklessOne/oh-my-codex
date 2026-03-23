@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.11.7] - 2026-03-23
+
+Patch release for team delivery parity, degraded-state auto-nudge recovery, and real tmux release verification.
+
+### Fixed
+- **Leader mailbox resend recovery** — hook-preferred duplicate mailbox sends no longer regress into missing dispatch IDs after notification, restoring idempotent delivery confirmation in the leader control path.
+- **Linked Ralph terminal sync on missing team state** — linked Ralph mode now finalizes cleanly when the paired team state disappears instead of remaining active indefinitely.
+- **Degraded-state auto-nudge fallback** — the fallback watcher now reuses stalled HUD turn state to trigger auto-nudge when no active mode state is available, and can resolve the live Codex pane by cwd when anchor state is missing.
+- **Stale leader / worker nudge accuracy** — release now includes the current `origin/dev` fixes for reduced false stalled nudges and recovered fallback dispatch success state. (PRs #1021, #1023)
+
+### Verified
+- **Targeted hook + watcher regression suite** — `notify-fallback-watcher` and `notify-hook auto-nudge` pass with the new degraded-state coverage.
+- **Real tmux smoke for degraded auto-nudge** — a live Codex pane received `yes, proceed [OMX_TMUX_INJECT]` from the fallback watcher after a 5s stalled-turn window with only HUD state available.
+- **Real tmux smoke for Ralph anti-spam** — two back-to-back fallback watcher ticks did not emit repeated `Ralph loop active continue` sends; the persisted state stayed in cooldown (`startup_cooldown`).
+
 ## [0.11.6] - 2026-03-21
 
 Patch release for Ralph continue-steer restart throttling.

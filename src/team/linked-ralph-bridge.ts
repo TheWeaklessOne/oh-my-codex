@@ -127,6 +127,12 @@ export async function runLinkedRalphBridge(
   while (true) {
     const snapshot = await deps.monitorTeam(options.teamName, options.cwd);
     if (!snapshot) {
+      await deps.finalizeLinkedRalph(options.teamName, options.cwd, 'failed', {
+        linked_team_phase: 'missing',
+        linked_team_event_cursor: cursor,
+        linked_team_last_snapshot_at: new Date().toISOString(),
+        linked_team_missing: true,
+      });
       options.log?.(`[linked-ralph] team state missing for team=${options.teamName}`);
       return { status: 'missing', cursor };
     }

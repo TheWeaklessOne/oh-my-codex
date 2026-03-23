@@ -5,6 +5,7 @@
  */
 
 import { readFile, writeFile } from 'fs/promises';
+import { execFileSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 import { asNumber, safeString } from './utils.js';
@@ -287,6 +288,35 @@ export async function capturePane(paneId, lines = 10) {
   }
 }
 
+function resolveCodexPaneByCwdFallback(cwd) {
+  const normalizedCwd = safeString(cwd).trim();
+  if (!normalizedCwd) return '';
+
+  try {
+    const panes = execFileSync('tmux', [
+      'list-panes', '-a', '-F', '#{pane_id}	#{pane_current_path}	#{pane_current_command}	#{pane_start_command}',
+    ], { encoding: 'utf-8', timeout: 2000 })
+      .trim()
+      .split('\n')
+      .filter(Boolean);
+
+    for (const line of panes) {
+      const [paneId, panePath = '', paneCommand = '', startCommand = ''] = line.split('\t');
+      const normalizedPanePath = safeString(panePath).trim();
+      const normalizedStart = safeString(startCommand).toLowerCase();
+      const normalizedCommand = safeString(paneCommand).trim().toLowerCase();
+      if (!paneId || normalizedPanePath !== normalizedCwd) continue;
+      if (/\bomx\b.*\bhud\b.*--watch/i.test(normalizedStart)) continue;
+      if (normalizedStart.includes('codex')) return paneId;
+      if (normalizedCommand === 'codex' || normalizedCommand === 'node' || normalizedCommand === 'npx') return paneId;
+    }
+  } catch {
+    // Fall back to empty when tmux scan is unavailable.
+  }
+
+  return '';
+}
+
 async function resolveCodexPaneFromAnchor(anchorPane) {
   const paneId = safeString(anchorPane).trim();
   if (!paneId) return '';
@@ -316,7 +346,7 @@ async function resolveCodexPaneFromAnchor(anchorPane) {
   return '';
 }
 
-export async function resolveNudgePaneTarget(stateDir: any) {
+export async function resolveNudgePaneTarget(stateDir: any, cwd = '') {
   // Use canonical codex pane resolver — validates pane is running an agent, not a shell
   const { resolveCodexPane } = await import('../tmux-hook-engine.js');
   const codexPane = resolveCodexPane();
@@ -349,7 +379,9 @@ export async function resolveNudgePaneTarget(stateDir: any) {
     // Non-critical
   }
 
-  return fallbackPane;
+  if (fallbackPane) return fallbackPane;
+
+  return resolveCodexPaneByCwdFallback(cwd);
 }
 
 export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload }) {
@@ -379,7 +411,7 @@ export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload }) {
     const nudgeCount = asNumber(nudgeState.nudgeCount) ?? 0;
     if (Number.isFinite(config.maxNudgesPerSession) && nudgeCount >= config.maxNudgesPerSession) return;
 
-    const paneId = await resolveNudgePaneTarget(stateDir);
+    const paneId = await resolveNudgePaneTarget(stateDir, cwd);
 
     let detected = detectStallPattern(lastMessage, config.patterns);
     let source = 'payload';

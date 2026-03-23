@@ -3473,6 +3473,56 @@ esac
     }
   });
 
+
+  it('sendWorkerMessage keeps hook-preferred duplicate leader mailbox sends idempotent after notification', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-leader-dedupe-notified-'));
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-leader-dedupe-notified-bin-',
+          tmuxScript: (tmuxLogPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$$*" >> "${tmuxLogPath}"
+case "\${1:-}" in
+  send-keys)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+        },
+        async () => {
+          await initTeamState('team-leader-dedupe-notified', 'leader mailbox dedupe notified test', 'executor', 1, cwd);
+          const cfg = await readTeamConfig('team-leader-dedupe-notified', cwd);
+          assert.ok(cfg);
+          if (!cfg) throw new Error('missing team config');
+          cfg.leader_pane_id = '%55';
+          await saveTeamConfig(cfg, cwd);
+
+          const manifestPath = teamStateTestPath(cwd, 'team', 'team-leader-dedupe-notified', 'manifest.v2.json');
+          const manifest = JSON.parse(await readFile(manifestPath, 'utf-8'));
+          manifest.policy = { ...(manifest.policy || {}), dispatch_ack_timeout_ms: 100 };
+          await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+
+          await sendWorkerMessage('team-leader-dedupe-notified', 'worker-1', 'leader-fixed', 'INTEGRATED: same-body', cwd);
+          await sendWorkerMessage('team-leader-dedupe-notified', 'worker-1', 'leader-fixed', 'INTEGRATED: same-body', cwd);
+
+          const messages = await listMailboxMessages('team-leader-dedupe-notified', 'leader-fixed', cwd);
+          const workerMessages = messages.filter((message) => message.from_worker === 'worker-1' && message.body === 'INTEGRATED: same-body');
+          assert.equal(workerMessages.length, 1);
+          assert.ok(workerMessages[0]?.notified_at);
+
+          const requests = await listDispatchRequests('team-leader-dedupe-notified', cwd, { kind: 'mailbox', to_worker: 'leader-fixed' });
+          assert.ok(requests.some((request) => request.status === 'notified' && request.message_id === workerMessages[0]?.message_id));
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('sendWorkerMessage hook-preferred path persists leader mailbox guidance when leader pane exists', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-leader-inject-'));
     try {
