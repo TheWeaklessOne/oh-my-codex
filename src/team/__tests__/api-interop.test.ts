@@ -18,6 +18,7 @@ import {
   sendDirectMessage,
   enqueueDispatchRequest,
   readDispatchRequest,
+  listDispatchRequests,
   appendTeamEvent,
   updateWorkerHeartbeat,
   writeMonitorSnapshot,
@@ -184,13 +185,78 @@ describe('executeTeamApiOperation: send-message', () => {
       const messageId = String(message.message_id ?? '');
       assert.ok(messageId, 'message should include a message_id');
 
-      const requests = await readFile(join(cwd, '.omx', 'state', 'team', 'msg-team', 'dispatch', 'requests.json'), 'utf-8');
-      const parsedRequests = JSON.parse(requests) as Array<Record<string, unknown>>;
-      const mailboxRequest = parsedRequests.find((request) => request.kind === 'mailbox' && request.message_id === messageId);
+      const parsedRequests = await listDispatchRequests('msg-team', cwd, { kind: 'mailbox' });
+      const mailboxRequest = parsedRequests.find((request) => request.message_id === messageId);
       assert.ok(mailboxRequest, 'send-message should enqueue a mailbox dispatch request');
       assert.equal(mailboxRequest?.to_worker, 'worker-2');
     } finally {
       await cleanup();
+    }
+  });
+
+  it('returns the persisted leader mailbox message when hook-targeted sends are deduped from a worker worktree', async () => {
+    const teamName = 'msg-team-leader-dedupe';
+    const repoCwd = await mkdtemp(join(tmpdir(), 'omx-interop-send-root-'));
+    const workerCwd = await mkdtemp(join(tmpdir(), 'omx-interop-send-worktree-'));
+    const prevTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
+    delete process.env.OMX_TEAM_STATE_ROOT;
+
+    try {
+      await initTeamState(teamName, 'leader mailbox dedupe', 'executor', 2, repoCwd);
+
+      const configPath = join(repoCwd, '.omx', 'state', 'team', teamName, 'config.json');
+      const config = JSON.parse(await readFile(configPath, 'utf-8')) as {
+        leader_pane_id?: string;
+      };
+      config.leader_pane_id = '%55';
+      await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+      const manifestPath = join(repoCwd, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as {
+        leader_pane_id?: string;
+      };
+      manifest.leader_pane_id = '%55';
+      await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+
+      process.env.OMX_TEAM_STATE_ROOT = join(repoCwd, '.omx', 'state');
+
+      const first = await executeTeamApiOperation('send-message', {
+        team_name: teamName,
+        from_worker: 'worker-1',
+        to_worker: 'leader-fixed',
+        body: 'ACK: worker-1 initialized',
+      }, workerCwd);
+      assert.equal(first.ok, true);
+      if (!first.ok) throw new Error('expected first send-message call to succeed');
+
+      const second = await executeTeamApiOperation('send-message', {
+        team_name: teamName,
+        from_worker: 'worker-1',
+        to_worker: 'leader-fixed',
+        body: 'ACK: worker-1 initialized',
+      }, workerCwd);
+      assert.equal(second.ok, true);
+      if (!second.ok) throw new Error('expected duplicate send-message call to succeed');
+
+      const firstMessage = first.data.message as Record<string, unknown>;
+      const secondMessage = second.data.message as Record<string, unknown>;
+      assert.equal(secondMessage.message_id, firstMessage.message_id);
+      assert.equal(secondMessage.to_worker, 'leader-fixed');
+      assert.equal(secondMessage.body, 'ACK: worker-1 initialized');
+
+      const mailbox = JSON.parse(await readFile(
+        join(repoCwd, '.omx', 'state', 'team', teamName, 'mailbox', 'leader-fixed.json'),
+        'utf-8',
+      )) as { messages?: Array<Record<string, unknown>> };
+      const workerMessages = (mailbox.messages ?? []).filter((message) =>
+        message.from_worker === 'worker-1' && message.to_worker === 'leader-fixed',
+      );
+      assert.equal(workerMessages.length, 1, 'deduped leader sends should not append duplicate worker mailbox rows');
+    } finally {
+      if (typeof prevTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = prevTeamStateRoot;
+      else delete process.env.OMX_TEAM_STATE_ROOT;
+      await rm(repoCwd, { recursive: true, force: true });
+      await rm(workerCwd, { recursive: true, force: true });
     }
   });
 

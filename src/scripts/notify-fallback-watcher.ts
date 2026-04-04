@@ -1228,9 +1228,13 @@ async function runLeaderNudgeTick(): Promise<void> {
 
   try {
     const preComputedLeaderStale = await isLeaderStale(stateDir, staleThresholdMs, Date.now());
-    if (preComputedLeaderStale) {
-      await maybeNudgeTeamLeader({ cwd, stateDir, logsDir, preComputedLeaderStale });
-    }
+    await maybeNudgeTeamLeader({
+      cwd,
+      stateDir,
+      logsDir,
+      preComputedLeaderStale,
+      allowFreshMailboxNudges: false,
+    });
     leaderNudgeRuns += 1;
     lastLeaderNudge = {
       enabled: true,

@@ -751,6 +751,189 @@ describe('notify-fallback watcher', () => {
     }
   });
 
+  it('runs stalled-worker leader nudges from the fallback watcher even when the leader is not stale', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-worker-stall-nudge-'));
+    const fakeBinDir = join(wd, 'fake-bin');
+    const tmuxLogPath = join(wd, 'tmux.log');
+    try {
+      await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
+      await mkdir(join(wd, '.omx', 'state', 'team', 'dispatch-team', 'workers', 'worker-1'), { recursive: true });
+      await mkdir(join(wd, '.omx', 'state', 'team', 'dispatch-team', 'tasks'), { recursive: true });
+      await mkdir(fakeBinDir, { recursive: true });
+
+      const tmuxScript = `#!/usr/bin/env bash
+set -eu
+echo "$@" >> "${tmuxLogPath}"
+cmd="$1"
+shift || true
+if [[ "$cmd" == "display-message" ]]; then
+  target=""
+  fmt=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      -t)
+        shift
+        target="$1"
+        ;;
+      *)
+        fmt="$1"
+        ;;
+    esac
+    shift || true
+  done
+  if [[ "$fmt" == "#{pane_in_mode}" ]]; then
+    echo "0"
+    exit 0
+  fi
+  if [[ "$fmt" == "#{pane_id}" ]]; then
+    echo "\${target:-%42}"
+    exit 0
+  fi
+  if [[ "$fmt" == "#{pane_current_path}" ]]; then
+    dirname "${tmuxLogPath}"
+    exit 0
+  fi
+  if [[ "$fmt" == "#{pane_current_command}" ]]; then
+    echo "codex"
+    exit 0
+  fi
+  if [[ "$fmt" == "#S" ]]; then
+    echo "omx-team-dispatch-team"
+    exit 0
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "send-keys" ]]; then
+  exit 0
+fi
+if [[ "$cmd" == "list-panes" ]]; then
+  target=""
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      -t)
+        shift
+        target="$1"
+        ;;
+    esac
+    shift || true
+  done
+  if [[ -n "$target" ]]; then
+    printf "%%42 12345\n%%10 12346\n%%11 12347\n"
+    exit 0
+  fi
+  echo "%42 1"
+  exit 0
+fi
+exit 0
+`;
+      await writeFile(join(fakeBinDir, 'tmux'), tmuxScript);
+      await chmod(join(fakeBinDir, 'tmux'), 0o755);
+
+      const now = Date.now();
+      await writeFile(join(wd, '.omx', 'state', 'team-state.json'), JSON.stringify({
+        active: true,
+        team_name: 'dispatch-team',
+        current_phase: 'team-exec',
+      }, null, 2));
+      await writeFile(join(wd, '.omx', 'state', 'hud-state.json'), JSON.stringify({
+        last_turn_at: new Date().toISOString(),
+        turn_count: 3,
+      }, null, 2));
+      await writeFile(join(wd, '.omx', 'state', 'team', 'dispatch-team', 'config.json'), JSON.stringify({
+        name: 'dispatch-team',
+        tmux_session: 'omx-team-dispatch-team',
+        leader_pane_id: '%42',
+        workers: [
+          { name: 'worker-1', index: 1, pane_id: '%10' },
+          { name: 'worker-2', index: 2, pane_id: '%11' },
+        ],
+      }, null, 2));
+      await writeFile(join(wd, '.omx', 'state', 'team', 'dispatch-team', 'tasks', 'task-1.json'), JSON.stringify({
+        id: '1',
+        subject: 'Pending work',
+        description: 'Needs attention',
+        status: 'pending',
+        created_at: new Date().toISOString(),
+      }, null, 2));
+      await writeFile(join(wd, '.omx', 'state', 'team', 'dispatch-team', 'workers', 'worker-1', 'status.json'), JSON.stringify({
+        state: 'working',
+        current_task_id: '1',
+        updated_at: new Date(now - 180_000).toISOString(),
+      }, null, 2));
+      await writeFile(join(wd, '.omx', 'state', 'team', 'dispatch-team', 'workers', 'worker-1', 'heartbeat.json'), JSON.stringify({
+        alive: true,
+        pid: 101,
+        turn_count: 2,
+        last_turn_at: new Date(now - 180_000).toISOString(),
+      }, null, 2));
+      await writeFile(join(wd, '.omx', 'state', 'team-leader-nudge.json'), JSON.stringify({
+        last_nudged_by_team: {
+          'dispatch-team': {
+            at: new Date(now - 5_000).toISOString(),
+            last_message_id: '',
+            reason: 'new_mailbox_message',
+          },
+        },
+        progress_by_team: {
+          'dispatch-team': {
+            signature: JSON.stringify({
+              tasks: [{ id: '1', owner: '', status: 'pending' }],
+              workers: [
+                {
+                  worker: 'worker-1',
+                  state: 'working',
+                  current_task_id: '1',
+                  status_missing: false,
+                  turn_count: 2,
+                  heartbeat_missing: false,
+                },
+                {
+                  worker: 'worker-2',
+                  state: 'unknown',
+                  current_task_id: '',
+                  status_missing: true,
+                  turn_count: null,
+                  heartbeat_missing: true,
+                },
+              ],
+            }),
+            last_progress_at: new Date(now - 180_000).toISOString(),
+          },
+        },
+      }, null, 2));
+
+      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const result = spawnSync(
+        process.execPath,
+        [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook],
+        {
+          encoding: 'utf-8',
+          env: buildCleanNotifyEnv({
+            PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
+            OMX_TEAM_PROGRESS_STALL_MS: '60000',
+            OMX_TEAM_LEADER_NUDGE_MS: '30000',
+            OMX_TEAM_LEADER_STALE_MS: '60000',
+          }),
+        },
+      );
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const tmuxLog = await readFile(tmuxLogPath, 'utf8');
+      assert.match(tmuxLog, /send-keys -t %42 -l Team dispatch-team: worker panes stalled, no progress 3m/);
+      assert.doesNotMatch(tmuxLog, /leader stale/);
+
+      const watcherStatePath = join(wd, '.omx', 'state', 'notify-fallback-state.json');
+      const watcherState = JSON.parse(await readFile(watcherStatePath, 'utf-8'));
+      assert.equal(watcherState.leader_nudge?.enabled, true);
+      assert.equal(watcherState.leader_nudge?.leader_only, true);
+      assert.equal(watcherState.leader_nudge?.run_count, 1);
+      assert.equal(watcherState.leader_nudge?.precomputed_leader_stale, false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('auto-nudges stalled session output even when no active mode state exists', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-auto-nudge-stalled-'));
     const fakeBinDir = join(wd, 'fake-bin');

@@ -510,7 +510,13 @@ async function emitLeaderNudgeDeferredEvent(cwd, teamName, reason, nowIso, { tmu
   }
 }
 
-export async function maybeNudgeTeamLeader({ cwd, stateDir, logsDir, preComputedLeaderStale }) {
+export async function maybeNudgeTeamLeader({
+  cwd,
+  stateDir,
+  logsDir,
+  preComputedLeaderStale,
+  allowFreshMailboxNudges = true,
+}) {
   const intervalMs = resolveLeaderNudgeIntervalMs();
   const idleCooldownMs = resolveLeaderAllIdleNudgeCooldownMs();
   const fallbackProgressStallThresholdMs = resolveFallbackProgressStallThresholdMs();
@@ -683,7 +689,8 @@ export async function maybeNudgeTeamLeader({ cwd, stateDir, logsDir, preComputed
     const stalledTeamNudge = teamProgressStalled && (dueByTime || !previousStalledTeamNudge);
     const staleFollowupDue = stalePanesNudge && dueByTime;
 
-    if (!shouldSendAllIdleNudge && !hasNewMessage && !stalledTeamNudge && !staleFollowupDue) continue;
+    const hasActionableNewMessage = hasNewMessage && (allowFreshMailboxNudges || leaderStale);
+    if (!shouldSendAllIdleNudge && !hasActionableNewMessage && !stalledTeamNudge && !staleFollowupDue) continue;
 
     let nudgeReason = '';
     let text = '';
@@ -717,7 +724,7 @@ export async function maybeNudgeTeamLeader({ cwd, stateDir, logsDir, preComputed
         `Team ${teamName}: ${stallPrefix}no progress ${formatDurationMs(stalledForMs)}. `
         + `${leaderActionGuidance} `
         + `(p:${pending} ip:${in_progress} b:${blocked}${missingSignals})`;
-    } else if (stalePanesNudge && hasNewMessage) {
+    } else if (stalePanesNudge && hasActionableNewMessage) {
       nudgeReason = 'stale_leader_with_messages';
       text =
         `Team ${teamName}: leader stale, ${paneStatus.paneCount} pane(s) active, ${messages.length} msg(s) pending. `
@@ -727,7 +734,7 @@ export async function maybeNudgeTeamLeader({ cwd, stateDir, logsDir, preComputed
       text =
         `Team ${teamName}: leader stale, ${paneStatus.paneCount} worker pane(s) still active. `
         + leaderActionGuidance;
-    } else if (hasNewMessage) {
+    } else if (hasActionableNewMessage) {
       nudgeReason = 'new_mailbox_message';
       text = `Team ${teamName}: ${messages.length} msg(s) for leader. ${buildMailboxCheckReminder(teamName)}`;
     } else {

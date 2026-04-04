@@ -3431,7 +3431,7 @@ export async function sendWorkerMessage(
   toWorker: string,
   body: string,
   cwd: string,
-): Promise<void> {
+): Promise<DispatchOutcome> {
   const sanitized = sanitizeTeamName(teamName);
   const config = await readTeamConfig(sanitized, cwd);
   if (!config) throw new Error(`Team ${sanitized} not found`);
@@ -3496,7 +3496,7 @@ export async function sendWorkerMessage(
       });
     }
     if (!finalOutcome.ok) throw new Error(`mailbox_notify_failed:${finalOutcome.reason}`);
-    return;
+    return finalOutcome;
   }
 
   const recipient = config.workers.find((w) => w.name === toWorker);
@@ -3548,6 +3548,7 @@ export async function sendWorkerMessage(
     });
   }
   if (!finalOutcome.ok) throw new Error(`mailbox_notify_failed:${finalOutcome.reason}`);
+  return finalOutcome;
 }
 
 export async function broadcastWorkerMessage(

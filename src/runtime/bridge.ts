@@ -77,7 +77,7 @@ export type RuntimeEvent =
   | { event: 'DispatchFailed'; request_id: string; reason: string }
   | { event: 'ReplayRequested'; cursor?: string }
   | { event: 'SnapshotCaptured' }
-  | { event: 'MailboxMessageCreated'; message_id: string; from_worker: string; to_worker: string }
+  | { event: 'MailboxMessageCreated'; message_id: string; from_worker: string; to_worker: string; body?: string }
   | { event: 'MailboxNotified'; message_id: string }
   | { event: 'MailboxDelivered'; message_id: string };
 

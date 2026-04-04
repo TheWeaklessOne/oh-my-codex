@@ -1368,21 +1368,39 @@ export async function appendTeamEvent(teamName: string, event: Omit<TeamEvent, '
 }
 
 async function readMailbox(teamName: string, workerName: string, cwd: string): Promise<TeamMailbox> {
+  const legacyMailbox = await readLegacyMailbox(teamName, workerName, cwd);
+
   if (isBridgeEnabled()) {
     try {
       const bridge = getDefaultBridge(resolveBridgeStateDir(cwd));
       const compat = bridge.readCompatFile<{ records?: unknown[] }>('mailbox.json');
       if (compat) {
-        const messages = bridge.readMailboxRecords()
+        const legacyById = new Map(
+          legacyMailbox.messages
+            .filter((message) => typeof message.message_id === 'string' && message.message_id !== '')
+            .map((message) => [message.message_id, message]),
+        );
+        const bridgeMessages = bridge.readMailboxRecords()
           .filter((record) => record.to_worker === workerName)
-          .map((record) => normalizeBridgeMailboxMessage(record));
-        return { worker: workerName, messages };
+          .map((record) => {
+            const normalized = normalizeBridgeMailboxMessage(record);
+            if (!normalized.body) {
+              const legacyMessage = legacyById.get(normalized.message_id);
+              if (legacyMessage?.body) return { ...normalized, body: legacyMessage.body };
+            }
+            return normalized;
+          });
+        return { worker: workerName, messages: bridgeMessages };
       }
     } catch {
       // fall through to legacy file fallback
     }
   }
 
+  return legacyMailbox;
+}
+
+async function readLegacyMailbox(teamName: string, workerName: string, cwd: string): Promise<TeamMailbox> {
   const p = mailboxPath(teamName, workerName, cwd);
   try {
     if (!existsSync(p)) return { worker: workerName, messages: [] };
@@ -1548,6 +1566,7 @@ export async function sendDirectMessage(
     cwd,
     withMailboxLock,
     readMailbox,
+    readLegacyMailbox,
     writeMailbox,
     appendTeamEvent,
     readTeamConfig,
@@ -1565,6 +1584,7 @@ export async function broadcastMessage(
     cwd,
     withMailboxLock,
     readMailbox,
+    readLegacyMailbox,
     writeMailbox,
     appendTeamEvent,
     readTeamConfig,
@@ -1582,6 +1602,7 @@ export async function markMessageDelivered(
     cwd,
     withMailboxLock,
     readMailbox,
+    readLegacyMailbox,
     writeMailbox,
     appendTeamEvent,
     readTeamConfig,
@@ -1599,6 +1620,7 @@ export async function markMessageNotified(
     cwd,
     withMailboxLock,
     readMailbox,
+    readLegacyMailbox,
     writeMailbox,
     appendTeamEvent,
     readTeamConfig,
@@ -1615,6 +1637,7 @@ export async function listMailboxMessages(
     cwd,
     withMailboxLock,
     readMailbox,
+    readLegacyMailbox,
     writeMailbox,
     appendTeamEvent,
     readTeamConfig,

@@ -541,8 +541,8 @@ export async function maybeNotifyLeaderWorkerIdle({ cwd, stateDir, logsDir, pars
     await rename(tmpPath, prevStatePath);
   } catch { /* best effort */ }
 
-  // Only fire on working->idle transition (non-idle to idle)
-  if (currentState !== 'idle') return;
+  // Fire when a worker leaves active work into an idle-ish terminal state.
+  if (currentState !== 'idle' && currentState !== 'done') return;
   if (!statusFresh) return;
   if (prevState === 'idle' || prevState === 'done') return;
 
@@ -608,7 +608,7 @@ export async function maybeNotifyLeaderWorkerIdle({ cwd, stateDir, logsDir, pars
   }
 
   // Build notification message with context
-  const parts = [`[OMX] ${workerName} idle`];
+  const parts = [`[OMX] ${workerName} ${currentState}`];
   if (prevState && prevState !== 'unknown') parts.push(`(was: ${prevState})`);
   if (currentTaskId) parts.push(`task: ${currentTaskId}`);
   if (currentReason) parts.push(`reason: ${currentReason}`);

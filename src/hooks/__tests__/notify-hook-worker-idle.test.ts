@@ -137,6 +137,60 @@ describe('notify-hook per-worker idle notification', () => {
     });
   });
 
+  it('fires notification on working->done transition', async () => {
+    await withTempWorkingDir(async (cwd) => {
+      const stateDir = join(cwd, '.omx', 'state');
+      const logsDir = join(cwd, '.omx', 'logs');
+      const teamName = 'done-team';
+      const teamDir = join(stateDir, 'team', teamName);
+      const workersDir = join(teamDir, 'workers');
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const fakeTmuxPath = join(fakeBinDir, 'tmux');
+      const tmuxLogPath = join(cwd, 'tmux.log');
+
+      await mkdir(logsDir, { recursive: true });
+      await mkdir(fakeBinDir, { recursive: true });
+
+      await writeJson(join(teamDir, 'config.json'), {
+        name: teamName,
+        tmux_session: 'done-sess:0',
+        workers: [
+          { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] },
+        ],
+      });
+
+      await writeJson(join(workersDir, 'worker-1', 'status.json'), {
+        state: 'done',
+        current_task_id: 'task-42',
+        reason: 'task complete',
+        updated_at: new Date().toISOString(),
+      });
+      await writeJson(join(workersDir, 'worker-1', 'prev-notify-state.json'), {
+        state: 'working',
+        updated_at: new Date(Date.now() - 5000).toISOString(),
+      });
+
+      await writeFile(fakeTmuxPath, buildFakeTmux(tmuxLogPath));
+      await chmod(fakeTmuxPath, 0o755);
+
+      const result = runNotifyHookAsWorker(cwd, fakeBinDir, `${teamName}/worker-1`);
+      assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
+
+      const eventsPath = join(teamDir, 'events', 'events.ndjson');
+      assert.ok(existsSync(eventsPath), 'events.ndjson should exist for done-state leader notification');
+      const events = (await readFile(eventsPath, 'utf-8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+      const event = events.find((entry: { type?: string; reason?: string; worker?: string; to_worker?: string }) =>
+        entry.type === 'leader_notification_deferred'
+        && entry.reason === 'leader_pane_missing_no_injection'
+        && entry.worker === 'worker-1'
+        && entry.to_worker === 'leader-fixed');
+      assert.ok(event, 'done transition should still notify the leader through the deferred path when no pane is available');
+      assert.equal(event.tmux_session, 'done-sess:0');
+      assert.equal(event.leader_pane_id, null);
+      assert.equal(event.tmux_injection_attempted, false);
+    });
+  });
+
 
   it('does not inject worker-idle notification into a shell leader pane', async () => {
     await withTempWorkingDir(async (cwd) => {

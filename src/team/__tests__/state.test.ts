@@ -1199,7 +1199,7 @@ exit 1
     }
   });
 
-  it('prefers bridge-authored mailbox records without mutating the legacy mailbox file', async () => {
+  it('uses bridge-authored mailbox records while shadowing legacy mailbox bodies for recovery', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-mailbox-bridge-authority-'));
     const previousRuntimeBinary = process.env.OMX_RUNTIME_BINARY;
     try {
@@ -1221,13 +1221,26 @@ exit 1
       const messages = await listMailboxMessages('team-mailbox-bridge-authority', 'worker-2', cwd);
       assert.equal(messages.length, 1);
       assert.equal(messages[0]?.message_id, message.message_id);
+      assert.equal(messages[0]?.body, 'hello');
       assert.equal(typeof messages[0]?.notified_at, 'string');
       assert.equal(typeof messages[0]?.delivered_at, 'string');
 
-      if (existsSync(legacyPath)) {
-        const after = JSON.parse(await readFile(legacyPath, 'utf8')) as { messages: unknown[] };
-        assert.equal(after.messages.length, 0, 'bridge-success path should not rewrite legacy mailbox JSON');
-      }
+      assert.equal(existsSync(legacyPath), true, 'bridge-success path should shadow-write legacy mailbox JSON for body recovery');
+      const after = JSON.parse(await readFile(legacyPath, 'utf8')) as { messages: Array<{ message_id: string; body: string }> };
+      assert.equal(after.messages.length, 1);
+      assert.equal(after.messages[0]?.message_id, message.message_id);
+      assert.equal(after.messages[0]?.body, 'hello');
+
+      const compatPath = join(cwd, '.omx', 'state', 'mailbox.json');
+      const compat = JSON.parse(await readFile(compatPath, 'utf8')) as { records: Array<{ message_id: string; body: string }> };
+      const compatRecord = compat.records.find((entry) => entry.message_id === message.message_id);
+      assert.ok(compatRecord);
+      compatRecord!.body = '';
+      await writeFile(compatPath, JSON.stringify(compat, null, 2));
+
+      const recovered = await listMailboxMessages('team-mailbox-bridge-authority', 'worker-2', cwd);
+      assert.equal(recovered.length, 1);
+      assert.equal(recovered[0]?.body, 'hello', 'legacy shadow mailbox should backfill blank compat bodies');
     } finally {
       if (typeof previousRuntimeBinary === 'string') process.env.OMX_RUNTIME_BINARY = previousRuntimeBinary;
       else delete process.env.OMX_RUNTIME_BINARY;

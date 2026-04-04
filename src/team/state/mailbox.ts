@@ -21,6 +21,7 @@ interface MailboxDeps {
   cwd: string;
   withMailboxLock: <T>(teamName: string, workerName: string, cwd: string, fn: () => Promise<T>) => Promise<T>;
   readMailbox: (teamName: string, workerName: string, cwd: string) => Promise<TeamMailbox>;
+  readLegacyMailbox?: (teamName: string, workerName: string, cwd: string) => Promise<TeamMailbox>;
   writeMailbox: (teamName: string, mailbox: TeamMailbox, cwd: string) => Promise<void>;
   appendTeamEvent: (
     teamName: string,
@@ -69,7 +70,21 @@ export async function sendDirectMessage(
 
   await deps.withMailboxLock(deps.teamName, toWorker, deps.cwd, async () => {
     const mailbox = await deps.readMailbox(deps.teamName, toWorker, deps.cwd);
-    const existing = mailbox.messages.find((candidate) =>
+    const legacyMailbox = deps.readLegacyMailbox
+      ? await deps.readLegacyMailbox(deps.teamName, toWorker, deps.cwd)
+      : mailbox;
+    const dedupeCandidates = [...mailbox.messages];
+    if (deps.readLegacyMailbox) {
+      const seenMessageIds = new Set(dedupeCandidates.map((candidate) => candidate.message_id));
+      for (const legacyMessage of legacyMailbox.messages) {
+        if (!seenMessageIds.has(legacyMessage.message_id)) {
+          dedupeCandidates.push(legacyMessage);
+          seenMessageIds.add(legacyMessage.message_id);
+        }
+      }
+    }
+
+    const existing = dedupeCandidates.find((candidate) =>
       candidate.from_worker === fromWorker
       && candidate.to_worker === toWorker
       && candidate.body === body
@@ -91,7 +106,18 @@ export async function sendDirectMessage(
       const bridgeMailbox = await deps.readMailbox(deps.teamName, toWorker, deps.cwd);
       const bridgeMessage = bridgeMailbox.messages.find((candidate) => candidate.message_id === msgId);
       if (bridgeMessage) {
-        msg = bridgeMessage;
+        msg = {
+          ...bridgeMessage,
+          body: bridgeMessage.body || body,
+        };
+        const shadowMailbox = {
+          worker: legacyMailbox.worker,
+          messages: [...legacyMailbox.messages],
+        };
+        const shadowIndex = shadowMailbox.messages.findIndex((candidate) => candidate.message_id === msgId);
+        if (shadowIndex >= 0) shadowMailbox.messages[shadowIndex] = msg;
+        else shadowMailbox.messages.push(msg);
+        await deps.writeMailbox(deps.teamName, shadowMailbox, deps.cwd);
         created = true;
         return;
       }
@@ -104,8 +130,11 @@ export async function sendDirectMessage(
       body,
       created_at: new Date().toISOString(),
     };
-    mailbox.messages.push(msg);
-    await deps.writeMailbox(deps.teamName, mailbox, deps.cwd);
+    const shadowMailbox = {
+      worker: legacyMailbox.worker,
+      messages: [...legacyMailbox.messages, msg],
+    };
+    await deps.writeMailbox(deps.teamName, shadowMailbox, deps.cwd);
     created = true;
   });
 

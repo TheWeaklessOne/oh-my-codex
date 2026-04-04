@@ -173,6 +173,7 @@ impl RuntimeEngine {
                     message_id,
                     from_worker,
                     to_worker,
+                    body: Some(body),
                 }
             }
             RuntimeCommand::MarkMailboxNotified { message_id } => {
@@ -293,7 +294,10 @@ impl RuntimeEngine {
         lock_file.lock_shared()?;
 
         let events_json = std::fs::read_to_string(dir.join("events.json"))?;
-        let events: Vec<RuntimeEvent> = serde_json::from_str(&events_json)?;
+        let mut events: Vec<RuntimeEvent> = serde_json::from_str(&events_json)?;
+        let mailbox = std::fs::read_to_string(dir.join("mailbox.json"))
+            .ok()
+            .and_then(|mailbox_json| serde_json::from_str::<MailboxLog>(&mailbox_json).ok());
 
         drop(lock_file);
 
@@ -302,6 +306,32 @@ impl RuntimeEngine {
         for event in &events {
             replay_event(&mut engine, event);
         }
+
+        if let Some(mailbox_state) = mailbox {
+            let body_by_message_id: std::collections::HashMap<&str, &str> = mailbox_state
+                .records()
+                .iter()
+                .map(|record| (record.message_id.as_str(), record.body.as_str()))
+                .collect();
+
+            for event in &mut events {
+                if let RuntimeEvent::MailboxMessageCreated {
+                    message_id, body, ..
+                } = event
+                {
+                    if body.is_none() {
+                        if let Some(record_body) = body_by_message_id.get(message_id.as_str()) {
+                            if !record_body.is_empty() {
+                                *body = Some((*record_body).to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            engine.mailbox = mailbox_state;
+        }
+
         engine.event_log = events;
 
         Ok(engine)
@@ -357,10 +387,14 @@ fn replay_event(engine: &mut RuntimeEngine, event: &RuntimeEvent) {
             message_id,
             from_worker,
             to_worker,
+            body,
         } => {
-            engine
-                .mailbox
-                .create(message_id, from_worker, to_worker, "");
+            engine.mailbox.create(
+                message_id,
+                from_worker,
+                to_worker,
+                body.as_deref().unwrap_or(""),
+            );
         }
         RuntimeEvent::MailboxNotified { message_id } => {
             let _ = engine.mailbox.mark_notified(message_id);
@@ -511,6 +545,90 @@ mod tests {
         assert_eq!(original_snap.authority, loaded_snap.authority);
         assert_eq!(original_snap.backlog, loaded_snap.backlog);
         assert_eq!(loaded.event_log().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_and_load_round_trip_preserves_mailbox_body() {
+        let dir = std::env::temp_dir().join("omx-runtime-test-mailbox-body");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut engine = RuntimeEngine::new().with_state_dir(&dir);
+        engine
+            .process(RuntimeCommand::CreateMailboxMessage {
+                message_id: "msg-1".into(),
+                from_worker: "worker-1".into(),
+                to_worker: "leader-fixed".into(),
+                body: "ACK: worker-1 initialized".into(),
+            })
+            .unwrap();
+        engine.persist().unwrap();
+
+        let loaded = RuntimeEngine::load(&dir).unwrap();
+        loaded.write_compatibility_view().unwrap();
+
+        let mailbox_json = std::fs::read_to_string(dir.join("mailbox.json")).unwrap();
+        let mailbox: serde_json::Value = serde_json::from_str(&mailbox_json).unwrap();
+        assert_eq!(
+            mailbox["records"][0]["body"],
+            serde_json::Value::String("ACK: worker-1 initialized".into())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_backfills_legacy_mailbox_event_body_from_mailbox_json() {
+        let dir = std::env::temp_dir().join("omx-runtime-test-mailbox-backfill");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("events.json"),
+            serde_json::to_string_pretty(&vec![RuntimeEvent::MailboxMessageCreated {
+                message_id: "msg-legacy".into(),
+                from_worker: "worker-1".into(),
+                to_worker: "leader-fixed".into(),
+                body: None,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("mailbox.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "records": [{
+                    "message_id": "msg-legacy",
+                    "from_worker": "worker-1",
+                    "to_worker": "leader-fixed",
+                    "body": "recovered body",
+                    "created_at": "2026-04-04T00:00:00.000Z",
+                    "notified_at": null,
+                    "delivered_at": null
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("engine.lock"), "").unwrap();
+
+        let loaded = RuntimeEngine::load(&dir).unwrap();
+        loaded.persist().unwrap();
+
+        let events_json = std::fs::read_to_string(dir.join("events.json")).unwrap();
+        let persisted_events: Vec<RuntimeEvent> = serde_json::from_str(&events_json).unwrap();
+        assert!(matches!(
+            &persisted_events[0],
+            RuntimeEvent::MailboxMessageCreated { body: Some(body), .. } if body == "recovered body"
+        ));
+
+        let mailbox_json = std::fs::read_to_string(dir.join("mailbox.json")).unwrap();
+        let mailbox: serde_json::Value = serde_json::from_str(&mailbox_json).unwrap();
+        assert_eq!(
+            mailbox["records"][0]["body"],
+            serde_json::Value::String("recovered body".into())
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

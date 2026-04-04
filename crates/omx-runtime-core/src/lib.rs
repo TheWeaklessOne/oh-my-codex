@@ -271,6 +271,8 @@ pub enum RuntimeEvent {
         message_id: String,
         from_worker: String,
         to_worker: String,
+        #[serde(default)]
+        body: Option<String>,
     },
     MailboxNotified {
         message_id: String,
@@ -632,5 +634,20 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: RuntimeEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, deserialized);
+    }
+
+    #[test]
+    fn mailbox_message_created_event_deserializes_without_body_for_back_compat() {
+        let json = r#"{"event":"MailboxMessageCreated","message_id":"msg-1","from_worker":"worker-1","to_worker":"leader-fixed"}"#;
+        let deserialized: RuntimeEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            deserialized,
+            RuntimeEvent::MailboxMessageCreated {
+                message_id: "msg-1".into(),
+                from_worker: "worker-1".into(),
+                to_worker: "leader-fixed".into(),
+                body: None,
+            }
+        );
     }
 }
