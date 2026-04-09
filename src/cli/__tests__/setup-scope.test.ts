@@ -203,6 +203,10 @@ describe("omx setup scope behavior", () => {
         existsSync(join(localSkills, "ask-gemini", "SKILL.md")),
         true,
       );
+      assert.equal(
+        existsSync(join(localSkills, "setup-omx-daemon", "SKILL.md")),
+        true,
+      );
       assert.ok(
         (await readdir(localPrompts)).length > 0,
         "local prompts should be installed",

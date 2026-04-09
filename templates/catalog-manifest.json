@@ -242,6 +242,13 @@
       "internalRequired": false
     },
     {
+      "name": "setup-omx-daemon",
+      "category": "utility",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
       "name": "configure-notifications",
       "category": "utility",
       "status": "active",

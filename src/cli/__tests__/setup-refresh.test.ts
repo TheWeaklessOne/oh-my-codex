@@ -15,7 +15,11 @@ import { tmpdir } from "node:os";
 import { setup } from "../setup.js";
 
 const EXPECTED_PROJECT_GITIGNORE = [
-  ".omx/",
+  ".omx/*",
+  "!.omx/daemon/",
+  ".omx/daemon/*",
+  "!.omx/daemon/*.md",
+  "!.omx/daemon/daemon.config.json",
   ".codex/*",
   "!.codex/agents/",
   "!.codex/agents/**",
@@ -133,7 +137,8 @@ describe("omx setup refresh summary and dry-run behavior", () => {
 
       const gitignore = await readFile(join(wd, ".gitignore"), "utf-8");
       assert.equal(gitignore, `node_modules/\n${EXPECTED_PROJECT_GITIGNORE}`);
-      assert.equal(gitignore.match(/^\.omx\/$/gm)?.length ?? 0, 1);
+      assert.equal(gitignore.match(/^\.omx\/\*$/gm)?.length ?? 0, 1);
+      assert.equal(gitignore.match(/^!\.omx\/daemon\/$/gm)?.length ?? 0, 1);
       assert.equal(gitignore.match(/^\.codex\/\*$/gm)?.length ?? 0, 1);
     } finally {
       await rm(wd, { recursive: true, force: true });
@@ -190,6 +195,47 @@ describe("omx setup refresh summary and dry-run behavior", () => {
       const gitignore = await readFile(join(wd, ".gitignore"), "utf-8");
       assert.equal(gitignore, EXPECTED_PROJECT_GITIGNORE);
       assert.equal(gitignore.match(/^\.codex\/$/gm)?.length ?? 0, 0);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+
+  it("keeps tracked .omx/daemon governance files visible while ignoring runtime daemon state", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-setup-refresh-"));
+    try {
+      const initResult = spawnSync("git", ["init", "-q"], { cwd: wd });
+      assert.equal(initResult.status, 0);
+
+      await runSetupInTempDir(wd, { scope: "project" });
+      await mkdir(join(wd, ".omx", "daemon"), { recursive: true });
+      await mkdir(join(wd, ".omx", "state", "daemon"), { recursive: true });
+      await writeFile(join(wd, ".omx", "daemon", "ISSUE_GATE.md"), "# gate\n");
+      await writeFile(join(wd, ".omx", "daemon", "daemon.config.json"), "{}\n");
+      await writeFile(join(wd, ".omx", "state", "daemon", "queue.json"), "[]\n");
+
+      const status = spawnSync(
+        "git",
+        [
+          "status",
+          "--short",
+          "--ignored",
+          ".omx/daemon/ISSUE_GATE.md",
+          ".omx/daemon/daemon.config.json",
+        ],
+        { cwd: wd, encoding: "utf-8" },
+      );
+      assert.equal(status.status, 0);
+      assert.match(status.stdout, /^\?\? \.omx\/daemon\/ISSUE_GATE\.md$/m);
+      assert.match(status.stdout, /^\?\? \.omx\/daemon\/daemon\.config\.json$/m);
+      const ignored = spawnSync(
+        "git",
+        ["check-ignore", "-v", ".omx/state/daemon/queue.json"],
+        { cwd: wd, encoding: "utf-8" },
+      );
+      assert.equal(ignored.status, 0, ignored.stderr || ignored.stdout);
+      assert.match(ignored.stdout, /\.gitignore:1:\.omx\/\*/);
+      assert.match(ignored.stdout, /\.omx\/state\/daemon\/queue\.json\s*$/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

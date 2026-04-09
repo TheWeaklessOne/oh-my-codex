@@ -131,7 +131,11 @@ export interface SkillFrontmatterMetadata {
 }
 
 const PROJECT_GITIGNORE_ENTRIES = [
-  ".omx/",
+  ".omx/*",
+  "!.omx/daemon/",
+  ".omx/daemon/*",
+  "!.omx/daemon/*.md",
+  "!.omx/daemon/daemon.config.json",
   ".codex/*",
   "!.codex/agents/",
   "!.codex/agents/**",
@@ -141,7 +145,7 @@ const PROJECT_GITIGNORE_ENTRIES = [
   "!.codex/prompts/",
   "!.codex/prompts/**",
 ] as const;
-const LEGACY_PROJECT_GITIGNORE_ENTRIES = [".codex/"] as const;
+const LEGACY_PROJECT_GITIGNORE_ENTRIES = [".omx/", ".codex/"] as const;
 
 function applyScopePathRewritesToAgentsTemplate(
   content: string,
@@ -707,11 +711,11 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
     );
     if (gitignoreResult === "created") {
       console.log(
-        "  Created .gitignore with OMX project ignore rules so local runtime state stays out of source control while .codex agents, skills, and prompts remain trackable.\n",
+        "  Created .gitignore with OMX project ignore rules so local runtime state stays out of source control while `.omx/daemon/*` policy inputs and `.codex` assets remain trackable.\n",
       );
     } else if (gitignoreResult === "updated") {
       console.log(
-        "  Updated .gitignore with OMX project ignore rules so local runtime state stays out of source control while .codex agents, skills, and prompts remain trackable.\n",
+        "  Updated .gitignore with OMX project ignore rules so local runtime state stays out of source control while `.omx/daemon/*` policy inputs and `.codex` assets remain trackable.\n",
       );
     }
   }

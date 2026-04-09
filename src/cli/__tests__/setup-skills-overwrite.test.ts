@@ -28,6 +28,7 @@ describe('omx setup skills overwrite behavior', () => {
       assert.equal(installed.has('frontend-ui-ux'), false);
       assert.equal(installed.has('pipeline'), false);
       assert.equal(installed.has('configure-notifications'), true);
+      assert.equal(installed.has('setup-omx-daemon'), true);
       assert.equal(installed.has('configure-discord'), false);
       assert.equal(installed.has('configure-telegram'), false);
       assert.equal(installed.has('configure-slack'), false);

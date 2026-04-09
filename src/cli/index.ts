@@ -17,6 +17,7 @@ import { teamCommand } from "./team.js";
 import { ralphCommand } from "./ralph.js";
 import { askCommand } from "./ask.js";
 import { stateCommand } from "./state.js";
+import { daemonCommand } from "./daemon.js";
 import {
   cleanupCommand,
   cleanupOmxMcpProcesses,
@@ -144,6 +145,7 @@ Usage:
   omx ask       Ask local provider CLI (claude|gemini) and write artifact output
   omx resume    Resume a previous interactive Codex session
   omx explore   Default read-only exploration entrypoint (may adaptively use sparkshell backend)
+  omx daemon    Manage daemon lifecycle for GitHub issue triage (start|stop|status|run-once|approve|reject)
   omx session   Search prior local session transcripts and history artifacts
   omx agents-init [path]
                 Bootstrap lightweight AGENTS.md files for a repo/subtree
@@ -255,6 +257,7 @@ type CliCommand =
   | "cleanup"
   | "ask"
   | "explore"
+  | "daemon"
   | "sparkshell"
   | "team"
   | "session"
@@ -285,6 +288,7 @@ const NESTED_HELP_COMMANDS = new Set<CliCommand>([
   "resume",
   "session",
   "sparkshell",
+  "daemon",
   "team",
   "tmux-hook",
 ]);
@@ -621,6 +625,7 @@ export async function main(args: string[]): Promise<void> {
     "ask",
     "autoresearch",
     "explore",
+    "daemon",
     "sparkshell",
     "team",
     "ralph",
@@ -702,6 +707,9 @@ export async function main(args: string[]): Promise<void> {
         break;
       case "explore":
         await exploreCommand(args.slice(1));
+        break;
+      case "daemon":
+        await daemonCommand(args.slice(1));
         break;
       case "exec":
         await execWithOverlay(launchArgs);
