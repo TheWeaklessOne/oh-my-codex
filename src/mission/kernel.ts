@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import {
   DEFAULT_MISSION_CLOSURE_POLICY,
   DEFAULT_MISSION_PLATEAU_POLICY,
+  MISSION_LANE_POLICIES,
   MISSION_LANE_TYPES,
   closureMatrixDecision,
   computeResidualSetFingerprint,
@@ -12,6 +13,7 @@ import {
   isResidualStableMatch,
   normalizeLaneSummary,
   type MissionClosurePolicy,
+  type MissionResidual,
   type MissionLaneSummary,
   type MissionLaneSummaryInput,
   type MissionLaneType,
@@ -267,7 +269,7 @@ function buildActiveLaneEntry(iteration: number, laneType: MissionLaneType): Mis
     lane_id: `pending:${key}`,
     session_id: `pending:${key}`,
     lane_type: laneType,
-    runner_type: laneType === 'execution' ? 'team' : laneType === 'hardening' ? 'ralph' : 'direct',
+    runner_type: MISSION_LANE_POLICIES[laneType].runnerType,
     finished_at: '',
   };
 }
@@ -412,6 +414,10 @@ function loadResidualHistory(deltaHistory: MissionDelta[]): Set<string> {
   return new Set(deltaHistory.flatMap((delta) => delta.oscillating_residual_ids));
 }
 
+function isMergeLineageResidual(residual: MissionResidual): boolean {
+  return residual.lineage?.kind === 'merge' && residual.lineage.related_residual_ids.length > 1;
+}
+
 function compareResiduals(previous: MissionLaneSummary | null, current: MissionLaneSummary, deltaHistory: MissionDelta[] = []): MissionDelta {
   const previousResiduals = previous?.residuals ?? [];
   const currentResiduals = current.residuals;
@@ -461,6 +467,9 @@ function compareResiduals(previous: MissionLaneSummary | null, current: MissionL
   }
 
   for (const residual of currentResiduals) {
+    if (isMergeLineageResidual(residual)) {
+      lineageMerge.add(residual.stable_id);
+    }
     if (matchedCurrent.has(residual.stable_id)) continue;
     introduced.add(residual.stable_id);
     regressed.add(residual.stable_id);
@@ -469,15 +478,6 @@ function compareResiduals(previous: MissionLaneSummary | null, current: MissionL
     }
     if (deltaHistory.some((delta) => delta.resolved_residual_ids.includes(residual.stable_id))) {
       oscillating.add(residual.stable_id);
-    }
-    if (residual.lineage?.kind === 'merge' && residual.lineage.related_residual_ids.length > 1) {
-      lineageMerge.add(residual.stable_id);
-    }
-  }
-
-  for (const residual of currentResiduals) {
-    if (residual.lineage?.kind === 'merge' && residual.lineage.related_residual_ids.length > 1) {
-      lineageMerge.add(residual.stable_id);
     }
   }
 

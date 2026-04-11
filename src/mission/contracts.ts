@@ -141,6 +141,46 @@ export interface MissionLifecycleTransition {
   required_evidence: string[];
 }
 
+export interface MissionLanePolicy {
+  runnerType: MissionLaneProvenance['runner_type'];
+  freshSession: boolean;
+  readOnly: boolean;
+  rationale: string;
+}
+
+export const MISSION_LANE_POLICIES: Record<MissionLaneType, MissionLanePolicy> = {
+  audit: {
+    runnerType: 'direct',
+    freshSession: true,
+    readOnly: true,
+    rationale: 'Audit must run in a fresh read-only lane before remediation begins.',
+  },
+  remediation: {
+    runnerType: 'direct',
+    freshSession: false,
+    readOnly: false,
+    rationale: 'Remediation shaping stays direct and bounded unless later escalation needs coordinated execution.',
+  },
+  execution: {
+    runnerType: 'team',
+    freshSession: true,
+    readOnly: false,
+    rationale: 'Execution defaults to team as the coordinated executor.',
+  },
+  hardening: {
+    runnerType: 'ralph',
+    freshSession: true,
+    readOnly: false,
+    rationale: 'Hardening uses a bounded Ralph follow-up only when a narrow stubborn slice remains.',
+  },
+  re_audit: {
+    runnerType: 'direct',
+    freshSession: true,
+    readOnly: true,
+    rationale: 'Re-audit must run in a fresh read-only lane instead of reusing execution context.',
+  },
+};
+
 const STOP_WORDS = new Set([
   'a',
   'an',
