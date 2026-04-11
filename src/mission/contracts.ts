@@ -17,7 +17,7 @@ export type MissionStatus = (typeof MISSION_STATUSES)[number];
 export const MISSION_SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'] as const;
 export type MissionSeverity = (typeof MISSION_SEVERITIES)[number];
 
-export type ResidualIdentitySource = 'stable_id' | 'canonical_key' | 'lineage' | 'matcher' | 'fallback_hash';
+export type ResidualIdentitySource = 'stable_id' | 'canonical_key' | 'structural_key' | 'lineage' | 'matcher' | 'fallback_hash';
 export type ResidualIdentityConfidence = 'high' | 'medium' | 'low';
 
 export interface MissionResidualLineageInput {
@@ -37,6 +37,10 @@ export interface MissionResidualInput {
   title?: string;
   summary: string;
   severity?: MissionSeverity | string;
+  category?: string;
+  closure_condition?: string;
+  identity_version?: string;
+  low_confidence_marker?: boolean;
   target_path?: string;
   symbol?: string;
   source_anchor?: string;
@@ -51,10 +55,15 @@ export interface MissionResidual {
   normalized_title: string;
   summary: string;
   severity: MissionSeverity;
+  category: string;
+  closure_condition: string;
+  identity_version: string;
+  low_confidence_marker: boolean;
   target_path?: string;
   symbol?: string;
   source_anchor?: string;
   evidence_refs: string[];
+  structural_key?: string;
   matcher_key: string;
   fallback_key: string;
   token_signature: string[];
@@ -99,7 +108,7 @@ export interface MissionLaneSummary {
 export interface ResidualIdentityMatchResult {
   matched: boolean;
   confidence: ResidualIdentityConfidence;
-  reason: 'stable_id' | 'canonical_key' | 'lineage' | 'matcher' | 'fallback_hash' | 'no_match';
+  reason: 'stable_id' | 'canonical_key' | 'structural_key' | 'lineage' | 'matcher' | 'fallback_hash' | 'no_match';
 }
 
 export interface MissionClosurePolicy {
@@ -242,6 +251,21 @@ function normalizeSeverity(raw: MissionResidualInput['severity']): MissionSeveri
     : 'medium';
 }
 
+function normalizeCategory(raw: MissionResidualInput['category']): string {
+  const value = normalizeWhitespace(String(raw || ''));
+  return value || 'general';
+}
+
+function normalizeClosureCondition(raw: MissionResidualInput['closure_condition']): string {
+  const value = normalizeWhitespace(String(raw || ''));
+  return value || 're audit pass';
+}
+
+function normalizeIdentityVersion(raw: MissionResidualInput['identity_version']): string {
+  const value = String(raw || '').trim().toLowerCase();
+  return value || 'v1';
+}
+
 function normalizeConfidence(raw: MissionLaneSummaryInput['confidence']): MissionConfidence {
   if (typeof raw !== 'string') return 'low';
   const normalized = raw.trim().toLowerCase();
@@ -294,6 +318,10 @@ export function normalizeResidualIdentity(input: MissionResidualInput): MissionR
   const title = String(input.title || summary || 'Unnamed residual').trim();
   const normalizedTitle = normalizeWhitespace(title || summary || 'unnamed residual');
   const severity = normalizeSeverity(input.severity);
+  const category = normalizeCategory(input.category);
+  const closureCondition = normalizeClosureCondition(input.closure_condition);
+  const identityVersion = normalizeIdentityVersion(input.identity_version);
+  const lowConfidenceMarker = input.low_confidence_marker === true;
   const canonicalKey = normalizeStableId(input.canonical_key);
   const explicitStableId = normalizeStableId(input.stable_id);
   const lineage = normalizeLineage(input.lineage);
@@ -309,8 +337,24 @@ export function normalizeResidualIdentity(input: MissionResidualInput): MissionR
     input.symbol?.trim().toLowerCase() ?? '',
     tokenSignature.join('.'),
   ].join('|');
+  const structuralSeed = [
+    identityVersion,
+    category,
+    closureCondition,
+    input.target_path?.trim().toLowerCase() ?? '',
+    input.symbol?.trim().toLowerCase() ?? '',
+    tokenSignature.join('.'),
+  ].join('|');
+  const structuralKey = structuralSeed.replace(/\|+/g, '|');
   const matcherKey = matcherSeed.replace(/\|+/g, '|');
   const fallbackKey = `fallback:${hashValue([severity, normalizedTitle, normalizeWhitespace(summary)].join('|'))}`;
+  const hasStructuralIdentity =
+    Boolean(input.category)
+    || Boolean(input.closure_condition)
+    || Boolean(input.target_path)
+    || Boolean(input.symbol)
+    || tokenSignature.length > 0;
+  const hasMatcherIdentity = tokenSignature.length > 0 || Boolean(input.target_path) || Boolean(input.symbol);
 
   let stableId: string;
   let identitySource: ResidualIdentitySource;
@@ -327,11 +371,15 @@ export function normalizeResidualIdentity(input: MissionResidualInput): MissionR
   } else if (lineage) {
     stableId = `residual:${hashValue([lineage.lineage_key, matcherKey].join('|'))}`;
     identitySource = 'lineage';
-    identityConfidence = lineage.related_residual_ids.length > 1 ? 'medium' : 'high';
-  } else if (tokenSignature.length > 0) {
+    identityConfidence = lowConfidenceMarker ? 'low' : (lineage.related_residual_ids.length > 1 ? 'medium' : 'high');
+  } else if (hasStructuralIdentity) {
+    stableId = `residual:${hashValue(structuralKey)}`;
+    identitySource = 'structural_key';
+    identityConfidence = lowConfidenceMarker ? 'low' : (tokenSignature.length >= 3 ? 'high' : 'medium');
+  } else if (hasMatcherIdentity) {
     stableId = `residual:${hashValue(matcherKey)}`;
     identitySource = 'matcher';
-    identityConfidence = tokenSignature.length >= 3 ? 'high' : 'medium';
+    identityConfidence = lowConfidenceMarker ? 'low' : (tokenSignature.length >= 3 ? 'high' : 'medium');
   } else {
     stableId = `residual:${hashValue(fallbackKey)}`;
     identitySource = 'fallback_hash';
@@ -345,10 +393,15 @@ export function normalizeResidualIdentity(input: MissionResidualInput): MissionR
     normalized_title: normalizedTitle,
     summary,
     severity,
+    category,
+    closure_condition: closureCondition,
+    identity_version: identityVersion,
+    low_confidence_marker: lowConfidenceMarker,
     ...(input.target_path ? { target_path: input.target_path } : {}),
     ...(input.symbol ? { symbol: input.symbol } : {}),
     ...(input.source_anchor ? { source_anchor: input.source_anchor } : {}),
     evidence_refs: cleanEvidenceRefs(input.evidence_refs),
+    ...(identitySource === 'structural_key' ? { structural_key: structuralKey } : {}),
     matcher_key: matcherKey,
     fallback_key: fallbackKey,
     token_signature: tokenSignature,
@@ -432,6 +485,18 @@ export function matchResidualIdentity(previous: MissionResidual, next: MissionRe
   if (previous.canonical_key && next.canonical_key && previous.canonical_key === next.canonical_key) {
     return { matched: true, confidence: 'high', reason: 'canonical_key' };
   }
+  if (previous.structural_key && next.structural_key && previous.structural_key === next.structural_key) {
+    return {
+      matched: true,
+      confidence:
+        previous.low_confidence_marker || next.low_confidence_marker
+          ? 'low'
+          : previous.identity_confidence === 'high' && next.identity_confidence === 'high'
+            ? 'high'
+            : 'medium',
+      reason: 'structural_key',
+    };
+  }
   const previousLineage = previous.lineage?.related_residual_ids ?? [];
   const nextLineage = next.lineage?.related_residual_ids ?? [];
   if (previous.lineage && next.lineage && previous.lineage.lineage_key === next.lineage.lineage_key) {
@@ -446,7 +511,12 @@ export function matchResidualIdentity(previous: MissionResidual, next: MissionRe
   if (previous.matcher_key && next.matcher_key && previous.matcher_key === next.matcher_key) {
     return {
       matched: true,
-      confidence: previous.identity_confidence === 'high' && next.identity_confidence === 'high' ? 'high' : 'medium',
+      confidence:
+        previous.low_confidence_marker || next.low_confidence_marker
+          ? 'low'
+          : previous.identity_confidence === 'high' && next.identity_confidence === 'high'
+            ? 'high'
+            : 'medium',
       reason: 'matcher',
     };
   }
