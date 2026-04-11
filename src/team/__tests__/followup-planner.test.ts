@@ -60,7 +60,7 @@ describe('followup-planner', () => {
     assert.equal(plan.launchHints.shellCommand, 'omx team 3:executor "Fix flaky integration tests and update README"');
     assert.equal(plan.launchHints.skillCommand, '$team 3:executor "Fix flaky integration tests and update README"');
     assert.match(plan.launchHints.rationale, /reserve Ralph/i);
-    assert.match(plan.verificationPlan.summary, /coordinated execution and verification owner/i);
+    assert.match(plan.verificationPlan.summary, /default coordinated executor/i);
     assert.equal(plan.verificationPlan.checkpoints.length, 3);
   });
 
