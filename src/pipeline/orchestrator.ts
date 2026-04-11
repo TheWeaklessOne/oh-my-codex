@@ -1,7 +1,8 @@
 /**
  * Pipeline Orchestrator for oh-my-codex
  *
- * Sequences configurable stages (RALPLAN -> teams -> ralph verification)
+ * Sequences configurable stages (for example: RALPLAN -> team execution ->
+ * bounded Ralph follow-up when needed)
  * and persists state through the ModeState system.
  *
  * Mirrors OMC #1130 pipeline design with OMX-specific adaptations:
@@ -270,8 +271,9 @@ function validateConfig(config: PipelineConfig): void {
 /**
  * Create the default autopilot pipeline configuration.
  *
- * Sequences: RALPLAN -> team-exec -> ralph-verify
- * This is the canonical OMX pipeline matching the OMC #1130 design.
+ * The caller provides the ordered stages. Typical OMX usage keeps team as
+ * the primary coordinated executor and uses ralph-verify only as a bounded
+ * fallback stage for narrow stubborn follow-up slices.
  */
 export function createAutopilotPipelineConfig(
   task: string,

@@ -47,6 +47,9 @@ describe('followup-planner', () => {
     );
 
     assert.equal(plan.mode, 'team');
+    assert.equal(plan.constraints.policy, 'coordinated-default');
+    assert.equal(plan.constraints.hardening, 'bounded');
+    assert.equal(plan.constraints.requiresPrimaryExecutionPass, false);
     assert.equal(plan.recommendedHeadcount, 3);
     assert.match(plan.staffingSummary, /test-engineer x1/);
     assert.match(plan.staffingSummary, /reasoning/);
@@ -56,7 +59,8 @@ describe('followup-planner', () => {
     );
     assert.equal(plan.launchHints.shellCommand, 'omx team 3:executor "Fix flaky integration tests and update README"');
     assert.equal(plan.launchHints.skillCommand, '$team 3:executor "Fix flaky integration tests and update README"');
-    assert.match(plan.verificationPlan.summary, /coordinated execution and verification owner/i);
+    assert.match(plan.launchHints.rationale, /reserve Ralph/i);
+    assert.match(plan.verificationPlan.summary, /default coordinated executor/i);
     assert.equal(plan.verificationPlan.checkpoints.length, 3);
   });
 
@@ -68,13 +72,17 @@ describe('followup-planner', () => {
     );
 
     assert.equal(plan.mode, 'ralph');
+    assert.equal(plan.constraints.policy, 'bounded-fallback');
+    assert.equal(plan.constraints.hardening, 'bounded');
+    assert.equal(plan.constraints.requiresPrimaryExecutionPass, true);
     assert.equal(plan.recommendedHeadcount, 3);
     assert.match(plan.staffingSummary, /architect x1/);
     assert.match(plan.staffingSummary, /test-engineer x1/);
     assert.ok(plan.allocations.some((allocation) => allocation.reason.includes('sign-off')));
     assert.equal(plan.launchHints.shellCommand, 'omx ralph "Investigate auth regression and verify the fix"');
     assert.equal(plan.launchHints.skillCommand, '$ralph "Investigate auth regression and verify the fix"');
-    assert.match(plan.verificationPlan.summary, /persistent execution and verification owner/i);
+    assert.match(plan.launchHints.rationale, /bounded fallback/i);
+    assert.match(plan.verificationPlan.summary, /bounded fallback/i);
     assert.equal(plan.verificationPlan.checkpoints.length, 3);
   });
 
