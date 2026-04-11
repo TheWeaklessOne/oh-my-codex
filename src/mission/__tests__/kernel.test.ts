@@ -5,7 +5,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { MissionLaneSummaryInput } from '../contracts.js';
+import { MISSION_LANE_POLICIES, type MissionLaneSummaryInput } from '../contracts.js';
 import {
   cancelMission,
   commitIteration,
@@ -56,7 +56,7 @@ function laneSummary(
       lane_id: `${laneType}-lane-${iteration}`,
       session_id: `${laneType}-session-${iteration}`,
       lane_type: laneType,
-      runner_type: laneType === 'execution' ? 'team' : laneType === 'hardening' ? 'ralph' : 'direct',
+      runner_type: MISSION_LANE_POLICIES[laneType].runnerType,
       adapter_version: 'mission-adapter/v1',
       started_at: '2026-04-11T17:00:00.000Z',
       finished_at: '2026-04-11T17:05:00.000Z',
@@ -106,6 +106,29 @@ describe('mission kernel', () => {
       assert.equal(handle.iteration, 1);
       assert.equal(existsSync(join(handle.iterationDir, 'audit', 'summary.json')), false);
       assert.equal(existsSync(join(repo, '.omx', 'missions', 'demo', 'latest.json')), false);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('seeds active lanes with the canonical runner mapping for a fresh iteration', async () => {
+    const repo = await initRepo();
+    try {
+      await createMission({ repoRoot: repo, slug: 'demo', targetFingerprint: 'repo:demo' });
+      await startIteration(repo, 'demo', 'initial');
+
+      const mission = await loadMission(repo, 'demo');
+      assert.equal(mission.current_stage, 'audit');
+      assert.deepEqual(
+        Object.fromEntries(mission.active_lanes.map((lane) => [lane.lane_type, lane.runner_type])),
+        {
+          audit: 'direct',
+          remediation: 'direct',
+          execution: 'team',
+          hardening: 'ralph',
+          re_audit: 'direct',
+        },
+      );
     } finally {
       await rm(repo, { recursive: true, force: true });
     }
@@ -437,6 +460,105 @@ describe('mission kernel', () => {
       assert.deepEqual(delta.lineage_split_residual_ids, ['residual:shared-parent']);
       assert.equal(delta.introduced_residual_ids.length, 0);
       assert.equal(delta.low_confidence_residual_ids.length > 0, true);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves merge lineage when a merged residual still matches prior residual history', async () => {
+    const repo = await initRepo();
+    try {
+      await createMission({ repoRoot: repo, slug: 'demo', targetFingerprint: 'repo:demo' });
+      await startIteration(repo, 'demo', 'initial');
+      await recordRequiredLaneSummaries(repo, 'demo', 1, {
+        verdict: 'PARTIAL',
+        confidence: 'high',
+        residuals: [
+          {
+            stable_id: 'residual:left-parent',
+            title: 'Audit lane reused execution session',
+            summary: 'Audit reused execution state.',
+            severity: 'medium',
+            category: 'fresh-lane-isolation',
+            closure_condition: 'audit provenance must be isolated',
+            target_path: 'src/mission/kernel.ts',
+            symbol: 'computeDelta',
+          },
+          {
+            stable_id: 'residual:right-parent',
+            title: 'Hardening lane reused execution session',
+            summary: 'Hardening reused execution state.',
+            severity: 'medium',
+            category: 'fresh-lane-isolation',
+            closure_condition: 'hardening provenance must be isolated',
+            target_path: 'src/mission/kernel.ts',
+            symbol: 'computeDelta',
+          },
+        ],
+        evidence_refs: ['logs/iter-1.txt'],
+        recommended_next_action: 'merge the duplicated provenance finding',
+        provenance: {
+          lane_id: 're-audit-lane-1',
+          session_id: 're-audit-session-1',
+          lane_type: 're_audit',
+          runner_type: 'direct',
+          adapter_version: 'mission-adapter/v1',
+          started_at: '2026-04-11T17:00:00.000Z',
+          finished_at: '2026-04-11T17:05:00.000Z',
+          parent_iteration: 1,
+          trigger_reason: 'initial re-audit',
+          read_only: true,
+        },
+      });
+      await commitIteration(
+        repo,
+        'demo',
+        1,
+        {
+          iteration_commit_succeeded: true,
+          no_unreconciled_lane_errors: true,
+          focused_checks_green: true,
+        },
+      );
+
+      await startIteration(repo, 'demo', 'merge-follow-up');
+      await recordRequiredLaneSummaries(repo, 'demo', 2, {
+        verdict: 'PARTIAL',
+        confidence: 'high',
+        residuals: [
+          {
+            title: 'Execution provenance still leaks across mission lanes',
+            summary: 'Audit and hardening still overlap execution provenance.',
+            severity: 'medium',
+            category: 'fresh-lane-isolation',
+            closure_condition: 'audit and hardening provenance must be isolated',
+            target_path: 'src/mission/kernel.ts',
+            symbol: 'computeDelta',
+            lineage: {
+              kind: 'merge',
+              related_residual_ids: ['residual:left-parent', 'residual:right-parent'],
+            },
+          },
+        ],
+        evidence_refs: ['logs/iter-2.txt'],
+        recommended_next_action: 'keep the merged finding tracked until both lanes isolate cleanly',
+        provenance: {
+          lane_id: 're-audit-lane-2',
+          session_id: 're-audit-session-2',
+          lane_type: 're_audit',
+          runner_type: 'direct',
+          adapter_version: 'mission-adapter/v1',
+          started_at: '2026-04-11T17:06:00.000Z',
+          finished_at: '2026-04-11T17:10:00.000Z',
+          parent_iteration: 2,
+          trigger_reason: 'merged follow-up re-audit',
+          read_only: true,
+        },
+      });
+
+      const delta = await computeDelta(repo, 'demo', 2);
+      assert.equal(delta.introduced_residual_ids.length, 0);
+      assert.equal(delta.lineage_merge_residual_ids.length, 1);
     } finally {
       await rm(repo, { recursive: true, force: true });
     }

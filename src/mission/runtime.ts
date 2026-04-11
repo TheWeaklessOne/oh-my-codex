@@ -1,5 +1,10 @@
 import { join } from 'node:path';
-import type { MissionLaneSummaryInput, MissionLaneType } from './contracts.js';
+import {
+  MISSION_LANE_POLICIES,
+  MISSION_LANE_TYPES,
+  type MissionLaneSummaryInput,
+  type MissionLaneType,
+} from './contracts.js';
 import {
   cancelMission,
   commitIteration,
@@ -39,42 +44,6 @@ export interface PrepareMissionRuntimeOptions extends MissionCreateOptions {
   strategyKey?: string | null;
 }
 
-const MISSION_LANE_ROUTING: Record<
-  MissionLaneType,
-  Pick<MissionLaneRuntimePlan, 'runnerType' | 'freshSession' | 'readOnly' | 'rationale'>
-> = {
-  audit: {
-    runnerType: 'direct',
-    freshSession: true,
-    readOnly: true,
-    rationale: 'Audit must run in a fresh read-only lane before remediation begins.',
-  },
-  remediation: {
-    runnerType: 'direct',
-    freshSession: false,
-    readOnly: false,
-    rationale: 'Remediation shaping stays direct and bounded unless later escalation needs coordinated execution.',
-  },
-  execution: {
-    runnerType: 'team',
-    freshSession: true,
-    readOnly: false,
-    rationale: 'Execution defaults to team as the coordinated executor.',
-  },
-  hardening: {
-    runnerType: 'ralph',
-    freshSession: true,
-    readOnly: false,
-    rationale: 'Hardening uses a bounded Ralph follow-up only when a narrow stubborn slice remains.',
-  },
-  re_audit: {
-    runnerType: 'direct',
-    freshSession: true,
-    readOnly: true,
-    rationale: 'Re-audit must run in a fresh read-only lane instead of reusing execution context.',
-  },
-};
-
 function missionFile(missionRoot: string): string {
   return join(missionRoot, 'mission.json');
 }
@@ -100,38 +69,17 @@ async function ensureMissionState(options: MissionCreateOptions): Promise<Missio
 }
 
 function buildLanePlans(iteration: MissionIterationHandle): Record<MissionLaneType, MissionLaneRuntimePlan> {
-  return {
-    audit: {
-      laneType: 'audit',
-      laneDir: iteration.laneDirs.audit,
-      summaryPath: laneSummaryPath(iteration.laneDirs.audit),
-      ...MISSION_LANE_ROUTING.audit,
-    },
-    remediation: {
-      laneType: 'remediation',
-      laneDir: iteration.laneDirs.remediation,
-      summaryPath: laneSummaryPath(iteration.laneDirs.remediation),
-      ...MISSION_LANE_ROUTING.remediation,
-    },
-    execution: {
-      laneType: 'execution',
-      laneDir: iteration.laneDirs.execution,
-      summaryPath: laneSummaryPath(iteration.laneDirs.execution),
-      ...MISSION_LANE_ROUTING.execution,
-    },
-    hardening: {
-      laneType: 'hardening',
-      laneDir: iteration.laneDirs.hardening,
-      summaryPath: laneSummaryPath(iteration.laneDirs.hardening),
-      ...MISSION_LANE_ROUTING.hardening,
-    },
-    re_audit: {
-      laneType: 're_audit',
-      laneDir: iteration.laneDirs.re_audit,
-      summaryPath: laneSummaryPath(iteration.laneDirs.re_audit),
-      ...MISSION_LANE_ROUTING.re_audit,
-    },
-  };
+  return Object.fromEntries(
+    MISSION_LANE_TYPES.map((laneType) => [
+      laneType,
+      {
+        laneType,
+        laneDir: iteration.laneDirs[laneType],
+        summaryPath: laneSummaryPath(iteration.laneDirs[laneType]),
+        ...MISSION_LANE_POLICIES[laneType],
+      },
+    ]),
+  ) as Record<MissionLaneType, MissionLaneRuntimePlan>;
 }
 
 export async function prepareMissionRuntime(options: PrepareMissionRuntimeOptions): Promise<PreparedMissionRuntime> {
