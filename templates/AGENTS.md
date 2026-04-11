@@ -132,6 +132,7 @@ Default posture: work directly.
 Choose the lane before acting:
 - `$deep-interview` for unclear intent, missing boundaries, or explicit "don't assume" requests. This mode clarifies and hands off; it does not implement.
 - `$ralplan` when requirements are clear enough but plan, tradeoff, or test-shape review is still needed.
+- `$mission` when the user wants a thin supervisor that keeps iterating until a fresh audit/re-audit closes the work or the mission plateaus.
 - `$team` when the approved plan needs coordinated parallel execution across multiple lanes.
 - `$ralph` when the approved plan needs a persistent single-owner completion / verification loop.
 - **Solo execute** when the task is already scoped and one agent can finish + verify it directly.
@@ -200,7 +201,7 @@ Specialists remain available through the role catalog and native child-agent sur
 When the user message contains a mapped keyword, activate the corresponding skill immediately.
 Do not ask for confirmation.
 
-Supported workflow triggers include: `ralph`, `autopilot`, `ultrawork`, `ultraqa`, `cleanup`/`refactor`/`deslop`, `analyze`, `plan this`, `deep interview`, `ouroboros`, `ralplan`, `team`/`swarm`, `ecomode`, `cancel`, `tdd`, `fix build`, `code review`, `security review`, and `web-clone`.
+Supported workflow triggers include: `mission`, `ralph`, `autopilot`, `ultrawork`, `ultraqa`, `cleanup`/`refactor`/`deslop`, `analyze`, `plan this`, `deep interview`, `ouroboros`, `ralplan`, `team`/`swarm`, `ecomode`, `cancel`, `tdd`, `fix build`, `code review`, `security review`, and `web-clone`.
 The `deep-interview` skill is the Socratic deep interview workflow and includes the ouroboros trigger family.
 
 | Keyword(s) | Skill | Action |
@@ -214,6 +215,7 @@ Runtime availability gate:
 |-------------|-------|--------|
 | "ralph", "don't stop", "must complete", "keep going" | `$ralph` | Runtime-only: read `~/.codex/skills/ralph/SKILL.md`, execute persistence loop only inside OMX CLI/runtime |
 | "autopilot", "build me", "I want a" | `$autopilot` | Runtime-only: read `~/.codex/skills/autopilot/SKILL.md`, execute autonomous pipeline only inside OMX CLI/runtime |
+| "mission", "closure loop", "re-audit loop" | `$mission` | Read `~/.codex/skills/mission/SKILL.md`, run the thin-supervisor mission workflow |
 | "ultrawork", "ulw", "parallel" | `$ultrawork` | Runtime-only: read `~/.codex/skills/ultrawork/SKILL.md`, execute parallel agents only inside OMX CLI/runtime |
 | "ultraqa" | `$ultraqa` | Runtime-only: read `~/.codex/skills/ralph/SKILL.md`, run persistent completion and verification loop only inside OMX CLI/runtime (UltraQA compatibility alias) |
 | "analyze", "investigate" | `$analyze` | Read `~/.codex/prompts/debugger.md`, run root-cause analysis (analyze compatibility alias) |
@@ -246,7 +248,7 @@ Ralph / Ralplan execution gate:
 
 <skills>
 Skills are workflow commands.
-Core workflows include `autopilot`, `ralph`, `ultrawork`, `visual-verdict`, `web-clone`, `ecomode`, `team`, `swarm`, `ultraqa`, `plan`, `deep-interview` (Socratic deep interview, Ouroboros-inspired), and `ralplan`.
+Core workflows include `autopilot`, `mission`, `ralph`, `ultrawork`, `visual-verdict`, `web-clone`, `ecomode`, `team`, `swarm`, `ultraqa`, `plan`, `deep-interview` (Socratic deep interview, Ouroboros-inspired), and `ralplan`.
 Utilities include `cancel`, `note`, `doctor`, `help`, and `trace`.
 </skills>
 
@@ -307,6 +309,7 @@ Verification loop: identify what proves the claim, run the verification, read th
 Mode selection:
 - Use `$deep-interview` first when the request is broad, intent/boundaries are unclear, or the user says not to assume.
 - Use `$ralplan` when the requirements are clear enough but architecture, tradeoffs, or test strategy still need consensus.
+- Use `$mission` when the task is an oracle-driven closure loop that should persist mission state and require fresh audit/re-audit semantics.
 - Use `$team` when the approved plan has multiple independent lanes, shared blockers, or durable coordination needs.
 - Use `$ralph` when the approved plan should stay in a persistent completion / verification loop with one owner.
 - Otherwise execute directly in solo mode.

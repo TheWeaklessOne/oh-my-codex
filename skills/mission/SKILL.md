@@ -7,6 +7,11 @@ description: Thin mission-supervisor entrypoint for long-running oracle-driven c
 
 `$mission` is the operator-facing entrypoint for the Mission MVP.
 
+You can invoke it either:
+
+- in-session via `$mission "..."`, or
+- from the shell via `omx mission "..."`.
+
 Use it when the user wants OMX to keep iterating until an **independent audit/re-audit lane** says the target is closed, plateaued, or failed — not merely when local checks look green.
 
 ## Core contract
@@ -76,6 +81,6 @@ Do **not** persist raw lane transcripts by default.
 - One verifier/oracle contract
 - One default execution policy
 - No generalized plugin ecosystem
-- No first-class `omx mission ...` CLI yet
+- `omx mission ...` is now a first-class OMX entrypoint for launching this workflow from the shell
 
 This skill is the UX/orchestration entrypoint; the kernel remains the authoritative state machine.

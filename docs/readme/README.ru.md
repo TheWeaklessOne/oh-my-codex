@@ -32,6 +32,7 @@ Spark Initiative — это релиз, усиливающий нативный 
 ```text
 $deep-interview "clarify the auth change"
 $ralplan "approve the auth plan and review tradeoffs"
+$mission "итеративно доводи auth flow до closure через fresh re-audit"
 $ralph "carry the approved plan to completion"
 $team 3:executor "execute the approved plan in parallel"
 ```
@@ -48,7 +49,7 @@ omx team shutdown <team-name>
 
 1. `$deep-interview` — когда объём задачи или границы ещё не прояснены.
 2. `$ralplan` — чтобы превратить уточнённый объём в согласованный план архитектуры и реализации.
-3. `$team` или `$ralph` — используйте `$team` для координированного параллельного выполнения, а `$ralph` — для настойчивого цикла доведения до конца и проверки с одним ответственным.
+3. `$mission`, `$team` или `$ralph` — используйте `$mission` для mission/closure loop с fresh re-audit, `$team` для координированного параллельного выполнения, а `$ralph` — для настойчивого цикла доведения до конца и проверки с одним ответственным.
 
 ## Базовая модель
 
@@ -72,6 +73,7 @@ omx setup          # Установить промпты/навыки/конфи
 omx doctor         # Диагностика установки/среды выполнения
 omx doctor --team  # Диагностика Team/swarm
 omx team ...       # Запуск/статус/возобновление/завершение рабочих tmux
+omx mission ...    # Запуск Mission workflow из shell
 omx status         # Показать активные режимы
 omx cancel         # Отменить активные режимы выполнения
 omx reasoning <mode> # low|medium|high|xhigh
