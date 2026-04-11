@@ -20,11 +20,17 @@ Use it when the user wants OMX to keep iterating until an **independent audit/re
 - **Fresh lanes**: audit and re-audit must run in fresh OMX sessions/lane identities; they must not reuse the execution lane context.
 - **Kernel owns truth**: lifecycle transitions, iteration bookkeeping, delta judgment, plateau detection, resume, cancel, and latest-read-model updates live in `src/mission/kernel.ts`.
 - **Contract-first artifacts**: mission state persists under `.omx/missions/<slug>/` with:
+  - `source-pack.json`
+  - `mission-brief.md`
+  - `acceptance-contract.json`
+  - `execution-plan.md`
   - `mission.json`
   - `latest.json` (read model only; never authoritative)
   - `iterations/<n>/{audit,remediation,execution,re_audit}/summary.json`
+  - `iterations/<n>/*/briefing.md` lane-specific handoff context derived from the contract/plan
   - `iterations/<n>/hardening/summary.json` only when the bounded hardening fallback runs
   - `iterations/<n>/delta.json`
+  - `closeout.md` once the kernel reaches a terminal state
 
 ## Default routing policy
 
@@ -40,20 +46,25 @@ Do **not** let the outer mission loop devolve into “everything is Ralph”.
 When the user invokes `$mission`:
 
 1. Create or load the mission via the mission kernel.
-2. Lock the iteration contract before broad execution:
+2. Build or reuse the pre-loop Mission V2 artifacts before iteration 1:
+   - source grounding / source pack
+   - mission brief
+   - acceptance / verification contract
+   - explicit planning handoff (`plan` / `ralplan` / `deep-interview`) persisted as an execution plan artifact
+3. Lock the iteration contract before broad execution:
    - mission/lane/verifier artifacts
    - residual identity + normalization rules
    - closure matrix and lifecycle table
-3. Start a fresh **audit** lane.
-4. If the audit closes immediately, still require the kernel’s closure matrix + safety baseline to declare `complete`.
+4. Start a fresh **audit** lane.
+5. If the audit closes immediately, still require the kernel’s closure matrix + safety baseline to declare `complete`.
    The kernel must refuse terminal closure if the final `re_audit` summary reuses non-verifier lane provenance.
-5. Otherwise run:
+6. Otherwise run:
    - remediation shaping
    - execution
    - optional hardening
    - fresh re-audit
    - kernel delta / plateau / closure judgment
-6. Continue until the kernel returns one of:
+7. Continue until the kernel returns one of:
    - `complete`
    - `plateau`
    - `failed`

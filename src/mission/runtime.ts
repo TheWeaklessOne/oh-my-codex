@@ -6,6 +6,16 @@ import {
   type MissionLaneType,
 } from './contracts.js';
 import {
+  missionLaneBriefingPath,
+  prepareMissionOrchestrationArtifacts,
+  syncMissionCloseout,
+  writeMissionLaneBriefings,
+  type MissionOrchestrationArtifactPaths,
+  type MissionOrchestrationArtifacts,
+  type MissionPlanningMode,
+  type MissionRequirementSourceInput,
+} from './orchestration.js';
+import {
   cancelMission,
   commitIteration,
   createMission,
@@ -27,21 +37,52 @@ export interface MissionLaneRuntimePlan {
   readOnly: boolean;
   laneDir: string;
   summaryPath: string;
+  briefingPath: string;
+  missionBriefPath: string;
+  acceptanceContractPath: string;
+  executionPlanPath: string;
   rationale: string;
 }
 
 export interface PreparedMissionRuntime {
   mission: MissionState;
-  iteration: MissionIterationHandle;
+  iteration: MissionIterationHandle | null;
   missionRoot: string;
   missionFile: string;
   latestFile: string;
-  deltaFile: string;
-  lanePlans: Record<MissionLaneType, MissionLaneRuntimePlan>;
+  deltaFile: string | null;
+  lanePlans: Partial<Record<MissionLaneType, MissionLaneRuntimePlan>>;
+  artifacts: MissionOrchestrationArtifacts;
+  artifactPaths: MissionOrchestrationArtifactPaths;
+  planning: {
+    mode: MissionPlanningMode;
+    handoffSurface: 'plan' | 'ralplan' | 'deep-interview';
+    status: 'approved' | 'blocked';
+    blockingReason: string | null;
+    strategyKey: string;
+  };
 }
 
 export interface PrepareMissionRuntimeOptions extends MissionCreateOptions {
   strategyKey?: string | null;
+  task?: string;
+  desiredOutcome?: string;
+  requirementSources?: MissionRequirementSourceInput[];
+  constraints?: string[];
+  unknowns?: string[];
+  assumptions?: string[];
+  nonGoals?: string[];
+  projectTouchpoints?: string[];
+  repoContext?: Record<string, string>;
+  ambiguity?: 'low' | 'medium' | 'high';
+  acceptanceCriteria?: string[];
+  invariants?: string[];
+  requiredTestEvidence?: string[];
+  requiredOperationalEvidence?: string[];
+  residualClassificationRules?: string[];
+  verifierGuidance?: string[];
+  planningMode?: MissionPlanningMode;
+  highRisk?: boolean;
 }
 
 function missionFile(missionRoot: string): string {
@@ -68,7 +109,10 @@ async function ensureMissionState(options: MissionCreateOptions): Promise<Missio
   }
 }
 
-function buildLanePlans(iteration: MissionIterationHandle): Record<MissionLaneType, MissionLaneRuntimePlan> {
+function buildLanePlans(
+  iteration: MissionIterationHandle,
+  artifactPaths: MissionOrchestrationArtifactPaths,
+): Record<MissionLaneType, MissionLaneRuntimePlan> {
   return Object.fromEntries(
     MISSION_LANE_TYPES.map((laneType) => [
       laneType,
@@ -76,6 +120,10 @@ function buildLanePlans(iteration: MissionIterationHandle): Record<MissionLaneTy
         laneType,
         laneDir: iteration.laneDirs[laneType],
         summaryPath: laneSummaryPath(iteration.laneDirs[laneType]),
+        briefingPath: missionLaneBriefingPath(iteration.laneDirs[laneType]),
+        missionBriefPath: artifactPaths.missionBriefPath,
+        acceptanceContractPath: artifactPaths.acceptanceContractPath,
+        executionPlanPath: artifactPaths.executionPlanPath,
         ...MISSION_LANE_POLICIES[laneType],
       },
     ]),
@@ -84,16 +132,53 @@ function buildLanePlans(iteration: MissionIterationHandle): Record<MissionLaneTy
 
 export async function prepareMissionRuntime(options: PrepareMissionRuntimeOptions): Promise<PreparedMissionRuntime> {
   await ensureMissionState(options);
-  const iteration = await startIteration(options.repoRoot, options.slug, options.strategyKey ?? null);
   const currentMission = await loadMission(options.repoRoot, options.slug);
+  const { artifacts, paths } = await prepareMissionOrchestrationArtifacts(currentMission, options);
+  if (artifacts.executionPlan.status !== 'approved') {
+    return {
+      mission: currentMission,
+      iteration: null,
+      missionRoot: currentMission.mission_root,
+      missionFile: missionFile(currentMission.mission_root),
+      latestFile: latestFile(currentMission.mission_root),
+      deltaFile: null,
+      lanePlans: {},
+      artifacts,
+      artifactPaths: paths,
+      planning: {
+        mode: artifacts.executionPlan.planning_mode,
+        handoffSurface: artifacts.executionPlan.handoff_surface,
+        status: artifacts.executionPlan.status,
+        blockingReason: artifacts.executionPlan.blocking_reason,
+        strategyKey: artifacts.executionPlan.strategy_key,
+      },
+    };
+  }
+  const iteration = await startIteration(
+    options.repoRoot,
+    options.slug,
+    options.strategyKey ?? artifacts.executionPlan.strategy_key,
+  );
+  const nextMission = await loadMission(options.repoRoot, options.slug);
+  const lanePlans = buildLanePlans(iteration, paths);
+  await writeMissionLaneBriefings(iteration.laneDirs, artifacts, paths);
   return {
-    mission: currentMission,
+    mission: nextMission,
     iteration,
-    missionRoot: currentMission.mission_root,
-    missionFile: missionFile(currentMission.mission_root),
-    latestFile: latestFile(currentMission.mission_root),
+    missionRoot: nextMission.mission_root,
+    missionFile: missionFile(nextMission.mission_root),
+    latestFile: latestFile(nextMission.mission_root),
     deltaFile: deltaFile(iteration.iterationDir),
-    lanePlans: buildLanePlans(iteration),
+    lanePlans,
+    artifacts,
+    artifactPaths: paths,
+    planning: {
+      mode: artifacts.executionPlan.planning_mode,
+      handoffSurface: artifacts.executionPlan.handoff_surface,
+      status: artifacts.executionPlan.status,
+      blockingReason: artifacts.executionPlan.blocking_reason,
+      strategyKey: artifacts.executionPlan.strategy_key,
+    },
   };
 }
 
@@ -105,7 +190,10 @@ export async function recordMissionRuntimeLaneSummary(
   iteration?: number,
 ): Promise<MissionRecordLaneResult> {
   const mission = await loadMission(repoRoot, slug);
-  return recordLaneSummary(repoRoot, slug, iteration ?? mission.current_iteration, laneType, summaryInput);
+  const result = await recordLaneSummary(repoRoot, slug, iteration ?? mission.current_iteration, laneType, summaryInput);
+  const nextMission = await loadMission(repoRoot, slug);
+  await syncMissionCloseout(nextMission);
+  return result;
 }
 
 export async function commitMissionRuntimeIteration(
@@ -116,7 +204,9 @@ export async function commitMissionRuntimeIteration(
   iteration?: number,
 ): Promise<CommitIterationResult> {
   const mission = await loadMission(repoRoot, slug);
-  return commitIteration(repoRoot, slug, iteration ?? mission.current_iteration, safetyBaseline, strategyChanged);
+  const result = await commitIteration(repoRoot, slug, iteration ?? mission.current_iteration, safetyBaseline, strategyChanged);
+  await syncMissionCloseout(result.mission);
+  return result;
 }
 
 export async function cancelMissionRuntime(
@@ -124,5 +214,7 @@ export async function cancelMissionRuntime(
   slug: string,
   reason?: string,
 ): Promise<MissionState> {
-  return cancelMission(repoRoot, slug, reason);
+  const mission = await cancelMission(repoRoot, slug, reason);
+  await syncMissionCloseout(mission);
+  return mission;
 }

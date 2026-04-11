@@ -67,17 +67,32 @@ describe('mission runtime', () => {
         repoRoot: repo,
         slug: 'demo',
         targetFingerprint: 'repo:demo',
+        task: 'Implement Mission V2 bootstrap artifacts',
+        projectTouchpoints: ['src/mission/runtime.ts'],
       });
 
       assert.equal(runtime.mission.slug, 'demo');
-      assert.equal(runtime.iteration.iteration, 1);
-      assert.equal(runtime.lanePlans.execution.runnerType, 'team');
-      assert.equal(runtime.lanePlans.hardening.runnerType, 'ralph');
-      assert.equal(runtime.lanePlans.audit.readOnly, true);
-      assert.equal(runtime.lanePlans.re_audit.freshSession, true);
+      assert.equal(runtime.iteration?.iteration, 1);
+      assert.equal(runtime.planning.mode, 'direct');
+      assert.equal(runtime.lanePlans.execution?.runnerType, 'team');
+      assert.equal(runtime.lanePlans.hardening?.runnerType, 'ralph');
+      assert.equal(runtime.lanePlans.audit?.readOnly, true);
+      assert.equal(runtime.lanePlans.re_audit?.freshSession, true);
       assert.equal(existsSync(runtime.missionFile), true);
       assert.equal(runtime.latestFile.endsWith('latest.json'), true);
-      assert.equal(runtime.deltaFile.endsWith('delta.json'), true);
+      assert.equal(runtime.deltaFile?.endsWith('delta.json'), true);
+      assert.equal(existsSync(runtime.artifactPaths.sourcePackPath), true);
+      assert.equal(existsSync(runtime.artifactPaths.missionBriefPath), true);
+      assert.equal(existsSync(runtime.artifactPaths.acceptanceContractPath), true);
+      assert.equal(existsSync(runtime.artifactPaths.executionPlanPath), true);
+      assert.equal(existsSync(runtime.lanePlans.audit?.briefingPath || ''), true);
+
+      const auditBriefing = await readFile(runtime.lanePlans.audit?.briefingPath || '', 'utf-8');
+      assert.match(auditBriefing, /acceptance-contract\.json/i);
+      assert.match(auditBriefing, /PASS/i);
+
+      const mission = await loadMission(repo, 'demo');
+      assert.equal(mission.last_strategy_key, runtime.planning.strategyKey);
     } finally {
       await rm(repo, { recursive: true, force: true });
     }
@@ -95,11 +110,65 @@ describe('mission runtime', () => {
         repoRoot: repo,
         slug: 'demo',
         targetFingerprint: 'repo:demo',
+        task: 'Implement Mission V2 bootstrap artifacts',
       });
 
       assert.equal(second.mission.mission_id, first.mission.mission_id);
-      assert.equal(second.iteration.iteration, first.iteration.iteration);
-      assert.equal(second.iteration.resumed, true);
+      assert.equal(second.iteration?.iteration, first.iteration?.iteration);
+      assert.equal(second.iteration?.resumed, true);
+      assert.equal(second.artifacts.executionPlan.plan_id, first.artifacts.executionPlan.plan_id);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks execution iteration 1 until clarification when source grounding remains ambiguous', async () => {
+    const repo = await initRepo();
+    try {
+      const runtime = await prepareMissionRuntime({
+        repoRoot: repo,
+        slug: 'demo',
+        targetFingerprint: 'repo:demo',
+        task: 'Implement Mission V2 from partial notes only',
+        unknowns: ['Need a clarified acceptance contract before planning.'],
+      });
+
+      assert.equal(runtime.iteration, null);
+      assert.equal(runtime.planning.mode, 'blocked');
+      assert.equal(runtime.planning.handoffSurface, 'deep-interview');
+      assert.equal(existsSync(runtime.artifactPaths.executionPlanPath), true);
+      assert.equal(existsSync(join(repo, '.omx', 'missions', 'demo', 'iterations', '001')), false);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('marks high-risk or broad missions for ralplan handoff before kernel-managed execution', async () => {
+    const repo = await initRepo();
+    try {
+      const runtime = await prepareMissionRuntime({
+        repoRoot: repo,
+        slug: 'demo',
+        targetFingerprint: 'repo:demo',
+        task: 'Roll out Mission V2 orchestration across runtime, docs, and tests',
+        highRisk: true,
+        requirementSources: [
+          { kind: 'issue', content: 'Mission lacks source grounding.' },
+          { kind: 'spec', content: 'Mission needs acceptance contracts.' },
+          { kind: 'doc', content: 'Mission must remain project-agnostic.' },
+        ],
+        projectTouchpoints: [
+          'src/mission/runtime.ts',
+          'src/mission/kernel.ts',
+          'skills/mission/SKILL.md',
+          'docs/contracts/mission-kernel-semantics-contract.md',
+        ],
+      });
+
+      assert.equal(runtime.planning.mode, 'ralplan');
+      assert.equal(runtime.planning.handoffSurface, 'ralplan');
+      assert.equal(runtime.iteration?.iteration, 1);
+      assert.match(runtime.artifacts.executionPlan.summary, /ralplan/i);
     } finally {
       await rm(repo, { recursive: true, force: true });
     }
@@ -162,8 +231,12 @@ describe('mission runtime', () => {
 
       assert.equal(committed.mission.status, 'complete');
       const mission = await loadMission(repo, 'demo');
-      assert.equal(mission.latest_summary_path, runtime.lanePlans.re_audit.summaryPath);
+      assert.equal(mission.latest_summary_path, runtime.lanePlans.re_audit?.summaryPath);
       assert.equal(existsSync(runtime.latestFile), true);
+      assert.equal(existsSync(runtime.artifactPaths.closeoutPath), true);
+      const closeout = await readFile(runtime.artifactPaths.closeoutPath, 'utf-8');
+      assert.match(closeout, /Mission Closeout/);
+      assert.match(closeout, /Final verdict: `PASS`/);
     } finally {
       await rm(repo, { recursive: true, force: true });
     }
@@ -281,13 +354,13 @@ describe('mission runtime', () => {
         },
       });
 
-      const auditSummary = JSON.parse(await readFile(runtime.lanePlans.audit.summaryPath, 'utf-8')) as {
+      const auditSummary = JSON.parse(await readFile(runtime.lanePlans.audit?.summaryPath || '', 'utf-8')) as {
         provenance: { session_id: string; lane_id: string; read_only?: boolean };
       };
-      const reAuditSummary = JSON.parse(await readFile(runtime.lanePlans.re_audit.summaryPath, 'utf-8')) as {
+      const reAuditSummary = JSON.parse(await readFile(runtime.lanePlans.re_audit?.summaryPath || '', 'utf-8')) as {
         provenance: { session_id: string; lane_id: string; read_only?: boolean };
       };
-      const executionSummary = JSON.parse(await readFile(runtime.lanePlans.execution.summaryPath, 'utf-8')) as {
+      const executionSummary = JSON.parse(await readFile(runtime.lanePlans.execution?.summaryPath || '', 'utf-8')) as {
         provenance: { session_id: string; lane_id: string };
       };
 
@@ -392,6 +465,7 @@ describe('mission runtime', () => {
         slug: 'demo',
         targetFingerprint: 'repo:demo',
       });
+      if (!runtime.deltaFile) throw new Error('expected deltaFile for active iteration');
       await writeFile(runtime.deltaFile, JSON.stringify({
         previous_iteration: null,
         current_iteration: 1,
@@ -420,6 +494,7 @@ describe('mission runtime', () => {
         slug: 'demo',
         targetFingerprint: 'repo:demo',
       });
+      if (!resumed.iteration) throw new Error('expected resumed iteration');
       assert.equal(resumed.iteration.iteration, 1);
       assert.equal(resumed.iteration.resumed, true);
     } finally {
