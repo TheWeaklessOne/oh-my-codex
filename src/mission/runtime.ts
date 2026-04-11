@@ -135,7 +135,7 @@ function buildLanePlans(iteration: MissionIterationHandle): Record<MissionLaneTy
 }
 
 export async function prepareMissionRuntime(options: PrepareMissionRuntimeOptions): Promise<PreparedMissionRuntime> {
-  const mission = await ensureMissionState(options);
+  await ensureMissionState(options);
   const iteration = await startIteration(options.repoRoot, options.slug, options.strategyKey ?? null);
   const currentMission = await loadMission(options.repoRoot, options.slug);
   return {
