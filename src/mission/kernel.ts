@@ -9,7 +9,7 @@ import {
   closureMatrixDecision,
   computeResidualSetFingerprint,
   canTransitionMissionStatus,
-  matchResidualIdentity,
+  isResidualStableMatch,
   normalizeLaneSummary,
   type MissionClosurePolicy,
   type MissionLaneSummary,
@@ -80,9 +80,6 @@ export interface MissionDelta {
   resolved_residual_ids: string[];
   introduced_residual_ids: string[];
   oscillating_residual_ids: string[];
-  lineage_split_residual_ids: string[];
-  lineage_merge_residual_ids: string[];
-  low_confidence_residual_ids: string[];
   severity_rollup: {
     improved: number;
     unchanged: number;
@@ -356,38 +353,17 @@ function compareResiduals(previous: MissionLaneSummary | null, current: MissionL
   const introduced = new Set<string>();
   const oscillating = loadResidualHistory(deltaHistory);
   const matchedCurrent = new Set<string>();
-  const lineageSplit = new Set<string>();
-  const lineageMerge = new Set<string>();
-  const lowConfidence = new Set<string>();
 
   for (const prior of previousResiduals) {
-    const matches = currentResiduals
-      .map((candidate) => ({ candidate, match: matchResidualIdentity(prior, candidate) }))
-      .filter((entry) => entry.match.matched);
-    if (matches.length === 0) {
+    const exact = currentResiduals.find((candidate) => isResidualStableMatch(prior, candidate));
+    if (!exact) {
       resolved.add(prior.stable_id);
       continue;
     }
-    for (const entry of matches) {
-      matchedCurrent.add(entry.candidate.stable_id);
-      if (entry.match.confidence === 'low' || entry.candidate.low_confidence_marker || prior.low_confidence_marker) {
-        lowConfidence.add(entry.candidate.stable_id);
-        lowConfidence.add(prior.stable_id);
-      }
-    }
-    if (matches.some((entry) => entry.match.reason === 'lineage') && matches.length > 1) {
-      lineageSplit.add(prior.stable_id);
-    }
-
-    const bestMatch = matches
-      .map((entry) => entry.candidate)
-      .reduce((best, candidate) => (
-        severityRank(candidate.severity) < severityRank(best.severity) ? candidate : best
-      ));
-
-    if (bestMatch.severity === prior.severity) {
+    matchedCurrent.add(exact.stable_id);
+    if (exact.severity === prior.severity) {
       unchanged.add(prior.stable_id);
-    } else if (severityRank(bestMatch.severity) < severityRank(prior.severity)) {
+    } else if (severityRank(exact.severity) < severityRank(prior.severity)) {
       improved.add(prior.stable_id);
     } else {
       regressed.add(prior.stable_id);
@@ -404,18 +380,6 @@ function compareResiduals(previous: MissionLaneSummary | null, current: MissionL
     if (deltaHistory.some((delta) => delta.resolved_residual_ids.includes(residual.stable_id))) {
       oscillating.add(residual.stable_id);
     }
-    if (residual.low_confidence_marker) {
-      lowConfidence.add(residual.stable_id);
-    }
-    if (residual.lineage?.kind === 'merge' && residual.lineage.related_residual_ids.length > 1) {
-      lineageMerge.add(residual.stable_id);
-    }
-  }
-
-  for (const residual of currentResiduals) {
-    if (residual.lineage?.kind === 'merge' && residual.lineage.related_residual_ids.length > 1) {
-      lineageMerge.add(residual.stable_id);
-    }
   }
 
   return {
@@ -429,9 +393,6 @@ function compareResiduals(previous: MissionLaneSummary | null, current: MissionL
     resolved_residual_ids: Array.from(resolved).sort(),
     introduced_residual_ids: Array.from(introduced).sort(),
     oscillating_residual_ids: Array.from(oscillating).sort(),
-    lineage_split_residual_ids: Array.from(lineageSplit).sort(),
-    lineage_merge_residual_ids: Array.from(lineageMerge).sort(),
-    low_confidence_residual_ids: Array.from(lowConfidence).sort(),
     severity_rollup: {
       improved: improved.size,
       unchanged: unchanged.size,
