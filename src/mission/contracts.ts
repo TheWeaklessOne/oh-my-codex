@@ -10,6 +10,7 @@ export type MissionConfidence = (typeof MISSION_CONFIDENCE_LEVELS)[number];
 
 export const MISSION_LANE_TYPES = ['audit', 'remediation', 'execution', 'hardening', 're_audit'] as const;
 export type MissionLaneType = (typeof MISSION_LANE_TYPES)[number];
+export const MISSION_REQUIRED_LANE_TYPES = ['audit', 'remediation', 'execution', 're_audit'] as const;
 
 export const MISSION_STATUSES = ['running', 'cancelling', 'cancelled', 'complete', 'plateau', 'failed'] as const;
 export type MissionStatus = (typeof MISSION_STATUSES)[number];

@@ -30,8 +30,8 @@ The skill layer may shape UX and summaries, but it must not become the source of
 - `mission.json`, `latest.json`, iteration summaries, and `delta.json` are written with atomic temp-file + rename semantics.
 - Iteration commit durability is ordered as:
   1. `mission.json`
-  2. `latest.json`
-  3. `delta.json`
+  2. `delta.json`
+  3. `latest.json`
 - `latest.json` is a read model only and advances **after** iteration commit succeeds.
 - Partial/torn writes must never become the authoritative latest mission state.
 - `startIteration` only advances when the previous iteration has both:
@@ -48,7 +48,7 @@ The skill layer may shape UX and summaries, but it must not become the source of
   - audit
   - remediation
   - execution
-  - hardening
+  - optional hardening
   - re-audit
   - delta / closure judgment
 
@@ -56,12 +56,12 @@ The skill layer may shape UX and summaries, but it must not become the source of
 
 - Lane summaries are **write once** per `<iteration, lane_type>`.
 - Duplicate writes return deterministic duplicate handling instead of mutating the summary.
-- `commitIteration` requires all five lane summaries for the current iteration:
+- `commitIteration` requires these lane summaries for the current iteration:
   - audit
   - remediation
   - execution
-  - hardening
   - re-audit
+- `hardening` is optional and only participates when the bounded fallback lane ran for that iteration.
 - Summaries for older iterations are ignored as `superseded`.
 - Summaries for future iterations are ignored as `future`.
 - Late summaries after terminal mission states are ignored deterministically.
@@ -87,6 +87,7 @@ Lineage-aware comparison means split/merge follow-up findings should not be sile
 
 - Local green checks alone do **not** close the mission.
 - Closure still requires the closure matrix to accept the fresh verifier verdict + green safety baseline.
+- Terminal closure is blocked when the final verifier provenance is not a fresh read-only verifier lane distinct from non-verifier lane identities.
 - Repeated unchanged findings can plateau only when the plateau policy threshold is met.
 - Oscillation and ambiguous retry exhaustion follow explicit deterministic exits.
 

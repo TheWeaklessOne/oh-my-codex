@@ -164,6 +164,7 @@ describe('Team Exec Stage', () => {
     const arts = result.artifacts as Record<string, unknown>;
     assert.equal(arts.workerCount, 2);
     assert.equal(arts.agentType, 'executor');
+    assert.equal(arts.residual_followup_required, true);
   });
 
   it('respects custom worker count and agent type', async () => {
@@ -198,6 +199,14 @@ describe('Team Exec Stage', () => {
     const descriptor = (result.artifacts as Record<string, unknown>).teamDescriptor as Record<string, unknown>;
     assert.equal(descriptor.task, 'raw task description');
     assert.equal(typeof (descriptor.staffingPlan as Record<string, unknown>).staffingSummary, 'string');
+  });
+
+  it('lets callers explicitly opt out of the Ralph fallback request', async () => {
+    const stage = createTeamExecStage({ residualFollowupRequired: false });
+    const result = await stage.run(makeCtx());
+
+    const arts = result.artifacts as Record<string, unknown>;
+    assert.equal(arts.residual_followup_required, false);
   });
 
   describe('buildTeamInstruction', () => {

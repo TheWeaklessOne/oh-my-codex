@@ -22,8 +22,14 @@ Examples:
 const MISSION_APPEND_ENV = 'OMX_MISSION_APPEND_INSTRUCTIONS_FILE';
 const VALUE_TAKING_FLAGS = new Set(['--model', '--provider', '--config', '-c', '-i', '--images-dir']);
 
-function missionTaskFromArgs(args: readonly string[]): string {
+export interface MissionCliParseResult {
+  task: string;
+  launchArgs: string[];
+}
+
+export function parseMissionCliArgs(args: readonly string[]): MissionCliParseResult {
   const words: string[] = [];
+  const launchArgs: string[] = [];
   let i = 0;
   while (i < args.length) {
     const token = args[i];
@@ -32,21 +38,30 @@ function missionTaskFromArgs(args: readonly string[]): string {
       break;
     }
     if (token.startsWith('--') && token.includes('=')) {
+      launchArgs.push(token);
       i += 1;
       continue;
     }
     if (token.startsWith('-') && VALUE_TAKING_FLAGS.has(token)) {
+      launchArgs.push(token);
+      if (i + 1 < args.length) {
+        launchArgs.push(args[i + 1]!);
+      }
       i += 2;
       continue;
     }
     if (token.startsWith('-')) {
+      launchArgs.push(token);
       i += 1;
       continue;
     }
     words.push(token);
     i += 1;
   }
-  return words.join(' ').trim() || 'mission-cli-launch';
+  return {
+    task: words.join(' ').trim() || 'mission-cli-launch',
+    launchArgs,
+  };
 }
 
 function buildMissionAppendInstructions(task: string): string {
@@ -71,23 +86,33 @@ async function writeMissionAppendixFile(cwd: string, task: string): Promise<stri
   return appendixPath;
 }
 
-export async function missionCommand(args: string[]): Promise<void> {
+interface MissionCommandDependencies {
+  launchWithHud?: (args: string[]) => Promise<void>;
+  writeAppendixFile?: (cwd: string, task: string) => Promise<string>;
+}
+
+export async function missionCommand(
+  args: string[],
+  dependencies: MissionCommandDependencies = {},
+): Promise<void> {
   if (args[0] === '--help' || args[0] === '-h' || args[0] === 'help') {
     console.log(MISSION_HELP);
     return;
   }
 
   const cwd = process.cwd();
-  const task = missionTaskFromArgs(args);
+  const parsed = parseMissionCliArgs(args);
+  const task = parsed.task;
 
   const previousAppendix = process.env[MISSION_APPEND_ENV];
-  const appendixPath = await writeMissionAppendixFile(cwd, task);
+  const appendixPath = await (dependencies.writeAppendixFile ?? writeMissionAppendixFile)(cwd, task);
   process.env[MISSION_APPEND_ENV] = appendixPath;
 
   try {
-    const { launchWithHud } = await import('./index.js');
+    const launchWithHud = dependencies.launchWithHud
+      ?? (await import('./index.js')).launchWithHud;
     const missionPrompt = task === 'mission-cli-launch' ? '$mission' : `$mission ${task}`;
-    await launchWithHud([missionPrompt]);
+    await launchWithHud([...parsed.launchArgs, missionPrompt]);
   } finally {
     if (typeof previousAppendix === 'string') process.env[MISSION_APPEND_ENV] = previousAppendix;
     else delete process.env[MISSION_APPEND_ENV];
