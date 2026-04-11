@@ -1,0 +1,95 @@
+# Mission kernel lifecycle + atomic iteration semantics
+
+This document freezes the Mission MVP kernel behavior that task 3 depends on.
+
+Authoritative implementation:
+
+- `src/mission/kernel.ts`
+- `src/mission/contracts.ts`
+- `src/mission/__tests__/kernel.test.ts`
+
+## Required kernel surface
+
+The Mission MVP kernel owns these operations:
+
+- `createMission`
+- `loadMission`
+- `resumeMission`
+- `startIteration`
+- `recordLaneSummary`
+- `commitIteration`
+- `computeDelta`
+- `judgeMissionState`
+- `cancelMission`
+- `finalizeMission`
+
+The skill layer may shape UX and summaries, but it must not become the source of truth for lifecycle transitions.
+
+## Atomic write rules
+
+- `mission.json`, `latest.json`, iteration summaries, and `delta.json` are written with atomic temp-file + rename semantics.
+- `latest.json` is a read model only and advances **after** iteration commit succeeds.
+- Partial/torn writes must never become the authoritative latest mission state.
+
+## Iteration semantics
+
+- Iterations live under `.omx/missions/<slug>/iterations/<NNN>/`.
+- `startIteration` resumes the current iteration when it already exists without a committed `delta.json`.
+- Once an iteration has `delta.json`, the next `startIteration` advances to a new iteration number.
+- The iteration loop is:
+  - audit
+  - remediation
+  - execution
+  - hardening
+  - re-audit
+  - delta / closure judgment
+
+## Late-summary reconciliation
+
+- Lane summaries are **write once** per `<iteration, lane_type>`.
+- Duplicate writes return deterministic duplicate handling instead of mutating the summary.
+- Summaries for older iterations are ignored as `superseded`.
+- Late summaries after terminal mission states are ignored deterministically.
+- Cancelled / cancelling missions take precedence over late-arriving lane summaries.
+
+## Delta semantics
+
+Delta comparison must surface:
+
+- improved residuals
+- unchanged residuals
+- regressed residuals
+- resolved residuals
+- introduced residuals
+- oscillating residuals
+- split lineage residuals
+- merge lineage residuals
+- low-confidence residual identities
+
+Lineage-aware comparison means split/merge follow-up findings should not be silently treated as wholly new work when lineage explicitly ties them back to prior residuals.
+
+## Plateau / closure expectations
+
+- Local green checks alone do **not** close the mission.
+- Closure still requires the closure matrix to accept the fresh verifier verdict + green safety baseline.
+- Repeated unchanged findings can plateau only when the plateau policy threshold is met.
+- Oscillation and ambiguous retry exhaustion follow explicit deterministic exits.
+
+## Cancel / terminal-state expectations
+
+- `cancelMission` yields:
+  - `cancelling` when active lanes are still tracked
+  - `cancelled` when no active lanes remain
+- Invalid lifecycle transitions are rejected instead of normalized silently.
+- Terminal states are:
+  - `complete`
+  - `plateau`
+  - `failed`
+  - `cancelled`
+
+## Collision safety
+
+- `createMission` rejects non-terminal same-target collisions.
+- Collision safety keys off the target fingerprint, not only the slug.
+
+This keeps concurrent launches from corrupting a live mission for the same target.
