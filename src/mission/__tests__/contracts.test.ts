@@ -71,21 +71,54 @@ describe('mission contracts', () => {
     assert.equal(mergeResidual.lineage?.lineage_key, 'merge:residual:left|residual:right');
   });
 
+  it('prefers structural identity fields before looser matcher fallbacks', () => {
+    const residual = normalizeResidualIdentity({
+      title: 'Re-audit still reports stale summaries',
+      summary: 'Re-audit still reports stale summaries after execution.',
+      severity: 'medium',
+      category: 'fresh-lane-isolation',
+      closure_condition: 'fresh re audit must differ from execution lane',
+      identity_version: 'v2',
+      target_path: 'src/mission/kernel.ts',
+      symbol: 'computeDelta',
+    });
+
+    assert.equal(residual.identity_source, 'structural_key');
+    assert.equal(residual.category, 'fresh lane isolation');
+    assert.equal(residual.closure_condition, 'fresh re audit must differ from execution lane');
+    assert.equal(residual.identity_version, 'v2');
+    assert.match(residual.structural_key || '', /^v2\|fresh lane isolation\|fresh re audit must differ from execution lane\|/);
+  });
+
+  it('only falls back to a low-confidence hash when stronger identity fields are absent', () => {
+    const residual = normalizeResidualIdentity({
+      summary: '???',
+      low_confidence_marker: true,
+    });
+
+    assert.equal(residual.identity_source, 'fallback_hash');
+    assert.equal(residual.identity_confidence, 'low');
+    assert.equal(residual.low_confidence_marker, true);
+  });
+
   it('classifies wording drift deterministically instead of falling through to no-match', () => {
     const previous = normalizeResidualIdentity({
       title: 'Unexpected oracle ambiguity',
       summary: 'Verifier wording is unstable.',
       severity: 'low',
+      low_confidence_marker: true,
     });
     const next = normalizeResidualIdentity({
       title: 'Unexpected oracle ambiguity!!!',
       summary: 'Verifier wording changed but the same ambiguity remains.',
       severity: 'low',
+      low_confidence_marker: true,
     });
 
     const match = matchResidualIdentity(previous, next);
     assert.equal(match.matched, true);
     assert.notEqual(match.reason, 'no_match');
+    assert.equal(match.confidence, 'low');
   });
 
   it('normalizes malformed verifier artifacts into a non-closing summary', () => {
