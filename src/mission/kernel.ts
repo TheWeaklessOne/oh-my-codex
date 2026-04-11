@@ -80,6 +80,9 @@ export interface MissionDelta {
   resolved_residual_ids: string[];
   introduced_residual_ids: string[];
   oscillating_residual_ids: string[];
+  lineage_split_residual_ids: string[];
+  lineage_merge_residual_ids: string[];
+  low_confidence_residual_ids: string[];
   severity_rollup: {
     improved: number;
     unchanged: number;
@@ -353,14 +356,32 @@ function compareResiduals(previous: MissionLaneSummary | null, current: MissionL
   const introduced = new Set<string>();
   const oscillating = loadResidualHistory(deltaHistory);
   const matchedCurrent = new Set<string>();
+  const lineageSplit = new Set<string>();
+  const lineageMerge = new Set<string>();
+  const lowConfidence = new Set<string>();
 
   for (const prior of previousResiduals) {
-    const exact = currentResiduals.find((candidate) => isResidualStableMatch(prior, candidate));
-    if (!exact) {
+    const matches = currentResiduals
+      .map((candidate) => ({ candidate, matched: isResidualStableMatch(prior, candidate) }))
+      .filter((entry) => entry.matched)
+      .map((entry) => entry.candidate);
+    if (matches.length === 0) {
       resolved.add(prior.stable_id);
       continue;
     }
-    matchedCurrent.add(exact.stable_id);
+    for (const candidate of matches) {
+      matchedCurrent.add(candidate.stable_id);
+      if (candidate.low_confidence_marker || prior.low_confidence_marker) {
+        lowConfidence.add(prior.stable_id);
+        lowConfidence.add(candidate.stable_id);
+      }
+    }
+    if (matches.length > 1 && matches.some((candidate) => candidate.lineage?.kind === 'split')) {
+      lineageSplit.add(prior.stable_id);
+    }
+    const exact = matches.reduce((best, candidate) => (
+      severityRank(candidate.severity) < severityRank(best.severity) ? candidate : best
+    ));
     if (exact.severity === prior.severity) {
       unchanged.add(prior.stable_id);
     } else if (severityRank(exact.severity) < severityRank(prior.severity)) {
@@ -377,8 +398,20 @@ function compareResiduals(previous: MissionLaneSummary | null, current: MissionL
     if (matchedCurrent.has(residual.stable_id)) continue;
     introduced.add(residual.stable_id);
     regressed.add(residual.stable_id);
+    if (residual.low_confidence_marker) {
+      lowConfidence.add(residual.stable_id);
+    }
     if (deltaHistory.some((delta) => delta.resolved_residual_ids.includes(residual.stable_id))) {
       oscillating.add(residual.stable_id);
+    }
+    if (residual.lineage?.kind === 'merge' && residual.lineage.related_residual_ids.length > 1) {
+      lineageMerge.add(residual.stable_id);
+    }
+  }
+
+  for (const residual of currentResiduals) {
+    if (residual.lineage?.kind === 'merge' && residual.lineage.related_residual_ids.length > 1) {
+      lineageMerge.add(residual.stable_id);
     }
   }
 
@@ -393,6 +426,9 @@ function compareResiduals(previous: MissionLaneSummary | null, current: MissionL
     resolved_residual_ids: Array.from(resolved).sort(),
     introduced_residual_ids: Array.from(introduced).sort(),
     oscillating_residual_ids: Array.from(oscillating).sort(),
+    lineage_split_residual_ids: Array.from(lineageSplit).sort(),
+    lineage_merge_residual_ids: Array.from(lineageMerge).sort(),
+    low_confidence_residual_ids: Array.from(lowConfidence).sort(),
     severity_rollup: {
       improved: improved.size,
       unchanged: unchanged.size,
