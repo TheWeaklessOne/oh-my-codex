@@ -112,7 +112,7 @@ export interface MissionRecordLaneResult {
   status: 'written' | 'duplicate' | 'ignored';
   summaryPath: string;
   summary?: MissionLaneSummary;
-  reason?: 'terminal' | 'superseded' | 'duplicate' | 'cancelled';
+  reason?: 'terminal' | 'superseded' | 'future' | 'duplicate' | 'cancelled';
 }
 
 export interface MissionSafetyBaseline {
@@ -168,6 +168,10 @@ function laneSummaryPath(repoRoot: string, slug: string, iteration: number, lane
 
 function deltaPath(repoRoot: string, slug: string, iteration: number): string {
   return join(iterationRoot(repoRoot, slug, iteration), 'delta.json');
+}
+
+function expectedLatestSummaryPath(repoRoot: string, slug: string, iteration: number): string {
+  return laneSummaryPath(repoRoot, slug, iteration, 're_audit');
 }
 
 function hashValue(input: string): string {
@@ -257,6 +261,73 @@ export async function resumeMission(repoRoot: string, slug: string): Promise<Mis
   return loadMission(repoRoot, slug);
 }
 
+function buildActiveLaneEntry(iteration: number, laneType: MissionLaneType): MissionState['active_lanes'][number] {
+  const key = `${laneType}-${iteration}`;
+  return {
+    lane_id: `pending:${key}`,
+    session_id: `pending:${key}`,
+    lane_type: laneType,
+    runner_type: laneType === 'execution' ? 'team' : laneType === 'hardening' ? 'ralph' : 'direct',
+    finished_at: '',
+  };
+}
+
+async function deriveActiveLanes(repoRoot: string, slug: string, iteration: number): Promise<MissionState['active_lanes']> {
+  return MISSION_LANE_TYPES
+    .filter((laneType) => !existsSync(laneSummaryPath(repoRoot, slug, iteration, laneType)))
+    .map((laneType) => buildActiveLaneEntry(iteration, laneType));
+}
+
+function nextStageFromActiveLanes(activeLanes: MissionState['active_lanes']): MissionState['current_stage'] {
+  return activeLanes[0]?.lane_type ?? 'judging';
+}
+
+async function isIterationCommitted(repoRoot: string, slug: string, mission: MissionState, iteration: number): Promise<boolean> {
+  if (!existsSync(deltaPath(repoRoot, slug, iteration))) return false;
+  const expectedSummaryPath = expectedLatestSummaryPath(repoRoot, slug, iteration);
+  if (mission.latest_summary_path !== expectedSummaryPath) return false;
+  if (!existsSync(latestPath(repoRoot, slug))) return false;
+  const latest = await readJsonFile<MissionLatestSnapshot>(latestPath(repoRoot, slug));
+  return latest.current_iteration === iteration && latest.latest_summary_path === expectedSummaryPath;
+}
+
+function removeActiveLane(
+  mission: MissionState,
+  laneType: MissionLaneType,
+  laneSummary?: MissionLaneSummary,
+): MissionState {
+  const remaining = mission.active_lanes.filter((entry) => entry.lane_type !== laneType);
+  const latestLaneProvenance = laneSummary
+    ? [
+        ...mission.latest_lane_provenance.filter((entry) => entry.lane_type !== laneType),
+        {
+          lane_id: laneSummary.provenance.lane_id,
+          session_id: laneSummary.provenance.session_id,
+          lane_type: laneSummary.provenance.lane_type,
+          runner_type: laneSummary.provenance.runner_type,
+          finished_at: laneSummary.provenance.finished_at,
+        },
+      ]
+    : mission.latest_lane_provenance;
+
+  const status =
+    mission.status === 'cancelling' && remaining.length === 0
+      ? 'cancelled'
+      : mission.status;
+
+  return {
+    ...mission,
+    status,
+    updated_at: nowIso(),
+    current_stage:
+      status === 'cancelled'
+        ? 'idle'
+        : nextStageFromActiveLanes(remaining),
+    active_lanes: remaining,
+    latest_lane_provenance: latestLaneProvenance,
+  };
+}
+
 export async function startIteration(repoRoot: string, slug: string, strategyKey?: string | null): Promise<MissionIterationHandle> {
   const mission = await loadMission(repoRoot, slug);
   if (isTerminalStatus(mission.status)) {
@@ -266,7 +337,7 @@ export async function startIteration(repoRoot: string, slug: string, strategyKey
   let iteration = mission.current_iteration;
   let resumed = existsSync(iterationRoot(repoRoot, slug, iteration));
 
-  if (existsSync(deltaPath(repoRoot, slug, iteration))) {
+  if (await isIterationCommitted(repoRoot, slug, mission, iteration)) {
     iteration += 1;
     resumed = false;
   }
@@ -278,13 +349,15 @@ export async function startIteration(repoRoot: string, slug: string, strategyKey
     await mkdir(laneDirs[laneType], { recursive: true });
   }
 
+  const activeLanes = await deriveActiveLanes(repoRoot, slug, iteration);
+
   const nextMission: MissionState = {
     ...mission,
     current_iteration: iteration,
-    current_stage: 'audit',
+    current_stage: nextStageFromActiveLanes(activeLanes),
     updated_at: nowIso(),
     last_strategy_key: strategyKey ?? mission.last_strategy_key ?? null,
-    active_lanes: [],
+    active_lanes: activeLanes,
   };
   await writeJsonFile(missionPath(repoRoot, slug), nextMission);
 
@@ -297,8 +370,9 @@ export async function startIteration(repoRoot: string, slug: string, strategyKey
 }
 
 function validateLaneIteration(mission: MissionState, iteration: number): MissionRecordLaneResult['reason'] | null {
-  if (isTerminalStatus(mission.status)) return mission.status === 'cancelled' || mission.status === 'cancelling' ? 'cancelled' : 'terminal';
+  if (isTerminalStatus(mission.status)) return mission.status === 'cancelled' ? 'cancelled' : 'terminal';
   if (iteration < mission.current_iteration) return 'superseded';
+  if (iteration > mission.current_iteration) return 'future';
   return null;
 }
 
@@ -315,29 +389,21 @@ export async function recordLaneSummary(
   if (invalidReason) {
     return { status: 'ignored', summaryPath: summaryFile, reason: invalidReason };
   }
+  const summary = normalizeLaneSummary(summaryInput);
+
+  if (mission.status === 'cancelling') {
+    const nextMission = removeActiveLane(mission, laneType, summary);
+    await writeJsonFile(missionPath(repoRoot, slug), nextMission);
+    return { status: 'ignored', summaryPath: summaryFile, reason: 'cancelled', summary };
+  }
+
   if (existsSync(summaryFile)) {
     return { status: 'duplicate', summaryPath: summaryFile, reason: 'duplicate', summary: await readJsonFile<MissionLaneSummary>(summaryFile) };
   }
 
-  const summary = normalizeLaneSummary(summaryInput);
   await mkdir(join(iterationRoot(repoRoot, slug, iteration), laneType), { recursive: true });
   await writeJsonFile(summaryFile, summary);
-
-  const nextMission: MissionState = {
-    ...mission,
-    updated_at: nowIso(),
-    current_stage: laneType,
-    latest_lane_provenance: [
-      ...mission.latest_lane_provenance.filter((entry) => entry.lane_type !== laneType),
-      {
-        lane_id: summary.provenance.lane_id,
-        session_id: summary.provenance.session_id,
-        lane_type: summary.provenance.lane_type,
-        runner_type: summary.provenance.runner_type,
-        finished_at: summary.provenance.finished_at,
-      },
-    ],
-  };
+  const nextMission = removeActiveLane(mission, laneType, summary);
   await writeJsonFile(missionPath(repoRoot, slug), nextMission);
   return { status: 'written', summaryPath: summaryFile, summary };
 }
@@ -461,6 +527,22 @@ export async function computeDelta(
   return compareResiduals(previousSummary, current, history);
 }
 
+async function readRequiredIterationSummaries(
+  repoRoot: string,
+  slug: string,
+  iteration: number,
+): Promise<Record<MissionLaneType, MissionLaneSummary>> {
+  const summaries = {} as Record<MissionLaneType, MissionLaneSummary>;
+  for (const laneType of MISSION_LANE_TYPES) {
+    const summaryFile = laneSummaryPath(repoRoot, slug, iteration, laneType);
+    if (!existsSync(summaryFile)) {
+      throw new Error(`missing_iteration_lane_summary:${laneType}`);
+    }
+    summaries[laneType] = await readJsonFile<MissionLaneSummary>(summaryFile);
+  }
+  return summaries;
+}
+
 function isGreenSafetyBaseline(baseline: MissionSafetyBaseline): boolean {
   return baseline.iteration_commit_succeeded
     && baseline.no_unreconciled_lane_errors
@@ -539,9 +621,9 @@ export async function commitIteration(
   strategyChanged = false,
 ): Promise<CommitIterationResult> {
   const mission = await loadMission(repoRoot, slug);
-  const verifier = await readJsonFile<MissionLaneSummary>(laneSummaryPath(repoRoot, slug, iteration, 're_audit'));
+  const laneSummaries = await readRequiredIterationSummaries(repoRoot, slug, iteration);
+  const verifier = laneSummaries.re_audit;
   const delta = await computeDelta(repoRoot, slug, iteration);
-  await writeJsonFile(deltaPath(repoRoot, slug, iteration), delta);
 
   const judgement = judgeMissionState(mission, verifier, delta, safetyBaseline, strategyChanged);
   if (!canTransitionMissionStatus(mission.status, judgement.nextStatus)) {
@@ -570,8 +652,6 @@ export async function commitIteration(
     final_reason: judgement.nextStatus === 'running' ? null : judgement.reason,
     active_lanes: [],
   };
-  await writeJsonFile(missionPath(repoRoot, slug), nextMission);
-
   const latest: MissionLatestSnapshot = {
     mission_id: mission.mission_id,
     current_iteration: iteration,
@@ -580,7 +660,10 @@ export async function commitIteration(
     latest_summary_path: laneSummaryPath(repoRoot, slug, iteration, 're_audit'),
     updated_at: nextMission.updated_at,
   };
+
+  await writeJsonFile(missionPath(repoRoot, slug), nextMission);
   await writeJsonFile(latestPath(repoRoot, slug), latest);
+  await writeJsonFile(deltaPath(repoRoot, slug, iteration), delta);
   return { mission: nextMission, delta, latest, judgement };
 }
 

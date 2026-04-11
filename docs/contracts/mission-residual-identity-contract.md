@@ -44,9 +44,10 @@ Residual identity follows this strict precedence order:
 
 1. **`stable_id`** — explicit operator/adapter supplied stable identifier
 2. **`canonical_key`** — explicit normalized canonical key, promoted to `residual:<canonical_key>`
-3. **`lineage`** — split/merge lineage key combined with matcher seed
-4. **matcher-derived key** — deterministic hash of severity + target path + symbol + normalized title tokens
-5. **fallback hash** — deterministic hash of normalized title/summary when nothing better is available
+3. **structural key** — deterministic key from `identity_version + category + closure_condition + target path + symbol + normalized title tokens`
+4. **`lineage`** — split/merge lineage key combined with matcher seed
+5. **matcher-derived key** — deterministic hash of severity + target path + symbol + normalized title tokens
+6. **fallback hash** — deterministic hash of normalized title/summary when nothing better is available
 
 This precedence prevents low-signal wording changes from unnecessarily rekeying the same residual.
 
@@ -93,15 +94,17 @@ Identity match order:
 
 1. exact `stable_id`
 2. exact `canonical_key`
-3. exact lineage key
-4. shared lineage relation
-5. exact matcher key
-6. exact fallback hash
-7. otherwise `no_match`
+3. exact structural key
+4. exact lineage key
+5. shared lineage relation
+6. exact matcher key
+7. exact fallback hash
+8. otherwise `no_match`
 
 Confidence expectations:
 
 - exact `stable_id` / `canonical_key` => `high`
+- exact structural key => `high` or `medium`
 - exact lineage key => `medium`
 - shared lineage relation => `low`
 - exact matcher key => `high` or `medium` based on matcher confidence

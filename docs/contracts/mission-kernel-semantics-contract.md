@@ -28,14 +28,22 @@ The skill layer may shape UX and summaries, but it must not become the source of
 ## Atomic write rules
 
 - `mission.json`, `latest.json`, iteration summaries, and `delta.json` are written with atomic temp-file + rename semantics.
+- Iteration commit durability is ordered as:
+  1. `mission.json`
+  2. `latest.json`
+  3. `delta.json`
 - `latest.json` is a read model only and advances **after** iteration commit succeeds.
 - Partial/torn writes must never become the authoritative latest mission state.
+- `startIteration` only advances when the previous iteration has both:
+  - `delta.json`
+  - a matching committed `latest.json` / `mission.latest_summary_path`
 
 ## Iteration semantics
 
 - Iterations live under `.omx/missions/<slug>/iterations/<NNN>/`.
 - `startIteration` resumes the current iteration when it already exists without a committed `delta.json`.
 - Once an iteration has `delta.json`, the next `startIteration` advances to a new iteration number.
+- `recordLaneSummary` rejects future iterations as well as past ones.
 - The iteration loop is:
   - audit
   - remediation
@@ -48,7 +56,14 @@ The skill layer may shape UX and summaries, but it must not become the source of
 
 - Lane summaries are **write once** per `<iteration, lane_type>`.
 - Duplicate writes return deterministic duplicate handling instead of mutating the summary.
+- `commitIteration` requires all five lane summaries for the current iteration:
+  - audit
+  - remediation
+  - execution
+  - hardening
+  - re-audit
 - Summaries for older iterations are ignored as `superseded`.
+- Summaries for future iterations are ignored as `future`.
 - Late summaries after terminal mission states are ignored deterministically.
 - Cancelled / cancelling missions take precedence over late-arriving lane summaries.
 
@@ -80,6 +95,8 @@ Lineage-aware comparison means split/merge follow-up findings should not be sile
 - `cancelMission` yields:
   - `cancelling` when active lanes are still tracked
   - `cancelled` when no active lanes remain
+- `startIteration` derives `active_lanes` from the set of lane summaries still missing for the current iteration.
+- Late summaries received during `cancelling` do not mutate iteration artifacts, but they do reconcile pending lanes so the kernel can transition from `cancelling` to `cancelled` deterministically.
 - Invalid lifecycle transitions are rejected instead of normalized silently.
 - Terminal states are:
   - `complete`

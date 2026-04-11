@@ -11,6 +11,8 @@ export interface FollowupConstraints {
   executionShape: 'coordinated-team' | 'single-owner-bounded-followup';
   scope: 'coordinated' | 'narrow';
   hardening: 'bounded';
+  roleContract: 'shared-agent-type' | 'single-owner';
+  laneAllocationsAreAdvisory: boolean;
   requiresPrimaryExecutionPass: boolean;
   summary: string;
   checkpoints: string[];
@@ -181,26 +183,31 @@ function buildFollowupConstraints(mode: FollowupMode): FollowupConstraints {
       executionShape: 'coordinated-team',
       scope: 'coordinated',
       hardening: 'bounded',
+      roleContract: 'shared-agent-type',
+      laneAllocationsAreAdvisory: true,
       requiresPrimaryExecutionPass: false,
-      summary: 'Use team as the default coordinated executor and keep hardening targeted instead of turning review/cleanup into an unbounded second implementation pass.',
+      summary: 'Use team as the default coordinated executor and keep hardening targeted instead of turning review/cleanup into an unbounded second implementation pass. Under the current team runtime, lane allocations are advisory staffing guidance because workers still launch under one shared agent type.',
       checkpoints: [
         'Prefer team for the main implementation pass when the work benefits from durable coordination or parallel lanes.',
+        'Treat verification/specialist lane allocations as advisory until the runtime grows explicit per-lane role selection.',
         'Keep hardening bounded to focused verification, cleanup, or review slices tied to the delivered change.',
         'Escalate to Ralph only if a later stubborn narrow follow-up slice still needs a persistent single-owner loop.',
       ],
     };
   }
 
-  return {
-    policy: 'bounded-fallback',
-    executionShape: 'single-owner-bounded-followup',
-    scope: 'narrow',
-    hardening: 'bounded',
-    requiresPrimaryExecutionPass: true,
-    summary: 'Use Ralph only as a bounded fallback after the main execution pass when a stubborn narrow follow-up slice still needs a persistent single-owner fix/verify loop.',
-    checkpoints: [
-      'Only launch Ralph after the main execution path or bounded hardening pass leaves a specific unresolved follow-up slice.',
-      'Keep the slice narrow: no broad redesign, no replacement for the primary coordinated execution path.',
+    return {
+      policy: 'bounded-fallback',
+      executionShape: 'single-owner-bounded-followup',
+      scope: 'narrow',
+      hardening: 'bounded',
+      roleContract: 'single-owner',
+      laneAllocationsAreAdvisory: false,
+      requiresPrimaryExecutionPass: true,
+      summary: 'Use Ralph only as a bounded fallback after the main execution pass when a stubborn narrow follow-up slice still needs a persistent single-owner fix/verify loop.',
+      checkpoints: [
+        'Only launch Ralph after the main execution path or bounded hardening pass leaves a specific unresolved follow-up slice.',
+        'Keep the slice narrow: no broad redesign, no replacement for the primary coordinated execution path.',
       'Stop once focused verification is green and the residual follow-up is reconciled.',
     ],
   };
@@ -242,8 +249,8 @@ function buildVerificationPlan(
       summary: constraints.summary,
       checkpoints: [
         'Launch via `omx team ...` (or `$team ...`) so the team runtime owns both parallel delivery and coordinated verification.',
-        `Keep ${qualityLane?.role ?? 'the verification lane'} focused on tests, regression coverage, and evidence capture before team shutdown.`,
-        constraints.checkpoints[2],
+        `Keep ${qualityLane?.role ?? 'the verification lane'} focused on tests, regression coverage, and evidence capture before team shutdown, while remembering the current runtime still uses one shared agent type.`,
+        constraints.checkpoints[3],
       ],
     };
   }
