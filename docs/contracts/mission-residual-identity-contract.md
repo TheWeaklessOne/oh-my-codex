@@ -117,6 +117,6 @@ This contract is intentionally limited to the Mission MVP:
 - one verifier contract
 - one default execution policy
 - no pluginized oracle adapters
-- no first-class `omx mission ...` CLI yet
+- Mission now has a first-class `omx mission ...` CLI entrypoint, but the kernel remains the source of truth
 
 The Mission skill is the UX surface; the mission kernel remains the authoritative state machine.
