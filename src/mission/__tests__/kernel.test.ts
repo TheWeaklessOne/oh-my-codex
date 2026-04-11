@@ -225,6 +225,91 @@ describe('mission kernel', () => {
     }
   });
 
+  it('does not complete on low-confidence or ambiguous oracle output even with a green baseline', async () => {
+    const repo = await initRepo();
+    try {
+      await createMission({
+        repoRoot: repo,
+        slug: 'demo',
+        targetFingerprint: 'repo:demo',
+        plateauPolicy: { max_ambiguous_iterations: 1 },
+      });
+
+      await startIteration(repo, 'demo', 'initial');
+      await recordLaneSummary(repo, 'demo', 1, 're_audit', {
+        verdict: 'PASS',
+        confidence: 'low',
+        residuals: [],
+        evidence_refs: ['logs/low-confidence.txt'],
+        recommended_next_action: 're-run verifier with stronger evidence',
+        provenance: {
+          lane_id: 're-audit-low-confidence',
+          session_id: 're-audit-low-confidence',
+          lane_type: 're_audit',
+          runner_type: 'direct',
+          adapter_version: 'mission-adapter/v1',
+          started_at: '2026-04-11T17:00:00.000Z',
+          finished_at: '2026-04-11T17:05:00.000Z',
+          parent_iteration: 1,
+          trigger_reason: 'low-confidence re-audit',
+          read_only: true,
+        },
+      });
+
+      const lowConfidenceCommit = await commitIteration(
+        repo,
+        'demo',
+        1,
+        {
+          iteration_commit_succeeded: true,
+          no_unreconciled_lane_errors: true,
+          focused_checks_green: true,
+        },
+      );
+      assert.equal(lowConfidenceCommit.mission.status, 'running');
+
+      await startIteration(repo, 'demo', 'ambiguous-follow-up');
+      await recordLaneSummary(repo, 'demo', 2, 're_audit', {
+        verdict: 'AMBIGUOUS',
+        confidence: 'low',
+        residuals: [{
+          summary: 'Verifier could not decide whether the mission is closed.',
+          severity: 'medium',
+          low_confidence_marker: true,
+        }],
+        evidence_refs: ['logs/ambiguous.txt'],
+        recommended_next_action: 'retry oracle',
+        provenance: {
+          lane_id: 're-audit-ambiguous',
+          session_id: 're-audit-ambiguous',
+          lane_type: 're_audit',
+          runner_type: 'direct',
+          adapter_version: 'mission-adapter/v1',
+          started_at: '2026-04-11T17:06:00.000Z',
+          finished_at: '2026-04-11T17:10:00.000Z',
+          parent_iteration: 2,
+          trigger_reason: 'ambiguous re-audit',
+          read_only: true,
+        },
+      });
+
+      const ambiguousCommit = await commitIteration(
+        repo,
+        'demo',
+        2,
+        {
+          iteration_commit_succeeded: true,
+          no_unreconciled_lane_errors: true,
+          focused_checks_green: true,
+        },
+      );
+      assert.equal(ambiguousCommit.mission.status, 'plateau');
+      assert.match(ambiguousCommit.judgement.reason, /ambiguous/i);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
   it('tracks split lineage and low-confidence markers during kernel delta comparison', async () => {
     const repo = await initRepo();
     try {

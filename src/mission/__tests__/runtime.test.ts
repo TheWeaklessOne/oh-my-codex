@@ -1,13 +1,14 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { MissionLaneSummaryInput } from '../contracts.js';
 import { loadMission } from '../kernel.js';
 import {
+  cancelMissionRuntime,
   commitMissionRuntimeIteration,
   prepareMissionRuntime,
   recordMissionRuntimeLaneSummary,
@@ -127,6 +128,96 @@ describe('mission runtime', () => {
       const mission = await loadMission(repo, 'demo');
       assert.equal(mission.latest_summary_path, runtime.lanePlans.re_audit.summaryPath);
       assert.equal(existsSync(runtime.latestFile), true);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps audit and re-audit isolated from execution lane provenance', async () => {
+    const repo = await initRepo();
+    try {
+      const runtime = await prepareMissionRuntime({
+        repoRoot: repo,
+        slug: 'demo',
+        targetFingerprint: 'repo:demo',
+      });
+
+      await recordMissionRuntimeLaneSummary(repo, 'demo', 'audit', {
+        ...laneSummary('audit', 1, 'PARTIAL'),
+        provenance: {
+          ...laneSummary('audit', 1, 'PARTIAL').provenance,
+          session_id: 'audit-session-fresh',
+          lane_id: 'audit-lane-fresh',
+        },
+      });
+      await recordMissionRuntimeLaneSummary(repo, 'demo', 'execution', {
+        verdict: 'PASS',
+        confidence: 'high',
+        residuals: [],
+        evidence_refs: ['logs/exec.txt'],
+        recommended_next_action: 'handoff to hardening',
+        provenance: {
+          lane_id: 'execution-lane-1',
+          session_id: 'execution-session-1',
+          lane_type: 'execution',
+          runner_type: 'team',
+          adapter_version: 'mission-adapter/v1',
+          started_at: '2026-04-11T17:00:00.000Z',
+          finished_at: '2026-04-11T17:05:00.000Z',
+          parent_iteration: 1,
+          trigger_reason: 'execution stage',
+        },
+      });
+      await recordMissionRuntimeLaneSummary(repo, 'demo', 're_audit', {
+        ...laneSummary('re_audit', 1, 'PASS'),
+        provenance: {
+          ...laneSummary('re_audit', 1, 'PASS').provenance,
+          session_id: 're-audit-session-fresh',
+          lane_id: 're-audit-lane-fresh',
+        },
+      });
+
+      const auditSummary = JSON.parse(await readFile(runtime.lanePlans.audit.summaryPath, 'utf-8')) as {
+        provenance: { session_id: string; lane_id: string; read_only?: boolean };
+      };
+      const reAuditSummary = JSON.parse(await readFile(runtime.lanePlans.re_audit.summaryPath, 'utf-8')) as {
+        provenance: { session_id: string; lane_id: string; read_only?: boolean };
+      };
+      const executionSummary = JSON.parse(await readFile(runtime.lanePlans.execution.summaryPath, 'utf-8')) as {
+        provenance: { session_id: string; lane_id: string };
+      };
+
+      assert.notEqual(auditSummary.provenance.session_id, executionSummary.provenance.session_id);
+      assert.notEqual(reAuditSummary.provenance.session_id, executionSummary.provenance.session_id);
+      assert.notEqual(auditSummary.provenance.lane_id, executionSummary.provenance.lane_id);
+      assert.notEqual(reAuditSummary.provenance.lane_id, executionSummary.provenance.lane_id);
+      assert.equal(auditSummary.provenance.read_only, true);
+      assert.equal(reAuditSummary.provenance.read_only, true);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores duplicate or late lane summaries after runtime cancellation', async () => {
+    const repo = await initRepo();
+    try {
+      await prepareMissionRuntime({
+        repoRoot: repo,
+        slug: 'demo',
+        targetFingerprint: 'repo:demo',
+      });
+
+      const first = await recordMissionRuntimeLaneSummary(repo, 'demo', 'audit', laneSummary('audit', 1, 'PARTIAL'));
+      const duplicate = await recordMissionRuntimeLaneSummary(repo, 'demo', 'audit', laneSummary('audit', 1, 'PARTIAL'));
+      assert.equal(first.status, 'written');
+      assert.equal(duplicate.status, 'duplicate');
+
+      const cancelled = await cancelMissionRuntime(repo, 'demo', 'operator requested cancellation');
+      assert.equal(cancelled.status, 'cancelled');
+
+      const late = await recordMissionRuntimeLaneSummary(repo, 'demo', 're_audit', laneSummary('re_audit', 1, 'PASS'));
+      assert.equal(late.status, 'ignored');
+      assert.equal(late.reason, 'cancelled');
     } finally {
       await rm(repo, { recursive: true, force: true });
     }
