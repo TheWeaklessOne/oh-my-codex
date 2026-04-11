@@ -9,6 +9,7 @@ import type { MissionLaneSummaryInput } from '../contracts.js';
 import {
   cancelMission,
   commitIteration,
+  computeDelta,
   createMission,
   loadMission,
   recordLaneSummary,
@@ -219,6 +220,108 @@ describe('mission kernel', () => {
 
       const mission = await loadMission(repo, 'demo');
       assert.equal(mission.current_iteration, 1);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('tracks split lineage and low-confidence markers during kernel delta comparison', async () => {
+    const repo = await initRepo();
+    try {
+      await createMission({ repoRoot: repo, slug: 'demo', targetFingerprint: 'repo:demo' });
+      await startIteration(repo, 'demo', 'initial');
+      await recordLaneSummary(repo, 'demo', 1, 're_audit', {
+        verdict: 'PARTIAL',
+        confidence: 'high',
+        residuals: [{
+          stable_id: 'residual:shared-parent',
+          title: 'Execution lane leaked into audit lane',
+          summary: 'Audit lane reused execution context.',
+          severity: 'high',
+          category: 'fresh-lane-isolation',
+          closure_condition: 'audit and execution provenance must differ',
+          target_path: 'src/mission/kernel.ts',
+          symbol: 'computeDelta',
+        }],
+        evidence_refs: ['logs/iter-1.txt'],
+        recommended_next_action: 'split residuals by failing lane pair',
+        provenance: {
+          lane_id: 're-audit-lane-1',
+          session_id: 're-audit-session-1',
+          lane_type: 're_audit',
+          runner_type: 'direct',
+          adapter_version: 'mission-adapter/v1',
+          started_at: '2026-04-11T17:00:00.000Z',
+          finished_at: '2026-04-11T17:05:00.000Z',
+          parent_iteration: 1,
+          trigger_reason: 'initial re-audit',
+          read_only: true,
+        },
+      });
+      await commitIteration(
+        repo,
+        'demo',
+        1,
+        {
+          iteration_commit_succeeded: true,
+          no_unreconciled_lane_errors: true,
+          focused_checks_green: true,
+        },
+      );
+
+      await startIteration(repo, 'demo', 'lineage-follow-up');
+      await recordLaneSummary(repo, 'demo', 2, 're_audit', {
+        verdict: 'PARTIAL',
+        confidence: 'low',
+        residuals: [
+          {
+            title: 'Audit lane reused execution session',
+            summary: 'Audit lane session still overlaps execution.',
+            severity: 'medium',
+            category: 'fresh-lane-isolation',
+            closure_condition: 'audit and execution provenance must differ',
+            target_path: 'src/mission/kernel.ts',
+            symbol: 'computeDelta',
+            lineage: {
+              kind: 'split',
+              related_residual_ids: ['residual:shared-parent'],
+            },
+          },
+          {
+            title: 'Re-audit lane reused hardening session',
+            summary: 'Re-audit still overlaps a hardening lane.',
+            severity: 'medium',
+            category: 'fresh-lane-isolation',
+            closure_condition: 're audit and hardening provenance must differ',
+            target_path: 'src/mission/kernel.ts',
+            symbol: 'computeDelta',
+            lineage: {
+              kind: 'split',
+              related_residual_ids: ['residual:shared-parent'],
+            },
+            low_confidence_marker: true,
+          },
+        ],
+        evidence_refs: ['logs/iter-2.txt'],
+        recommended_next_action: 'keep separate provenance fixes',
+        provenance: {
+          lane_id: 're-audit-lane-2',
+          session_id: 're-audit-session-2',
+          lane_type: 're_audit',
+          runner_type: 'direct',
+          adapter_version: 'mission-adapter/v1',
+          started_at: '2026-04-11T17:06:00.000Z',
+          finished_at: '2026-04-11T17:10:00.000Z',
+          parent_iteration: 2,
+          trigger_reason: 'follow-up re-audit',
+          read_only: true,
+        },
+      });
+
+      const delta = await computeDelta(repo, 'demo', 2);
+      assert.deepEqual(delta.lineage_split_residual_ids, ['residual:shared-parent']);
+      assert.equal(delta.introduced_residual_ids.length, 0);
+      assert.equal(delta.low_confidence_residual_ids.length > 0, true);
     } finally {
       await rm(repo, { recursive: true, force: true });
     }

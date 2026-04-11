@@ -423,7 +423,11 @@ export function isResidualStableMatch(previous: MissionResidual, next: MissionRe
 
 export function matchResidualIdentity(previous: MissionResidual, next: MissionResidual): ResidualIdentityMatchResult {
   if (previous.stable_id === next.stable_id) {
-    return { matched: true, confidence: 'high', reason: 'stable_id' };
+    return {
+      matched: true,
+      confidence: previous.low_confidence_marker || next.low_confidence_marker ? 'low' : 'high',
+      reason: 'stable_id',
+    };
   }
   if (previous.canonical_key && next.canonical_key && previous.canonical_key === next.canonical_key) {
     return { matched: true, confidence: 'high', reason: 'canonical_key' };
@@ -432,6 +436,9 @@ export function matchResidualIdentity(previous: MissionResidual, next: MissionRe
   const nextLineage = next.lineage?.related_residual_ids ?? [];
   if (previous.lineage && next.lineage && previous.lineage.lineage_key === next.lineage.lineage_key) {
     return { matched: true, confidence: 'medium', reason: 'lineage' };
+  }
+  if (nextLineage.includes(previous.stable_id) || previousLineage.includes(next.stable_id)) {
+    return { matched: true, confidence: 'low', reason: 'lineage' };
   }
   if (previousLineage.some((related) => nextLineage.includes(related))) {
     return { matched: true, confidence: 'low', reason: 'lineage' };
