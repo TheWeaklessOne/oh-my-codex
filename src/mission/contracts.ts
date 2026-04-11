@@ -264,8 +264,7 @@ export function normalizeResidualIdentity(input: MissionResidualInput): MissionR
   const canonicalKey = normalizeStableId(input.canonical_key);
   const explicitStableId = normalizeStableId(input.stable_id);
   const tokenSignature = tokenizeIdentity([
-    title,
-    summary,
+    title || summary,
     input.target_path ?? '',
     input.symbol ?? '',
   ].join(' '));
