@@ -116,5 +116,5 @@ export interface TeamExecDescriptor {
  */
 export function buildTeamInstruction(descriptor: TeamExecDescriptor): string {
   const launchCommand = `omx team ${descriptor.workerCount}:${descriptor.agentType} ${JSON.stringify(descriptor.task)}`;
-  return `${launchCommand} # staffing=${descriptor.staffingPlan.staffingSummary} # verify=${descriptor.staffingPlan.verificationPlan.summary}`;
+  return `${launchCommand} # policy=${descriptor.staffingPlan.constraints.policy} # hardening=${descriptor.staffingPlan.constraints.hardening} # staffing=${descriptor.staffingPlan.staffingSummary} # verify=${descriptor.staffingPlan.verificationPlan.summary}`;
 }

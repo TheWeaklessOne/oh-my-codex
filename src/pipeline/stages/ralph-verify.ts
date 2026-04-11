@@ -1,8 +1,9 @@
 /**
- * Ralph verification stage adapter for pipeline orchestrator.
+ * Ralph bounded follow-up stage adapter for pipeline orchestrator.
  *
- * Wraps the ralph persistence loop into a PipelineStage for the
- * verification phase. Uses configurable iteration count.
+ * Wraps the Ralph persistence loop into a PipelineStage only for
+ * narrow stubborn follow-up slices after the main execution path.
+ * Uses configurable iteration count.
  */
 
 import type { PipelineStage, StageContext, StageResult } from '../types.js';
@@ -22,9 +23,10 @@ export interface RalphVerifyStageOptions {
 /**
  * Create a ralph-verify pipeline stage.
  *
- * This stage wraps the ralph persistence loop for the verification phase
- * of the pipeline. It takes the execution results from team-exec and
- * orchestrates architect-verified completion.
+ * This stage wraps the Ralph persistence loop only as a bounded fallback
+ * after the coordinated execution path. It takes the execution results
+ * from team-exec and emits a constrained follow-up descriptor instead of
+ * treating Ralph as the primary execution owner.
  *
  * The iteration count is configurable, addressing issue #396 requirement
  * for configurable ralph iteration count.
@@ -46,7 +48,7 @@ export function createRalphVerifyStage(options: RalphVerifyStageOptions = {}): P
           workerCount: Math.min(maxIterations, 3),
         });
 
-        // Build ralph verification descriptor
+        // Build bounded Ralph follow-up descriptor
         const verifyDescriptor: RalphVerifyDescriptor = {
           task: ctx.task,
           maxIterations,
@@ -102,5 +104,5 @@ export interface RalphVerifyDescriptor {
  * Build the ralph CLI instruction from a descriptor.
  */
 export function buildRalphInstruction(descriptor: RalphVerifyDescriptor): string {
-  return `${descriptor.staffingPlan.launchHints.shellCommand} # max_iterations=${descriptor.maxIterations} # staffing=${descriptor.staffingPlan.staffingSummary} # verify=${descriptor.staffingPlan.verificationPlan.summary}`;
+  return `${descriptor.staffingPlan.launchHints.shellCommand} # policy=${descriptor.staffingPlan.constraints.policy} # hardening=${descriptor.staffingPlan.constraints.hardening} # max_iterations=${descriptor.maxIterations} # staffing=${descriptor.staffingPlan.staffingSummary} # verify=${descriptor.staffingPlan.verificationPlan.summary}`;
 }
