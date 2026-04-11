@@ -209,6 +209,7 @@ describe('Team Exec Stage', () => {
         task: 'implement feature',
         workerCount: 3,
         agentType: 'executor',
+        roleContract: 'shared-agent-type',
         availableAgentTypes: ['executor', 'test-engineer'],
         staffingPlan,
         useWorktrees: false,
@@ -217,6 +218,7 @@ describe('Team Exec Stage', () => {
 
       assert.match(instruction, /^omx team 3:executor /);
       assert.match(instruction, /policy=coordinated-default/);
+      assert.match(instruction, /role_contract=shared-agent-type/);
       assert.match(instruction, /hardening=bounded/);
       assert.match(instruction, /implement feature/);
       assert.match(instruction, /staffing=/);
@@ -232,6 +234,7 @@ describe('Team Exec Stage', () => {
         task: longTask,
         workerCount: 1,
         agentType: 'executor',
+        roleContract: 'shared-agent-type',
         availableAgentTypes: ['executor', 'test-engineer'],
         staffingPlan,
         useWorktrees: false,
@@ -240,6 +243,7 @@ describe('Team Exec Stage', () => {
 
       assert.match(instruction, /^omx team 1:executor /);
       assert.match(instruction, /policy=coordinated-default/);
+      assert.match(instruction, /role_contract=shared-agent-type/);
       assert.match(instruction, /staffing=/);
     });
   });
@@ -260,7 +264,11 @@ describe('Ralph Verify Stage', () => {
 
   it('uses default max iterations of 10', async () => {
     const stage = createRalphVerifyStage();
-    const result = await stage.run(makeCtx());
+    const result = await stage.run(makeCtx({
+      artifacts: {
+        'team-exec': { residual_followup_required: true },
+      },
+    }));
 
     assert.equal(result.status, 'completed');
     const arts = result.artifacts as Record<string, unknown>;
@@ -269,7 +277,11 @@ describe('Ralph Verify Stage', () => {
 
   it('respects custom max iterations', async () => {
     const stage = createRalphVerifyStage({ maxIterations: 25 });
-    const result = await stage.run(makeCtx());
+    const result = await stage.run(makeCtx({
+      artifacts: {
+        'team-exec': { residual_followup_required: true },
+      },
+    }));
 
     const arts = result.artifacts as Record<string, unknown>;
     assert.equal(arts.maxIterations, 25);
@@ -279,7 +291,7 @@ describe('Ralph Verify Stage', () => {
     const stage = createRalphVerifyStage();
     const ctx = makeCtx({
       artifacts: {
-        'team-exec': { teamDescriptor: { task: 'completed work' } },
+        'team-exec': { teamDescriptor: { task: 'completed work' }, residual_followup_required: true },
       },
     });
     const result = await stage.run(ctx);
@@ -289,6 +301,23 @@ describe('Ralph Verify Stage', () => {
     assert.ok(execArtifacts.teamDescriptor);
     assert.ok(Array.isArray(descriptor.availableAgentTypes));
     assert.equal(typeof (descriptor.staffingPlan as Record<string, unknown>).staffingSummary, 'string');
+  });
+
+  it('skips Ralph follow-up when team execution did not request a residual fallback', async () => {
+    const stage = createRalphVerifyStage();
+    const result = await stage.run(makeCtx({
+      artifacts: {
+        'team-exec': { residual_followup_required: false },
+      },
+    }));
+
+    assert.equal(result.status, 'skipped');
+    assert.equal((result.artifacts as Record<string, unknown>).reason, 'no residual follow-up requested after team execution');
+    assert.equal(stage.canSkip?.(makeCtx({
+      artifacts: {
+        'team-exec': { residual_followup_required: false },
+      },
+    })), true);
   });
 
   describe('buildRalphInstruction', () => {

@@ -67,6 +67,19 @@ function laneSummary(
   };
 }
 
+async function recordRequiredLaneSummaries(
+  repo: string,
+  slug: string,
+  iteration: number,
+  reAuditInput: MissionLaneSummaryInput,
+): Promise<void> {
+  await recordLaneSummary(repo, slug, iteration, 'audit', laneSummary('audit', iteration, { verdict: 'PASS', readOnly: true }));
+  await recordLaneSummary(repo, slug, iteration, 'remediation', laneSummary('remediation', iteration, { verdict: 'PASS' }));
+  await recordLaneSummary(repo, slug, iteration, 'execution', laneSummary('execution', iteration, { verdict: 'PASS' }));
+  await recordLaneSummary(repo, slug, iteration, 'hardening', laneSummary('hardening', iteration, { verdict: 'PASS' }));
+  await recordLaneSummary(repo, slug, iteration, 're_audit', reAuditInput);
+}
+
 describe('mission kernel', () => {
   it('bootstraps mission state and rejects same-target collisions', async () => {
     const repo = await initRepo();
@@ -109,10 +122,16 @@ describe('mission kernel', () => {
       assert.equal(duplicate.status, 'duplicate');
 
       const cancelled = await cancelMission(repo, 'demo');
-      assert.equal(cancelled.status, 'cancelled');
+      assert.equal(cancelled.status, 'cancelling');
       const late = await recordLaneSummary(repo, 'demo', 1, 're_audit', laneSummary('re_audit', 1, { verdict: 'PASS', readOnly: true }));
       assert.equal(late.status, 'ignored');
       assert.equal(late.reason, 'cancelled');
+
+      for (const lane of ['remediation', 'execution', 'hardening'] as const) {
+        await recordLaneSummary(repo, 'demo', 1, lane, laneSummary(lane, 1, { verdict: 'PASS' }));
+      }
+      const reconciled = await loadMission(repo, 'demo');
+      assert.equal(reconciled.status, 'cancelled');
     } finally {
       await rm(repo, { recursive: true, force: true });
     }
@@ -123,11 +142,12 @@ describe('mission kernel', () => {
     try {
       await createMission({ repoRoot: repo, slug: 'demo', targetFingerprint: 'repo:demo' });
       await startIteration(repo, 'demo', 'initial');
-      await recordLaneSummary(repo, 'demo', 1, 'audit', laneSummary('audit', 1, { verdict: 'PARTIAL', confidence: 'high', readOnly: true }));
-      await recordLaneSummary(repo, 'demo', 1, 'remediation', laneSummary('remediation', 1, { verdict: 'PASS' }));
-      await recordLaneSummary(repo, 'demo', 1, 'execution', laneSummary('execution', 1, { verdict: 'PASS' }));
-      await recordLaneSummary(repo, 'demo', 1, 'hardening', laneSummary('hardening', 1, { verdict: 'PASS' }));
-      await recordLaneSummary(repo, 'demo', 1, 're_audit', laneSummary('re_audit', 1, { verdict: 'PASS', confidence: 'high', readOnly: true }));
+      await recordRequiredLaneSummaries(
+        repo,
+        'demo',
+        1,
+        laneSummary('re_audit', 1, { verdict: 'PASS', confidence: 'high', readOnly: true }),
+      );
 
       const committed = await commitIteration(
         repo,
@@ -162,12 +182,17 @@ describe('mission kernel', () => {
       });
 
       await startIteration(repo, 'demo', 'strategy-a');
-      await recordLaneSummary(repo, 'demo', 1, 're_audit', laneSummary('re_audit', 1, {
-        verdict: 'PARTIAL',
-        confidence: 'high',
-        summary: 'Residual wording drift remains',
-        readOnly: true,
-      }));
+      await recordRequiredLaneSummaries(
+        repo,
+        'demo',
+        1,
+        laneSummary('re_audit', 1, {
+          verdict: 'PARTIAL',
+          confidence: 'high',
+          summary: 'Residual wording drift remains',
+          readOnly: true,
+        }),
+      );
       const firstCommit = await commitIteration(
         repo,
         'demo',
@@ -182,12 +207,17 @@ describe('mission kernel', () => {
       assert.equal(firstCommit.mission.status, 'running');
 
       await startIteration(repo, 'demo', 'strategy-b');
-      await recordLaneSummary(repo, 'demo', 2, 're_audit', laneSummary('re_audit', 2, {
-        verdict: 'PARTIAL',
-        confidence: 'high',
-        summary: 'Wording drift still remains',
-        readOnly: true,
-      }));
+      await recordRequiredLaneSummaries(
+        repo,
+        'demo',
+        2,
+        laneSummary('re_audit', 2, {
+          verdict: 'PARTIAL',
+          confidence: 'high',
+          summary: 'Wording drift still remains',
+          readOnly: true,
+        }),
+      );
       const secondCommit = await commitIteration(
         repo,
         'demo',
@@ -236,7 +266,7 @@ describe('mission kernel', () => {
       });
 
       await startIteration(repo, 'demo', 'initial');
-      await recordLaneSummary(repo, 'demo', 1, 're_audit', {
+      await recordRequiredLaneSummaries(repo, 'demo', 1, {
         verdict: 'PASS',
         confidence: 'low',
         residuals: [],
@@ -269,7 +299,7 @@ describe('mission kernel', () => {
       assert.equal(lowConfidenceCommit.mission.status, 'running');
 
       await startIteration(repo, 'demo', 'ambiguous-follow-up');
-      await recordLaneSummary(repo, 'demo', 2, 're_audit', {
+      await recordRequiredLaneSummaries(repo, 'demo', 2, {
         verdict: 'AMBIGUOUS',
         confidence: 'low',
         residuals: [{
@@ -315,7 +345,7 @@ describe('mission kernel', () => {
     try {
       await createMission({ repoRoot: repo, slug: 'demo', targetFingerprint: 'repo:demo' });
       await startIteration(repo, 'demo', 'initial');
-      await recordLaneSummary(repo, 'demo', 1, 're_audit', {
+      await recordRequiredLaneSummaries(repo, 'demo', 1, {
         verdict: 'PARTIAL',
         confidence: 'high',
         residuals: [{
@@ -355,7 +385,7 @@ describe('mission kernel', () => {
       );
 
       await startIteration(repo, 'demo', 'lineage-follow-up');
-      await recordLaneSummary(repo, 'demo', 2, 're_audit', {
+      await recordRequiredLaneSummaries(repo, 'demo', 2, {
         verdict: 'PARTIAL',
         confidence: 'low',
         residuals: [
@@ -423,7 +453,7 @@ describe('mission kernel', () => {
       });
 
       await startIteration(repo, 'demo', 'first-pass');
-      await recordLaneSummary(repo, 'demo', 1, 're_audit', {
+      await recordRequiredLaneSummaries(repo, 'demo', 1, {
         verdict: 'PARTIAL',
         confidence: 'high',
         residuals: [{
@@ -460,7 +490,7 @@ describe('mission kernel', () => {
       );
 
       await startIteration(repo, 'demo', 'second-pass');
-      await recordLaneSummary(repo, 'demo', 2, 're_audit', {
+      await recordRequiredLaneSummaries(repo, 'demo', 2, {
         verdict: 'PARTIAL',
         confidence: 'high',
         residuals: [{
@@ -497,7 +527,7 @@ describe('mission kernel', () => {
       );
 
       await startIteration(repo, 'demo', 'third-pass');
-      await recordLaneSummary(repo, 'demo', 3, 're_audit', {
+      await recordRequiredLaneSummaries(repo, 'demo', 3, {
         verdict: 'PARTIAL',
         confidence: 'high',
         residuals: [{
@@ -538,6 +568,77 @@ describe('mission kernel', () => {
       );
       assert.equal(committed.mission.status, 'plateau');
       assert.match(committed.judgement.reason, /oscillating/i);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects future iteration summaries so stale workers cannot poison the next iteration', async () => {
+    const repo = await initRepo();
+    try {
+      await createMission({ repoRoot: repo, slug: 'demo', targetFingerprint: 'repo:demo' });
+      await startIteration(repo, 'demo', 'initial');
+
+      const future = await recordLaneSummary(repo, 'demo', 2, 'audit', laneSummary('audit', 2, { verdict: 'PASS', readOnly: true }));
+      assert.equal(future.status, 'ignored');
+      assert.equal(future.reason, 'future');
+      assert.equal(existsSync(join(repo, '.omx', 'missions', 'demo', 'iterations', '002', 'audit', 'summary.json')), false);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects committing an iteration when required lane summaries are missing', async () => {
+    const repo = await initRepo();
+    try {
+      await createMission({ repoRoot: repo, slug: 'demo', targetFingerprint: 'repo:demo' });
+      await startIteration(repo, 'demo', 'initial');
+      await recordLaneSummary(repo, 'demo', 1, 're_audit', laneSummary('re_audit', 1, { verdict: 'PASS', readOnly: true }));
+
+      await assert.rejects(
+        () => commitIteration(repo, 'demo', 1, {
+          iteration_commit_succeeded: true,
+          no_unreconciled_lane_errors: true,
+          focused_checks_green: true,
+        }),
+        /missing_iteration_lane_summary:audit/i,
+      );
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('does not advance to the next iteration when only delta.json exists from a torn commit', async () => {
+    const repo = await initRepo();
+    try {
+      await createMission({ repoRoot: repo, slug: 'demo', targetFingerprint: 'repo:demo' });
+      const handle = await startIteration(repo, 'demo', 'initial');
+      await writeFile(join(handle.iterationDir, 'delta.json'), JSON.stringify({
+        previous_iteration: null,
+        current_iteration: 1,
+        previous_verdict: null,
+        current_verdict: 'PASS',
+        improved_residual_ids: [],
+        unchanged_residual_ids: [],
+        regressed_residual_ids: [],
+        resolved_residual_ids: [],
+        introduced_residual_ids: [],
+        oscillating_residual_ids: [],
+        lineage_split_residual_ids: [],
+        lineage_merge_residual_ids: [],
+        low_confidence_residual_ids: [],
+        severity_rollup: {
+          improved: 0,
+          unchanged: 0,
+          regressed: 0,
+          resolved: 0,
+          introduced: 0,
+        },
+      }, null, 2));
+
+      const resumed = await startIteration(repo, 'demo', 'initial');
+      assert.equal(resumed.iteration, 1);
+      assert.equal(resumed.resumed, true);
     } finally {
       await rm(repo, { recursive: true, force: true });
     }
