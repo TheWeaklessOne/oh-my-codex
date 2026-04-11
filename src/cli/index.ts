@@ -15,6 +15,7 @@ import { hooksCommand } from "./hooks.js";
 import { hudCommand } from "../hud/index.js";
 import { teamCommand } from "./team.js";
 import { ralphCommand } from "./ralph.js";
+import { missionCommand } from "./mission.js";
 import { askCommand } from "./ask.js";
 import { questionCommand } from "./question.js";
 import { stateCommand } from "./state.js";
@@ -173,6 +174,7 @@ Usage:
                 Alias for agents-init (lightweight AGENTS bootstrap only)
   omx team      Spawn parallel worker panes in tmux and bootstrap inbox/task state
   omx ralph     Launch Codex with ralph persistence mode active
+  omx mission   Launch Codex with mission supervisor mode active
   omx autoresearch [DEPRECATED] Use $autoresearch; direct CLI launch removed
   omx version   Show version information
   omx tmux-hook Manage tmux prompt injection workaround (init|status|validate|test)
@@ -236,6 +238,8 @@ const OMX_BYPASS_DEFAULT_SYSTEM_PROMPT_ENV = "OMX_BYPASS_DEFAULT_SYSTEM_PROMPT";
 const OMX_MODEL_INSTRUCTIONS_FILE_ENV = "OMX_MODEL_INSTRUCTIONS_FILE";
 const OMX_RALPH_APPEND_INSTRUCTIONS_FILE_ENV =
   "OMX_RALPH_APPEND_INSTRUCTIONS_FILE";
+const OMX_MISSION_APPEND_INSTRUCTIONS_FILE_ENV =
+  "OMX_MISSION_APPEND_INSTRUCTIONS_FILE";
 const OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE_ENV =
   "OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE";
 const REASONING_MODES = ["low", "medium", "high", "xhigh"] as const;
@@ -284,6 +288,7 @@ type CliCommand =
   | "explore"
   | "sparkshell"
   | "team"
+  | "mission"
   | "session"
   | "resume"
   | "version"
@@ -304,6 +309,7 @@ const NESTED_HELP_COMMANDS = new Set<CliCommand>([
   "cleanup",
   "adapt",
   "autoresearch",
+  "mission",
   "agents",
   "agents-init",
   "deepinit",
@@ -317,6 +323,7 @@ const NESTED_HELP_COMMANDS = new Set<CliCommand>([
   "session",
   "sparkshell",
   "team",
+  "mission",
   "tmux-hook",
 ]);
 
@@ -607,6 +614,7 @@ export async function main(args: string[]): Promise<void> {
     "ask",
     "question",
     "autoresearch",
+    "mission",
     "explore",
     "sparkshell",
     "team",
@@ -695,6 +703,9 @@ export async function main(args: string[]): Promise<void> {
         break;
       case "autoresearch":
         await autoresearchCommand(args.slice(1));
+        break;
+      case "mission":
+        await missionCommand(args.slice(1));
         break;
       case "explore":
         await exploreCommand(args.slice(1));
@@ -1824,6 +1835,7 @@ export function buildDetachedSessionBootstrapSteps(
 async function readLaunchAppendInstructions(): Promise<string> {
   const appendixCandidates = [
     process.env[OMX_RALPH_APPEND_INSTRUCTIONS_FILE_ENV]?.trim(),
+    process.env[OMX_MISSION_APPEND_INSTRUCTIONS_FILE_ENV]?.trim(),
     process.env[OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE_ENV]?.trim(),
   ].filter(
     (value): value is string => typeof value === "string" && value.length > 0,

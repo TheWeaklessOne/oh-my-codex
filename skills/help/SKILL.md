@@ -26,9 +26,12 @@ You can include these words naturally in your request for explicit control:
 | Keyword | Effect | Example |
 |---------|--------|---------|
 | **ralph** | Persistence mode | "ralph: fix all the bugs" |
+| **mission** | Thin supervisor closure loop | "mission: keep iterating until re-audit closes" |
 | **ralplan** | Iterative planning | "ralplan this feature" |
 | **ulw** | Max parallelism | "ulw refactor the API" |
 | **plan** | Planning interview | "plan the new endpoints" |
+
+**mission uses team + bounded Ralph:** Mission is the thin-supervisor workflow for oracle-driven closure loops. It keeps authoritative state in `.omx/missions/`, uses team as the default coordinated executor, and only uses Ralph as a narrow stubborn fallback when needed.
 
 **ralph includes ultrawork:** When you activate ralph mode, it automatically includes ultrawork's parallel execution. No need to combine keywords.
 

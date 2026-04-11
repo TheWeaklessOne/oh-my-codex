@@ -140,6 +140,7 @@ Default posture: work directly.
 Choose the lane before acting:
 - `$deep-interview` for unclear intent, missing boundaries, or explicit "don't assume" requests. This mode clarifies and hands off; it does not implement.
 - `$ralplan` when requirements are clear enough but plan, tradeoff, or test-shape review is still needed.
+- `$mission` when the user wants a thin supervisor that keeps iterating until a fresh audit/re-audit closes the work or the mission plateaus.
 - `$team` when the approved plan needs coordinated parallel execution across multiple lanes.
 - `$ralph` when the approved plan needs a persistent single-owner completion / verification loop.
 - **Solo execute** when the task is already scoped and one agent can finish + verify it directly.
@@ -227,7 +228,7 @@ Keyword routing is implemented primarily by native `UserPromptSubmit` hooks and 
 
 Fallback behavior when hook context is unavailable:
 - Explicit `$name` invocations run left-to-right and override implicit keywords.
-- Bare skill names do not activate skills by themselves; skill-name activation requires explicit `$skill` invocation. Natural-language routing phrases may still map to a workflow when they are not just the bare skill name. Examples: `analyze` / `investigate` → `$analyze` for read-only deep analysis with ranked synthesis, explicit confidence, and concrete file references; `deep interview`, `interview`, `don't assume`, or `ouroboros` → `$deep-interview`; `ralplan` / `consensus plan` → `$ralplan`; `cancel`, `stop`, or `abort` → `$cancel`.
+- Bare skill names do not activate skills by themselves; skill-name activation requires explicit `$skill` invocation. Natural-language routing phrases may still map to a workflow when they are not just the bare skill name. Examples: `analyze` / `investigate` → `$analyze` for read-only deep analysis with ranked synthesis, explicit confidence, and concrete file references; `deep interview`, `interview`, `don't assume`, or `ouroboros` → `$deep-interview`; `closure loop` or `re-audit loop` → `$mission`; `ralplan` / `consensus plan` → `$ralplan`; `cancel`, `stop`, or `abort` → `$cancel`.
 - Keep the detailed keyword list in `src/hooks/keyword-registry.ts`; do not duplicate that table here.
 
 Runtime availability gate:
@@ -260,7 +261,7 @@ Ralph / Ralplan execution gate:
 
 <skills>
 Skills are workflow commands.
-Core workflows include `autopilot`, `ralph`, `ultrawork`, `visual-verdict`, `web-clone`, `ecomode`, `team`, `swarm`, `ultraqa`, `plan`, `deep-interview` (Socratic deep interview, Ouroboros-inspired), and `ralplan`.
+Core workflows include `autopilot`, `mission`, `ralph`, `ultrawork`, `visual-verdict`, `web-clone`, `ecomode`, `team`, `swarm`, `ultraqa`, `plan`, `deep-interview` (Socratic deep interview, Ouroboros-inspired), and `ralplan`.
 Utilities include `cancel`, `note`, `doctor`, `help`, and `trace`.
 </skills>
 
@@ -321,6 +322,7 @@ Verification loop: identify what proves the claim, run the verification, read th
 Mode selection:
 - Use `$deep-interview` first when the request is broad, intent/boundaries are unclear, or the user says not to assume.
 - Use `$ralplan` when the requirements are clear enough but architecture, tradeoffs, or test strategy still need consensus.
+- Use `$mission` when the task is an oracle-driven closure loop that should persist mission state and require fresh audit/re-audit semantics.
 - Use `$team` when the approved plan has multiple independent lanes, shared blockers, or durable coordination needs.
 - Use `$ralph` when the approved plan should stay in a persistent completion / verification loop with one owner.
 - Otherwise execute directly in solo mode.

@@ -28,6 +28,7 @@ describe('nested help routing', () => {
     [['ask', '--help'], /Usage:\s*omx ask <claude\|gemini> <question or task>/i],
     [['question', '--help'], /omx question - OMX-owned blocking user question entrypoint/i],
     [['autoresearch', '--help'], /hard-deprecated legacy command surface[\s\S]*\$autoresearch/i],
+    [['mission', '--help'], /omx mission - Launch Codex with mission supervisor mode active/i],
     [['hud', '--help'], /Usage:\s*\n\s*omx hud\s+Show current HUD state/i],
     [['hooks', '--help'], /Usage:\s*\n\s*omx hooks init/i],
     [['state', '--help'], /Usage:\s*omx state <read\|write\|clear\|list-active\|get-status>/i],

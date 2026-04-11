@@ -29,7 +29,8 @@
     {
       "name": "mission",
       "category": "execution",
-      "status": "active"
+      "status": "active",
+      "core": true
     },
     {
       "name": "ecomode",

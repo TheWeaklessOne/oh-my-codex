@@ -12,6 +12,7 @@
     "ralph",
     "ultrawork",
     "team",
+    "mission",
     "ralplan"
   ],
   "skills": [
@@ -38,6 +39,13 @@
     },
     {
       "name": "team",
+      "category": "execution",
+      "status": "active",
+      "core": true,
+      "internalRequired": false
+    },
+    {
+      "name": "mission",
       "category": "execution",
       "status": "active",
       "core": true,

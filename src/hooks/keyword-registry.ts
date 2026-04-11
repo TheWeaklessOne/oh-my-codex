@@ -15,6 +15,10 @@ export const KEYWORD_TRIGGER_DEFINITIONS: readonly KeywordTriggerDefinition[] = 
   { keyword: 'build me', skill: 'autopilot', priority: 10, guidance: 'Activate autopilot skill for autonomous execution' },
   { keyword: 'I want a', skill: 'autopilot', priority: 10, guidance: 'Activate autopilot skill for autonomous execution' },
 
+  { keyword: '$mission', skill: 'mission', priority: 10, guidance: 'Activate the mission supervisor workflow for iterative closure loops' },
+  { keyword: 'closure loop', skill: 'mission', priority: 9, guidance: 'Activate the mission supervisor workflow for iterative closure loops' },
+  { keyword: 're-audit loop', skill: 'mission', priority: 9, guidance: 'Activate the mission supervisor workflow for iterative closure loops' },
+
   { keyword: '$ultrawork', skill: 'ultrawork', priority: 10, guidance: 'Activate ultrawork parallel execution mode' },
   { keyword: 'ulw', skill: 'ultrawork', priority: 10, guidance: 'Activate ultrawork parallel execution mode' },
   { keyword: 'parallel', skill: 'ultrawork', priority: 10, guidance: 'Activate ultrawork parallel execution mode' },

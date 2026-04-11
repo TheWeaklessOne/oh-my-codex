@@ -26,11 +26,12 @@
       <ol>
         <li><code>$deep-interview</code> - clarify intent, boundaries, and non-goals when the task is still fuzzy.</li>
         <li><code>$ralplan</code> - approve the plan and tradeoffs before execution.</li>
-        <li><code>$team</code> or <code>$ralph</code> - choose <code>$team</code> for coordinated parallel execution, or <code>$ralph</code> for a persistent completion loop.</li>
+        <li><code>$mission</code>, <code>$team</code>, or <code>$ralph</code> - choose <code>$mission</code> for closure loops with fresh audit/re-audit semantics, <code>$team</code> for coordinated parallel execution, or <code>$ralph</code> for a persistent completion loop.</li>
       </ol>
 
       <h2>Execution Modes</h2>
       <ul>
+        <li><code>$mission</code> - thin-supervisor mission workflow with authoritative state under <code>.omx/missions/</code></li>
         <li><code>$team</code> - coordinated multi-agent execution for the approved plan</li>
         <li><code>$ralph</code> - persistence loop until completion</li>
         <li><code>$autopilot</code> - full autonomous execution when you intentionally skip the standard workflow</li>

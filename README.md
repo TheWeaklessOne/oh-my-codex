@@ -28,7 +28,7 @@ OMX is a workflow layer for [OpenAI Codex CLI](https://github.com/openai/codex).
 It keeps Codex as the execution engine and makes it easier to:
 - start a stronger Codex session by default
 - run one consistent workflow from clarification to completion
-- invoke the canonical skills with `$deep-interview`, `$ralplan`, `$team`, and `$ralph`
+- invoke the canonical skills with `$deep-interview`, `$ralplan`, `$mission`, `$team`, and `$ralph`
 - keep project guidance, plans, logs, and state in `.omx/`
 
 ## Core Maintainers
@@ -70,18 +70,19 @@ Then work normally inside Codex:
 ```text
 $deep-interview "clarify the authentication change"
 $ralplan "approve the auth plan and review tradeoffs"
+$mission "keep iterating until a fresh re-audit closes the auth change"
 $ralph "carry the approved plan to completion"
 $team 3:executor "execute the approved plan in parallel"
 ```
 
 That is the main path.
 Before you treat the runtime as ready, run the quick-start smoke test below: `omx doctor` verifies the install shape, while `omx exec` proves the active Codex runtime can actually authenticate and complete a model call from the current environment.
-Start OMX strongly, clarify first when needed, approve the plan, then choose `$team` for coordinated parallel execution or `$ralph` for the persistent completion loop.
+Start OMX strongly, clarify first when needed, approve the plan, then choose `$mission` for oracle-driven closure loops, `$team` for coordinated parallel execution, or `$ralph` for the persistent completion loop.
 
 ## What OMX is for
 
 Use OMX if you already like Codex and want a better day-to-day runtime around it:
-- a standard workflow built around `$deep-interview`, `$ralplan`, `$team`, and `$ralph`
+- a standard workflow built around `$deep-interview`, `$ralplan`, `$mission`, `$team`, and `$ralph`
 - specialist roles and supporting skills when the task needs them
 - project guidance through scoped `AGENTS.md`
 - durable state under `.omx/` for plans, logs, memory, and mode tracking
@@ -128,11 +129,12 @@ Then try the canonical workflow:
 ```text
 $deep-interview "clarify the authentication change"
 $ralplan "approve the safest implementation path"
+$mission "close the task only when a fresh re-audit is satisfied or the mission plateaus"
 $ralph "carry the approved plan to completion"
 $team 3:executor "execute the approved plan in parallel"
 ```
 
-Use `$team` when the approved plan needs coordinated parallel work, or `$ralph` when one persistent owner should keep pushing to completion.
+Use `$mission` when the work needs a thin supervisor that persists mission state and waits for a fresh audit/re-audit, `$team` when the approved plan needs coordinated parallel work, or `$ralph` when one persistent owner should keep pushing to completion.
 
 ## A simple mental model
 
@@ -155,13 +157,13 @@ Most users should think of OMX as **better task routing + better workflow + bett
 5. Launch with `omx --madmax --high`
 6. Use `$deep-interview "..."` when the request or boundaries are still unclear
 7. Use `$ralplan "..."` to approve the plan and review tradeoffs
-8. Choose `$team` for coordinated parallel execution or `$ralph` for persistent completion loops
+8. Choose `$mission` for closure loops, `$team` for coordinated parallel execution, or `$ralph` for persistent completion loops
 
 ## Recommended workflow
 
 1. `$deep-interview` — clarify scope when the request or boundaries are still vague.
 2. `$ralplan` — turn that clarified scope into an approved architecture and implementation plan.
-3. `$team` or `$ralph` — use `$team` for coordinated parallel execution, or `$ralph` when you want a persistent completion loop with one owner.
+3. `$mission`, `$team`, or `$ralph` — use `$mission` when you want a thin supervisor with mission state and fresh re-audits, `$team` for coordinated parallel execution, or `$ralph` when you want a persistent completion loop with one owner.
 
 ## Common in-session surfaces
 
@@ -169,9 +171,16 @@ Most users should think of OMX as **better task routing + better workflow + bett
 | --- | --- |
 | `$deep-interview "..."` | clarifying intent, boundaries, and non-goals |
 | `$ralplan "..."` | approving the implementation plan and tradeoffs |
+| `$mission "..."` | thin-supervisor closure loops with mission state and fresh re-audits |
 | `$ralph "..."` | persistent completion and verification loops |
 | `$team "..."` | coordinated parallel execution when the work is big enough |
 | `/skills` | browsing installed skills and supporting helpers |
+
+You can also launch the workflow directly from the shell:
+
+```bash
+omx mission "Audit and iteratively fix the payment retry flow until a fresh re-audit closes it"
+```
 
 ## Advanced / operator surfaces
 
