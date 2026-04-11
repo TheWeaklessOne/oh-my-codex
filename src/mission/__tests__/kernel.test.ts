@@ -87,12 +87,7 @@ describe('mission kernel', () => {
   it('creates the mission iteration layout and keeps latest.json absent until commit', async () => {
     const repo = await initRepo();
     try {
-      await createMission({
-        repoRoot: repo,
-        slug: 'demo',
-        targetFingerprint: 'repo:demo',
-        plateauPolicy: { max_unchanged_iterations: 1 },
-      });
+      await createMission({ repoRoot: repo, slug: 'demo', targetFingerprint: 'repo:demo' });
       const handle = await startIteration(repo, 'demo', 'initial');
       assert.equal(handle.iteration, 1);
       assert.equal(existsSync(join(handle.iterationDir, 'audit', 'summary.json')), false);
@@ -158,7 +153,12 @@ describe('mission kernel', () => {
   it('plateaus deterministically after repeated unchanged residuals once strategy changes', async () => {
     const repo = await initRepo();
     try {
-      await createMission({ repoRoot: repo, slug: 'demo', targetFingerprint: 'repo:demo' });
+      await createMission({
+        repoRoot: repo,
+        slug: 'demo',
+        targetFingerprint: 'repo:demo',
+        plateauPolicy: { max_unchanged_iterations: 1 },
+      });
 
       await startIteration(repo, 'demo', 'strategy-a');
       await recordLaneSummary(repo, 'demo', 1, 're_audit', laneSummary('re_audit', 1, {
