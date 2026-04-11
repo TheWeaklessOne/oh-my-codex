@@ -2,7 +2,8 @@
  * Pipeline stage interfaces for oh-my-codex
  *
  * Shared stage contracts that align with OMC pipeline design (#1130).
- * The pipeline sequences: RALPLAN -> teams (codex workers) -> ralph verification.
+ * The pipeline sequences a primary planning/execution path and may add
+ * a bounded Ralph follow-up stage only for narrow stubborn residual work.
  */
 
 // ---------------------------------------------------------------------------
@@ -92,8 +93,9 @@ export interface PipelineConfig {
   sessionId?: string;
 
   /**
-   * Maximum ralph verification iterations.
-   * Passed through to the ralph-verify stage. Defaults to 10.
+   * Maximum Ralph bounded-follow-up iterations.
+   * Passed through to the ralph-verify stage when that fallback is used.
+   * Defaults to 10.
    */
   maxRalphIterations?: number;
 
@@ -157,7 +159,7 @@ export interface PipelineModeStateExtension {
   /** Per-stage results collected so far. */
   pipeline_stage_results: Record<string, StageResult>;
 
-  /** Ralph iteration ceiling for the verification stage. */
+  /** Ralph iteration ceiling for the bounded follow-up stage. */
   pipeline_max_ralph_iterations: number;
 
   /** Worker count for team execution. */

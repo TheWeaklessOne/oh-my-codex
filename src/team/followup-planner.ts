@@ -4,6 +4,17 @@ import { resolveAgentReasoningEffort, type TeamReasoningEffort } from './model-c
 import { listAvailableRoles, routeTaskToRole } from './role-router.js';
 
 export type FollowupMode = 'team' | 'ralph';
+export type FollowupPolicy = 'coordinated-default' | 'bounded-fallback';
+
+export interface FollowupConstraints {
+  policy: FollowupPolicy;
+  executionShape: 'coordinated-team' | 'single-owner-bounded-followup';
+  scope: 'coordinated' | 'narrow';
+  hardening: 'bounded';
+  requiresPrimaryExecutionPass: boolean;
+  summary: string;
+  checkpoints: string[];
+}
 
 export interface FollowupAllocation {
   role: string;
@@ -25,6 +36,7 @@ export interface FollowupVerificationPlan {
 
 export interface FollowupStaffingPlan {
   mode: FollowupMode;
+  constraints: FollowupConstraints;
   availableAgentTypes: string[];
   recommendedHeadcount: number;
   allocations: FollowupAllocation[];
@@ -162,6 +174,38 @@ function summarizeAllocations(allocations: readonly FollowupAllocation[]): strin
     .join('; ');
 }
 
+function buildFollowupConstraints(mode: FollowupMode): FollowupConstraints {
+  if (mode === 'team') {
+    return {
+      policy: 'coordinated-default',
+      executionShape: 'coordinated-team',
+      scope: 'coordinated',
+      hardening: 'bounded',
+      requiresPrimaryExecutionPass: false,
+      summary: 'Use team as the default coordinated executor and keep hardening targeted instead of turning review/cleanup into an unbounded second implementation pass.',
+      checkpoints: [
+        'Prefer team for the main implementation pass when the work benefits from durable coordination or parallel lanes.',
+        'Keep hardening bounded to focused verification, cleanup, or review slices tied to the delivered change.',
+        'Escalate to Ralph only if a later stubborn narrow follow-up slice still needs a persistent single-owner loop.',
+      ],
+    };
+  }
+
+  return {
+    policy: 'bounded-fallback',
+    executionShape: 'single-owner-bounded-followup',
+    scope: 'narrow',
+    hardening: 'bounded',
+    requiresPrimaryExecutionPass: true,
+    summary: 'Use Ralph only as a bounded fallback after the main execution pass when a stubborn narrow follow-up slice still needs a persistent single-owner fix/verify loop.',
+    checkpoints: [
+      'Only launch Ralph after the main execution path or bounded hardening pass leaves a specific unresolved follow-up slice.',
+      'Keep the slice narrow: no broad redesign, no replacement for the primary coordinated execution path.',
+      'Stop once focused verification is green and the residual follow-up is reconciled.',
+    ],
+  };
+}
+
 function toQuotedCliArg(value: string): string {
   return JSON.stringify(value);
 }
@@ -176,14 +220,14 @@ function buildLaunchHints(
     return {
       shellCommand: `omx team ${recommendedHeadcount}:${fallbackRole} ${toQuotedCliArg(task)}`,
       skillCommand: `$team ${recommendedHeadcount}:${fallbackRole} ${toQuotedCliArg(task)}`,
-      rationale: 'Launch team directly when coordinated parallel delivery plus built-in verification lanes are sufficient without a separate linked Ralph launch.',
+      rationale: 'Launch team directly for the primary coordinated execution path; keep hardening bounded and reserve Ralph for any later narrow stubborn follow-up slice.',
     };
   }
 
   return {
     shellCommand: `omx ralph ${toQuotedCliArg(task)}`,
     skillCommand: `$ralph ${toQuotedCliArg(task)}`,
-    rationale: 'Launch Ralph directly when one persistent implementation + verification loop is sufficient without team coordination overhead.',
+    rationale: 'Launch Ralph only as a bounded fallback when a later stubborn narrow follow-up slice still needs a persistent single-owner fix/verify loop after the main execution path.',
   };
 }
 
@@ -191,24 +235,25 @@ function buildVerificationPlan(
   mode: FollowupMode,
   allocations: readonly FollowupAllocation[],
 ): FollowupVerificationPlan {
+  const constraints = buildFollowupConstraints(mode);
   if (mode === 'team') {
     const qualityLane = allocations.find((allocation) => allocation.reason.includes('verification'));
     return {
-      summary: 'Use team as the coordinated execution and verification owner: delivery lanes run in parallel while a dedicated verification lane captures fresh evidence before shutdown.',
+      summary: constraints.summary,
       checkpoints: [
         'Launch via `omx team ...` (or `$team ...`) so the team runtime owns both parallel delivery and coordinated verification.',
         `Keep ${qualityLane?.role ?? 'the verification lane'} focused on tests, regression coverage, and evidence capture before team shutdown.`,
-        'Escalate to a separate Ralph run only when a later manual follow-up still needs a persistent single-owner verification/fix loop.',
+        constraints.checkpoints[2],
       ],
     };
   }
 
   return {
-    summary: 'Use Ralph as the persistent execution and verification owner: implementation happens first, then evidence/regression checks, then final sign-off.',
+    summary: constraints.summary,
     checkpoints: [
-      'Run fresh verification commands before claiming completion.',
-      'Keep the evidence/regression lane current with test/build output.',
-      'Finish with the final sign-off lane reviewing completion evidence against acceptance criteria.',
+      constraints.checkpoints[0],
+      'Run fresh focused verification commands before claiming completion.',
+      constraints.checkpoints[2],
     ],
   };
 }
@@ -274,6 +319,7 @@ export function buildFollowupStaffingPlan(
   availableAgentTypes: readonly string[],
   options: BuildFollowupStaffingPlanOptions = {},
 ): FollowupStaffingPlan {
+  const constraints = buildFollowupConstraints(mode);
   const fallbackRole = options.fallbackRole ?? 'executor';
   const workerCount = Math.max(1, options.workerCount ?? (mode === 'team' ? 2 : 3));
   const primaryRoute = routeTaskToRole(
@@ -320,6 +366,7 @@ export function buildFollowupStaffingPlan(
 
   return {
     mode,
+    constraints,
     availableAgentTypes: [...availableAgentTypes],
     recommendedHeadcount: workerCount,
     allocations,

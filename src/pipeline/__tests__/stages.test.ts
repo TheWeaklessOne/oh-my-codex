@@ -216,6 +216,8 @@ describe('Team Exec Stage', () => {
       });
 
       assert.match(instruction, /^omx team 3:executor /);
+      assert.match(instruction, /policy=coordinated-default/);
+      assert.match(instruction, /hardening=bounded/);
       assert.match(instruction, /implement feature/);
       assert.match(instruction, /staffing=/);
       assert.match(instruction, /verify=/);
@@ -237,6 +239,7 @@ describe('Team Exec Stage', () => {
       });
 
       assert.match(instruction, /^omx team 1:executor /);
+      assert.match(instruction, /policy=coordinated-default/);
       assert.match(instruction, /staffing=/);
     });
   });
@@ -301,6 +304,8 @@ describe('Ralph Verify Stage', () => {
       });
 
       assert.match(instruction, /max_iterations=15/);
+      assert.match(instruction, /policy=bounded-fallback/);
+      assert.match(instruction, /hardening=bounded/);
       assert.match(instruction, /^omx ralph /);
       assert.match(instruction, /verify feature/);
       assert.match(instruction, /staffing=/);
@@ -320,6 +325,7 @@ describe('Ralph Verify Stage', () => {
       });
 
       assert.match(instruction, /^omx ralph /);
+      assert.match(instruction, /policy=bounded-fallback/);
       assert.match(instruction, /staffing=/);
     });
   });
