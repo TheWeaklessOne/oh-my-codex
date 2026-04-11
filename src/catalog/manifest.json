@@ -27,6 +27,11 @@
       "core": true
     },
     {
+      "name": "mission",
+      "category": "execution",
+      "status": "active"
+    },
+    {
       "name": "ecomode",
       "category": "execution",
       "status": "merged",

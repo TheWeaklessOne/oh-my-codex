@@ -31,6 +31,13 @@
       "internalRequired": false
     },
     {
+      "name": "mission",
+      "category": "execution",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
       "name": "ecomode",
       "category": "execution",
       "status": "merged",
