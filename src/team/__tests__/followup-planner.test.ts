@@ -49,6 +49,8 @@ describe('followup-planner', () => {
     assert.equal(plan.mode, 'team');
     assert.equal(plan.constraints.policy, 'coordinated-default');
     assert.equal(plan.constraints.hardening, 'bounded');
+    assert.equal(plan.constraints.roleContract, 'shared-agent-type');
+    assert.equal(plan.constraints.laneAllocationsAreAdvisory, true);
     assert.equal(plan.constraints.requiresPrimaryExecutionPass, false);
     assert.equal(plan.recommendedHeadcount, 3);
     assert.match(plan.staffingSummary, /test-engineer x1/);
@@ -60,6 +62,7 @@ describe('followup-planner', () => {
     assert.equal(plan.launchHints.shellCommand, 'omx team 3:executor "Fix flaky integration tests and update README"');
     assert.equal(plan.launchHints.skillCommand, '$team 3:executor "Fix flaky integration tests and update README"');
     assert.match(plan.launchHints.rationale, /reserve Ralph/i);
+    assert.match(plan.verificationPlan.checkpoints[1], /shared agent type/i);
     assert.match(plan.verificationPlan.summary, /default coordinated executor/i);
     assert.equal(plan.verificationPlan.checkpoints.length, 3);
   });
@@ -74,6 +77,8 @@ describe('followup-planner', () => {
     assert.equal(plan.mode, 'ralph');
     assert.equal(plan.constraints.policy, 'bounded-fallback');
     assert.equal(plan.constraints.hardening, 'bounded');
+    assert.equal(plan.constraints.roleContract, 'single-owner');
+    assert.equal(plan.constraints.laneAllocationsAreAdvisory, false);
     assert.equal(plan.constraints.requiresPrimaryExecutionPass, true);
     assert.equal(plan.recommendedHeadcount, 3);
     assert.match(plan.staffingSummary, /architect x1/);

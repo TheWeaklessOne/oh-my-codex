@@ -18,6 +18,21 @@ export interface RalphVerifyStageOptions {
    * Defaults to 10.
    */
   maxIterations?: number;
+
+  /**
+   * Optional override for determining whether the bounded Ralph follow-up
+   * should run.
+   */
+  shouldRun?: (ctx: StageContext) => boolean;
+}
+
+function shouldRunRalphFollowup(
+  ctx: StageContext,
+  options: RalphVerifyStageOptions,
+): boolean {
+  if (options.shouldRun) return options.shouldRun(ctx);
+  const teamArtifacts = ctx.artifacts['team-exec'] as Record<string, unknown> | undefined;
+  return teamArtifacts?.residual_followup_required === true;
 }
 
 /**
@@ -36,11 +51,25 @@ export function createRalphVerifyStage(options: RalphVerifyStageOptions = {}): P
 
   return {
     name: 'ralph-verify',
+    canSkip(ctx) {
+      return !shouldRunRalphFollowup(ctx, options);
+    },
 
     async run(ctx: StageContext): Promise<StageResult> {
       const startTime = Date.now();
 
       try {
+        if (!shouldRunRalphFollowup(ctx, options)) {
+          return {
+            status: 'skipped',
+            artifacts: {
+              stage: 'ralph-verify',
+              reason: 'no residual follow-up requested after team execution',
+            },
+            duration_ms: Date.now() - startTime,
+          };
+        }
+
         // Extract execution context from previous stage
         const teamArtifacts = ctx.artifacts['team-exec'] as Record<string, unknown> | undefined;
         const availableAgentTypes = await resolveAvailableAgentTypes(ctx.cwd);
