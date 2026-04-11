@@ -4,6 +4,7 @@ import {
   MISSION_LIFECYCLE_TABLE,
   canTransitionMissionStatus,
   closureMatrixDecision,
+  matchResidualIdentity,
   normalizeResidualIdentity,
   normalizeVerifierArtifact,
 } from '../contracts.js';
@@ -40,6 +41,51 @@ describe('mission contracts', () => {
     assert.equal(residual.stable_id, 'residual:lane-collision');
     assert.equal(residual.identity_source, 'stable_id');
     assert.equal(residual.identity_confidence, 'high');
+  });
+
+  it('preserves deterministic split/merge lineage hints for residual identity', () => {
+    const splitResidual = normalizeResidualIdentity({
+      title: 'Residual split',
+      summary: 'The verifier split one broad issue into a narrower finding.',
+      severity: 'medium',
+      target_path: 'src/mission/kernel.ts',
+      lineage: {
+        kind: 'split',
+        related_residual_ids: ['residual:parent-finding'],
+      },
+    });
+    const mergeResidual = normalizeResidualIdentity({
+      title: 'Residual merge',
+      summary: 'The verifier merged two prior findings into one.',
+      severity: 'medium',
+      target_path: 'src/mission/kernel.ts',
+      lineage: {
+        kind: 'merge',
+        related_residual_ids: ['residual:left', 'residual:right'],
+      },
+    });
+
+    assert.equal(splitResidual.identity_source, 'lineage');
+    assert.equal(splitResidual.lineage?.lineage_key, 'split:residual:parent-finding');
+    assert.equal(mergeResidual.identity_source, 'lineage');
+    assert.equal(mergeResidual.lineage?.lineage_key, 'merge:residual:left|residual:right');
+  });
+
+  it('classifies low-confidence wording drift deterministically through the fallback matcher', () => {
+    const previous = normalizeResidualIdentity({
+      title: 'Unexpected oracle ambiguity',
+      summary: 'Verifier wording is unstable.',
+      severity: 'low',
+    });
+    const next = normalizeResidualIdentity({
+      title: 'Unexpected oracle ambiguity!!!',
+      summary: 'Verifier wording changed but the same ambiguity remains.',
+      severity: 'low',
+    });
+
+    const match = matchResidualIdentity(previous, next);
+    assert.equal(match.matched, true);
+    assert.equal(match.reason, 'matcher');
   });
 
   it('normalizes malformed verifier artifacts into a non-closing summary', () => {
