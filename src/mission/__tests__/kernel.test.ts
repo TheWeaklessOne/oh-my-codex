@@ -411,4 +411,135 @@ describe('mission kernel', () => {
       await rm(repo, { recursive: true, force: true });
     }
   });
+
+  it('surfaces oscillating residual behavior instead of treating it as unchanged', async () => {
+    const repo = await initRepo();
+    try {
+      await createMission({
+        repoRoot: repo,
+        slug: 'demo',
+        targetFingerprint: 'repo:demo',
+        plateauPolicy: { oscillation_window: 1 },
+      });
+
+      await startIteration(repo, 'demo', 'first-pass');
+      await recordLaneSummary(repo, 'demo', 1, 're_audit', {
+        verdict: 'PARTIAL',
+        confidence: 'high',
+        residuals: [{
+          stable_id: 'residual:oscillating-finding',
+          summary: 'Residual remains at high severity.',
+          severity: 'high',
+          category: 'oracle-consistency',
+          closure_condition: 'verifier must stop oscillating',
+        }],
+        evidence_refs: ['logs/iter-1.txt'],
+        recommended_next_action: 'reduce severity',
+        provenance: {
+          lane_id: 're-audit-osc-1',
+          session_id: 're-audit-osc-1',
+          lane_type: 're_audit',
+          runner_type: 'direct',
+          adapter_version: 'mission-adapter/v1',
+          started_at: '2026-04-11T17:00:00.000Z',
+          finished_at: '2026-04-11T17:05:00.000Z',
+          parent_iteration: 1,
+          trigger_reason: 'first oscillation sample',
+          read_only: true,
+        },
+      });
+      await commitIteration(
+        repo,
+        'demo',
+        1,
+        {
+          iteration_commit_succeeded: true,
+          no_unreconciled_lane_errors: true,
+          focused_checks_green: true,
+        },
+      );
+
+      await startIteration(repo, 'demo', 'second-pass');
+      await recordLaneSummary(repo, 'demo', 2, 're_audit', {
+        verdict: 'PARTIAL',
+        confidence: 'high',
+        residuals: [{
+          stable_id: 'residual:oscillating-finding',
+          summary: 'Residual improved to medium severity.',
+          severity: 'medium',
+          category: 'oracle-consistency',
+          closure_condition: 'verifier must stop oscillating',
+        }],
+        evidence_refs: ['logs/iter-2.txt'],
+        recommended_next_action: 'keep improving',
+        provenance: {
+          lane_id: 're-audit-osc-2',
+          session_id: 're-audit-osc-2',
+          lane_type: 're_audit',
+          runner_type: 'direct',
+          adapter_version: 'mission-adapter/v1',
+          started_at: '2026-04-11T17:06:00.000Z',
+          finished_at: '2026-04-11T17:10:00.000Z',
+          parent_iteration: 2,
+          trigger_reason: 'improved oscillation sample',
+          read_only: true,
+        },
+      });
+      await commitIteration(
+        repo,
+        'demo',
+        2,
+        {
+          iteration_commit_succeeded: true,
+          no_unreconciled_lane_errors: true,
+          focused_checks_green: true,
+        },
+      );
+
+      await startIteration(repo, 'demo', 'third-pass');
+      await recordLaneSummary(repo, 'demo', 3, 're_audit', {
+        verdict: 'PARTIAL',
+        confidence: 'high',
+        residuals: [{
+          stable_id: 'residual:oscillating-finding',
+          summary: 'Residual regressed back to high severity.',
+          severity: 'high',
+          category: 'oracle-consistency',
+          closure_condition: 'verifier must stop oscillating',
+        }],
+        evidence_refs: ['logs/iter-3.txt'],
+        recommended_next_action: 'stop oscillation',
+        provenance: {
+          lane_id: 're-audit-osc-3',
+          session_id: 're-audit-osc-3',
+          lane_type: 're_audit',
+          runner_type: 'direct',
+          adapter_version: 'mission-adapter/v1',
+          started_at: '2026-04-11T17:11:00.000Z',
+          finished_at: '2026-04-11T17:15:00.000Z',
+          parent_iteration: 3,
+          trigger_reason: 'regressed oscillation sample',
+          read_only: true,
+        },
+      });
+
+      const delta = await computeDelta(repo, 'demo', 3);
+      assert.deepEqual(delta.oscillating_residual_ids, ['residual:oscillating-finding']);
+
+      const committed = await commitIteration(
+        repo,
+        'demo',
+        3,
+        {
+          iteration_commit_succeeded: true,
+          no_unreconciled_lane_errors: true,
+          focused_checks_green: true,
+        },
+      );
+      assert.equal(committed.mission.status, 'plateau');
+      assert.match(committed.judgement.reason, /oscillating/i);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
 });
