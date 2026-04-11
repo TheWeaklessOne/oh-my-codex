@@ -72,11 +72,14 @@ async function recordRequiredLaneSummaries(
   slug: string,
   iteration: number,
   reAuditInput: MissionLaneSummaryInput,
+  options: { includeHardening?: boolean } = {},
 ): Promise<void> {
   await recordLaneSummary(repo, slug, iteration, 'audit', laneSummary('audit', iteration, { verdict: 'PASS', readOnly: true }));
   await recordLaneSummary(repo, slug, iteration, 'remediation', laneSummary('remediation', iteration, { verdict: 'PASS' }));
   await recordLaneSummary(repo, slug, iteration, 'execution', laneSummary('execution', iteration, { verdict: 'PASS' }));
-  await recordLaneSummary(repo, slug, iteration, 'hardening', laneSummary('hardening', iteration, { verdict: 'PASS' }));
+  if (options.includeHardening === true) {
+    await recordLaneSummary(repo, slug, iteration, 'hardening', laneSummary('hardening', iteration, { verdict: 'PASS' }));
+  }
   await recordLaneSummary(repo, slug, iteration, 're_audit', reAuditInput);
 }
 
@@ -125,7 +128,6 @@ describe('mission kernel', () => {
           audit: 'direct',
           remediation: 'direct',
           execution: 'team',
-          hardening: 'ralph',
           re_audit: 'direct',
         },
       );
@@ -150,7 +152,7 @@ describe('mission kernel', () => {
       assert.equal(late.status, 'ignored');
       assert.equal(late.reason, 'cancelled');
 
-      for (const lane of ['remediation', 'execution', 'hardening'] as const) {
+      for (const lane of ['remediation', 'execution'] as const) {
         await recordLaneSummary(repo, 'demo', 1, lane, laneSummary(lane, 1, { verdict: 'PASS' }));
       }
       const reconciled = await loadMission(repo, 'demo');
@@ -189,6 +191,70 @@ describe('mission kernel', () => {
 
       const latest = JSON.parse(await readFile(join(repo, '.omx', 'missions', 'demo', 'latest.json'), 'utf-8')) as { latest_verdict: string };
       assert.equal(latest.latest_verdict, 'PASS');
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('allows commitIteration to succeed without a hardening summary when the fallback was not needed', async () => {
+    const repo = await initRepo();
+    try {
+      await createMission({ repoRoot: repo, slug: 'demo', targetFingerprint: 'repo:demo' });
+      await startIteration(repo, 'demo', 'initial');
+      await recordRequiredLaneSummaries(
+        repo,
+        'demo',
+        1,
+        laneSummary('re_audit', 1, { verdict: 'PASS', confidence: 'high', readOnly: true }),
+      );
+
+      const committed = await commitIteration(
+        repo,
+        'demo',
+        1,
+        {
+          iteration_commit_succeeded: true,
+          no_unreconciled_lane_errors: true,
+          focused_checks_green: true,
+        },
+      );
+
+      assert.equal(committed.mission.status, 'complete');
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses to close the mission when re-audit reuses execution provenance', async () => {
+    const repo = await initRepo();
+    try {
+      await createMission({ repoRoot: repo, slug: 'demo', targetFingerprint: 'repo:demo' });
+      await startIteration(repo, 'demo', 'initial');
+      await recordLaneSummary(repo, 'demo', 1, 'audit', laneSummary('audit', 1, { verdict: 'PASS', readOnly: true }));
+      await recordLaneSummary(repo, 'demo', 1, 'remediation', laneSummary('remediation', 1, { verdict: 'PASS' }));
+      await recordLaneSummary(repo, 'demo', 1, 'execution', laneSummary('execution', 1, { verdict: 'PASS' }));
+      await recordLaneSummary(repo, 'demo', 1, 're_audit', {
+        ...laneSummary('re_audit', 1, { verdict: 'PASS', readOnly: true }),
+        provenance: {
+          ...laneSummary('re_audit', 1, { verdict: 'PASS', readOnly: true }).provenance,
+          session_id: 'execution-session-1',
+          lane_id: 'execution-lane-1',
+        },
+      });
+
+      const committed = await commitIteration(
+        repo,
+        'demo',
+        1,
+        {
+          iteration_commit_succeeded: true,
+          no_unreconciled_lane_errors: true,
+          focused_checks_green: true,
+        },
+      );
+
+      assert.equal(committed.mission.status, 'running');
+      assert.match(committed.judgement.reason, /re-audit lane must not reuse execution lane identity/i);
     } finally {
       await rm(repo, { recursive: true, force: true });
     }

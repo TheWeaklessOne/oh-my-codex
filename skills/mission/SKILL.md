@@ -22,7 +22,8 @@ Use it when the user wants OMX to keep iterating until an **independent audit/re
 - **Contract-first artifacts**: mission state persists under `.omx/missions/<slug>/` with:
   - `mission.json`
   - `latest.json` (read model only; never authoritative)
-  - `iterations/<n>/{audit,remediation,execution,hardening,re_audit}/summary.json`
+  - `iterations/<n>/{audit,remediation,execution,re_audit}/summary.json`
+  - `iterations/<n>/hardening/summary.json` only when the bounded hardening fallback runs
   - `iterations/<n>/delta.json`
 
 ## Default routing policy
@@ -30,7 +31,7 @@ Use it when the user wants OMX to keep iterating until an **independent audit/re
 - **Audit / re-audit**: fresh read-only lane by contract
 - **Remediation shaping**: direct bounded lane unless coordination is needed
 - **Execution**: `team` is the default coordinated executor
-- **Hardening / stubborn narrow follow-up**: bounded `ralph` slice when needed
+- **Hardening / stubborn narrow follow-up**: bounded `ralph` slice when needed; if no hardening slice is needed, the iteration may commit without a hardening summary
 
 Do **not** let the outer mission loop devolve into “everything is Ralph”.
 
@@ -45,10 +46,11 @@ When the user invokes `$mission`:
    - closure matrix and lifecycle table
 3. Start a fresh **audit** lane.
 4. If the audit closes immediately, still require the kernel’s closure matrix + safety baseline to declare `complete`.
+   The kernel must refuse terminal closure if the final `re_audit` summary reuses non-verifier lane provenance.
 5. Otherwise run:
    - remediation shaping
    - execution
-   - hardening
+   - optional hardening
    - fresh re-audit
    - kernel delta / plateau / closure judgment
 6. Continue until the kernel returns one of:

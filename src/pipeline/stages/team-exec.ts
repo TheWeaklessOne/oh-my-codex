@@ -24,6 +24,13 @@ export interface TeamExecStageOptions {
 
   /** Additional environment variables for worker launch. */
   extraEnv?: Record<string, string>;
+
+  /**
+   * Whether this execution pass should request the bounded Ralph follow-up
+   * stage. Defaults to true so the fallback remains reachable unless the
+   * caller explicitly opts out.
+   */
+  residualFollowupRequired?: boolean;
 }
 
 /**
@@ -37,6 +44,7 @@ export interface TeamExecStageOptions {
 export function createTeamExecStage(options: TeamExecStageOptions = {}): PipelineStage {
   const workerCount = options.workerCount ?? 2;
   const agentType = options.agentType ?? 'executor';
+  const residualFollowupRequired = options.residualFollowupRequired ?? true;
 
   return {
     name: 'team-exec',
@@ -75,7 +83,7 @@ export function createTeamExecStage(options: TeamExecStageOptions = {}): Pipelin
             teamDescriptor,
             workerCount,
             agentType,
-            residual_followup_required: false,
+            residual_followup_required: residualFollowupRequired,
             availableAgentTypes,
             staffingPlan,
             stage: 'team-exec',

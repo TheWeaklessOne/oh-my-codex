@@ -6,6 +6,7 @@ import {
   DEFAULT_MISSION_CLOSURE_POLICY,
   DEFAULT_MISSION_PLATEAU_POLICY,
   MISSION_LANE_POLICIES,
+  MISSION_REQUIRED_LANE_TYPES,
   MISSION_LANE_TYPES,
   closureMatrixDecision,
   computeResidualSetFingerprint,
@@ -127,6 +128,14 @@ export interface MissionJudgement {
   nextStatus: MissionStatus;
   reason: string;
   closureDecision: 'complete' | 'iterate' | 'failed';
+}
+
+interface MissionIterationSummaries {
+  audit: MissionLaneSummary;
+  remediation: MissionLaneSummary;
+  execution: MissionLaneSummary;
+  hardening: MissionLaneSummary | null;
+  re_audit: MissionLaneSummary;
 }
 
 export interface CommitIterationResult {
@@ -275,7 +284,7 @@ function buildActiveLaneEntry(iteration: number, laneType: MissionLaneType): Mis
 }
 
 async function deriveActiveLanes(repoRoot: string, slug: string, iteration: number): Promise<MissionState['active_lanes']> {
-  return MISSION_LANE_TYPES
+  return MISSION_REQUIRED_LANE_TYPES
     .filter((laneType) => !existsSync(laneSummaryPath(repoRoot, slug, iteration, laneType)))
     .map((laneType) => buildActiveLaneEntry(iteration, laneType));
 }
@@ -418,6 +427,48 @@ function isMergeLineageResidual(residual: MissionResidual): boolean {
   return residual.lineage?.kind === 'merge' && residual.lineage.related_residual_ids.length > 1;
 }
 
+function isVerifierLane(summary: MissionLaneSummary, laneType: 'audit' | 're_audit'): boolean {
+  const policy = MISSION_LANE_POLICIES[laneType];
+  return summary.provenance.runner_type === policy.runnerType
+    && summary.provenance.read_only === true;
+}
+
+function sharesLaneIdentity(left: MissionLaneSummary, right: MissionLaneSummary | null): boolean {
+  if (!right) return false;
+  return left.provenance.session_id === right.provenance.session_id
+    || left.provenance.lane_id === right.provenance.lane_id;
+}
+
+function validateFreshVerifierProvenance(laneSummaries: MissionIterationSummaries): string | null {
+  if (!isVerifierLane(laneSummaries.audit, 'audit')) {
+    return 'audit lane must use fresh read-only verifier provenance';
+  }
+  if (!isVerifierLane(laneSummaries.re_audit, 're_audit')) {
+    return 're-audit lane must use fresh read-only verifier provenance';
+  }
+
+  const verifierComparisons: Array<[string, MissionLaneSummary | null]> = [
+    ['remediation', laneSummaries.remediation],
+    ['execution', laneSummaries.execution],
+    ['hardening', laneSummaries.hardening],
+  ];
+
+  for (const [laneName, summary] of verifierComparisons) {
+    if (sharesLaneIdentity(laneSummaries.audit, summary)) {
+      return `audit lane must not reuse ${laneName} lane identity`;
+    }
+    if (sharesLaneIdentity(laneSummaries.re_audit, summary)) {
+      return `re-audit lane must not reuse ${laneName} lane identity`;
+    }
+  }
+
+  if (sharesLaneIdentity(laneSummaries.audit, laneSummaries.re_audit)) {
+    return 'audit and re-audit lanes must use distinct lane identities';
+  }
+
+  return null;
+}
+
 function compareResiduals(previous: MissionLaneSummary | null, current: MissionLaneSummary, deltaHistory: MissionDelta[] = []): MissionDelta {
   const previousResiduals = previous?.residuals ?? [];
   const currentResiduals = current.residuals;
@@ -531,15 +582,24 @@ async function readRequiredIterationSummaries(
   repoRoot: string,
   slug: string,
   iteration: number,
-): Promise<Record<MissionLaneType, MissionLaneSummary>> {
-  const summaries = {} as Record<MissionLaneType, MissionLaneSummary>;
-  for (const laneType of MISSION_LANE_TYPES) {
+): Promise<MissionIterationSummaries> {
+  const summaries = {
+    hardening: null,
+  } as MissionIterationSummaries;
+
+  for (const laneType of MISSION_REQUIRED_LANE_TYPES) {
     const summaryFile = laneSummaryPath(repoRoot, slug, iteration, laneType);
     if (!existsSync(summaryFile)) {
       throw new Error(`missing_iteration_lane_summary:${laneType}`);
     }
-    summaries[laneType] = await readJsonFile<MissionLaneSummary>(summaryFile);
+    summaries[laneType] = await readJsonFile<MissionLaneSummary>(summaryFile) as MissionIterationSummaries[typeof laneType];
   }
+
+  const hardeningSummaryFile = laneSummaryPath(repoRoot, slug, iteration, 'hardening');
+  if (existsSync(hardeningSummaryFile)) {
+    summaries.hardening = await readJsonFile<MissionLaneSummary>(hardeningSummaryFile);
+  }
+
   return summaries;
 }
 
@@ -554,10 +614,19 @@ export function judgeMissionState(
   verifier: MissionLaneSummary,
   delta: MissionDelta,
   safetyBaseline: MissionSafetyBaseline,
+  verifierFreshnessError: string | null,
   strategyChanged = false,
 ): MissionJudgement {
   const safety = isGreenSafetyBaseline(safetyBaseline) ? 'green' : 'red';
   const closure = closureMatrixDecision(verifier.verdict, verifier.confidence, safety);
+
+  if (mission.closure_policy.require_fresh_verifier && verifierFreshnessError && closure.outcome !== 'iterate') {
+    return {
+      nextStatus: 'running',
+      reason: verifierFreshnessError,
+      closureDecision: 'iterate',
+    };
+  }
 
   if (closure.outcome === 'complete') {
     return { nextStatus: 'complete', reason: closure.reason, closureDecision: closure.outcome };
@@ -624,8 +693,16 @@ export async function commitIteration(
   const laneSummaries = await readRequiredIterationSummaries(repoRoot, slug, iteration);
   const verifier = laneSummaries.re_audit;
   const delta = await computeDelta(repoRoot, slug, iteration);
+  const verifierFreshnessError = validateFreshVerifierProvenance(laneSummaries);
 
-  const judgement = judgeMissionState(mission, verifier, delta, safetyBaseline, strategyChanged);
+  const judgement = judgeMissionState(
+    mission,
+    verifier,
+    delta,
+    safetyBaseline,
+    verifierFreshnessError,
+    strategyChanged,
+  );
   if (!canTransitionMissionStatus(mission.status, judgement.nextStatus)) {
     throw new Error(`invalid_mission_transition:${mission.status}->${judgement.nextStatus}`);
   }
@@ -662,8 +739,8 @@ export async function commitIteration(
   };
 
   await writeJsonFile(missionPath(repoRoot, slug), nextMission);
-  await writeJsonFile(latestPath(repoRoot, slug), latest);
   await writeJsonFile(deltaPath(repoRoot, slug, iteration), delta);
+  await writeJsonFile(latestPath(repoRoot, slug), latest);
   return { mission: nextMission, delta, latest, judgement };
 }
 
