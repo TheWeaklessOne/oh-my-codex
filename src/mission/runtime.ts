@@ -6,6 +6,8 @@ import {
   type MissionLaneType,
 } from './contracts.js';
 import {
+  loadMissionOrchestrationArtifacts,
+  missionOrchestrationArtifactPaths,
   missionLaneBriefingPath,
   prepareMissionOrchestrationArtifacts,
   syncMissionCloseout,
@@ -15,6 +17,7 @@ import {
   type MissionPlanningMode,
   type MissionRequirementSourceInput,
 } from './orchestration.js';
+import { syncMissionWorkflow } from './workflow.js';
 import {
   cancelMission,
   commitIteration,
@@ -109,6 +112,23 @@ async function ensureMissionState(options: MissionCreateOptions): Promise<Missio
   }
 }
 
+async function loadArtifactsForMission(
+  mission: MissionState,
+): Promise<{ artifacts: MissionOrchestrationArtifacts; paths: MissionOrchestrationArtifactPaths }> {
+  const existing = await loadMissionOrchestrationArtifacts(mission.mission_root);
+  if (existing) {
+    return {
+      artifacts: existing,
+      paths: missionOrchestrationArtifactPaths(mission.mission_root),
+    };
+  }
+  const prepared = await prepareMissionOrchestrationArtifacts(mission, {});
+  return {
+    artifacts: prepared.artifacts,
+    paths: prepared.paths,
+  };
+}
+
 function buildLanePlans(
   iteration: MissionIterationHandle,
   artifactPaths: MissionOrchestrationArtifactPaths,
@@ -134,6 +154,40 @@ export async function prepareMissionRuntime(options: PrepareMissionRuntimeOption
   await ensureMissionState(options);
   const currentMission = await loadMission(options.repoRoot, options.slug);
   const { artifacts, paths } = await prepareMissionOrchestrationArtifacts(currentMission, options);
+  await syncMissionWorkflow({
+    mission: currentMission,
+    artifacts,
+    artifactPaths: paths,
+    stage: 'intake',
+    detail: `Mission intake captured task: ${artifacts.sourcePack.task_statement}`,
+    blockedReason: null,
+  });
+  await syncMissionWorkflow({
+    mission: currentMission,
+    artifacts,
+    artifactPaths: paths,
+    stage: 'source-grounding',
+    detail: `Mission source grounding compiled ${artifacts.sourcePack.sources.length} normalized sources.`,
+    blockedReason: null,
+  });
+  await syncMissionWorkflow({
+    mission: currentMission,
+    artifacts,
+    artifactPaths: paths,
+    stage: 'contract-build',
+    detail: `Acceptance contract revision ${artifacts.acceptanceContract.contract_revision} prepared for verifier lanes.`,
+    blockedReason: null,
+  });
+  await syncMissionWorkflow({
+    mission: currentMission,
+    artifacts,
+    artifactPaths: paths,
+    stage: 'planning',
+    detail: artifacts.executionPlan.status === 'approved'
+      ? `Mission V2 artifacts prepared via ${artifacts.executionPlan.handoff_surface}`
+      : artifacts.executionPlan.blocking_reason ?? 'Mission planning is blocked',
+    blockedReason: artifacts.executionPlan.status === 'approved' ? null : artifacts.executionPlan.blocking_reason,
+  });
   if (artifacts.executionPlan.status !== 'approved') {
     return {
       mission: currentMission,
@@ -162,6 +216,15 @@ export async function prepareMissionRuntime(options: PrepareMissionRuntimeOption
   const nextMission = await loadMission(options.repoRoot, options.slug);
   const lanePlans = buildLanePlans(iteration, paths);
   await writeMissionLaneBriefings(iteration.laneDirs, artifacts, paths);
+  await syncMissionWorkflow({
+    mission: nextMission,
+    artifacts,
+    artifactPaths: paths,
+    stage: 'audit',
+    detail: 'Initial audit is ready to start from the approved Mission V2 plan.',
+    iteration: iteration.iteration,
+    laneType: 'audit',
+  });
   return {
     mission: nextMission,
     iteration,
@@ -190,9 +253,19 @@ export async function recordMissionRuntimeLaneSummary(
   iteration?: number,
 ): Promise<MissionRecordLaneResult> {
   const mission = await loadMission(repoRoot, slug);
+  const artifacts = await loadArtifactsForMission(mission);
   const result = await recordLaneSummary(repoRoot, slug, iteration ?? mission.current_iteration, laneType, summaryInput);
   const nextMission = await loadMission(repoRoot, slug);
   await syncMissionCloseout(nextMission);
+  await syncMissionWorkflow({
+    mission: nextMission,
+    artifacts: artifacts.artifacts,
+    artifactPaths: artifacts.paths,
+    stage: 'execution-loop',
+    detail: `Recorded ${laneType} lane summary for Mission V2.`,
+    iteration: iteration ?? mission.current_iteration,
+    laneType,
+  });
   return result;
 }
 
@@ -204,8 +277,22 @@ export async function commitMissionRuntimeIteration(
   iteration?: number,
 ): Promise<CommitIterationResult> {
   const mission = await loadMission(repoRoot, slug);
+  const artifacts = await loadArtifactsForMission(mission);
   const result = await commitIteration(repoRoot, slug, iteration ?? mission.current_iteration, safetyBaseline, strategyChanged);
   await syncMissionCloseout(result.mission);
+  await syncMissionWorkflow({
+    mission: result.mission,
+    artifacts: artifacts.artifacts,
+    artifactPaths: artifacts.paths,
+    stage: ['complete', 'plateau', 'failed', 'cancelled'].includes(result.mission.status) ? 'closeout' : 'execution-loop',
+    detail: ['complete', 'plateau', 'failed', 'cancelled'].includes(result.mission.status)
+      ? `Kernel reached terminal status: ${result.mission.status}.`
+      : strategyChanged
+        ? 'Kernel committed the latest iteration after an explicit strategy change.'
+        : 'Kernel committed the latest iteration and the mission remains in the execution loop.',
+    iteration: iteration ?? mission.current_iteration,
+    laneType: 're_audit',
+  });
   return result;
 }
 
@@ -216,5 +303,16 @@ export async function cancelMissionRuntime(
 ): Promise<MissionState> {
   const mission = await cancelMission(repoRoot, slug, reason);
   await syncMissionCloseout(mission);
+  const artifacts = await loadArtifactsForMission(mission);
+  await syncMissionWorkflow({
+    mission,
+    artifacts: artifacts.artifacts,
+    artifactPaths: artifacts.paths,
+    stage: mission.status === 'cancelled' ? 'closeout' : 'execution-loop',
+    detail: mission.status === 'cancelled'
+      ? 'Mission cancelled with all active lanes reconciled.'
+      : 'Mission cancellation requested; awaiting lane reconciliation.',
+    laneType: null,
+  });
   return mission;
 }

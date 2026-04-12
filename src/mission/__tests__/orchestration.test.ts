@@ -1,11 +1,28 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import {
   buildMissionExecutionPlan,
   buildMissionSourcePack,
   compileMissionAcceptanceContract,
   compileMissionBrief,
+  prepareMissionOrchestrationArtifacts,
 } from '../orchestration.js';
+import { createMission, loadMission } from '../kernel.js';
+
+async function initRepo(): Promise<string> {
+  const cwd = await mkdtemp(join(tmpdir(), 'omx-mission-orchestration-'));
+  execFileSync('git', ['init'], { cwd, stdio: 'ignore' });
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd, stdio: 'ignore' });
+  execFileSync('git', ['config', 'user.name', 'Test User'], { cwd, stdio: 'ignore' });
+  await writeFile(join(cwd, 'README.md'), 'hello\n', 'utf-8');
+  execFileSync('git', ['add', 'README.md'], { cwd, stdio: 'ignore' });
+  execFileSync('git', ['commit', '-m', 'init'], { cwd, stdio: 'ignore' });
+  return cwd;
+}
 
 describe('mission orchestration artifacts', () => {
   it('builds a prompt-only source pack and mission brief for prompt-grounded runs', () => {
@@ -121,5 +138,35 @@ describe('mission orchestration artifacts', () => {
     assert.equal(blockedPlan.handoff_surface, 'deep-interview');
     assert.equal(blockedPlan.status, 'blocked');
     assert.match(blockedPlan.blocking_reason || '', /(clarif|unresolved questions)/i);
+  });
+
+  it('versions acceptance contracts and execution plans when the mission requirements change', async () => {
+    const repo = await initRepo();
+    try {
+      await createMission({ repoRoot: repo, slug: 'demo', targetFingerprint: 'repo:demo' });
+      const mission = await loadMission(repo, 'demo');
+
+      const first = await prepareMissionOrchestrationArtifacts(mission, {
+        task: 'Implement Mission V2 workflow',
+        acceptanceCriteria: ['Create acceptance-contract.json before audit.'],
+        projectTouchpoints: ['src/mission/runtime.ts'],
+      });
+      const second = await prepareMissionOrchestrationArtifacts(mission, {
+        task: 'Implement Mission V2 workflow',
+        acceptanceCriteria: ['Create acceptance-contract.json before audit.', 'Emit workflow.json stage state.'],
+        projectTouchpoints: ['src/mission/runtime.ts', 'src/mission/workflow.ts'],
+        forceRebuild: true,
+      });
+
+      assert.equal(first.artifacts.acceptanceContract.contract_revision, 1);
+      assert.equal(first.artifacts.executionPlan.plan_revision, 1);
+      assert.equal(second.artifacts.acceptanceContract.contract_revision, 2);
+      assert.equal(second.artifacts.executionPlan.plan_revision, 2);
+      assert.equal(second.artifacts.executionPlan.previous_plan_id, first.artifacts.executionPlan.plan_id);
+      assert.equal(second.changed.acceptanceContract, true);
+      assert.equal(second.changed.executionPlan, true);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
   });
 });

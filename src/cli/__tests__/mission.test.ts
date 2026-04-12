@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -30,6 +30,10 @@ describe('omx mission', () => {
       '--model', 'gpt-5.4',
       '--provider=openai',
       '--config', 'custom.toml',
+      '--source', 'https://tracker.example/issues/123',
+      '--constraint', 'do not break kernel authority',
+      '--touchpoint', 'src/mission/runtime.ts',
+      '--high-risk',
       'audit', 'this',
       '--',
       '--task-with-leading-dash',
@@ -41,6 +45,10 @@ describe('omx mission', () => {
       '--provider=openai',
       '--config', 'custom.toml',
     ]);
+    assert.deepEqual(parsed.bootstrap.sourceRefs, ['https://tracker.example/issues/123']);
+    assert.deepEqual(parsed.bootstrap.constraints, ['do not break kernel authority']);
+    assert.deepEqual(parsed.bootstrap.touchpoints, ['src/mission/runtime.ts']);
+    assert.equal(parsed.bootstrap.highRisk, true);
   });
 
   it('documents mission in top-level help', async () => {
@@ -86,6 +94,10 @@ describe('omx mission', () => {
             const appendix = process.env.OMX_MISSION_APPEND_INSTRUCTIONS_FILE;
             assert.ok(typeof appendix === 'string' && appendix.endsWith('.omx/mission/session-instructions.md'));
             assert.equal(existsSync(appendix), true);
+            const appendixContent = await readFile(appendix, 'utf-8');
+            assert.match(appendixContent, /Mission brief:/);
+            assert.match(appendixContent, /Acceptance contract:/);
+            assert.match(appendixContent, /Execution plan:/);
           },
         },
       );
@@ -96,6 +108,41 @@ describe('omx mission', () => {
       process.chdir(originalCwd);
       if (typeof previousAppendix === 'string') process.env.OMX_MISSION_APPEND_INSTRUCTIONS_FILE = previousAppendix;
       else delete process.env.OMX_MISSION_APPEND_INSTRUCTIONS_FILE;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('bootstraps Mission V2 artifacts from source-file inputs before launch', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-mission-source-file-'));
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(cwd);
+      await writeFile(join(cwd, 'requirements.md'), '# Mission\n\nUse file-backed requirements.\n', 'utf-8');
+
+      await missionCommand(
+        ['--source-file', 'requirements.md', '--desired-outcome', 'Ship Mission V2', 'implement', 'mission', 'workflow'],
+        {
+          async launchWithHud() {
+            const sourcePack = JSON.parse(await readFile(join(cwd, '.omx', 'missions', 'implement-mission-workflow', 'source-pack.json'), 'utf-8')) as {
+              desired_outcome: string;
+              sources: Array<{ refs: string[]; content: string }>;
+            };
+            const workflow = JSON.parse(await readFile(join(cwd, '.omx', 'missions', 'implement-mission-workflow', 'workflow.json'), 'utf-8')) as {
+              current_stage: string;
+              artifact_refs: { mission_brief: string; execution_plan: string };
+            };
+
+            assert.equal(sourcePack.desired_outcome, 'Ship Mission V2');
+            assert.equal(sourcePack.sources.some((source) => source.refs.includes('requirements.md')), true);
+            assert.equal(sourcePack.sources.some((source) => /Use file-backed requirements/i.test(source.content)), true);
+            assert.equal(workflow.current_stage, 'audit');
+            assert.match(workflow.artifact_refs.mission_brief, /mission-brief\.md$/);
+            assert.match(workflow.artifact_refs.execution_plan, /execution-plan\.md$/);
+          },
+        },
+      );
+    } finally {
+      process.chdir(originalCwd);
       await rm(cwd, { recursive: true, force: true });
     }
   });

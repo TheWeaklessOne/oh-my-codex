@@ -126,6 +126,8 @@ export interface MissionExecutionPlan {
   schema_version: 1;
   generated_at: string;
   plan_id: string;
+  plan_revision: number;
+  previous_plan_id: string | null;
   strategy_key: string;
   planning_mode: MissionPlanningMode;
   handoff_surface: 'plan' | 'ralplan' | 'deep-interview';
@@ -168,6 +170,17 @@ export interface MissionOrchestrationArtifacts {
   brief: MissionBrief;
   acceptanceContract: MissionAcceptanceContract;
   executionPlan: MissionExecutionPlan;
+}
+
+export interface MissionOrchestrationArtifactUpdate {
+  artifacts: MissionOrchestrationArtifacts;
+  paths: MissionOrchestrationArtifactPaths;
+  changed: {
+    sourcePack: boolean;
+    brief: boolean;
+    acceptanceContract: boolean;
+    executionPlan: boolean;
+  };
 }
 
 export interface MissionOrchestrationArtifactPaths {
@@ -224,6 +237,10 @@ function summarizeContent(content: string): string {
 function markdownList(items: readonly string[], empty = '- None recorded'): string {
   if (items.length === 0) return empty;
   return items.map((item) => `- ${item}`).join('\n');
+}
+
+function stableJson(value: unknown): string {
+  return JSON.stringify(value);
 }
 
 function writeJson(filePath: string, value: unknown): Promise<void> {
@@ -329,6 +346,7 @@ export function compileMissionBrief(sourcePack: MissionSourcePack, nonGoals: rea
 export function compileMissionAcceptanceContract(
   brief: MissionBrief,
   input: MissionAcceptanceContractInput = {},
+  previous?: MissionAcceptanceContract | null,
 ): MissionAcceptanceContract {
   const acceptanceCriteria = normalizeList(input.acceptanceCriteria);
   const invariants = normalizeList(input.invariants);
@@ -344,7 +362,7 @@ export function compileMissionAcceptanceContract(
     requiredOperationalEvidence,
     residualClassificationRules,
   });
-  return {
+  const next: MissionAcceptanceContract = {
     schema_version: MISSION_V2_ARTIFACT_VERSION,
     generated_at: nowIso(),
     contract_id: `contract:${hashValue(contractSeed)}`,
@@ -401,6 +419,35 @@ export function compileMissionAcceptanceContract(
           'Prefer residuals with stable identities and evidence references.',
         ],
   };
+  if (!previous) return next;
+
+  const previousComparable = {
+    brief_id: previous.brief_id,
+    status_rules: previous.status_rules,
+    acceptance_criteria: previous.acceptance_criteria,
+    invariants: previous.invariants,
+    required_test_evidence: previous.required_test_evidence,
+    required_operational_evidence: previous.required_operational_evidence,
+    residual_classification_rules: previous.residual_classification_rules,
+    verifier_guidance: previous.verifier_guidance,
+  };
+  const nextComparable = {
+    brief_id: next.brief_id,
+    status_rules: next.status_rules,
+    acceptance_criteria: next.acceptance_criteria,
+    invariants: next.invariants,
+    required_test_evidence: next.required_test_evidence,
+    required_operational_evidence: next.required_operational_evidence,
+    residual_classification_rules: next.residual_classification_rules,
+    verifier_guidance: next.verifier_guidance,
+  };
+  if (stableJson(previousComparable) === stableJson(nextComparable)) {
+    return previous;
+  }
+  return {
+    ...next,
+    contract_revision: previous.contract_revision + 1,
+  };
 }
 
 export function buildMissionExecutionPlan(
@@ -408,6 +455,7 @@ export function buildMissionExecutionPlan(
   brief: MissionBrief,
   contract: MissionAcceptanceContract,
   options: MissionExecutionPlanOptions = {},
+  previous?: MissionExecutionPlan | null,
 ): MissionExecutionPlan {
   const planningMode = options.planningMode
     ?? (brief.ambiguity === 'high'
@@ -428,10 +476,12 @@ export function buildMissionExecutionPlan(
     touchpoints: brief.project_touchpoints,
   });
   const planId = `plan:${hashValue(planSeed)}`;
-  return {
+  const next: MissionExecutionPlan = {
     schema_version: MISSION_V2_ARTIFACT_VERSION,
     generated_at: nowIso(),
     plan_id: planId,
+    plan_revision: 1,
+    previous_plan_id: null,
     strategy_key: `strategy:${hashValue(`${planId}:${contract.contract_id}:${planningMode}`)}`,
     planning_mode: planningMode,
     handoff_surface: handoffSurface,
@@ -472,6 +522,42 @@ export function buildMissionExecutionPlan(
       'Skip hardening when audit + execution + re-audit already satisfy the contract.',
       'Use hardening only for narrow stubborn residuals that benefit from a bounded Ralph follow-up.',
     ],
+  };
+  if (!previous) return next;
+
+  const previousComparable = {
+    planning_mode: previous.planning_mode,
+    handoff_surface: previous.handoff_surface,
+    status: previous.status,
+    blocking_reason: previous.blocking_reason,
+    approval_basis: previous.approval_basis,
+    summary: previous.summary,
+    execution_order: previous.execution_order,
+    lane_expectations: previous.lane_expectations,
+    verification_checkpoints: previous.verification_checkpoints,
+    strategy_change_triggers: previous.strategy_change_triggers,
+    optional_hardening_rules: previous.optional_hardening_rules,
+  };
+  const nextComparable = {
+    planning_mode: next.planning_mode,
+    handoff_surface: next.handoff_surface,
+    status: next.status,
+    blocking_reason: next.blocking_reason,
+    approval_basis: next.approval_basis,
+    summary: next.summary,
+    execution_order: next.execution_order,
+    lane_expectations: next.lane_expectations,
+    verification_checkpoints: next.verification_checkpoints,
+    strategy_change_triggers: next.strategy_change_triggers,
+    optional_hardening_rules: next.optional_hardening_rules,
+  };
+  if (stableJson(previousComparable) === stableJson(nextComparable)) {
+    return previous;
+  }
+  return {
+    ...next,
+    plan_revision: previous.plan_revision + 1,
+    previous_plan_id: previous.plan_id,
   };
 }
 
@@ -515,6 +601,8 @@ function formatMissionExecutionPlanMarkdown(plan: MissionExecutionPlan): string 
     '# Mission Execution Plan',
     '',
     `- Plan ID: \`${plan.plan_id}\``,
+    `- Plan revision: ${plan.plan_revision}`,
+    plan.previous_plan_id ? `- Previous plan ID: \`${plan.previous_plan_id}\`` : null,
     `- Strategy key: \`${plan.strategy_key}\``,
     `- Planning mode: \`${plan.planning_mode}\``,
     `- Handoff surface: \`${plan.handoff_surface}\``,
@@ -611,20 +699,20 @@ export async function loadMissionOrchestrationArtifacts(
 export async function prepareMissionOrchestrationArtifacts(
   mission: MissionState,
   options: PrepareMissionOrchestrationOptions,
-): Promise<{
-  artifacts: MissionOrchestrationArtifacts;
-  paths: MissionOrchestrationArtifactPaths;
-}> {
-  if (options.forceRebuild !== true) {
-    const existing = await loadMissionOrchestrationArtifacts(mission.mission_root);
-    if (existing) {
-      return {
-        artifacts: existing,
-        paths: missionOrchestrationArtifactPaths(mission.mission_root),
-      };
-    }
+): Promise<MissionOrchestrationArtifactUpdate> {
+  const existing = await loadMissionOrchestrationArtifacts(mission.mission_root);
+  if (existing && options.forceRebuild !== true) {
+    return {
+      artifacts: existing,
+      paths: missionOrchestrationArtifactPaths(mission.mission_root),
+      changed: {
+        sourcePack: false,
+        brief: false,
+        acceptanceContract: false,
+        executionPlan: false,
+      },
+    };
   }
-
   const sourcePack = buildMissionSourcePack({
     task: options.task || mission.slug,
     desiredOutcome: options.desiredOutcome,
@@ -637,8 +725,18 @@ export async function prepareMissionOrchestrationArtifacts(
     ambiguity: options.ambiguity,
   });
   const brief = compileMissionBrief(sourcePack, options.nonGoals);
-  const acceptanceContract = compileMissionAcceptanceContract(brief, options);
-  const executionPlan = buildMissionExecutionPlan(sourcePack, brief, acceptanceContract, options);
+  const acceptanceContract = compileMissionAcceptanceContract(
+    brief,
+    options,
+    existing?.acceptanceContract ?? null,
+  );
+  const executionPlan = buildMissionExecutionPlan(
+    sourcePack,
+    brief,
+    acceptanceContract,
+    options,
+    existing?.executionPlan ?? null,
+  );
   const artifacts = {
     sourcePack,
     brief,
@@ -646,7 +744,16 @@ export async function prepareMissionOrchestrationArtifacts(
     executionPlan,
   };
   const paths = await writeMissionOrchestrationArtifacts(mission.mission_root, artifacts);
-  return { artifacts, paths };
+  return {
+    artifacts,
+    paths,
+    changed: {
+      sourcePack: stableJson(existing?.sourcePack ?? null) !== stableJson(sourcePack),
+      brief: stableJson(existing?.brief ?? null) !== stableJson(brief),
+      acceptanceContract: stableJson(existing?.acceptanceContract ?? null) !== stableJson(acceptanceContract),
+      executionPlan: stableJson(existing?.executionPlan ?? null) !== stableJson(executionPlan),
+    },
+  };
 }
 
 export async function writeMissionLaneBriefings(
