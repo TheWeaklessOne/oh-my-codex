@@ -24,6 +24,7 @@ Use it when the user wants OMX to keep iterating until an **independent audit/re
   - `mission-brief.md`
   - `acceptance-contract.json`
   - `execution-plan.md`
+  - `workflow.json` (Mission V2 stage + strategy history above the kernel)
   - `mission.json`
   - `latest.json` (read model only; never authoritative)
   - `iterations/<n>/{audit,remediation,execution,re_audit}/summary.json`
