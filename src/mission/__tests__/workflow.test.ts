@@ -7,7 +7,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { loadMission } from '../kernel.js';
 import { prepareMissionRuntime, recordMissionRuntimeLaneSummary, commitMissionRuntimeIteration } from '../runtime.js';
-import { loadMissionWorkflow, missionWorkflowPath } from '../workflow.js';
+import { loadMissionEvents, missionEventsPath } from '../events.js';
+import { loadMissionWorkflow, missionWorkflowPath, reconcileMissionWorkflow } from '../workflow.js';
 import type { MissionLaneSummaryInput } from '../contracts.js';
 
 async function initRepo(): Promise<string> {
@@ -65,8 +66,13 @@ describe('mission workflow state', () => {
       });
 
       assert.equal(existsSync(missionWorkflowPath(runtime.missionRoot)), true);
+      assert.equal(existsSync(missionEventsPath(runtime.missionRoot)), true);
       let workflow = await loadMissionWorkflow(runtime.missionRoot);
       assert.equal(workflow?.current_stage, 'audit');
+      const initialEvents = await loadMissionEvents(runtime.missionRoot);
+      assert.equal(initialEvents.some((event) => event.event_type === 'mission_bootstrapped'), true);
+      assert.equal(initialEvents.some((event) => event.event_type === 'execution_plan_prepared'), true);
+      assert.equal(initialEvents.some((event) => event.event_type === 'workflow_stage_entered'), true);
 
       await recordMissionRuntimeLaneSummary(repo, 'demo', 'audit', laneSummary('audit', 1, 'PARTIAL'));
       workflow = await loadMissionWorkflow(runtime.missionRoot);
@@ -130,6 +136,12 @@ describe('mission workflow state', () => {
       assert.equal(workflow?.stage_history.some((entry) => entry.stage === 'execution-loop'), true);
       assert.equal(workflow?.stage_history.some((entry) => entry.stage === 'closeout'), true);
       assert.equal(workflow?.strategy_key, committed.mission.last_strategy_key);
+
+      await writeFile(missionWorkflowPath(runtime.missionRoot), JSON.stringify({ drifted: true }, null, 2));
+      const reconciled = await reconcileMissionWorkflow(mission);
+      assert.equal(reconciled.driftDetected, true);
+      assert.equal(reconciled.rebuilt.current_stage, 'closeout');
+      assert.equal(reconciled.rebuilt.closeout_status, 'complete');
     } finally {
       await rm(repo, { recursive: true, force: true });
     }

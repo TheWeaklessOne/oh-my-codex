@@ -6,6 +6,14 @@ import {
   type MissionLaneType,
 } from './contracts.js';
 import {
+  appendMissionCancelRequestedEvent,
+  appendMissionCloseoutEvent,
+  appendMissionIterationCommittedEvent,
+  appendMissionLaneSummaryEvent,
+  appendMissionOrchestrationEvents,
+  ensureMissionBootstrapEvent,
+} from './events.js';
+import {
   loadMissionOrchestrationArtifacts,
   missionOrchestrationArtifactPaths,
   missionLaneBriefingPath,
@@ -153,7 +161,10 @@ function buildLanePlans(
 export async function prepareMissionRuntime(options: PrepareMissionRuntimeOptions): Promise<PreparedMissionRuntime> {
   await ensureMissionState(options);
   const currentMission = await loadMission(options.repoRoot, options.slug);
-  const { artifacts, paths } = await prepareMissionOrchestrationArtifacts(currentMission, options);
+  await ensureMissionBootstrapEvent(currentMission);
+  const prepared = await prepareMissionOrchestrationArtifacts(currentMission, options);
+  const { artifacts, paths } = prepared;
+  await appendMissionOrchestrationEvents(currentMission, prepared);
   await syncMissionWorkflow({
     mission: currentMission,
     artifacts,
@@ -256,7 +267,20 @@ export async function recordMissionRuntimeLaneSummary(
   const artifacts = await loadArtifactsForMission(mission);
   const result = await recordLaneSummary(repoRoot, slug, iteration ?? mission.current_iteration, laneType, summaryInput);
   const nextMission = await loadMission(repoRoot, slug);
-  await syncMissionCloseout(nextMission);
+  if (result.summary) {
+    await appendMissionLaneSummaryEvent(
+      nextMission,
+      iteration ?? mission.current_iteration,
+      laneType,
+      result.summaryPath,
+      result.summary.verdict,
+      result.summary.confidence,
+    );
+  }
+  const closeout = await syncMissionCloseout(nextMission);
+  if (closeout) {
+    await appendMissionCloseoutEvent(nextMission, artifacts.paths);
+  }
   await syncMissionWorkflow({
     mission: nextMission,
     artifacts: artifacts.artifacts,
@@ -279,7 +303,11 @@ export async function commitMissionRuntimeIteration(
   const mission = await loadMission(repoRoot, slug);
   const artifacts = await loadArtifactsForMission(mission);
   const result = await commitIteration(repoRoot, slug, iteration ?? mission.current_iteration, safetyBaseline, strategyChanged);
-  await syncMissionCloseout(result.mission);
+  await appendMissionIterationCommittedEvent(result.mission, iteration ?? mission.current_iteration, strategyChanged);
+  const closeout = await syncMissionCloseout(result.mission);
+  if (closeout) {
+    await appendMissionCloseoutEvent(result.mission, artifacts.paths);
+  }
   await syncMissionWorkflow({
     mission: result.mission,
     artifacts: artifacts.artifacts,
@@ -302,8 +330,12 @@ export async function cancelMissionRuntime(
   reason?: string,
 ): Promise<MissionState> {
   const mission = await cancelMission(repoRoot, slug, reason);
-  await syncMissionCloseout(mission);
+  await appendMissionCancelRequestedEvent(mission, reason ?? null);
   const artifacts = await loadArtifactsForMission(mission);
+  const closeout = await syncMissionCloseout(mission);
+  if (closeout) {
+    await appendMissionCloseoutEvent(mission, artifacts.paths);
+  }
   await syncMissionWorkflow({
     mission,
     artifacts: artifacts.artifacts,
