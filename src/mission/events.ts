@@ -222,60 +222,72 @@ export async function appendMissionOrchestrationEvents(
 	options?: {
 		forceAll?: boolean;
 	},
-): Promise<void> {
+): Promise<boolean> {
 	const { artifacts, paths, changed } = update;
 	const forceAll = options?.forceAll === true;
+	const existingEvents = await loadMissionEvents(mission.mission_root);
+	const seenEventTypes = new Set(
+		existingEvents.map((event) => event.event_type),
+	);
+	let appendedAny = false;
 	const prefix = {
 		schema_version: 1 as const,
 		mission_id: mission.mission_id,
 		slug: mission.slug,
 		recorded_at: nowIso(),
 	};
-	if (forceAll || changed.sourcePack) {
+	const shouldAppend = (
+		eventType: MissionEventType,
+		changedValue: boolean,
+	): boolean => forceAll || changedValue || !seenEventTypes.has(eventType);
+	const statusFor = (eventType: MissionEventType): "prepared" | "updated" =>
+		seenEventTypes.has(eventType) ? "updated" : "prepared";
+	if (shouldAppend("source_pack_prepared", changed.sourcePack)) {
 		await appendMissionEvent(mission.mission_root, {
 			...prefix,
 			event_type: "source_pack_prepared",
 			payload: {
-				status: forceAll ? "updated" : "prepared",
+				status: statusFor("source_pack_prepared"),
 				path: paths.sourcePackPath,
 				source_count: artifacts.sourcePack.sources.length,
 				ambiguity: artifacts.sourcePack.ambiguity,
 			},
 		});
+		appendedAny = true;
 	}
-	if (forceAll || changed.brief) {
+	if (shouldAppend("mission_brief_prepared", changed.brief)) {
 		await appendMissionEvent(mission.mission_root, {
 			...prefix,
 			event_type: "mission_brief_prepared",
 			payload: {
-				status: forceAll ? "updated" : "prepared",
+				status: statusFor("mission_brief_prepared"),
 				path: paths.missionBriefPath,
 				brief_id: artifacts.brief.brief_id,
 			},
 		});
+		appendedAny = true;
 	}
-	if (forceAll || changed.acceptanceContract) {
+	if (
+		shouldAppend("acceptance_contract_prepared", changed.acceptanceContract)
+	) {
 		await appendMissionEvent(mission.mission_root, {
 			...prefix,
 			event_type: "acceptance_contract_prepared",
 			payload: {
-				status:
-					artifacts.acceptanceContract.contract_revision > 1
-						? "updated"
-						: "prepared",
+				status: statusFor("acceptance_contract_prepared"),
 				path: paths.acceptanceContractPath,
 				contract_id: artifacts.acceptanceContract.contract_id,
 				contract_revision: artifacts.acceptanceContract.contract_revision,
 			},
 		});
+		appendedAny = true;
 	}
-	if (forceAll || changed.executionPlan) {
+	if (shouldAppend("execution_plan_prepared", changed.executionPlan)) {
 		await appendMissionEvent(mission.mission_root, {
 			...prefix,
 			event_type: "execution_plan_prepared",
 			payload: {
-				status:
-					artifacts.executionPlan.plan_revision > 1 ? "updated" : "prepared",
+				status: statusFor("execution_plan_prepared"),
 				path: paths.executionPlanPath,
 				plan_id: artifacts.executionPlan.plan_id,
 				plan_revision: artifacts.executionPlan.plan_revision,
@@ -287,6 +299,9 @@ export async function appendMissionOrchestrationEvents(
 				blocking_reason: artifacts.executionPlan.blocking_reason,
 			},
 		});
+		appendedAny = true;
+	}
+	if (shouldAppend("planning_transaction_recorded", changed.executionPlan)) {
 		await appendMissionEvent(mission.mission_root, {
 			...prefix,
 			event_type: "planning_transaction_recorded",
@@ -306,7 +321,9 @@ export async function appendMissionOrchestrationEvents(
 				strategy_key: artifacts.planningTransaction.strategy_key,
 			},
 		});
+		appendedAny = true;
 	}
+	return appendedAny;
 }
 
 export async function appendMissionWorkflowStageEvent(

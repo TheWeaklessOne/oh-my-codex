@@ -91,6 +91,15 @@ describe("mission workflow state", () => {
 			let workflow = await loadMissionWorkflow(runtime.missionRoot);
 			assert.equal(workflow?.current_stage, "audit");
 			const initialEvents = await loadMissionEvents(runtime.missionRoot);
+			const sourcePackEvent = initialEvents.find(
+				(event) => event.event_type === "source_pack_prepared",
+			);
+			const missionBriefEvent = initialEvents.find(
+				(event) => event.event_type === "mission_brief_prepared",
+			);
+			const executionPlanEvent = initialEvents.find(
+				(event) => event.event_type === "execution_plan_prepared",
+			);
 			assert.equal(
 				initialEvents.some(
 					(event) => event.event_type === "mission_bootstrapped",
@@ -98,11 +107,44 @@ describe("mission workflow state", () => {
 				true,
 			);
 			assert.equal(
+				initialEvents.filter(
+					(event) => event.event_type === "source_pack_prepared",
+				).length,
+				1,
+			);
+			if (
+				!sourcePackEvent ||
+				sourcePackEvent.event_type !== "source_pack_prepared"
+			) {
+				throw new Error("missing source_pack_prepared event");
+			}
+			assert.equal(sourcePackEvent.payload.status, "prepared");
+			assert.equal(
+				initialEvents.filter(
+					(event) => event.event_type === "mission_brief_prepared",
+				).length,
+				1,
+			);
+			if (
+				!missionBriefEvent ||
+				missionBriefEvent.event_type !== "mission_brief_prepared"
+			) {
+				throw new Error("missing mission_brief_prepared event");
+			}
+			assert.equal(missionBriefEvent.payload.status, "prepared");
+			assert.equal(
 				initialEvents.some(
 					(event) => event.event_type === "execution_plan_prepared",
 				),
 				true,
 			);
+			if (
+				!executionPlanEvent ||
+				executionPlanEvent.event_type !== "execution_plan_prepared"
+			) {
+				throw new Error("missing execution_plan_prepared event");
+			}
+			assert.equal(executionPlanEvent.payload.status, "prepared");
 			assert.equal(
 				initialEvents.some(
 					(event) => event.event_type === "planning_transaction_recorded",
@@ -175,7 +217,8 @@ describe("mission workflow state", () => {
 					"re_audit",
 					1,
 					"PASS",
-					runtime.lanePlans.re_audit?.executionEnvelope.provenance_binding_token,
+					runtime.lanePlans.re_audit?.executionEnvelope
+						.provenance_binding_token,
 				),
 			);
 			const committed = await commitMissionRuntimeIteration(repo, "demo", {
@@ -308,6 +351,70 @@ describe("mission workflow state", () => {
 			assert.equal(
 				workflow?.artifact_refs.source_pack,
 				resumed.artifactPaths.sourcePackPath,
+			);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("backfills missing bootstrap events after artifact writes were persisted before the event append step", async () => {
+		const repo = await initRepo();
+		try {
+			const first = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+				task: "Seed Mission V2 artifacts before simulating a bootstrap crash",
+			});
+
+			const bootstrappedOnly = (
+				await loadMissionEvents(first.missionRoot)
+			).filter((event) => event.event_type === "mission_bootstrapped");
+			await writeFile(
+				missionEventsPath(first.missionRoot),
+				`${bootstrappedOnly.map((event) => JSON.stringify(event)).join("\n")}\n`,
+				"utf-8",
+			);
+			await rm(missionWorkflowPath(first.missionRoot), { force: true });
+
+			const resumed = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+				task: "Seed Mission V2 artifacts before simulating a bootstrap crash",
+			});
+
+			const events = await loadMissionEvents(resumed.missionRoot);
+			assert.equal(
+				events.filter((event) => event.event_type === "source_pack_prepared")
+					.length,
+				1,
+			);
+			assert.equal(
+				events.filter((event) => event.event_type === "mission_brief_prepared")
+					.length,
+				1,
+			);
+			assert.equal(
+				events.filter(
+					(event) => event.event_type === "acceptance_contract_prepared",
+				).length,
+				1,
+			);
+			assert.equal(
+				events.filter((event) => event.event_type === "execution_plan_prepared")
+					.length,
+				1,
+			);
+			assert.equal(
+				events.filter(
+					(event) => event.event_type === "planning_transaction_recorded",
+				).length,
+				1,
+			);
+			assert.equal(
+				events.some((event) => event.event_type === "workflow_stage_entered"),
+				true,
 			);
 		} finally {
 			await rm(repo, { recursive: true, force: true });
