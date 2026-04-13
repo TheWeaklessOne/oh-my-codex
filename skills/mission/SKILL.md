@@ -27,6 +27,7 @@ Use it when the user wants OMX to keep iterating until an **independent audit/re
   - `execution-plan.md`
   - `planning-transaction.json` as the canonical planning transaction record
   - `workflow.json` (derived Mission V2 stage + strategy history read model)
+  - `budget.json`, `run-metrics.json`, and `watchdog.json` for runtime telemetry / expensive-failure controls
   - `mission.json`
   - `latest.json` (read model only; never authoritative)
   - `iterations/<n>/{audit,remediation,execution,re_audit}/summary.json`

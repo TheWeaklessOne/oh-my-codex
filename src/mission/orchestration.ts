@@ -201,6 +201,11 @@ export interface MissionCloseout {
   residual_ids: string[];
   evidence_refs: string[];
   evidence_index: string[];
+  telemetry_refs: {
+    budget: string;
+    run_metrics: string;
+    watchdog: string;
+  };
   artifact_refs: {
     source_pack: string;
     mission_brief: string;
@@ -240,6 +245,9 @@ export interface MissionOrchestrationArtifactPaths {
   executionPlanStatePath: string;
   planningTransactionPath: string;
   planningTransactionsDir: string;
+  budgetPath: string;
+  runMetricsPath: string;
+  watchdogPath: string;
   closeoutPath: string;
   closeoutStatePath: string;
 }
@@ -366,6 +374,9 @@ export function missionOrchestrationArtifactPaths(missionRoot: string): MissionO
     executionPlanStatePath: join(missionRoot, 'execution-plan.json'),
     planningTransactionPath: join(missionRoot, 'planning-transaction.json'),
     planningTransactionsDir: join(missionRoot, 'planning-transactions'),
+    budgetPath: join(missionRoot, 'budget.json'),
+    runMetricsPath: join(missionRoot, 'run-metrics.json'),
+    watchdogPath: join(missionRoot, 'watchdog.json'),
     closeoutPath: join(missionRoot, 'closeout.md'),
     closeoutStatePath: join(missionRoot, 'closeout.json'),
   };
@@ -1054,7 +1065,15 @@ export async function buildMissionCloseout(mission: MissionState): Promise<Missi
       ...evidenceRefs,
       latestSnapshot?.latest_summary_path ?? mission.latest_summary_path ?? '',
       delta ? missionDeltaPath(mission.mission_root, mission.current_iteration) : '',
+      artifactPaths.budgetPath,
+      artifactPaths.runMetricsPath,
+      artifactPaths.watchdogPath,
     ]),
+    telemetry_refs: {
+      budget: artifactPaths.budgetPath,
+      run_metrics: artifactPaths.runMetricsPath,
+      watchdog: artifactPaths.watchdogPath,
+    },
     artifact_refs: {
       source_pack: artifactPaths.sourcePackPath,
       mission_brief: artifactPaths.missionBriefPath,
