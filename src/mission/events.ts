@@ -7,6 +7,7 @@ import type {
 	MissionOrchestrationArtifactPaths,
 	MissionOrchestrationArtifactUpdate,
 } from "./orchestration.js";
+import type { MissionWatchdogDecision } from "./telemetry.js";
 
 export const MISSION_EVENT_TYPES = [
 	"mission_bootstrapped",
@@ -19,6 +20,7 @@ export const MISSION_EVENT_TYPES = [
 	"lane_summary_recorded",
 	"iteration_committed",
 	"mission_cancel_requested",
+	"watchdog_decision_recorded",
 	"closeout_generated",
 ] as const;
 export type MissionEventType = (typeof MISSION_EVENT_TYPES)[number];
@@ -135,6 +137,14 @@ export type MissionEvent =
 			{
 				status: MissionStatus;
 				reason: string | null;
+			}
+	  >
+	| MissionEventBase<
+			"watchdog_decision_recorded",
+			{
+				path: string;
+				decision: string;
+				reasons: string[];
 			}
 	  >
 	| MissionEventBase<
@@ -399,6 +409,25 @@ export async function appendMissionCloseoutEvent(
 			status: mission.status,
 			closeout_path: artifactPaths.closeoutPath,
 			closeout_state_path: artifactPaths.closeoutStatePath,
+		},
+	});
+}
+
+export async function appendMissionWatchdogDecisionEvent(
+	mission: MissionState,
+	watchdog: MissionWatchdogDecision,
+	watchdogPath: string,
+): Promise<void> {
+	await appendMissionEvent(mission.mission_root, {
+		schema_version: 1,
+		event_type: "watchdog_decision_recorded",
+		mission_id: mission.mission_id,
+		slug: mission.slug,
+		recorded_at: nowIso(),
+		payload: {
+			path: watchdogPath,
+			decision: watchdog.decision,
+			reasons: watchdog.reasons,
 		},
 	});
 }

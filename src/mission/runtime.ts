@@ -39,6 +39,7 @@ import {
 	syncMissionCloseout,
 	writeMissionLaneBriefings,
 } from "./orchestration.js";
+import { syncMissionTelemetry } from "./telemetry.js";
 import { reconcileMissionWorkflow, syncMissionWorkflow } from "./workflow.js";
 
 export interface MissionLaneRuntimePlan {
@@ -227,6 +228,7 @@ export async function prepareMissionRuntime(
 		if (!lifecycleSeedNeeded) {
 			await reconcileMissionWorkflow(currentMission);
 		}
+		await syncMissionTelemetry(currentMission, paths);
 		return {
 			mission: currentMission,
 			iteration: null,
@@ -271,6 +273,7 @@ export async function prepareMissionRuntime(
 	} else {
 		await reconcileMissionWorkflow(nextMission);
 	}
+	await syncMissionTelemetry(nextMission, paths);
 	return {
 		mission: nextMission,
 		iteration,
@@ -334,6 +337,7 @@ export async function recordMissionRuntimeLaneSummary(
 		iteration: iteration ?? mission.current_iteration,
 		laneType,
 	});
+	await syncMissionTelemetry(nextMission, artifacts.paths);
 	return result;
 }
 
@@ -381,6 +385,7 @@ export async function commitMissionRuntimeIteration(
 		iteration: iteration ?? mission.current_iteration,
 		laneType: "re_audit",
 	});
+	await syncMissionTelemetry(result.mission, artifacts.paths);
 	return result;
 }
 
@@ -407,5 +412,6 @@ export async function cancelMissionRuntime(
 				: "Mission cancellation requested; awaiting lane reconciliation.",
 		laneType: null,
 	});
+	await syncMissionTelemetry(mission, artifacts.paths);
 	return mission;
 }
