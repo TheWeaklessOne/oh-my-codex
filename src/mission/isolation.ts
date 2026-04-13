@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import type { MissionLaneType } from "./contracts.js";
@@ -106,6 +106,45 @@ function ensureDetachedWorktree(repoRoot: string, worktreePath: string, baseRef:
 	return resolve(worktreePath);
 }
 
+function materializeVerifierSnapshot(
+	repoRoot: string,
+	snapshotPath: string,
+	baseRef: string,
+): string {
+	rmSync(snapshotPath, { recursive: true, force: true });
+	mkdirSync(snapshotPath, { recursive: true });
+	if (baseRef === "non-git") {
+		for (const entry of readdirSync(repoRoot, { withFileTypes: true })) {
+			if (entry.name === ".omx") continue;
+			cpSync(join(repoRoot, entry.name), join(snapshotPath, entry.name), {
+				recursive: true,
+			});
+		}
+		return resolve(snapshotPath);
+	}
+	const archive = spawnSync("git", ["archive", "--format=tar", baseRef], {
+		cwd: repoRoot,
+		windowsHide: true,
+	});
+	if (archive.status !== 0 || !archive.stdout) {
+		throw new Error(
+			(archive.stderr || "").toString().trim()
+				|| `git archive failed for ${baseRef}`,
+		);
+	}
+	const extract = spawnSync("tar", ["-xf", "-", "-C", snapshotPath], {
+		input: archive.stdout,
+		windowsHide: true,
+	});
+	if (extract.status !== 0) {
+		throw new Error(
+			(extract.stderr || "").toString().trim()
+				|| `tar extract failed for ${snapshotPath}`,
+		);
+	}
+	return resolve(snapshotPath);
+}
+
 function envelopeFilePath(missionRoot: string, iteration: number, laneType: MissionLaneType): string {
 	return join(
 		missionRoot,
@@ -137,12 +176,12 @@ function buildLaneEnvelope(
 			);
 			isolationKind = "detached_worktree";
 		} catch {
-			workspacePath = resolve(
+			workspacePath = materializeVerifierSnapshot(
+				repoRoot,
 				verifierSnapshotPath(mission, iteration, laneType),
+				baseRef,
 			);
-			mkdirSync(workspacePath, { recursive: true });
 			isolationKind = "isolated_snapshot";
-			effectiveBaseRef = "non-git";
 		}
 	}
 	return {

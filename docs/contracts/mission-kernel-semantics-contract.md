@@ -35,6 +35,12 @@ tracking, recovery, planning provenance, runtime observability, and lane isolati
 do **not** supersede the kernel-owned lifecycle, lane-summary, delta, or closure
 semantics described below.
 
+Artifact roles:
+- **Authoritative**: `mission.json`, iteration lane summaries, `delta.json`
+- **Append-only**: `events.ndjson`
+- **Canonical orchestration records**: `planning-transaction.json`
+- **Derived read models**: `workflow.json`, `budget.json`, `run-metrics.json`, `watchdog.json`, `closeout.md`, `closeout.json`
+
 ## Atomic write rules
 
 - `mission.json`, `latest.json`, iteration summaries, and `delta.json` are written with atomic temp-file + rename semantics.

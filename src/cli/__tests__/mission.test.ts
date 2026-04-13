@@ -188,4 +188,72 @@ describe('omx mission', () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it('rejects conflicting mission reruns instead of silently reusing stale artifacts', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-mission-conflict-'));
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(cwd);
+      await missionCommand(
+        ['--constraint', 'keep kernel authority', 'bootstrap', 'mission'],
+        {
+          async launchWithHud() {
+            // no-op
+          },
+        },
+      );
+
+      await assert.rejects(
+        missionCommand(
+          ['--constraint', 'route through alternate kernel', 'bootstrap', 'mission'],
+          {
+            async launchWithHud() {
+              // no-op
+            },
+          },
+        ),
+        /mission_target_mismatch:bootstrap-mission/,
+      );
+    } finally {
+      process.chdir(originalCwd);
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('prints a compact mission inspection view with artifact roles', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-mission-inspect-'));
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(cwd);
+      const printed: string[] = [];
+      await missionCommand(
+        ['bootstrap', 'mission'],
+        {
+          async launchWithHud() {
+            // no-op
+          },
+        },
+      );
+
+      await missionCommand(
+        ['inspect', 'bootstrap-mission'],
+        {
+          print(message) {
+            printed.push(message);
+          },
+        },
+      );
+
+      const output = printed.join('\n');
+      assert.match(output, /Mission: bootstrap-mission/);
+      assert.match(output, /Artifacts:/);
+      assert.match(output, /\[authoritative\].*mission\.json/);
+      assert.match(output, /\[append_only\].*events\.ndjson/);
+      assert.match(output, /\[canonical\].*planning-transaction\.json/);
+      assert.match(output, /\[derived\].*workflow\.json/);
+    } finally {
+      process.chdir(originalCwd);
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });
