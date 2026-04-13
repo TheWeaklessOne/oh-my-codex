@@ -29,6 +29,12 @@ export type MissionSourceKind = (typeof MISSION_SOURCE_KINDS)[number];
 export const MISSION_PLANNING_MODES = ['direct', 'ralplan', 'blocked'] as const;
 export type MissionPlanningMode = (typeof MISSION_PLANNING_MODES)[number];
 
+export const MISSION_PLANNING_TRANSACTION_STATUSES = ['draft', 'approved', 'superseded', 'rejected', 'blocked'] as const;
+export type MissionPlanningTransactionStatus = (typeof MISSION_PLANNING_TRANSACTION_STATUSES)[number];
+
+export const MISSION_PLANNING_APPROVAL_MODES = ['auto_policy', 'manual', 'carry_forward', 'needs_clarification'] as const;
+export type MissionPlanningApprovalMode = (typeof MISSION_PLANNING_APPROVAL_MODES)[number];
+
 export interface MissionRequirementSourceInput {
   kind?: string;
   title?: string;
@@ -143,6 +149,25 @@ export interface MissionExecutionPlan {
   optional_hardening_rules: string[];
 }
 
+export interface MissionPlanningTransaction {
+  schema_version: 1;
+  generated_at: string;
+  plan_run_id: string;
+  plan_id: string;
+  plan_revision: number;
+  status: MissionPlanningTransactionStatus;
+  approval_mode: MissionPlanningApprovalMode;
+  approved_at: string | null;
+  approved_by: string | null;
+  previous_plan_run_id: string | null;
+  superseded_by: string | null;
+  replan_reason: string | null;
+  strategy_key: string;
+  planning_mode: MissionPlanningMode;
+  handoff_surface: 'plan' | 'ralplan' | 'deep-interview';
+  blocking_reason: string | null;
+}
+
 export interface MissionCloseout {
   schema_version: 1;
   generated_at: string;
@@ -170,6 +195,7 @@ export interface MissionOrchestrationArtifacts {
   brief: MissionBrief;
   acceptanceContract: MissionAcceptanceContract;
   executionPlan: MissionExecutionPlan;
+  planningTransaction: MissionPlanningTransaction;
 }
 
 export interface MissionOrchestrationArtifactUpdate {
@@ -190,6 +216,8 @@ export interface MissionOrchestrationArtifactPaths {
   acceptanceContractPath: string;
   executionPlanPath: string;
   executionPlanStatePath: string;
+  planningTransactionPath: string;
+  planningTransactionsDir: string;
   closeoutPath: string;
   closeoutStatePath: string;
 }
@@ -198,6 +226,9 @@ export interface PrepareMissionOrchestrationOptions extends Omit<MissionSourcePa
   task?: string;
   nonGoals?: string[];
   forceRebuild?: boolean;
+  approvalMode?: MissionPlanningApprovalMode;
+  approvedBy?: string;
+  replanReason?: string;
 }
 
 function nowIso(): string {
@@ -267,6 +298,8 @@ export function missionOrchestrationArtifactPaths(missionRoot: string): MissionO
     acceptanceContractPath: join(missionRoot, 'acceptance-contract.json'),
     executionPlanPath: join(missionRoot, 'execution-plan.md'),
     executionPlanStatePath: join(missionRoot, 'execution-plan.json'),
+    planningTransactionPath: join(missionRoot, 'planning-transaction.json'),
+    planningTransactionsDir: join(missionRoot, 'planning-transactions'),
     closeoutPath: join(missionRoot, 'closeout.md'),
     closeoutStatePath: join(missionRoot, 'closeout.json'),
   };
@@ -561,6 +594,47 @@ export function buildMissionExecutionPlan(
   };
 }
 
+export function buildMissionPlanningTransaction(
+  executionPlan: MissionExecutionPlan,
+  options: PrepareMissionOrchestrationOptions = {},
+  previous?: MissionPlanningTransaction | null,
+): MissionPlanningTransaction {
+  const status: MissionPlanningTransactionStatus = executionPlan.status === 'blocked' ? 'blocked' : 'approved';
+  const approvalMode: MissionPlanningApprovalMode =
+    status === 'blocked'
+      ? 'needs_clarification'
+      : options.approvalMode
+        ?? (previous && previous.plan_id === executionPlan.plan_id && previous.plan_revision === executionPlan.plan_revision
+          ? 'carry_forward'
+          : 'auto_policy');
+  const generatedAt = nowIso();
+  const planRunId = `plan-run:${hashValue(JSON.stringify({
+    plan_id: executionPlan.plan_id,
+    plan_revision: executionPlan.plan_revision,
+    strategy_key: executionPlan.strategy_key,
+  }))}`;
+  return {
+    schema_version: MISSION_V2_ARTIFACT_VERSION,
+    generated_at: generatedAt,
+    plan_run_id: planRunId,
+    plan_id: executionPlan.plan_id,
+    plan_revision: executionPlan.plan_revision,
+    status,
+    approval_mode: approvalMode,
+    approved_at: status === 'approved' ? (options.approvedBy === null ? null : (previous?.approved_at ?? executionPlan.approved_at ?? generatedAt)) : null,
+    approved_by: status === 'approved' ? (options.approvedBy ?? previous?.approved_by ?? 'mission-auto-policy') : null,
+    previous_plan_run_id: previous?.plan_run_id ?? null,
+    superseded_by: null,
+    replan_reason: previous && previous.plan_id !== executionPlan.plan_id
+      ? (options.replanReason ?? 'execution plan changed')
+      : null,
+    strategy_key: executionPlan.strategy_key,
+    planning_mode: executionPlan.planning_mode,
+    handoff_surface: executionPlan.handoff_surface,
+    blocking_reason: executionPlan.blocking_reason,
+  };
+}
+
 function formatMissionBriefMarkdown(brief: MissionBrief): string {
   return [
     '# Mission Brief',
@@ -666,12 +740,15 @@ async function writeMissionOrchestrationArtifacts(
 ): Promise<MissionOrchestrationArtifactPaths> {
   const paths = missionOrchestrationArtifactPaths(missionRoot);
   await mkdir(missionRoot, { recursive: true });
+  await mkdir(paths.planningTransactionsDir, { recursive: true });
   await writeJson(paths.sourcePackPath, artifacts.sourcePack);
   await writeJson(paths.missionBriefStatePath, artifacts.brief);
   await writeAtomic(paths.missionBriefPath, `${formatMissionBriefMarkdown(artifacts.brief)}\n`);
   await writeJson(paths.acceptanceContractPath, artifacts.acceptanceContract);
   await writeJson(paths.executionPlanStatePath, artifacts.executionPlan);
   await writeAtomic(paths.executionPlanPath, `${formatMissionExecutionPlanMarkdown(artifacts.executionPlan)}\n`);
+  await writeJson(paths.planningTransactionPath, artifacts.planningTransaction);
+  await writeJson(join(paths.planningTransactionsDir, `${artifacts.planningTransaction.plan_run_id}.json`), artifacts.planningTransaction);
   return paths;
 }
 
@@ -684,6 +761,7 @@ export async function loadMissionOrchestrationArtifacts(
     || !existsSync(paths.missionBriefStatePath)
     || !existsSync(paths.acceptanceContractPath)
     || !existsSync(paths.executionPlanStatePath)
+    || !existsSync(paths.planningTransactionPath)
   ) {
     return null;
   }
@@ -693,6 +771,7 @@ export async function loadMissionOrchestrationArtifacts(
     brief: await readJson<MissionBrief>(paths.missionBriefStatePath),
     acceptanceContract: await readJson<MissionAcceptanceContract>(paths.acceptanceContractPath),
     executionPlan: await readJson<MissionExecutionPlan>(paths.executionPlanStatePath),
+    planningTransaction: await readJson<MissionPlanningTransaction>(paths.planningTransactionPath),
   };
 }
 
@@ -737,13 +816,33 @@ export async function prepareMissionOrchestrationArtifacts(
     options,
     existing?.executionPlan ?? null,
   );
+  const planningTransaction = buildMissionPlanningTransaction(
+    executionPlan,
+    options,
+    existing?.planningTransaction ?? null,
+  );
   const artifacts = {
     sourcePack,
     brief,
     acceptanceContract,
     executionPlan,
+    planningTransaction,
   };
   const paths = await writeMissionOrchestrationArtifacts(mission.mission_root, artifacts);
+  if (
+    existing?.planningTransaction
+    && existing.planningTransaction.plan_run_id !== planningTransaction.plan_run_id
+  ) {
+    const supersededTransaction: MissionPlanningTransaction = {
+      ...existing.planningTransaction,
+      status: 'superseded',
+      superseded_by: planningTransaction.plan_run_id,
+    };
+    await writeJson(
+      join(paths.planningTransactionsDir, `${existing.planningTransaction.plan_run_id}.json`),
+      supersededTransaction,
+    );
+  }
   return {
     artifacts,
     paths,
@@ -751,7 +850,9 @@ export async function prepareMissionOrchestrationArtifacts(
       sourcePack: stableJson(existing?.sourcePack ?? null) !== stableJson(sourcePack),
       brief: stableJson(existing?.brief ?? null) !== stableJson(brief),
       acceptanceContract: stableJson(existing?.acceptanceContract ?? null) !== stableJson(acceptanceContract),
-      executionPlan: stableJson(existing?.executionPlan ?? null) !== stableJson(executionPlan),
+      executionPlan:
+        stableJson(existing?.executionPlan ?? null) !== stableJson(executionPlan)
+        || stableJson(existing?.planningTransaction ?? null) !== stableJson(planningTransaction),
     },
   };
 }
