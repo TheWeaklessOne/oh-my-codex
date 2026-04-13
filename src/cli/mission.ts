@@ -2,14 +2,20 @@ import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { MissionRequirementSourceInput } from '../mission/orchestration.js';
+import { loadMission } from '../mission/kernel.js';
+import {
+  missionOrchestrationArtifactPaths,
+  type MissionRequirementSourceInput,
+} from '../mission/orchestration.js';
 import { prepareMissionRuntime, type PreparedMissionRuntime } from '../mission/runtime.js';
+import { loadMissionWorkflow } from '../mission/workflow.js';
 
 export const MISSION_HELP = `omx mission - Launch Codex with mission supervisor mode active
 
 Usage:
   omx mission [mission goal text...]
   omx mission [--source REF] [--source-file PATH] [--constraint TEXT] [--unknown TEXT] [--touchpoint PATH] [--desired-outcome TEXT] [--high-risk] [mission goal text...]
+  omx mission inspect <slug>
   omx mission --help
 
 Behavior:
@@ -23,6 +29,7 @@ Behavior:
 Examples:
   omx mission "Audit the auth flow until a fresh re-audit reports PASS"
   omx mission --source-file docs/spec.md --touchpoint src/mission/runtime.ts "Close Mission V2 gaps"
+  omx mission inspect demo
   omx mission "Close onboarding reliability gaps without adding new CLI surface area"
 `;
 
@@ -317,6 +324,60 @@ interface MissionCommandDependencies {
   launchWithHud?: (args: string[]) => Promise<void>;
   writeAppendixFile?: (cwd: string, task: string, runtime: PreparedMissionRuntime | null) => Promise<string>;
   bootstrapMission?: (cwd: string, parsed: MissionCliParseResult) => Promise<PreparedMissionRuntime>;
+  print?: (message: string) => void;
+}
+
+interface MissionInspectView {
+  slug: string;
+  status: string;
+  currentIteration: number;
+  latestVerdict: string;
+  currentStage: string | null;
+  planId: string | null;
+  planRunId: string | null;
+  artifactRoles: Array<{ path: string; role: 'authoritative' | 'append_only' | 'canonical' | 'derived' }>;
+}
+
+function formatMissionInspectView(view: MissionInspectView): string {
+  const lines = [
+    `Mission: ${view.slug}`,
+    `Status: ${view.status}`,
+    `Current iteration: ${view.currentIteration}`,
+    `Latest verdict: ${view.latestVerdict}`,
+    `Current stage: ${view.currentStage ?? '(none)'}`,
+    `Plan ID: ${view.planId ?? '(none)'}`,
+    `Plan run: ${view.planRunId ?? '(none)'}`,
+    '',
+    'Artifacts:',
+    ...view.artifactRoles.map((artifact) => `- [${artifact.role}] ${artifact.path}`),
+  ];
+  return lines.join('\n');
+}
+
+async function buildMissionInspectView(cwd: string, slug: string): Promise<MissionInspectView> {
+  const repoRoot = tryResolveRepoRoot(cwd);
+  const mission = await loadMission(repoRoot, slug);
+  const artifactPaths = missionOrchestrationArtifactPaths(mission.mission_root);
+  const workflow = await loadMissionWorkflow(mission.mission_root);
+  return {
+    slug: mission.slug,
+    status: mission.status,
+    currentIteration: mission.current_iteration,
+    latestVerdict: mission.latest_verdict,
+    currentStage: workflow?.current_stage ?? null,
+    planId: workflow?.plan_id ?? null,
+    planRunId: workflow?.plan_run_id ?? null,
+    artifactRoles: [
+      { path: join(mission.mission_root, 'mission.json'), role: 'authoritative' },
+      { path: join(mission.mission_root, 'latest.json'), role: 'derived' },
+      { path: join(mission.mission_root, 'events.ndjson'), role: 'append_only' },
+      { path: artifactPaths.planningTransactionPath, role: 'canonical' },
+      { path: join(mission.mission_root, 'workflow.json'), role: 'derived' },
+      { path: artifactPaths.runMetricsPath, role: 'derived' },
+      { path: artifactPaths.watchdogPath, role: 'derived' },
+      { path: artifactPaths.closeoutStatePath, role: 'derived' },
+    ],
+  };
 }
 
 export async function missionCommand(
@@ -325,6 +386,15 @@ export async function missionCommand(
 ): Promise<void> {
   if (args[0] === '--help' || args[0] === '-h' || args[0] === 'help') {
     console.log(MISSION_HELP);
+    return;
+  }
+  if (args[0] === 'inspect') {
+    const slug = args[1]?.trim();
+    if (!slug) {
+      throw new Error(`mission inspect requires <slug>.\n${MISSION_HELP}`);
+    }
+    const view = await buildMissionInspectView(process.cwd(), slug);
+    (dependencies.print ?? console.log)(formatMissionInspectView(view));
     return;
   }
 

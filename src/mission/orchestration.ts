@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename } from 'node:fs/promises';
 import { join, relative } from 'node:path';
 import type {
   MissionConfidence,
@@ -245,6 +245,7 @@ export interface MissionOrchestrationArtifactPaths {
   executionPlanStatePath: string;
   planningTransactionPath: string;
   planningTransactionsDir: string;
+  planningTransactionsArchiveDir: string;
   budgetPath: string;
   runMetricsPath: string;
   watchdogPath: string;
@@ -374,6 +375,7 @@ export function missionOrchestrationArtifactPaths(missionRoot: string): MissionO
     executionPlanStatePath: join(missionRoot, 'execution-plan.json'),
     planningTransactionPath: join(missionRoot, 'planning-transaction.json'),
     planningTransactionsDir: join(missionRoot, 'planning-transactions'),
+    planningTransactionsArchiveDir: join(missionRoot, 'archive', 'planning-transactions'),
     budgetPath: join(missionRoot, 'budget.json'),
     runMetricsPath: join(missionRoot, 'run-metrics.json'),
     watchdogPath: join(missionRoot, 'watchdog.json'),
@@ -845,6 +847,7 @@ async function writeMissionOrchestrationArtifacts(
   const paths = missionOrchestrationArtifactPaths(missionRoot);
   await mkdir(missionRoot, { recursive: true });
   await mkdir(paths.planningTransactionsDir, { recursive: true });
+  await mkdir(paths.planningTransactionsArchiveDir, { recursive: true });
   await writeJson(paths.sourcePackPath, artifacts.sourcePack);
   await writeJson(paths.missionBriefStatePath, artifacts.brief);
   await writeAtomic(paths.missionBriefPath, `${formatMissionBriefMarkdown(artifacts.brief)}\n`);
@@ -854,6 +857,24 @@ async function writeMissionOrchestrationArtifacts(
   await writeJson(paths.planningTransactionPath, artifacts.planningTransaction);
   await writeJson(join(paths.planningTransactionsDir, `${artifacts.planningTransaction.plan_run_id}.json`), artifacts.planningTransaction);
   return paths;
+}
+
+async function archiveSupersededPlanningTransactions(
+  paths: MissionOrchestrationArtifactPaths,
+  activePlanRunId: string,
+): Promise<void> {
+  if (!existsSync(paths.planningTransactionsDir)) return;
+  await mkdir(paths.planningTransactionsArchiveDir, { recursive: true });
+  const entries = await readdir(paths.planningTransactionsDir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    const filePath = join(paths.planningTransactionsDir, entry.name);
+    const tx = await readJson<MissionPlanningTransaction>(filePath);
+    if (tx.plan_run_id === activePlanRunId) continue;
+    if (tx.status !== 'superseded') continue;
+    const targetPath = join(paths.planningTransactionsArchiveDir, entry.name);
+    await rename(filePath, targetPath);
+  }
 }
 
 export async function loadMissionOrchestrationArtifacts(
@@ -947,6 +968,7 @@ export async function prepareMissionOrchestrationArtifacts(
       supersededTransaction,
     );
   }
+  await archiveSupersededPlanningTransactions(paths, planningTransaction.plan_run_id);
   return {
     artifacts,
     paths,

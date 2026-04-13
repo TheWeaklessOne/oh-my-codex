@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -10,6 +11,7 @@ import {
   buildMissionSourcePack,
   compileMissionAcceptanceContract,
   compileMissionBrief,
+  missionOrchestrationArtifactPaths,
   isMissionSourceStale,
   prepareMissionOrchestrationArtifacts,
 } from '../orchestration.js';
@@ -208,6 +210,9 @@ describe('mission orchestration artifacts', () => {
       assert.equal(second.artifacts.executionPlan.previous_plan_id, first.artifacts.executionPlan.plan_id);
       assert.equal(second.changed.acceptanceContract, true);
       assert.equal(second.changed.executionPlan, true);
+      const paths = missionOrchestrationArtifactPaths(mission.mission_root);
+      assert.equal(existsSync(join(paths.planningTransactionsDir, `${first.artifacts.planningTransaction.plan_run_id}.json`)), false);
+      assert.equal(existsSync(join(paths.planningTransactionsArchiveDir, `${first.artifacts.planningTransaction.plan_run_id}.json`)), true);
     } finally {
       await rm(repo, { recursive: true, force: true });
     }
