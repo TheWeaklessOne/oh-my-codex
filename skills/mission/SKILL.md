@@ -20,11 +20,12 @@ Use it when the user wants OMX to keep iterating until an **independent audit/re
 - **Fresh lanes**: audit and re-audit must run in fresh OMX sessions/lane identities; they must not reuse the execution lane context.
 - **Kernel owns truth**: lifecycle transitions, iteration bookkeeping, delta judgment, plateau detection, resume, cancel, and latest-read-model updates live in `src/mission/kernel.ts`.
 - **Contract-first artifacts**: mission state persists under `.omx/missions/<slug>/` with:
+  - `events.ndjson` as the append-only mission audit trail
   - `source-pack.json`
   - `mission-brief.md`
   - `acceptance-contract.json`
   - `execution-plan.md`
-  - `workflow.json` (Mission V2 stage + strategy history above the kernel)
+  - `workflow.json` (derived Mission V2 stage + strategy history read model)
   - `mission.json`
   - `latest.json` (read model only; never authoritative)
   - `iterations/<n>/{audit,remediation,execution,re_audit}/summary.json`
