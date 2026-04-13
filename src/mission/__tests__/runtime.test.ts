@@ -37,6 +37,7 @@ function laneSummary(
 	laneType: "audit" | "re_audit",
 	iteration: number,
 	verdict: "PASS" | "PARTIAL",
+	runToken?: string,
 ): MissionLaneSummaryInput {
 	return {
 		verdict,
@@ -67,8 +68,19 @@ function laneSummary(
 			parent_iteration: iteration,
 			trigger_reason: `${laneType} stage`,
 			read_only: true,
+			run_token: runToken,
 		},
 	};
+}
+
+function verifierRunToken(
+	runtime: Awaited<ReturnType<typeof prepareMissionRuntime>>,
+	laneType: "audit" | "re_audit",
+): string {
+	const token =
+		runtime.lanePlans[laneType]?.executionEnvelope.provenance_binding_token;
+	if (!token) throw new Error(`missing verifier token for ${laneType}`);
+	return token;
 }
 
 describe("mission runtime", () => {
@@ -223,7 +235,7 @@ describe("mission runtime", () => {
 				repo,
 				"demo",
 				"audit",
-				laneSummary("audit", 1, "PARTIAL"),
+				laneSummary("audit", 1, "PARTIAL", verifierRunToken(runtime, "audit")),
 			);
 			assert.equal(written.status, "written");
 
@@ -267,7 +279,12 @@ describe("mission runtime", () => {
 				repo,
 				"demo",
 				"re_audit",
-				laneSummary("re_audit", 1, "PASS"),
+				laneSummary(
+					"re_audit",
+					1,
+					"PASS",
+					verifierRunToken(runtime, "re_audit"),
+				),
 			);
 			const committed = await commitMissionRuntimeIteration(repo, "demo", {
 				iteration_commit_succeeded: true,
@@ -297,7 +314,7 @@ describe("mission runtime", () => {
 	it("keeps the mission running when the re-audit lane reuses execution provenance", async () => {
 		const repo = await initRepo();
 		try {
-			await prepareMissionRuntime({
+			const runtime = await prepareMissionRuntime({
 				repoRoot: repo,
 				slug: "demo",
 				targetFingerprint: "repo:demo",
@@ -307,7 +324,7 @@ describe("mission runtime", () => {
 				repo,
 				"demo",
 				"audit",
-				laneSummary("audit", 1, "PASS"),
+				laneSummary("audit", 1, "PASS", verifierRunToken(runtime, "audit")),
 			);
 			await recordMissionRuntimeLaneSummary(repo, "demo", "remediation", {
 				verdict: "PASS",
@@ -346,9 +363,19 @@ describe("mission runtime", () => {
 				},
 			});
 			await recordMissionRuntimeLaneSummary(repo, "demo", "re_audit", {
-				...laneSummary("re_audit", 1, "PASS"),
+				...laneSummary(
+					"re_audit",
+					1,
+					"PASS",
+					verifierRunToken(runtime, "re_audit"),
+				),
 				provenance: {
-					...laneSummary("re_audit", 1, "PASS").provenance,
+					...laneSummary(
+						"re_audit",
+						1,
+						"PASS",
+						verifierRunToken(runtime, "re_audit"),
+					).provenance,
 					session_id: "execution-session-1",
 					lane_id: "execution-lane-1",
 				},
@@ -380,9 +407,19 @@ describe("mission runtime", () => {
 			});
 
 			await recordMissionRuntimeLaneSummary(repo, "demo", "audit", {
-				...laneSummary("audit", 1, "PARTIAL"),
+				...laneSummary(
+					"audit",
+					1,
+					"PARTIAL",
+					verifierRunToken(runtime, "audit"),
+				),
 				provenance: {
-					...laneSummary("audit", 1, "PARTIAL").provenance,
+					...laneSummary(
+						"audit",
+						1,
+						"PARTIAL",
+						verifierRunToken(runtime, "audit"),
+					).provenance,
 					session_id: "audit-session-fresh",
 					lane_id: "audit-lane-fresh",
 				},
@@ -406,9 +443,19 @@ describe("mission runtime", () => {
 				},
 			});
 			await recordMissionRuntimeLaneSummary(repo, "demo", "re_audit", {
-				...laneSummary("re_audit", 1, "PASS"),
+				...laneSummary(
+					"re_audit",
+					1,
+					"PASS",
+					verifierRunToken(runtime, "re_audit"),
+				),
 				provenance: {
-					...laneSummary("re_audit", 1, "PASS").provenance,
+					...laneSummary(
+						"re_audit",
+						1,
+						"PASS",
+						verifierRunToken(runtime, "re_audit"),
+					).provenance,
 					session_id: "re-audit-session-fresh",
 					lane_id: "re-audit-lane-fresh",
 				},
@@ -464,7 +511,7 @@ describe("mission runtime", () => {
 	it("ignores duplicate or late lane summaries after runtime cancellation", async () => {
 		const repo = await initRepo();
 		try {
-			await prepareMissionRuntime({
+			const runtime = await prepareMissionRuntime({
 				repoRoot: repo,
 				slug: "demo",
 				targetFingerprint: "repo:demo",
@@ -474,13 +521,13 @@ describe("mission runtime", () => {
 				repo,
 				"demo",
 				"audit",
-				laneSummary("audit", 1, "PARTIAL"),
+				laneSummary("audit", 1, "PARTIAL", verifierRunToken(runtime, "audit")),
 			);
 			const duplicate = await recordMissionRuntimeLaneSummary(
 				repo,
 				"demo",
 				"audit",
-				laneSummary("audit", 1, "PARTIAL"),
+				laneSummary("audit", 1, "PARTIAL", verifierRunToken(runtime, "audit")),
 			);
 			assert.equal(first.status, "written");
 			assert.equal(duplicate.status, "duplicate");
@@ -496,7 +543,12 @@ describe("mission runtime", () => {
 				repo,
 				"demo",
 				"re_audit",
-				laneSummary("re_audit", 1, "PASS"),
+				laneSummary(
+					"re_audit",
+					1,
+					"PASS",
+					verifierRunToken(runtime, "re_audit"),
+				),
 			);
 			assert.equal(late.status, "ignored");
 			assert.equal(late.reason, "cancelled");

@@ -27,12 +27,13 @@ The skill layer may shape UX and summaries, but it must not become the source of
 
 Mission V2 may add orchestration artifacts such as append-only `events.ndjson`,
 `source-pack.json`, `mission-brief.md`, `acceptance-contract.json`, `execution-plan.md`,
-canonical `planning-transaction.json`, derived `workflow.json`, lane `briefing.md` files,
-`budget.json`, `run-metrics.json`, `watchdog.json`, and terminal `closeout.md` packages
-under `.omx/missions/<slug>/`. Those artifacts are supportive context for source
-grounding, planning handoff, verifier guidance, stage tracking, recovery, planning
-provenance, and runtime observability; they do **not** supersede the kernel-owned
-lifecycle, lane-summary, delta, or closure semantics described below.
+canonical `planning-transaction.json`, derived `workflow.json`, lane `briefing.md`,
+lane `execution-envelope.json`, `budget.json`, `run-metrics.json`, `watchdog.json`,
+and terminal `closeout.md` packages under `.omx/missions/<slug>/`. Those artifacts are
+supportive context for source grounding, planning handoff, verifier guidance, stage
+tracking, recovery, planning provenance, runtime observability, and lane isolation; they
+do **not** supersede the kernel-owned lifecycle, lane-summary, delta, or closure
+semantics described below.
 
 ## Atomic write rules
 
