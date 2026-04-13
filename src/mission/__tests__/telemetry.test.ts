@@ -36,7 +36,7 @@ async function initRepo(): Promise<string> {
 	return cwd;
 }
 
-function auditSummary(iteration: number): MissionLaneSummaryInput {
+function auditSummary(iteration: number, runToken?: string): MissionLaneSummaryInput {
 	return {
 		verdict: "PARTIAL",
 		confidence: "high",
@@ -60,6 +60,7 @@ function auditSummary(iteration: number): MissionLaneSummaryInput {
 			parent_iteration: iteration,
 			trigger_reason: "audit stage",
 			read_only: true,
+			run_token: runToken,
 		},
 	};
 }
@@ -130,7 +131,10 @@ describe("mission telemetry", () => {
 				repo,
 				"demo",
 				"audit",
-				auditSummary(1),
+				auditSummary(
+					1,
+					runtime.lanePlans.audit?.executionEnvelope.provenance_binding_token,
+				),
 			);
 
 			const mission = await loadMission(repo, "demo");

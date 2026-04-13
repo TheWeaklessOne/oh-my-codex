@@ -14,6 +14,12 @@ import {
 	ensureMissionBootstrapEvent,
 } from "./events.js";
 import {
+	loadMissionLaneExecutionEnvelope,
+	missionLaneExecutionEnvelopePath,
+	prepareMissionLaneExecutionEnvelopes,
+	type MissionLaneExecutionEnvelope,
+} from "./isolation.js";
+import {
 	type CommitIterationResult,
 	cancelMission,
 	commitIteration,
@@ -53,6 +59,8 @@ export interface MissionLaneRuntimePlan {
 	missionBriefPath: string;
 	acceptanceContractPath: string;
 	executionPlanPath: string;
+	executionEnvelopePath: string;
+	executionEnvelope: MissionLaneExecutionEnvelope;
 	rationale: string;
 }
 
@@ -147,8 +155,10 @@ async function loadArtifactsForMission(mission: MissionState): Promise<{
 }
 
 function buildLanePlans(
+	missionRoot: string,
 	iteration: MissionIterationHandle,
 	artifactPaths: MissionOrchestrationArtifactPaths,
+	envelopes: Record<MissionLaneType, MissionLaneExecutionEnvelope>,
 ): Record<MissionLaneType, MissionLaneRuntimePlan> {
 	return Object.fromEntries(
 		MISSION_LANE_TYPES.map((laneType) => [
@@ -161,6 +171,12 @@ function buildLanePlans(
 				missionBriefPath: artifactPaths.missionBriefPath,
 				acceptanceContractPath: artifactPaths.acceptanceContractPath,
 				executionPlanPath: artifactPaths.executionPlanPath,
+				executionEnvelopePath: missionLaneExecutionEnvelopePath(
+					missionRoot,
+					iteration.iteration,
+					laneType,
+				),
+				executionEnvelope: envelopes[laneType],
 				...MISSION_LANE_POLICIES[laneType],
 			},
 		]),
@@ -257,7 +273,11 @@ export async function prepareMissionRuntime(
 		options.strategyKey ?? artifacts.executionPlan.strategy_key,
 	);
 	const nextMission = await loadMission(options.repoRoot, options.slug);
-	const lanePlans = buildLanePlans(iteration, paths);
+	const envelopes = await prepareMissionLaneExecutionEnvelopes(
+		nextMission,
+		iteration.iteration,
+	);
+	const lanePlans = buildLanePlans(nextMission.mission_root, iteration, paths, envelopes);
 	await writeMissionLaneBriefings(iteration.laneDirs, artifacts, paths);
 	if (lifecycleSeedNeeded || !iteration.resumed) {
 		await syncMissionWorkflow({
@@ -306,6 +326,19 @@ export async function recordMissionRuntimeLaneSummary(
 ): Promise<MissionRecordLaneResult> {
 	const mission = await loadMission(repoRoot, slug);
 	const artifacts = await loadArtifactsForMission(mission);
+	const envelope = await loadMissionLaneExecutionEnvelope(
+		mission.mission_root,
+		iteration ?? mission.current_iteration,
+		laneType,
+	);
+	if (
+		envelope.read_only_enforced &&
+		summaryInput.provenance.run_token !== envelope.provenance_binding_token
+	) {
+		throw new Error(
+			`lane_provenance_token_mismatch:${laneType}:${iteration ?? mission.current_iteration}`,
+		);
+	}
 	const result = await recordLaneSummary(
 		repoRoot,
 		slug,

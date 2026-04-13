@@ -40,6 +40,7 @@ function laneSummary(
 	laneType: "audit" | "re_audit",
 	iteration: number,
 	verdict: "PASS" | "PARTIAL",
+	runToken?: string,
 ): MissionLaneSummaryInput {
 	return {
 		verdict,
@@ -68,6 +69,7 @@ function laneSummary(
 			parent_iteration: iteration,
 			trigger_reason: `${laneType} stage`,
 			read_only: true,
+			run_token: runToken,
 		},
 	};
 }
@@ -118,7 +120,12 @@ describe("mission workflow state", () => {
 				repo,
 				"demo",
 				"audit",
-				laneSummary("audit", 1, "PARTIAL"),
+				laneSummary(
+					"audit",
+					1,
+					"PARTIAL",
+					runtime.lanePlans.audit?.executionEnvelope.provenance_binding_token,
+				),
 			);
 			workflow = await loadMissionWorkflow(runtime.missionRoot);
 			assert.equal(workflow?.current_stage, "execution-loop");
@@ -164,7 +171,12 @@ describe("mission workflow state", () => {
 				repo,
 				"demo",
 				"re_audit",
-				laneSummary("re_audit", 1, "PASS"),
+				laneSummary(
+					"re_audit",
+					1,
+					"PASS",
+					runtime.lanePlans.re_audit?.executionEnvelope.provenance_binding_token,
+				),
 			);
 			const committed = await commitMissionRuntimeIteration(repo, "demo", {
 				iteration_commit_succeeded: true,
