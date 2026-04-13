@@ -86,21 +86,48 @@ async function collectMissionRequirementSources(
   bootstrap: MissionCliParseResult['bootstrap'],
 ): Promise<MissionRequirementSourceInput[]> {
   const sources: MissionRequirementSourceInput[] = [];
+  const collectedAt = new Date().toISOString();
+  const repoRoot = tryResolveRepoRoot(cwd);
 
   for (const ref of bootstrap.sourceRefs) {
+    const content = `Mission source reference: ${ref}`;
     sources.push({
       kind: inferSourceKind(ref),
       title: `External source: ${ref}`,
-      content: `Mission source reference: ${ref}`,
+      content,
       refs: [ref],
       origin: 'external',
       adapter: 'cli-ref',
+      sourceUri: ref,
+      fetchedAt: collectedAt,
+      contentHash: `content:${hashValue(content)}`,
+      retrievalStatus: 'captured',
+      freshnessTtlSeconds: 3600,
+      trustLevel: 'medium',
     });
   }
 
   for (const file of bootstrap.sourceFiles) {
     const filePath = join(cwd, file);
-    if (!existsSync(filePath)) continue;
+    if (!existsSync(filePath)) {
+      const content = `Mission source file unavailable: ${file}`;
+      sources.push({
+        kind: inferSourceKind(file),
+        title: `File source: ${file}`,
+        content,
+        refs: [file],
+        origin: 'internal',
+        adapter: 'cli-file',
+        sourceUri: `file://${filePath}`,
+        fetchedAt: collectedAt,
+        contentHash: `content:${hashValue(content)}`,
+        retrievalStatus: 'partial_failure',
+        freshnessTtlSeconds: 300,
+        trustLevel: 'low',
+        partialFailureReason: `Source file not found at launch: ${file}`,
+      });
+      continue;
+    }
     const content = await readFile(filePath, 'utf-8');
     sources.push({
       kind: inferSourceKind(file),
@@ -109,6 +136,12 @@ async function collectMissionRequirementSources(
       refs: [file],
       origin: 'internal',
       adapter: 'cli-file',
+      sourceUri: `file://${filePath}`,
+      fetchedAt: collectedAt,
+      contentHash: `content:${hashValue(content)}`,
+      retrievalStatus: 'captured',
+      freshnessTtlSeconds: 300,
+      trustLevel: 'high',
     });
   }
 
@@ -132,6 +165,12 @@ async function collectMissionRequirementSources(
       refs: [],
       origin: 'internal',
       adapter: 'repo-evidence',
+      sourceUri: `repo://${repoRoot || cwd}`,
+      fetchedAt: collectedAt,
+      contentHash: `content:${hashValue(`Branch: ${branch || '(detached)'}\n${status || 'clean working tree'}`)}`,
+      retrievalStatus: 'captured',
+      freshnessTtlSeconds: 120,
+      trustLevel: 'high',
     });
   } catch {
     // Ignore non-git directories; prompt/task sources still bootstrap the mission.
