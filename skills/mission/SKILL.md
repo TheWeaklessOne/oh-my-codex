@@ -25,6 +25,7 @@ Use it when the user wants OMX to keep iterating until an **independent audit/re
   - `mission-brief.md`
   - `acceptance-contract.json`
   - `execution-plan.md`
+  - `planning-transaction.json` as the canonical planning transaction record
   - `workflow.json` (derived Mission V2 stage + strategy history read model)
   - `mission.json`
   - `latest.json` (read model only; never authoritative)
