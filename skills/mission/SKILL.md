@@ -30,6 +30,7 @@ Use it when the user wants OMX to keep iterating until an **independent audit/re
   - `budget.json`, `run-metrics.json`, and `watchdog.json` for runtime telemetry / expensive-failure controls
   - `iterations/<n>/*/execution-envelope.json` for lane workspace / write-policy / provenance binding
   - `mission.json`
+  - read models should be rebuildable from `mission.json` + `events.ndjson`; snapshots are not authoritative
   - `latest.json` (read model only; never authoritative)
   - `iterations/<n>/{audit,remediation,execution,re_audit}/summary.json`
   - `iterations/<n>/*/briefing.md` lane-specific handoff context derived from the contract/plan

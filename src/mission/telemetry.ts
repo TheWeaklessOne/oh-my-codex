@@ -265,3 +265,30 @@ export async function syncMissionTelemetry(
 
 	return { policy, metrics, watchdog };
 }
+
+export async function reconcileMissionTelemetry(
+	mission: MissionState,
+	paths: MissionOrchestrationArtifactPaths = missionOrchestrationArtifactPaths(
+		mission.mission_root,
+	),
+): Promise<{
+	policy: MissionBudgetPolicy;
+	metrics: MissionRunMetrics;
+	watchdog: MissionWatchdogDecision;
+	driftDetected: boolean;
+}> {
+	const existingMetrics = existsSync(paths.runMetricsPath)
+		? await readJson<MissionRunMetrics>(paths.runMetricsPath)
+		: null;
+	const existingWatchdog = existsSync(paths.watchdogPath)
+		? await readJson<MissionWatchdogDecision>(paths.watchdogPath)
+		: null;
+	const synced = await syncMissionTelemetry(mission, paths);
+	const driftDetected =
+		JSON.stringify(existingMetrics) !== JSON.stringify(synced.metrics)
+		|| JSON.stringify(existingWatchdog) !== JSON.stringify(synced.watchdog);
+	return {
+		...synced,
+		driftDetected,
+	};
+}
