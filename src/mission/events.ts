@@ -21,6 +21,7 @@ export const MISSION_EVENT_TYPES = [
 	"iteration_committed",
 	"mission_cancel_requested",
 	"watchdog_decision_recorded",
+	"read_models_recovered",
 	"closeout_generated",
 ] as const;
 export type MissionEventType = (typeof MISSION_EVENT_TYPES)[number];
@@ -145,6 +146,14 @@ export type MissionEvent =
 				path: string;
 				decision: string;
 				reasons: string[];
+			}
+	  >
+	| MissionEventBase<
+			"read_models_recovered",
+			{
+				workflow_drift: boolean;
+				telemetry_drift: boolean;
+				closeout_drift: boolean;
 			}
 	  >
 	| MissionEventBase<
@@ -428,6 +437,28 @@ export async function appendMissionWatchdogDecisionEvent(
 			path: watchdogPath,
 			decision: watchdog.decision,
 			reasons: watchdog.reasons,
+		},
+	});
+}
+
+export async function appendMissionReadModelsRecoveredEvent(
+	mission: MissionState,
+	drift: {
+		workflow: boolean;
+		telemetry: boolean;
+		closeout: boolean;
+	},
+): Promise<void> {
+	await appendMissionEvent(mission.mission_root, {
+		schema_version: 1,
+		event_type: "read_models_recovered",
+		mission_id: mission.mission_id,
+		slug: mission.slug,
+		recorded_at: nowIso(),
+		payload: {
+			workflow_drift: drift.workflow,
+			telemetry_drift: drift.telemetry,
+			closeout_drift: drift.closeout,
 		},
 	});
 }

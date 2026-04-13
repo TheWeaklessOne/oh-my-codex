@@ -1094,3 +1094,18 @@ export async function syncMissionCloseout(mission: MissionState): Promise<Missio
   await writeAtomic(paths.closeoutPath, `${formatMissionCloseoutMarkdown(closeout)}\n`);
   return closeout;
 }
+
+export async function reconcileMissionCloseout(mission: MissionState): Promise<{
+  closeout: MissionCloseout | null;
+  driftDetected: boolean;
+}> {
+  const paths = missionOrchestrationArtifactPaths(mission.mission_root);
+  const existing = existsSync(paths.closeoutStatePath)
+    ? await readJson<MissionCloseout>(paths.closeoutStatePath)
+    : null;
+  const closeout = await syncMissionCloseout(mission);
+  return {
+    closeout,
+    driftDetected: JSON.stringify(existing) !== JSON.stringify(closeout),
+  };
+}
