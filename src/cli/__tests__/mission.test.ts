@@ -125,7 +125,15 @@ describe('omx mission', () => {
           async launchWithHud() {
             const sourcePack = JSON.parse(await readFile(join(cwd, '.omx', 'missions', 'implement-mission-workflow', 'source-pack.json'), 'utf-8')) as {
               desired_outcome: string;
-              sources: Array<{ refs: string[]; content: string }>;
+              sources: Array<{
+                refs: string[];
+                content: string;
+                source_uri: string;
+                snapshot_id: string;
+                content_hash: string;
+                retrieval_status: string;
+                trust_level: string;
+              }>;
             };
             const workflow = JSON.parse(await readFile(join(cwd, '.omx', 'missions', 'implement-mission-workflow', 'workflow.json'), 'utf-8')) as {
               current_stage: string;
@@ -135,9 +143,43 @@ describe('omx mission', () => {
             assert.equal(sourcePack.desired_outcome, 'Ship Mission V2');
             assert.equal(sourcePack.sources.some((source) => source.refs.includes('requirements.md')), true);
             assert.equal(sourcePack.sources.some((source) => /Use file-backed requirements/i.test(source.content)), true);
+            assert.equal(sourcePack.sources.some((source) => source.source_uri.startsWith('file://')), true);
+            assert.equal(sourcePack.sources.every((source) => source.snapshot_id.startsWith('snapshot:')), true);
+            assert.equal(sourcePack.sources.every((source) => source.content_hash.startsWith('content:')), true);
+            assert.equal(sourcePack.sources.some((source) => source.retrieval_status === 'captured'), true);
+            assert.equal(sourcePack.sources.some((source) => source.trust_level === 'high'), true);
             assert.equal(workflow.current_stage, 'audit');
             assert.match(workflow.artifact_refs.mission_brief, /mission-brief\.md$/);
             assert.match(workflow.artifact_refs.execution_plan, /execution-plan\.md$/);
+          },
+        },
+      );
+    } finally {
+      process.chdir(originalCwd);
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('records partial source failures instead of silently dropping missing files', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-mission-missing-source-'));
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(cwd);
+      await missionCommand(
+        ['--source-file', 'missing-requirements.md', 'bootstrap', 'mission'],
+        {
+          async launchWithHud() {
+            const sourcePack = JSON.parse(await readFile(join(cwd, '.omx', 'missions', 'bootstrap-mission', 'source-pack.json'), 'utf-8')) as {
+              sources: Array<{
+                refs: string[];
+                retrieval_status: string;
+                partial_failure_reason: string | null;
+              }>;
+            };
+
+            assert.equal(sourcePack.sources.some((source) => source.refs.includes('missing-requirements.md')), true);
+            assert.equal(sourcePack.sources.some((source) => source.retrieval_status === 'partial_failure'), true);
+            assert.equal(sourcePack.sources.some((source) => /not found at launch/i.test(source.partial_failure_reason || '')), true);
           },
         },
       );

@@ -26,6 +26,12 @@ export const MISSION_SOURCE_KINDS = [
 ] as const;
 export type MissionSourceKind = (typeof MISSION_SOURCE_KINDS)[number];
 
+export const MISSION_SOURCE_RETRIEVAL_STATUSES = ['captured', 'partial_failure', 'unavailable'] as const;
+export type MissionSourceRetrievalStatus = (typeof MISSION_SOURCE_RETRIEVAL_STATUSES)[number];
+
+export const MISSION_SOURCE_TRUST_LEVELS = ['high', 'medium', 'low'] as const;
+export type MissionSourceTrustLevel = (typeof MISSION_SOURCE_TRUST_LEVELS)[number];
+
 export const MISSION_PLANNING_MODES = ['direct', 'ralplan', 'blocked'] as const;
 export type MissionPlanningMode = (typeof MISSION_PLANNING_MODES)[number];
 
@@ -43,6 +49,14 @@ export interface MissionRequirementSourceInput {
   metadata?: Record<string, string>;
   adapter?: string;
   origin?: 'prompt' | 'internal' | 'external';
+  sourceUri?: string;
+  snapshotId?: string;
+  fetchedAt?: string;
+  contentHash?: string;
+  retrievalStatus?: MissionSourceRetrievalStatus | string;
+  freshnessTtlSeconds?: number;
+  trustLevel?: MissionSourceTrustLevel | string;
+  partialFailureReason?: string;
 }
 
 export interface MissionSourcePackInput {
@@ -67,6 +81,14 @@ export interface MissionNormalizedSource {
   refs: string[];
   metadata: Record<string, string>;
   origin: 'prompt' | 'internal' | 'external';
+  source_uri: string;
+  snapshot_id: string;
+  fetched_at: string;
+  content_hash: string;
+  retrieval_status: MissionSourceRetrievalStatus;
+  freshness_ttl_seconds: number | null;
+  trust_level: MissionSourceTrustLevel;
+  partial_failure_reason: string | null;
 }
 
 export interface MissionSourcePack {
@@ -259,6 +281,50 @@ function normalizeSourceKind(kind: string | undefined): MissionSourceKind {
   return 'other';
 }
 
+function normalizeSourceRetrievalStatus(
+  status: string | undefined,
+  partialFailureReason?: string | null,
+): MissionSourceRetrievalStatus {
+  const normalized = normalizeWhitespace(String(status ?? '').toLowerCase()).replace(/[\s-]+/g, '_');
+  if (MISSION_SOURCE_RETRIEVAL_STATUSES.includes(normalized as MissionSourceRetrievalStatus)) {
+    return normalized as MissionSourceRetrievalStatus;
+  }
+  if (partialFailureReason) return 'partial_failure';
+  return 'captured';
+}
+
+function defaultTrustLevel(
+  origin: 'prompt' | 'internal' | 'external',
+  kind: MissionSourceKind,
+): MissionSourceTrustLevel {
+  if (origin === 'prompt') return 'high';
+  if (origin === 'internal' && ['spec', 'doc', 'repo_evidence', 'test_failure', 'runbook'].includes(kind)) return 'high';
+  if (origin === 'internal') return 'medium';
+  return kind === 'issue' ? 'medium' : 'low';
+}
+
+function normalizeSourceTrustLevel(
+  trustLevel: string | undefined,
+  origin: 'prompt' | 'internal' | 'external',
+  kind: MissionSourceKind,
+): MissionSourceTrustLevel {
+  const normalized = normalizeWhitespace(String(trustLevel ?? '').toLowerCase());
+  if (MISSION_SOURCE_TRUST_LEVELS.includes(normalized as MissionSourceTrustLevel)) {
+    return normalized as MissionSourceTrustLevel;
+  }
+  return defaultTrustLevel(origin, kind);
+}
+
+function normalizeFreshnessTtlSeconds(value: number | undefined): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return null;
+  return Math.floor(value);
+}
+
+function normalizeFetchedAt(value: string | undefined): string {
+  const date = value ? new Date(value) : new Date();
+  return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
+}
+
 function summarizeContent(content: string): string {
   const normalized = normalizeWhitespace(content);
   if (normalized.length <= 220) return normalized;
@@ -317,7 +383,16 @@ export function buildMissionSourcePack(input: MissionSourcePackInput): MissionSo
     : [{ kind: 'prompt', title: 'Prompt task', content: task, origin: 'prompt' as const }];
   const sources = sourcesInput.map((source, index) => {
     const kind = normalizeSourceKind(source.kind);
+    const origin = source.origin ?? (kind === 'prompt' ? 'prompt' : 'external');
     const content = normalizeWhitespace(source.content || task);
+    const partialFailureReason = normalizeWhitespace(source.partialFailureReason || '') || null;
+    const sourceUri = normalizeWhitespace(source.sourceUri || source.refs?.[0] || `${kind}:${index + 1}`);
+    const contentHash = source.contentHash || `content:${hashValue(content)}`;
+    const fetchedAt = normalizeFetchedAt(source.fetchedAt);
+    const retrievalStatus = normalizeSourceRetrievalStatus(source.retrievalStatus, partialFailureReason);
+    const freshnessTtlSeconds = normalizeFreshnessTtlSeconds(source.freshnessTtlSeconds);
+    const trustLevel = normalizeSourceTrustLevel(source.trustLevel, origin, kind);
+    const snapshotId = source.snapshotId || `snapshot:${hashValue(`${sourceUri}|${contentHash}`)}`;
     return {
       source_id: `source-${String(index + 1).padStart(2, '0')}`,
       kind,
@@ -327,7 +402,15 @@ export function buildMissionSourcePack(input: MissionSourcePackInput): MissionSo
       content,
       refs: normalizeList(source.refs),
       metadata: source.metadata ?? {},
-      origin: source.origin ?? (kind === 'prompt' ? 'prompt' : 'external'),
+      origin,
+      source_uri: sourceUri,
+      snapshot_id: snapshotId,
+      fetched_at: fetchedAt,
+      content_hash: contentHash,
+      retrieval_status: retrievalStatus,
+      freshness_ttl_seconds: freshnessTtlSeconds,
+      trust_level: trustLevel,
+      partial_failure_reason: partialFailureReason,
     };
   });
   const unknowns = normalizeList(input.unknowns);
@@ -347,6 +430,16 @@ export function buildMissionSourcePack(input: MissionSourcePackInput): MissionSo
     repo_context: input.repoContext ?? {},
     ambiguity,
   };
+}
+
+export function isMissionSourceStale(
+  source: MissionNormalizedSource,
+  now = new Date(),
+): boolean {
+  if (!source.freshness_ttl_seconds) return false;
+  const fetchedAt = new Date(source.fetched_at).getTime();
+  if (Number.isNaN(fetchedAt)) return false;
+  return fetchedAt + (source.freshness_ttl_seconds * 1000) < now.getTime();
 }
 
 export function compileMissionBrief(sourcePack: MissionSourcePack, nonGoals: readonly string[] = []): MissionBrief {

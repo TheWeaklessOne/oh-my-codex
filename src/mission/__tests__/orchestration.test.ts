@@ -10,6 +10,7 @@ import {
   buildMissionSourcePack,
   compileMissionAcceptanceContract,
   compileMissionBrief,
+  isMissionSourceStale,
   prepareMissionOrchestrationArtifacts,
 } from '../orchestration.js';
 import { createMission, loadMission } from '../kernel.js';
@@ -71,10 +72,42 @@ describe('mission orchestration artifacts', () => {
         ['spec', 'doc-adapter', 'internal'],
       ],
     );
+    assert.equal(sourcePack.sources.every((source) => typeof source.source_uri === 'string' && source.source_uri.length > 0), true);
+    assert.equal(sourcePack.sources.every((source) => source.snapshot_id.startsWith('snapshot:')), true);
+    assert.equal(sourcePack.sources.every((source) => source.content_hash.startsWith('content:')), true);
     assert.deepEqual(
       sourcePack.sources.map((source) => source.source_id),
       ['source-01', 'source-02'],
     );
+  });
+
+  it('keeps snapshot identity stable for unchanged sources and detects stale freshness windows', () => {
+    const first = buildMissionSourcePack({
+      task: 'Replay stable source pack',
+      requirementSources: [{
+        kind: 'spec',
+        title: 'Spec file',
+        sourceUri: 'file:///repo/spec.md',
+        content: 'Stable mission requirements',
+        fetchedAt: '2026-04-13T10:00:00.000Z',
+        freshnessTtlSeconds: 60,
+      }],
+    });
+    const second = buildMissionSourcePack({
+      task: 'Replay stable source pack',
+      requirementSources: [{
+        kind: 'spec',
+        title: 'Spec file',
+        sourceUri: 'file:///repo/spec.md',
+        content: 'Stable mission requirements',
+        fetchedAt: '2026-04-13T10:15:00.000Z',
+        freshnessTtlSeconds: 60,
+      }],
+    });
+
+    assert.equal(first.sources[0]?.snapshot_id, second.sources[0]?.snapshot_id);
+    assert.equal(isMissionSourceStale(first.sources[0]!, new Date('2026-04-13T10:00:30.000Z')), false);
+    assert.equal(isMissionSourceStale(first.sources[0]!, new Date('2026-04-13T10:02:00.000Z')), true);
   });
 
   it('compiles an acceptance contract with explicit verdict criteria and versioned identity', () => {
