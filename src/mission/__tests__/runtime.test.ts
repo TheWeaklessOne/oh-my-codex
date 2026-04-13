@@ -167,6 +167,31 @@ describe("mission runtime", () => {
 		}
 	});
 
+	it("requires fresh bootstrap inputs before recreating missing Mission V2 artifacts on resume", async () => {
+		const repo = await initRepo();
+		try {
+			const runtime = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+				task: "Implement Mission V2 bootstrap artifacts",
+			});
+
+			await rm(runtime.artifactPaths.sourcePackPath, { force: true });
+
+			await assert.rejects(
+				prepareMissionRuntime({
+					repoRoot: repo,
+					slug: "demo",
+					targetFingerprint: "repo:demo",
+				}),
+				/mission_orchestration_bootstrap_required:demo/,
+			);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
 	it("blocks execution iteration 1 until clarification when source grounding remains ambiguous", async () => {
 		const repo = await initRepo();
 		try {
@@ -531,6 +556,12 @@ describe("mission runtime", () => {
 			);
 			assert.equal(first.status, "written");
 			assert.equal(duplicate.status, "duplicate");
+			let events = await loadMissionEvents(runtime.missionRoot);
+			assert.equal(
+				events.filter((event) => event.event_type === "lane_summary_recorded")
+					.length,
+				1,
+			);
 
 			const cancelled = await cancelMissionRuntime(
 				repo,
@@ -609,6 +640,14 @@ describe("mission runtime", () => {
 			});
 			const reconciled = await loadMission(repo, "demo");
 			assert.equal(reconciled.status, "cancelled");
+			events = await loadMissionEvents(runtime.missionRoot);
+			assert.equal(
+				events
+					.filter((event) => event.event_type === "lane_summary_recorded")
+					.map((event) => event.payload.lane_type)
+					.join(","),
+				"audit",
+			);
 		} finally {
 			await rm(repo, { recursive: true, force: true });
 		}

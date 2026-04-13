@@ -189,7 +189,7 @@ function hashValue(input: string): string {
   return createHash('sha256').update(input).digest('hex').slice(0, 16);
 }
 
-function resolveTargetFingerprint(options: MissionCreateOptions): string {
+export function resolveTargetFingerprint(options: MissionCreateOptions): string {
   const raw = String(options.targetFingerprint || '').trim();
   if (raw) return raw;
   return `repo:${hashValue(options.repoRoot)}:slug:${hashValue(options.slug)}`;

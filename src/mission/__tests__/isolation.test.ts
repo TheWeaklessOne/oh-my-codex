@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -118,6 +118,41 @@ describe("mission verifier isolation", () => {
 				),
 			);
 			assert.equal(ok.status, "written");
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("falls back to a readable isolated snapshot when the verifier worktree is unavailable", async () => {
+		const repo = await initRepo();
+		try {
+			const first = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+				task: "Prepare mission verifier fallback isolation",
+			});
+
+			const auditWorkspace = first.lanePlans.audit?.executionEnvelope.workspace_path;
+			// Dirty the detached worktree so the next prepare must fall back.
+			await writeFile(join(auditWorkspace || repo, "DIRTY.txt"), "dirty\n", "utf-8");
+
+			const resumed = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+				task: "Prepare mission verifier fallback isolation",
+			});
+
+			const auditEnvelope = resumed.lanePlans.audit?.executionEnvelope;
+			assert.equal(auditEnvelope?.isolation_kind, "isolated_snapshot");
+			assert.equal(existsSync(join(auditEnvelope?.workspace_path || "", "README.md")), true);
+			assert.equal(existsSync(join(auditEnvelope?.workspace_path || "", ".git")), false);
+			const readme = await readFile(
+				join(auditEnvelope?.workspace_path || "", "README.md"),
+				"utf-8",
+			);
+			assert.match(readme, /hello/);
 		} finally {
 			await rm(repo, { recursive: true, force: true });
 		}

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
 	MISSION_LANE_POLICIES,
@@ -12,12 +13,13 @@ import {
 	appendMissionLaneSummaryEvent,
 	appendMissionOrchestrationEvents,
 	ensureMissionBootstrapEvent,
+	loadMissionEvents,
 } from "./events.js";
 import {
 	loadMissionLaneExecutionEnvelope,
+	type MissionLaneExecutionEnvelope,
 	missionLaneExecutionEnvelopePath,
 	prepareMissionLaneExecutionEnvelopes,
-	type MissionLaneExecutionEnvelope,
 } from "./isolation.js";
 import {
 	type CommitIterationResult,
@@ -31,6 +33,7 @@ import {
 	type MissionSafetyBaseline,
 	type MissionState,
 	recordLaneSummary,
+	resolveTargetFingerprint,
 	startIteration,
 } from "./kernel.js";
 import {
@@ -126,12 +129,22 @@ function laneSummaryPath(laneDir: string): string {
 
 async function ensureMissionState(
 	options: MissionCreateOptions,
-): Promise<MissionState> {
-	try {
-		return await loadMission(options.repoRoot, options.slug);
-	} catch {
-		return createMission(options);
+): Promise<{ mission: MissionState; created: boolean }> {
+	const stateFile = missionFile(
+		join(options.repoRoot, ".omx", "missions", options.slug),
+	);
+	if (!existsSync(stateFile)) {
+		return {
+			mission: await createMission(options),
+			created: true,
+		};
 	}
+	const mission = await loadMission(options.repoRoot, options.slug);
+	const requestedFingerprint = resolveTargetFingerprint(options);
+	if (mission.target_fingerprint !== requestedFingerprint) {
+		throw new Error(`mission_target_mismatch:${options.slug}`);
+	}
+	return { mission, created: false };
 }
 
 async function loadArtifactsForMission(mission: MissionState): Promise<{
@@ -147,11 +160,30 @@ async function loadArtifactsForMission(mission: MissionState): Promise<{
 			paths: missionOrchestrationArtifactPaths(mission.mission_root),
 		};
 	}
-	const prepared = await prepareMissionOrchestrationArtifacts(mission, {});
-	return {
-		artifacts: prepared.artifacts,
-		paths: prepared.paths,
-	};
+	throw new Error(`mission_orchestration_artifacts_missing:${mission.slug}`);
+}
+
+function hasBootstrapInputs(options: PrepareMissionRuntimeOptions): boolean {
+	return Boolean(
+		options.task ||
+			options.desiredOutcome ||
+			options.requirementSources?.length ||
+			options.constraints?.length ||
+			options.unknowns?.length ||
+			options.assumptions?.length ||
+			options.nonGoals?.length ||
+			options.projectTouchpoints?.length ||
+			options.acceptanceCriteria?.length ||
+			options.invariants?.length ||
+			options.requiredTestEvidence?.length ||
+			options.requiredOperationalEvidence?.length ||
+			options.residualClassificationRules?.length ||
+			options.verifierGuidance?.length ||
+			options.highRisk ||
+			options.planningMode ||
+			options.ambiguity ||
+			(options.repoContext && Object.keys(options.repoContext).length > 0),
+	);
 }
 
 function buildLanePlans(
@@ -186,19 +218,37 @@ function buildLanePlans(
 export async function prepareMissionRuntime(
 	options: PrepareMissionRuntimeOptions,
 ): Promise<PreparedMissionRuntime> {
-	await ensureMissionState(options);
-	const currentMission = await loadMission(options.repoRoot, options.slug);
+	const { mission: currentMission, created } =
+		await ensureMissionState(options);
+	const hadWorkflowStageEvents = (
+		await loadMissionEvents(currentMission.mission_root)
+	).some((event) => event.event_type === "workflow_stage_entered");
+	const existingArtifacts = await loadMissionOrchestrationArtifacts(
+		currentMission.mission_root,
+	);
+	if (!created && !existingArtifacts && !hasBootstrapInputs(options)) {
+		throw new Error(
+			`mission_orchestration_bootstrap_required:${currentMission.slug}`,
+		);
+	}
 	const bootstrapCreated = await ensureMissionBootstrapEvent(currentMission);
 	const prepared = await prepareMissionOrchestrationArtifacts(
 		currentMission,
 		options,
 	);
 	const { artifacts, paths } = prepared;
+	const changedArtifacts = Object.values(prepared.changed).some(Boolean);
+	const orchestrationEventsBackfilled = await appendMissionOrchestrationEvents(
+		currentMission,
+		prepared,
+		{
+			forceAll: bootstrapCreated,
+		},
+	);
 	const lifecycleSeedNeeded =
-		bootstrapCreated || Object.values(prepared.changed).some(Boolean);
-	await appendMissionOrchestrationEvents(currentMission, prepared, {
-		forceAll: bootstrapCreated,
-	});
+		bootstrapCreated ||
+		changedArtifacts ||
+		(orchestrationEventsBackfilled && !hadWorkflowStageEvents);
 	if (lifecycleSeedNeeded) {
 		await syncMissionWorkflow({
 			mission: currentMission,
@@ -277,7 +327,12 @@ export async function prepareMissionRuntime(
 		nextMission,
 		iteration.iteration,
 	);
-	const lanePlans = buildLanePlans(nextMission.mission_root, iteration, paths, envelopes);
+	const lanePlans = buildLanePlans(
+		nextMission.mission_root,
+		iteration,
+		paths,
+		envelopes,
+	);
 	await writeMissionLaneBriefings(iteration.laneDirs, artifacts, paths);
 	if (lifecycleSeedNeeded || !iteration.resumed) {
 		await syncMissionWorkflow({
@@ -347,7 +402,7 @@ export async function recordMissionRuntimeLaneSummary(
 		summaryInput,
 	);
 	const nextMission = await loadMission(repoRoot, slug);
-	if (result.summary) {
+	if (result.status === "written" && result.summary) {
 		await appendMissionLaneSummaryEvent(
 			nextMission,
 			iteration ?? mission.current_iteration,
