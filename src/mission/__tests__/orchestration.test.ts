@@ -5,6 +5,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
+  buildMissionPlanningTransaction,
   buildMissionExecutionPlan,
   buildMissionSourcePack,
   compileMissionAcceptanceContract,
@@ -138,6 +139,10 @@ describe('mission orchestration artifacts', () => {
     assert.equal(blockedPlan.handoff_surface, 'deep-interview');
     assert.equal(blockedPlan.status, 'blocked');
     assert.match(blockedPlan.blocking_reason || '', /(clarif|unresolved questions)/i);
+
+    const blockedTransaction = buildMissionPlanningTransaction(blockedPlan);
+    assert.equal(blockedTransaction.status, 'blocked');
+    assert.equal(blockedTransaction.approval_mode, 'needs_clarification');
   });
 
   it('versions acceptance contracts and execution plans when the mission requirements change', async () => {
@@ -160,8 +165,13 @@ describe('mission orchestration artifacts', () => {
 
       assert.equal(first.artifacts.acceptanceContract.contract_revision, 1);
       assert.equal(first.artifacts.executionPlan.plan_revision, 1);
+      assert.equal(first.artifacts.planningTransaction.plan_revision, 1);
+      assert.equal(first.artifacts.planningTransaction.status, 'approved');
       assert.equal(second.artifacts.acceptanceContract.contract_revision, 2);
       assert.equal(second.artifacts.executionPlan.plan_revision, 2);
+      assert.equal(second.artifacts.planningTransaction.plan_revision, 2);
+      assert.equal(second.artifacts.planningTransaction.previous_plan_run_id, first.artifacts.planningTransaction.plan_run_id);
+      assert.equal(second.artifacts.planningTransaction.replan_reason, 'execution plan changed');
       assert.equal(second.artifacts.executionPlan.previous_plan_id, first.artifacts.executionPlan.plan_id);
       assert.equal(second.changed.acceptanceContract, true);
       assert.equal(second.changed.executionPlan, true);
