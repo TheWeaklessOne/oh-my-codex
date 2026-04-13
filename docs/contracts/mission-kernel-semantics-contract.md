@@ -25,12 +25,13 @@ The Mission MVP kernel owns these operations:
 
 The skill layer may shape UX and summaries, but it must not become the source of truth for lifecycle transitions.
 
-Mission V2 may add orchestration artifacts such as `source-pack.json`, `mission-brief.md`,
-`acceptance-contract.json`, `execution-plan.md`, `workflow.json`, lane `briefing.md` files,
-and terminal `closeout.md` packages under `.omx/missions/<slug>/`. Those artifacts are
-supportive context for source grounding, planning handoff, verifier guidance, and stage
-tracking; they do **not** supersede the kernel-owned lifecycle, lane-summary, delta, or
-closure semantics described below.
+Mission V2 may add orchestration artifacts such as append-only `events.ndjson`,
+`source-pack.json`, `mission-brief.md`, `acceptance-contract.json`, `execution-plan.md`,
+derived `workflow.json`, lane `briefing.md` files, and terminal `closeout.md` packages
+under `.omx/missions/<slug>/`. Those artifacts are supportive context for source grounding,
+planning handoff, verifier guidance, stage tracking, and recovery; they do **not**
+supersede the kernel-owned lifecycle, lane-summary, delta, or closure semantics described
+below.
 
 ## Atomic write rules
 
