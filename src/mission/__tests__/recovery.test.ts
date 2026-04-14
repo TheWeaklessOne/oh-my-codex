@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import {
+	appendFile,
+	mkdtemp,
+	readFile,
+	rm,
+	unlink,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -83,23 +90,41 @@ describe("mission recovery", () => {
 				verifierSummary(runtime, "audit", 1, "PARTIAL"),
 			);
 
-			const artifactPaths = missionOrchestrationArtifactPaths(runtime.missionRoot);
-			await writeFile(missionWorkflowPath(runtime.missionRoot), JSON.stringify({ drifted: true }, null, 2));
-			await writeFile(artifactPaths.runMetricsPath, JSON.stringify({ drifted: true }, null, 2));
-			await writeFile(artifactPaths.watchdogPath, JSON.stringify({ drifted: true }, null, 2));
+			const artifactPaths = missionOrchestrationArtifactPaths(
+				runtime.missionRoot,
+			);
+			await writeFile(
+				missionWorkflowPath(runtime.missionRoot),
+				JSON.stringify({ drifted: true }, null, 2),
+			);
+			await writeFile(
+				artifactPaths.runMetricsPath,
+				JSON.stringify({ drifted: true }, null, 2),
+			);
+			await writeFile(
+				artifactPaths.watchdogPath,
+				JSON.stringify({ drifted: true }, null, 2),
+			);
 
 			const recovered = await recoverMissionReadModels(repo, "demo");
 			assert.equal(recovered.driftDetected, true);
 			assert.equal(recovered.workflow.rebuilt.current_stage, "execution-loop");
 			assert.equal(recovered.telemetry.metrics.lane_summary_counts.audit, 1);
 			const events = await loadMissionEvents(runtime.missionRoot);
-			assert.equal(events.some((event) => event.event_type === "read_models_recovered"), true);
+			assert.equal(
+				events.some((event) => event.event_type === "read_models_recovered"),
+				true,
+			);
+			assert.equal(
+				recovered.workflow.rebuilt.updated_at,
+				events.at(-1)?.recorded_at,
+			);
 		} finally {
 			await rm(repo, { recursive: true, force: true });
 		}
 	});
 
-	it("rebuilds closeout and telemetry after a simulated post-commit crash window", async () => {
+	it("rebuilds closeout, latest.json, and telemetry after a simulated post-commit crash window", async () => {
 		const repo = await initRepo();
 		try {
 			const runtime = await prepareMissionRuntime({
@@ -163,11 +188,14 @@ describe("mission recovery", () => {
 			});
 
 			const mission = await loadMission(repo, "demo");
-			const artifactPaths = missionOrchestrationArtifactPaths(runtime.missionRoot);
+			const artifactPaths = missionOrchestrationArtifactPaths(
+				runtime.missionRoot,
+			);
 			await unlink(artifactPaths.closeoutStatePath);
 			await unlink(artifactPaths.closeoutPath);
 			await unlink(artifactPaths.runMetricsPath);
 			await unlink(artifactPaths.watchdogPath);
+			await unlink(join(runtime.missionRoot, "latest.json"));
 
 			const recovered = await recoverMissionReadModels(repo, "demo");
 			assert.equal(recovered.driftDetected, true);
@@ -175,7 +203,73 @@ describe("mission recovery", () => {
 			assert.equal(existsSync(artifactPaths.closeoutPath), true);
 			assert.equal(existsSync(artifactPaths.runMetricsPath), true);
 			assert.equal(existsSync(artifactPaths.watchdogPath), true);
+			assert.equal(existsSync(join(runtime.missionRoot, "latest.json")), true);
+			assert.equal(
+				recovered.latest.latest?.latest_summary_path,
+				mission.latest_summary_path,
+			);
 			assert.equal(mission.status, "complete");
+
+			const second = await recoverMissionReadModels(repo, "demo");
+			assert.equal(second.driftDetected, false);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("repairs a malformed event-log tail before appending recovery events", async () => {
+		const repo = await initRepo();
+		try {
+			const runtime = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+				task: "Repair a torn Mission V2 event tail",
+			});
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"demo",
+				"audit",
+				verifierSummary(runtime, "audit", 1, "PARTIAL"),
+			);
+
+			const artifactPaths = missionOrchestrationArtifactPaths(
+				runtime.missionRoot,
+			);
+			await writeFile(
+				missionWorkflowPath(runtime.missionRoot),
+				JSON.stringify({ drifted: true }, null, 2),
+			);
+			await appendFile(
+				join(runtime.missionRoot, "events.ndjson"),
+				'{"broken":',
+				"utf-8",
+			);
+
+			const recovered = await recoverMissionReadModels(repo, "demo");
+			assert.equal(recovered.driftDetected, true);
+			assert.equal(recovered.workflow.rebuilt.current_stage, "execution-loop");
+
+			const repairedLog = await readFile(
+				join(runtime.missionRoot, "events.ndjson"),
+				"utf-8",
+			);
+			assert.equal(repairedLog.includes('{"broken":'), false);
+
+			const events = await loadMissionEvents(runtime.missionRoot);
+			const recoveryEvent = [...events]
+				.reverse()
+				.find((event) => event.event_type === "read_models_recovered");
+			assert.equal(recoveryEvent?.event_type, "read_models_recovered");
+			if (
+				!recoveryEvent ||
+				recoveryEvent.event_type !== "read_models_recovered"
+			) {
+				throw new Error("missing read_models_recovered event");
+			}
+			assert.equal(recoveryEvent.payload.workflow_drift, true);
+			assert.equal(recoveryEvent.payload.latest_drift, false);
+			assert.equal(existsSync(artifactPaths.runMetricsPath), true);
 		} finally {
 			await rm(repo, { recursive: true, force: true });
 		}

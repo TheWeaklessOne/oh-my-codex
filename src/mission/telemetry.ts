@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { writeAtomic } from "../team/state/io.js";
 import type { MissionLaneType, MissionStatus } from "./contracts.js";
 import {
 	appendMissionWatchdogDecisionEvent,
@@ -8,15 +9,14 @@ import {
 } from "./events.js";
 import type { MissionState } from "./kernel.js";
 import {
-	missionOrchestrationArtifactPaths,
 	type MissionOrchestrationArtifactPaths,
+	missionOrchestrationArtifactPaths,
 } from "./orchestration.js";
 import {
 	loadMissionWorkflow,
-	type MissionWorkflowState,
 	type MissionWorkflowStage,
+	type MissionWorkflowState,
 } from "./workflow.js";
-import { writeAtomic } from "../team/state/io.js";
 
 export interface MissionBudgetPolicy {
 	schema_version: 1;
@@ -65,6 +65,10 @@ function nowIso(): string {
 	return new Date().toISOString();
 }
 
+function stableJson(value: unknown): string {
+	return JSON.stringify(value);
+}
+
 async function writeJson(filePath: string, value: unknown): Promise<void> {
 	await writeAtomic(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
@@ -79,7 +83,9 @@ function wallClockMs(startedAt: string, now = new Date()): number {
 	return Math.max(0, now.getTime() - started);
 }
 
-function computeLaneSummaryCounts(events: MissionEvent[]): Record<MissionLaneType, number> {
+function computeLaneSummaryCounts(
+	events: MissionEvent[],
+): Record<MissionLaneType, number> {
 	const counts: Record<MissionLaneType, number> = {
 		audit: 0,
 		remediation: 0,
@@ -99,15 +105,17 @@ function computeStageMetrics(
 	now = new Date(),
 ): Record<MissionWorkflowStage, MissionStageMetric> {
 	const metrics = Object.fromEntries(
-		([
-			"intake",
-			"source-grounding",
-			"contract-build",
-			"planning",
-			"audit",
-			"execution-loop",
-			"closeout",
-		] as MissionWorkflowStage[]).map((stage) => [
+		(
+			[
+				"intake",
+				"source-grounding",
+				"contract-build",
+				"planning",
+				"audit",
+				"execution-loop",
+				"closeout",
+			] as MissionWorkflowStage[]
+		).map((stage) => [
 			stage,
 			{
 				enter_count: 0,
@@ -153,6 +161,62 @@ export function buildMissionRunMetrics(
 	};
 }
 
+function comparableMissionRunMetrics(metrics: MissionRunMetrics | null):
+	| (Omit<
+			MissionRunMetrics,
+			"updated_at" | "wall_clock_ms" | "stage_metrics"
+	  > & {
+			stage_metrics: Record<
+				MissionWorkflowStage,
+				Omit<MissionStageMetric, "current_duration_ms">
+			>;
+	  })
+	| null {
+	if (
+		!metrics ||
+		typeof metrics !== "object" ||
+		!("stage_metrics" in metrics)
+	) {
+		return null;
+	}
+	const {
+		updated_at: _updatedAt,
+		wall_clock_ms: _wallClockMs,
+		stage_metrics,
+		...rest
+	} = metrics;
+	if (!stage_metrics || typeof stage_metrics !== "object") {
+		return null;
+	}
+	return {
+		...rest,
+		stage_metrics: Object.fromEntries(
+			Object.entries(stage_metrics).map(([stage, metric]) => [
+				stage,
+				{
+					enter_count:
+						typeof metric?.enter_count === "number" ? metric.enter_count : 0,
+					last_entered_at:
+						typeof metric?.last_entered_at === "string"
+							? metric.last_entered_at
+							: null,
+				},
+			]),
+		) as Record<
+			MissionWorkflowStage,
+			Omit<MissionStageMetric, "current_duration_ms">
+		>,
+	};
+}
+
+function comparableMissionWatchdogDecision(
+	watchdog: MissionWatchdogDecision | null,
+): Omit<MissionWatchdogDecision, "evaluated_at"> | null {
+	if (!watchdog) return null;
+	const { evaluated_at: _evaluatedAt, ...rest } = watchdog;
+	return rest;
+}
+
 export function evaluateMissionWatchdog(
 	metrics: MissionRunMetrics,
 	policy: MissionBudgetPolicy = DEFAULT_MISSION_BUDGET_POLICY,
@@ -167,10 +231,14 @@ export function evaluateMissionWatchdog(
 		currentStageMetric.current_duration_ms >
 			policy.max_stage_duration_minutes * 60_000
 	) {
-		reasons.push(`current stage ${metrics.current_stage} exceeded duration budget`);
+		reasons.push(
+			`current stage ${metrics.current_stage} exceeded duration budget`,
+		);
 	}
 	if (currentStageMetric.enter_count > policy.max_stage_retries) {
-		reasons.push(`current stage ${metrics.current_stage} exceeded retry budget`);
+		reasons.push(
+			`current stage ${metrics.current_stage} exceeded retry budget`,
+		);
 	}
 	if (metrics.ambiguous_iterations >= policy.max_ambiguous_iterations) {
 		reasons.push("ambiguous iteration budget exhausted");
@@ -179,9 +247,7 @@ export function evaluateMissionWatchdog(
 	const decision =
 		reasons.length === 0
 			? "continue"
-			: reasons.some((reason) =>
-					/ambiguous|wall-clock|duration/i.test(reason),
-				)
+			: reasons.some((reason) => /ambiguous|wall-clock|duration/i.test(reason))
 				? "escalate"
 				: "warn";
 
@@ -207,42 +273,44 @@ export async function syncMissionTelemetry(
 	const policy = existsSync(paths.budgetPath)
 		? await readJson<MissionBudgetPolicy>(paths.budgetPath)
 		: DEFAULT_MISSION_BUDGET_POLICY;
-	const workflow = (await loadMissionWorkflow(mission.mission_root)) ?? ({
-		schema_version: 1,
-		mission_id: mission.mission_id,
-		slug: mission.slug,
-		mission_root: mission.mission_root,
-		updated_at: nowIso(),
-		current_stage: "intake",
-		blocked_reason: null,
-		current_iteration: null,
-		current_lane: null,
-		brief_id: "",
-		contract_id: "",
-		contract_revision: 0,
-		plan_id: "",
-		plan_run_id: "",
-		plan_revision: 0,
-		planning_status: "draft",
-		approval_mode: "auto_policy",
-		approved_at: null,
-		approved_by: null,
-		replan_reason: null,
-		planning_mode: "direct",
-		handoff_surface: "plan",
-		strategy_key: "",
-		closeout_status: null,
-		closeout_path: null,
-		artifact_refs: {
-			source_pack: "",
-			mission_brief: "",
-			acceptance_contract: "",
-			execution_plan: "",
-			closeout: null,
-		},
-		stage_history: [],
-		strategy_history: [],
-	}) as MissionWorkflowState;
+	const workflow =
+		(await loadMissionWorkflow(mission.mission_root)) ??
+		({
+			schema_version: 1,
+			mission_id: mission.mission_id,
+			slug: mission.slug,
+			mission_root: mission.mission_root,
+			updated_at: nowIso(),
+			current_stage: "intake",
+			blocked_reason: null,
+			current_iteration: null,
+			current_lane: null,
+			brief_id: "",
+			contract_id: "",
+			contract_revision: 0,
+			plan_id: "",
+			plan_run_id: "",
+			plan_revision: 0,
+			planning_status: "draft",
+			approval_mode: "auto_policy",
+			approved_at: null,
+			approved_by: null,
+			replan_reason: null,
+			planning_mode: "direct",
+			handoff_surface: "plan",
+			strategy_key: "",
+			closeout_status: null,
+			closeout_path: null,
+			artifact_refs: {
+				source_pack: "",
+				mission_brief: "",
+				acceptance_contract: "",
+				execution_plan: "",
+				closeout: null,
+			},
+			stage_history: [],
+			strategy_history: [],
+		} as MissionWorkflowState);
 	const events = await loadMissionEvents(mission.mission_root);
 	const metrics = buildMissionRunMetrics(mission, workflow, events);
 	const watchdog = evaluateMissionWatchdog(metrics, policy);
@@ -258,9 +326,14 @@ export async function syncMissionTelemetry(
 	if (
 		!previousWatchdog ||
 		previousWatchdog.decision !== watchdog.decision ||
-		JSON.stringify(previousWatchdog.reasons) !== JSON.stringify(watchdog.reasons)
+		JSON.stringify(previousWatchdog.reasons) !==
+			JSON.stringify(watchdog.reasons)
 	) {
-		await appendMissionWatchdogDecisionEvent(mission, watchdog, paths.watchdogPath);
+		await appendMissionWatchdogDecisionEvent(
+			mission,
+			watchdog,
+			paths.watchdogPath,
+		);
 	}
 
 	return { policy, metrics, watchdog };
@@ -285,8 +358,10 @@ export async function reconcileMissionTelemetry(
 		: null;
 	const synced = await syncMissionTelemetry(mission, paths);
 	const driftDetected =
-		JSON.stringify(existingMetrics) !== JSON.stringify(synced.metrics)
-		|| JSON.stringify(existingWatchdog) !== JSON.stringify(synced.watchdog);
+		stableJson(comparableMissionRunMetrics(existingMetrics)) !==
+			stableJson(comparableMissionRunMetrics(synced.metrics)) ||
+		stableJson(comparableMissionWatchdogDecision(existingWatchdog)) !==
+			stableJson(comparableMissionWatchdogDecision(synced.watchdog));
 	return {
 		...synced,
 		driftDetected,

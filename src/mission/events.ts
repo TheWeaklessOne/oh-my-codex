@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { appendFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { writeAtomic } from "../team/state/io.js";
 import type { MissionLaneType, MissionStatus } from "./contracts.js";
 import type { MissionState } from "./kernel.js";
 import type {
@@ -154,6 +155,7 @@ export type MissionEvent =
 				workflow_drift: boolean;
 				telemetry_drift: boolean;
 				closeout_drift: boolean;
+				latest_drift: boolean;
 			}
 	  >
 	| MissionEventBase<
@@ -177,11 +179,49 @@ async function appendMissionEvent(
 	missionRoot: string,
 	event: MissionEvent,
 ): Promise<void> {
-	await appendFile(
-		missionEventsPath(missionRoot),
-		`${JSON.stringify(event)}\n`,
-		"utf-8",
-	);
+	const filePath = missionEventsPath(missionRoot);
+	if (existsSync(filePath)) {
+		const parsed = parseMissionEventLog(await readFile(filePath, "utf-8"));
+		if (parsed.truncatedTail) {
+			await writeAtomic(filePath, serializeMissionEvents(parsed.events));
+		}
+	}
+	await appendFile(filePath, `${JSON.stringify(event)}\n`, "utf-8");
+}
+
+function serializeMissionEvents(events: MissionEvent[]): string {
+	return events
+		.map((event) => JSON.stringify(event))
+		.join("\n")
+		.concat(events.length > 0 ? "\n" : "");
+}
+
+function parseMissionEventLog(content: string): {
+	events: MissionEvent[];
+	truncatedTail: boolean;
+} {
+	const lines = content
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean);
+	const events: MissionEvent[] = [];
+	for (const [index, line] of lines.entries()) {
+		try {
+			events.push(JSON.parse(line) as MissionEvent);
+		} catch (error) {
+			if (index === lines.length - 1) {
+				return {
+					events,
+					truncatedTail: true,
+				};
+			}
+			throw error;
+		}
+	}
+	return {
+		events,
+		truncatedTail: false,
+	};
 }
 
 export async function loadMissionEvents(
@@ -189,12 +229,7 @@ export async function loadMissionEvents(
 ): Promise<MissionEvent[]> {
 	const filePath = missionEventsPath(missionRoot);
 	if (!existsSync(filePath)) return [];
-	const content = await readFile(filePath, "utf-8");
-	return content
-		.split(/\r?\n/)
-		.map((line) => line.trim())
-		.filter(Boolean)
-		.map((line) => JSON.parse(line) as MissionEvent);
+	return parseMissionEventLog(await readFile(filePath, "utf-8")).events;
 }
 
 export async function ensureMissionBootstrapEvent(
@@ -464,6 +499,7 @@ export async function appendMissionReadModelsRecoveredEvent(
 		workflow: boolean;
 		telemetry: boolean;
 		closeout: boolean;
+		latest: boolean;
 	},
 ): Promise<void> {
 	await appendMissionEvent(mission.mission_root, {
@@ -476,6 +512,7 @@ export async function appendMissionReadModelsRecoveredEvent(
 			workflow_drift: drift.workflow,
 			telemetry_drift: drift.telemetry,
 			closeout_drift: drift.closeout,
+			latest_drift: drift.latest,
 		},
 	});
 }
