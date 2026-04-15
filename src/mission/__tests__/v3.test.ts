@@ -13,8 +13,11 @@ import {
 	recordMissionRuntimeLaneSummary,
 } from "../runtime.js";
 import {
+	appendMissionV3ContractAmendment,
 	createMissionV3Candidate,
+	createMissionV3Waiver,
 	hybridizeMissionV3Candidates,
+	promoteMissionV3Candidate,
 	recordMissionV3ReleaseAction,
 	rescindMissionV3CandidateSelection,
 	selectMissionV3Candidate,
@@ -164,6 +167,19 @@ describe("mission v3 surfaces", () => {
 			assert.equal(existsSync(runtime.v3Paths.policySnapshotPath), true);
 			assert.equal(existsSync(runtime.v3Paths.statusLedgerPath), true);
 			assert.equal(existsSync(runtime.v3Paths.activeCandidateStatePath), true);
+			const defaultCandidate = JSON.parse(
+				await readFile(runtime.v3Paths.activeCandidateStatePath, "utf-8"),
+			) as { workspace_root: string };
+			assert.equal(
+				defaultCandidate.workspace_root,
+				join(repo, ".omx", "missions", "demo", "candidates", "candidate-001"),
+			);
+			assert.equal(
+				existsSync(
+					join(repo, ".omx", "missions", "demo", "candidate-state.json"),
+				),
+				false,
+			);
 
 			const assurance = JSON.parse(
 				await readFile(runtime.v3Paths.assuranceContractPath, "utf-8"),
@@ -354,6 +370,24 @@ describe("mission v3 surfaces", () => {
 			});
 			assert.equal(selected.active_candidate_id, "candidate-002");
 			assert.equal(selected.selected_candidate_id, "candidate-002");
+			const selectedTournament = JSON.parse(
+				await readFile(
+					join(repo, ".omx", "missions", "demo", "candidate-tournament.json"),
+					"utf-8",
+				),
+			) as {
+				selected_candidate_id: string | null;
+				candidates: Array<{ candidate_id: string; state: string }>;
+			};
+			assert.equal(selectedTournament.selected_candidate_id, "candidate-002");
+			assert.equal(
+				selectedTournament.candidates.some(
+					(candidate) =>
+						candidate.candidate_id === "candidate-002" &&
+						candidate.state === "selected",
+				),
+				true,
+			);
 
 			const rescinded = await rescindMissionV3CandidateSelection({
 				repoRoot: repo,
@@ -369,6 +403,24 @@ describe("mission v3 surfaces", () => {
 				true,
 			);
 			assert.equal(rescinded.lifecycle_state, "executing");
+			const rescindedTournament = JSON.parse(
+				await readFile(
+					join(repo, ".omx", "missions", "demo", "candidate-tournament.json"),
+					"utf-8",
+				),
+			) as {
+				selected_candidate_id: string | null;
+				candidates: Array<{ candidate_id: string; state: string }>;
+			};
+			assert.equal(rescindedTournament.selected_candidate_id, null);
+			assert.equal(
+				rescindedTournament.candidates.some(
+					(candidate) =>
+						candidate.candidate_id === "candidate-002" &&
+						candidate.state === "blocked",
+				),
+				true,
+			);
 
 			await recordMissionRuntimeLaneSummary(
 				repo,
@@ -481,7 +533,7 @@ describe("mission v3 surfaces", () => {
 				no_unreconciled_lane_errors: true,
 				focused_checks_green: true,
 			});
-			assert.equal(committed.mission.lifecycle_state, "promotion_ready");
+			assert.equal(committed.mission.lifecycle_state, "verified");
 			assert.equal(committed.mission.status, "complete");
 			assert.equal(existsSync(runtime.v3Paths.traceBundlePath), true);
 			assert.equal(existsSync(runtime.v3Paths.evalBundlePath), true);
@@ -568,6 +620,24 @@ describe("mission v3 surfaces", () => {
 					no_unreconciled_lane_errors: true,
 					focused_checks_green: true,
 				});
+				await assert.rejects(
+					recordMissionV3ReleaseAction({
+						repoRoot: secondRepo,
+						slug: "release-demo",
+						action: "released",
+						actor: "test-release-bot",
+						summary: "Attempt direct release from verified.",
+					}),
+					/mission_v3_release_requires_promotion_ready:verified/,
+				);
+				const promotionReady = await promoteMissionV3Candidate({
+					repoRoot: secondRepo,
+					slug: "release-demo",
+					actor: "test-release-bot",
+					summary:
+						"Promote the verified candidate into the release-ready state.",
+				});
+				assert.equal(promotionReady.lifecycle_state, "promotion_ready");
 				const released = await recordMissionV3ReleaseAction({
 					repoRoot: secondRepo,
 					slug: "release-demo",
@@ -630,6 +700,13 @@ describe("mission v3 surfaces", () => {
 					no_unreconciled_lane_errors: true,
 					focused_checks_green: true,
 				});
+				await promoteMissionV3Candidate({
+					repoRoot: thirdRepo,
+					slug: "handoff-demo",
+					actor: "test-review-bot",
+					summary:
+						"Promote the verified candidate into the handoff-ready state.",
+				});
 				const handedOff = await recordMissionV3ReleaseAction({
 					repoRoot: thirdRepo,
 					slug: "handoff-demo",
@@ -644,6 +721,248 @@ describe("mission v3 surfaces", () => {
 			} finally {
 				await rm(thirdRepo, { recursive: true, force: true });
 			}
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("supports waiver-driven verification and stale-proof demotion after contract amendments", async () => {
+		const repo = await initRepo();
+		try {
+			const runtime = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "waiver-demo",
+				targetFingerprint: "repo:waiver-demo",
+				task: "Exercise Mission V3 waiver and amendment semantics",
+			});
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"waiver-demo",
+				"audit",
+				verifierSummary("audit", 1, "PASS", verifierToken(runtime, "audit")),
+			);
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"waiver-demo",
+				"remediation",
+				workSummary("remediation", 1),
+			);
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"waiver-demo",
+				"execution",
+				workSummary("execution", 1),
+			);
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"waiver-demo",
+				"re_audit",
+				verifierSummary(
+					"re_audit",
+					1,
+					"PASS",
+					verifierToken(runtime, "re_audit"),
+				),
+			);
+
+			const blocked = await commitMissionRuntimeIteration(repo, "waiver-demo", {
+				iteration_commit_succeeded: true,
+				no_unreconciled_lane_errors: true,
+				focused_checks_green: false,
+			});
+			assert.equal(blocked.mission.lifecycle_state, "assuring");
+			assert.equal(
+				blocked.mission.verification_state.blocking_obligation_ids.includes(
+					"obl:static-analysis",
+				),
+				true,
+			);
+
+			const expiredWaiver = await createMissionV3Waiver({
+				repoRoot: repo,
+				slug: "waiver-demo",
+				scope: "expired static-analysis waiver",
+				authority: "test-waiver-authority",
+				rationale:
+					"This waiver is already expired and must not unblock proofs.",
+				obligationIds: ["obl:static-analysis"],
+				expiresAt: "2020-01-01T00:00:00.000Z",
+			});
+			assert.equal(expiredWaiver.obligation_ids[0], "obl:static-analysis");
+			const stillBlocked = await loadMission(repo, "waiver-demo");
+			assert.equal(stillBlocked.lifecycle_state, "assuring");
+			assert.equal(
+				stillBlocked.verification_state.blocking_obligation_ids.includes(
+					"obl:static-analysis",
+				),
+				true,
+			);
+
+			const waiver = await createMissionV3Waiver({
+				repoRoot: repo,
+				slug: "waiver-demo",
+				scope: "temporary static-analysis exception",
+				authority: "test-waiver-authority",
+				rationale:
+					"Demonstrate first-class waiver handling for a blocking obligation.",
+				obligationIds: ["obl:static-analysis"],
+				compensatingControls: ["manual reviewer sign-off"],
+				evidenceRefs: ["manual-review.md"],
+			});
+			assert.equal(waiver.obligation_ids.includes("obl:static-analysis"), true);
+			await assert.rejects(
+				createMissionV3Waiver({
+					repoRoot: repo,
+					slug: "waiver-demo",
+					scope: "forbidden adjudication waiver",
+					authority: "test-waiver-authority",
+					rationale: "Adjudication is not waivable.",
+					obligationIds: ["obl:adjudication"],
+				}),
+				/mission_v3_waiver_forbidden:obl:adjudication/,
+			);
+
+			const verified = await loadMission(repo, "waiver-demo");
+			assert.equal(verified.lifecycle_state, "verified");
+			assert.equal(
+				verified.verification_state.satisfied_obligation_ids.includes(
+					"obl:adjudication",
+				),
+				true,
+			);
+
+			const policyRepo = await initRepo();
+			try {
+				const policyRuntime = await prepareMissionRuntime({
+					repoRoot: policyRepo,
+					slug: "policy-waiver-demo",
+					targetFingerprint: "repo:policy-waiver-demo",
+					task: "Exercise Mission V3 policy waiver scoping",
+					requirementSources: [
+						{
+							content: "External low-trust material",
+							origin: "external",
+							retrievalStatus: "captured",
+							trustLevel: "low",
+							title: "external-note",
+						},
+					],
+				});
+				assert.equal(policyRuntime.mission.kernel_blockers.length > 0, true);
+				await createMissionV3Waiver({
+					repoRoot: policyRepo,
+					slug: "policy-waiver-demo",
+					scope: "clear one policy blocker only",
+					authority: "test-waiver-authority",
+					rationale:
+						"Only waive third-party incorporation review for this test.",
+					policyClauseIds: ["policy:third-party-incorporation"],
+				});
+				const policyMission = await loadMission(
+					policyRepo,
+					"policy-waiver-demo",
+				);
+				assert.equal(
+					policyMission.kernel_blockers.includes(
+						"policy:source-trust:require_review",
+					),
+					true,
+				);
+				assert.equal(
+					policyMission.kernel_blockers.includes(
+						"policy:third-party-incorporation:require_review",
+					),
+					false,
+				);
+			} finally {
+				await rm(policyRepo, { recursive: true, force: true });
+			}
+
+			const unrelatedAmendment = await appendMissionV3ContractAmendment({
+				repoRoot: repo,
+				slug: "waiver-demo",
+				targetContract: "proof-program",
+				authority: "test-amendment-authority",
+				rationale: "Change an unrelated proof-program binding.",
+				scope: "unrelated-proof-program-refresh",
+				affectedObligationIds: ["obl:release-smoke"],
+			});
+			assert.equal(unrelatedAmendment.target_contract, "proof-program");
+			const stillVerified = await loadMission(repo, "waiver-demo");
+			assert.equal(stillVerified.lifecycle_state, "verified");
+			const amendment = await appendMissionV3ContractAmendment({
+				repoRoot: repo,
+				slug: "waiver-demo",
+				targetContract: "proof-program",
+				authority: "test-amendment-authority",
+				rationale:
+					"Invalidate prior proof freshness after a proof-program change.",
+				scope: "test-proof-program-refresh",
+				affectedObligationIds: ["obl:reproduction", "obl:targeted-regression"],
+			});
+			assert.equal(amendment.target_contract, "proof-program");
+			const beforeRetryContract = JSON.parse(
+				await readFile(runtime.v3Paths.proofProgramPath, "utf-8"),
+			) as { revision?: number };
+			assert.equal(
+				existsSync(
+					join(
+						repo,
+						".omx",
+						"missions",
+						"waiver-demo",
+						"contract-revisions",
+						"proof-program",
+						"revision-001.json",
+					),
+				),
+				true,
+			);
+			const retriedAmendment = await appendMissionV3ContractAmendment({
+				repoRoot: repo,
+				slug: "waiver-demo",
+				targetContract: "proof-program",
+				authority: "test-amendment-authority",
+				rationale:
+					"Invalidate prior proof freshness after a proof-program change.",
+				scope: "test-proof-program-refresh",
+				affectedObligationIds: ["obl:reproduction", "obl:targeted-regression"],
+			});
+			const afterRetryContract = JSON.parse(
+				await readFile(runtime.v3Paths.proofProgramPath, "utf-8"),
+			) as { revision?: number };
+			assert.equal(retriedAmendment.amendment_id, amendment.amendment_id);
+			assert.equal(afterRetryContract.revision, beforeRetryContract.revision);
+			assert.equal(
+				existsSync(
+					join(
+						repo,
+						".omx",
+						"missions",
+						"waiver-demo",
+						"contract-revisions",
+						"proof-program",
+						`revision-${String(beforeRetryContract.revision ?? 0).padStart(3, "0")}.json`,
+					),
+				),
+				true,
+			);
+			const amendmentEvents = await readNdjson<{
+				payload?: { amendment_id?: string };
+			}>(runtime.v3Paths.contractAmendmentsPath);
+			assert.equal(
+				amendmentEvents.filter(
+					(event) => event.payload?.amendment_id === amendment.amendment_id,
+				).length,
+				1,
+			);
+
+			const demoted = await loadMission(repo, "waiver-demo");
+			assert.equal(demoted.lifecycle_state, "assuring");
+			assert.equal(
+				demoted.verification_state.stale_obligation_ids.length > 0,
+				true,
+			);
 		} finally {
 			await rm(repo, { recursive: true, force: true });
 		}
