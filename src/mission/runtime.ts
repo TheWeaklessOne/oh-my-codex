@@ -49,6 +49,14 @@ import {
 	writeMissionLaneBriefings,
 } from "./orchestration.js";
 import { syncMissionTelemetry } from "./telemetry.js";
+import {
+	type MissionV3ArtifactPaths,
+	missionV3ArtifactPaths,
+	recordMissionV3LaneSummary,
+	syncMissionV3AfterCancel,
+	syncMissionV3AfterCommit,
+	syncMissionV3Bootstrap,
+} from "./v3.js";
 import { reconcileMissionWorkflow, syncMissionWorkflow } from "./workflow.js";
 
 export interface MissionLaneRuntimePlan {
@@ -77,6 +85,7 @@ export interface PreparedMissionRuntime {
 	lanePlans: Partial<Record<MissionLaneType, MissionLaneRuntimePlan>>;
 	artifacts: MissionOrchestrationArtifacts;
 	artifactPaths: MissionOrchestrationArtifactPaths;
+	v3Paths: MissionV3ArtifactPaths;
 	planning: {
 		planRunId: string;
 		mode: MissionPlanningMode;
@@ -291,20 +300,28 @@ export async function prepareMissionRuntime(
 		});
 	}
 	if (artifacts.executionPlan.status !== "approved") {
-		if (!lifecycleSeedNeeded) {
-			await reconcileMissionWorkflow(currentMission);
-		}
-		await syncMissionTelemetry(currentMission, paths);
-		return {
+		const v3Result = await syncMissionV3Bootstrap({
 			mission: currentMission,
+			artifacts,
+			artifactPaths: paths,
+			highRisk: options.highRisk,
 			iteration: null,
-			missionRoot: currentMission.mission_root,
-			missionFile: missionFile(currentMission.mission_root),
-			latestFile: latestFile(currentMission.mission_root),
+		});
+		if (!lifecycleSeedNeeded) {
+			await reconcileMissionWorkflow(v3Result.mission);
+		}
+		await syncMissionTelemetry(v3Result.mission, paths);
+		return {
+			mission: v3Result.mission,
+			iteration: null,
+			missionRoot: v3Result.mission.mission_root,
+			missionFile: missionFile(v3Result.mission.mission_root),
+			latestFile: latestFile(v3Result.mission.mission_root),
 			deltaFile: null,
 			lanePlans: {},
 			artifacts,
 			artifactPaths: paths,
+			v3Paths: v3Result.paths,
 			planning: {
 				planRunId: artifacts.planningTransaction.plan_run_id,
 				mode: artifacts.executionPlan.planning_mode,
@@ -334,9 +351,16 @@ export async function prepareMissionRuntime(
 		envelopes,
 	);
 	await writeMissionLaneBriefings(iteration.laneDirs, artifacts, paths);
+	const v3Result = await syncMissionV3Bootstrap({
+		mission: nextMission,
+		artifacts,
+		artifactPaths: paths,
+		highRisk: options.highRisk,
+		iteration: iteration.iteration,
+	});
 	if (lifecycleSeedNeeded || !iteration.resumed) {
 		await syncMissionWorkflow({
-			mission: nextMission,
+			mission: v3Result.mission,
 			artifacts,
 			artifactPaths: paths,
 			stage: "audit",
@@ -346,19 +370,20 @@ export async function prepareMissionRuntime(
 			laneType: "audit",
 		});
 	} else {
-		await reconcileMissionWorkflow(nextMission);
+		await reconcileMissionWorkflow(v3Result.mission);
 	}
-	await syncMissionTelemetry(nextMission, paths);
+	await syncMissionTelemetry(v3Result.mission, paths);
 	return {
-		mission: nextMission,
+		mission: v3Result.mission,
 		iteration,
-		missionRoot: nextMission.mission_root,
-		missionFile: missionFile(nextMission.mission_root),
-		latestFile: latestFile(nextMission.mission_root),
+		missionRoot: v3Result.mission.mission_root,
+		missionFile: missionFile(v3Result.mission.mission_root),
+		latestFile: latestFile(v3Result.mission.mission_root),
 		deltaFile: deltaFile(iteration.iterationDir),
 		lanePlans,
 		artifacts,
 		artifactPaths: paths,
+		v3Paths: v3Result.paths,
 		planning: {
 			planRunId: artifacts.planningTransaction.plan_run_id,
 			mode: artifacts.executionPlan.planning_mode,
@@ -411,13 +436,23 @@ export async function recordMissionRuntimeLaneSummary(
 			result.summary.verdict,
 			result.summary.confidence,
 		);
+		await recordMissionV3LaneSummary({
+			mission: nextMission,
+			artifacts: artifacts.artifacts,
+			artifactPaths: artifacts.paths,
+			laneType,
+			summaryPath: result.summaryPath,
+			summary: result.summary,
+			iteration: iteration ?? mission.current_iteration,
+		});
 	}
-	const closeout = await syncMissionCloseout(nextMission);
+	const reconciledMission = await loadMission(repoRoot, slug);
+	const closeout = await syncMissionCloseout(reconciledMission);
 	if (closeout) {
-		await appendMissionCloseoutEvent(nextMission, artifacts.paths);
+		await appendMissionCloseoutEvent(reconciledMission, artifacts.paths);
 	}
 	await syncMissionWorkflow({
-		mission: nextMission,
+		mission: reconciledMission,
 		artifacts: artifacts.artifacts,
 		artifactPaths: artifacts.paths,
 		stage: "execution-loop",
@@ -425,7 +460,7 @@ export async function recordMissionRuntimeLaneSummary(
 		iteration: iteration ?? mission.current_iteration,
 		laneType,
 	});
-	await syncMissionTelemetry(nextMission, artifacts.paths);
+	await syncMissionTelemetry(reconciledMission, artifacts.paths);
 	return result;
 }
 
@@ -450,31 +485,42 @@ export async function commitMissionRuntimeIteration(
 		iteration ?? mission.current_iteration,
 		strategyChanged,
 	);
-	const closeout = await syncMissionCloseout(result.mission);
-	if (closeout) {
-		await appendMissionCloseoutEvent(result.mission, artifacts.paths);
-	}
-	await syncMissionWorkflow({
+	const v3Result = await syncMissionV3AfterCommit({
 		mission: result.mission,
 		artifacts: artifacts.artifacts,
 		artifactPaths: artifacts.paths,
+		safetyBaseline,
+		iteration: iteration ?? mission.current_iteration,
+		strategyChanged,
+	});
+	const closeout = await syncMissionCloseout(v3Result.mission);
+	if (closeout) {
+		await appendMissionCloseoutEvent(v3Result.mission, artifacts.paths);
+	}
+	await syncMissionWorkflow({
+		mission: v3Result.mission,
+		artifacts: artifacts.artifacts,
+		artifactPaths: artifacts.paths,
 		stage: ["complete", "plateau", "failed", "cancelled"].includes(
-			result.mission.status,
+			v3Result.mission.status,
 		)
 			? "closeout"
 			: "execution-loop",
 		detail: ["complete", "plateau", "failed", "cancelled"].includes(
-			result.mission.status,
+			v3Result.mission.status,
 		)
-			? `Kernel reached terminal status: ${result.mission.status}.`
+			? `Kernel reached terminal or promotion-ready compatibility status: ${v3Result.mission.status}.`
 			: strategyChanged
 				? "Kernel committed the latest iteration after an explicit strategy change."
 				: "Kernel committed the latest iteration and the mission remains in the execution loop.",
 		iteration: iteration ?? mission.current_iteration,
 		laneType: "re_audit",
 	});
-	await syncMissionTelemetry(result.mission, artifacts.paths);
-	return result;
+	await syncMissionTelemetry(v3Result.mission, artifacts.paths);
+	return {
+		...result,
+		mission: v3Result.mission,
+	};
 }
 
 export async function cancelMissionRuntime(
@@ -485,21 +531,27 @@ export async function cancelMissionRuntime(
 	const mission = await cancelMission(repoRoot, slug, reason);
 	await appendMissionCancelRequestedEvent(mission, reason ?? null);
 	const artifacts = await loadArtifactsForMission(mission);
-	const closeout = await syncMissionCloseout(mission);
-	if (closeout) {
-		await appendMissionCloseoutEvent(mission, artifacts.paths);
-	}
-	await syncMissionWorkflow({
+	const v3Result = await syncMissionV3AfterCancel({
 		mission,
 		artifacts: artifacts.artifacts,
 		artifactPaths: artifacts.paths,
-		stage: mission.status === "cancelled" ? "closeout" : "execution-loop",
+	});
+	const closeout = await syncMissionCloseout(v3Result.mission);
+	if (closeout) {
+		await appendMissionCloseoutEvent(v3Result.mission, artifacts.paths);
+	}
+	await syncMissionWorkflow({
+		mission: v3Result.mission,
+		artifacts: artifacts.artifacts,
+		artifactPaths: artifacts.paths,
+		stage:
+			v3Result.mission.status === "cancelled" ? "closeout" : "execution-loop",
 		detail:
-			mission.status === "cancelled"
+			v3Result.mission.status === "cancelled"
 				? "Mission cancelled with all active lanes reconciled."
 				: "Mission cancellation requested; awaiting lane reconciliation.",
 		laneType: null,
 	});
-	await syncMissionTelemetry(mission, artifacts.paths);
-	return mission;
+	await syncMissionTelemetry(v3Result.mission, artifacts.paths);
+	return v3Result.mission;
 }

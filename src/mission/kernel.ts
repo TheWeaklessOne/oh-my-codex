@@ -28,12 +28,26 @@ import { loadMissionLaneExecutionEnvelope } from "./isolation.js";
 
 export interface MissionState {
 	schema_version: 1;
+	mission_version: 3;
 	mission_id: string;
 	slug: string;
 	repo_root: string;
 	mission_root: string;
 	target_fingerprint: string;
 	status: MissionStatus;
+	lifecycle_state:
+		| "bootstrapping"
+		| "planning"
+		| "blocked_external"
+		| "executing"
+		| "assuring"
+		| "verified"
+		| "promotion_ready"
+		| "released"
+		| "handed_off"
+		| "plateau"
+		| "failed"
+		| "cancelled";
 	started_at: string;
 	updated_at: string;
 	current_iteration: number;
@@ -62,6 +76,42 @@ export interface MissionState {
 	last_residual_fingerprint: string | null;
 	last_strategy_key: string | null;
 	final_reason: string | null;
+	active_candidate_id: string | null;
+	selected_candidate_id: string | null;
+	candidate_ids: string[];
+	assurance_contract_id: string | null;
+	proof_program_id: string | null;
+	checker_lock_id: string | null;
+	environment_contract_id: string | null;
+	policy_profile: {
+		risk_class: string;
+		assurance_profile: string;
+		autonomy_profile: string;
+	};
+	verification_state: {
+		status: string;
+		blocking_obligation_ids: string[];
+		satisfied_obligation_ids: string[];
+		contradicted_obligation_ids: string[];
+		stale_obligation_ids: string[];
+		adjudication_state: string;
+		last_verified_at: string | null;
+	};
+	promotion_state: {
+		status: string;
+		blocking_reasons: string[];
+		last_decision_at: string | null;
+		decision_ref: string | null;
+	};
+	plateau_strategy_state: {
+		strategy_key: string | null;
+		mutation_attempts: number;
+		candidate_expansions: number;
+		exhausted: boolean;
+	};
+	kernel_blockers: string[];
+	latest_authoritative_iteration_ref: string | null;
+	latest_authoritative_adjudication_ref: string | null;
 }
 
 export interface MissionLatestSnapshot {
@@ -280,12 +330,14 @@ export async function createMission(
 	const missionId = `${options.slug}-${startedAt.replace(/[^0-9]/g, "").slice(0, 14)}-${hashValue(target)}`;
 	const state: MissionState = {
 		schema_version: 1,
+		mission_version: 3,
 		mission_id: missionId,
 		slug: options.slug,
 		repo_root: options.repoRoot,
 		mission_root: root,
 		target_fingerprint: target,
 		status: "running",
+		lifecycle_state: "bootstrapping",
 		started_at: startedAt,
 		updated_at: startedAt,
 		current_iteration: 1,
@@ -308,6 +360,42 @@ export async function createMission(
 		last_residual_fingerprint: null,
 		last_strategy_key: null,
 		final_reason: null,
+		active_candidate_id: null,
+		selected_candidate_id: null,
+		candidate_ids: [],
+		assurance_contract_id: null,
+		proof_program_id: null,
+		checker_lock_id: null,
+		environment_contract_id: null,
+		policy_profile: {
+			risk_class: "low-risk-local",
+			assurance_profile: "balanced",
+			autonomy_profile: "guarded",
+		},
+		verification_state: {
+			status: "pending",
+			blocking_obligation_ids: [],
+			satisfied_obligation_ids: [],
+			contradicted_obligation_ids: [],
+			stale_obligation_ids: [],
+			adjudication_state: "pending",
+			last_verified_at: null,
+		},
+		promotion_state: {
+			status: "blocked",
+			blocking_reasons: ["mission not yet verified"],
+			last_decision_at: null,
+			decision_ref: null,
+		},
+		plateau_strategy_state: {
+			strategy_key: null,
+			mutation_attempts: 0,
+			candidate_expansions: 0,
+			exhausted: false,
+		},
+		kernel_blockers: [],
+		latest_authoritative_iteration_ref: null,
+		latest_authoritative_adjudication_ref: null,
 	};
 	await writeJsonFile(missionPath(options.repoRoot, options.slug), state);
 	return state;
