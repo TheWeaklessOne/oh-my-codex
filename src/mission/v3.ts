@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, readdir, readFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, rm } from "node:fs/promises";
 import { arch, platform, release } from "node:os";
-import { basename, extname, join, relative } from "node:path";
+import { basename, dirname, extname, join, relative } from "node:path";
 import { writeAtomic } from "../team/state/io.js";
 import type { MissionLaneSummary, MissionLaneType } from "./contracts.js";
 import { MISSION_LANE_TYPES } from "./contracts.js";
@@ -12,6 +12,10 @@ import type {
 	MissionOrchestrationArtifactPaths,
 	MissionOrchestrationArtifacts,
 	MissionSourcePack,
+} from "./orchestration.js";
+import {
+	loadMissionOrchestrationArtifacts,
+	missionOrchestrationArtifactPaths,
 } from "./orchestration.js";
 
 export const MISSION_V3_ARTIFACT_VERSION = 1 as const;
@@ -244,6 +248,7 @@ export interface MissionV3ProofProgram {
 	schema_version: 1;
 	generated_at: string;
 	proof_program_id: string;
+	revision: number;
 	assurance_contract_id: string;
 	checker_lock_id: string;
 	environment_contract_id: string;
@@ -378,6 +383,68 @@ export interface MissionV3ReleaseOptions {
 	destination?: string;
 }
 
+export interface MissionV3PromoteOptions {
+	repoRoot: string;
+	slug: string;
+	actor: string;
+	summary: string;
+}
+
+export interface MissionV3Waiver {
+	waiver_id: string;
+	obligation_ids: string[];
+	policy_clause_ids: string[];
+	scope: string;
+	authority: string;
+	rationale: string;
+	compensating_controls: string[];
+	expires_at: string;
+	evidence_refs: string[];
+	created_at: string;
+}
+
+export interface MissionV3WaiverOptions {
+	repoRoot: string;
+	slug: string;
+	scope: string;
+	authority: string;
+	rationale: string;
+	obligationIds?: string[];
+	policyClauseIds?: string[];
+	compensatingControls?: string[];
+	evidenceRefs?: string[];
+	expiresAt?: string;
+}
+
+export interface MissionV3ContractAmendment {
+	amendment_id: string;
+	target_contract: MissionV3ContractTarget;
+	rationale: string;
+	authority: string;
+	scope: string;
+	resulting_revision_ref: string;
+	affected_obligation_ids: string[];
+	affected_policy_clause_ids: string[];
+	created_at: string;
+}
+
+export interface MissionV3ContractAmendmentOptions {
+	repoRoot: string;
+	slug: string;
+	targetContract: MissionV3ContractTarget;
+	authority: string;
+	rationale: string;
+	scope: string;
+	affectedObligationIds?: string[];
+	affectedPolicyClauseIds?: string[];
+}
+
+type MissionV3ContractTarget =
+	| "assurance-contract"
+	| "proof-program"
+	| "checker-lock"
+	| "environment-contract";
+
 interface MissionV3JournalEvent<T = Record<string, unknown>> {
 	event_id: string;
 	schema_version: 1;
@@ -485,7 +552,70 @@ async function loadJournal<T>(
 	return parseJournal<T>(await readFile(filePath, "utf-8")).events;
 }
 
-async function appendJournalEvent<T extends Record<string, unknown>>(
+function stripContractVolatileFields<T extends object>(
+	value: T,
+): Record<string, unknown> {
+	const clone = { ...(value as Record<string, unknown>) };
+	delete clone.generated_at;
+	delete clone.revision;
+	return clone;
+}
+
+function contractRevisionRef(
+	target: MissionV3ContractTarget,
+	value: Record<string, unknown>,
+): string {
+	const revision =
+		typeof value.revision === "number" ? `@${String(value.revision)}` : "";
+	switch (target) {
+		case "assurance-contract":
+			return `${String(value.assurance_contract_id ?? "assurance-contract")}${revision}`;
+		case "proof-program":
+			return `${String(value.proof_program_id ?? "proof-program")}${revision}`;
+		case "checker-lock":
+			return `${String(value.checker_lock_id ?? "checker-lock")}${revision}`;
+		case "environment-contract":
+			return `${String(value.env_contract_id ?? "environment-contract")}${revision}`;
+	}
+}
+
+function contractRevisionSnapshotPath(params: {
+	contractPath: string;
+	target: MissionV3ContractTarget;
+	revision: number | null;
+}): string | null {
+	if (params.revision == null) return null;
+	return join(
+		dirname(params.contractPath),
+		"contract-revisions",
+		params.target,
+		`revision-${String(params.revision).padStart(3, "0")}.json`,
+	);
+}
+
+async function writeMissionV3ContractWithSnapshot<T extends object>(params: {
+	path: string;
+	target: MissionV3ContractTarget;
+	value: T;
+}): Promise<void> {
+	const snapshotPath = contractRevisionSnapshotPath({
+		contractPath: params.path,
+		target: params.target,
+		revision:
+			typeof (params.value as { revision?: unknown }).revision === "number"
+				? Number((params.value as { revision: number }).revision)
+				: null,
+	});
+	if (snapshotPath) {
+		await mkdir(dirname(snapshotPath), { recursive: true });
+		if (!existsSync(snapshotPath)) {
+			await writeJson(snapshotPath, params.value);
+		}
+	}
+	await writeJson(params.path, params.value);
+}
+
+async function appendJournalEvent<T extends object>(
 	filePath: string,
 	input: {
 		journalType: string;
@@ -537,6 +667,86 @@ async function appendJournalEvent<T extends Record<string, unknown>>(
 	};
 	await appendFile(filePath, `${JSON.stringify(next)}\n`, "utf-8");
 	return next;
+}
+
+async function persistMissionV3Contract<T extends object>(params: {
+	path: string;
+	target: MissionV3ContractTarget;
+	missionId: string;
+	contractAmendmentsPath: string;
+	next: T;
+	authority: string;
+	rationale: string;
+	scope: string;
+	affectedObligationIds?: string[];
+	affectedPolicyClauseIds?: string[];
+}): Promise<T> {
+	const existing = existsSync(params.path)
+		? await readJson<T>(params.path)
+		: null;
+	const comparableNext = stableJson(stripContractVolatileFields(params.next));
+	if (existing) {
+		const comparableExisting = stableJson(
+			stripContractVolatileFields(existing),
+		);
+		if (comparableExisting === comparableNext) {
+			return existing;
+		}
+	}
+	const generatedAt = nowIso();
+	let nextValue = {
+		...params.next,
+		generated_at: generatedAt,
+	} as Record<string, unknown>;
+	if (
+		existing &&
+		typeof (existing as unknown as { revision?: unknown }).revision ===
+			"number" &&
+		typeof (nextValue as { revision?: unknown }).revision === "number"
+	) {
+		nextValue = {
+			...nextValue,
+			revision:
+				Number((existing as unknown as { revision: number }).revision) + 1,
+		};
+	}
+	if (existing) {
+		await appendJournalEvent(params.contractAmendmentsPath, {
+			journalType: "contract-amendments",
+			missionId: params.missionId,
+			actorPrincipal: params.authority,
+			idempotencyKey: `contract-amendment:${params.target}:${shortHash(
+				stableJson({
+					scope: params.scope,
+					rationale: params.rationale,
+					target: params.target,
+					next: stripContractVolatileFields(nextValue),
+				}),
+			)}`,
+			payload: {
+				amendment_id: `amendment:${params.target}:${shortHash(
+					stableJson({
+						target: params.target,
+						next: stripContractVolatileFields(nextValue),
+					}),
+				)}`,
+				target_contract: params.target,
+				rationale: params.rationale,
+				authority: params.authority,
+				scope: params.scope,
+				resulting_revision_ref: contractRevisionRef(params.target, nextValue),
+				affected_obligation_ids: params.affectedObligationIds ?? [],
+				affected_policy_clause_ids: params.affectedPolicyClauseIds ?? [],
+				created_at: generatedAt,
+			} satisfies MissionV3ContractAmendment,
+		});
+	}
+	await writeMissionV3ContractWithSnapshot({
+		path: params.path,
+		target: params.target,
+		value: nextValue as T,
+	});
+	return nextValue as unknown as T;
 }
 
 async function collectRepoTestFiles(root: string): Promise<string[]> {
@@ -1079,6 +1289,7 @@ function buildProofProgram(
 		schema_version: 1,
 		generated_at: nowIso(),
 		proof_program_id: `proof:${shortHash(stableJson({ mission: mission.mission_id, bindings }))}`,
+		revision: 1,
 		assurance_contract_id: assuranceContract.assurance_contract_id,
 		checker_lock_id: checkerLock.checker_lock_id,
 		environment_contract_id: environmentContract.env_contract_id,
@@ -1192,6 +1403,30 @@ async function ensureV3Layout(paths: MissionV3ArtifactPaths): Promise<void> {
 	}
 }
 
+async function normalizeMissionV3CandidateState(params: {
+	candidate: MissionV3CandidateState;
+	canonicalDir: string;
+	legacyStatePath?: string;
+}): Promise<MissionV3CandidateState> {
+	const { candidate, canonicalDir, legacyStatePath } = params;
+	if (candidate.workspace_root === canonicalDir) {
+		return candidate;
+	}
+	const normalized = {
+		...candidate,
+		workspace_root: canonicalDir,
+		updated_at: nowIso(),
+	} satisfies MissionV3CandidateState;
+	await writeJson(join(canonicalDir, "candidate-state.json"), normalized);
+	if (
+		legacyStatePath &&
+		legacyStatePath !== join(canonicalDir, "candidate-state.json")
+	) {
+		await rm(legacyStatePath, { force: true });
+	}
+	return normalized;
+}
+
 async function ensureCandidateState(
 	mission: MissionState,
 	artifactPaths: MissionOrchestrationArtifactPaths,
@@ -1199,8 +1434,24 @@ async function ensureCandidateState(
 	proofProgram: MissionV3ProofProgram,
 	environmentContract: MissionV3EnvironmentContract,
 ): Promise<MissionV3CandidateState> {
+	const legacyStatePath = join(mission.mission_root, "candidate-state.json");
 	if (existsSync(paths.activeCandidateStatePath)) {
-		return readJson<MissionV3CandidateState>(paths.activeCandidateStatePath);
+		return normalizeMissionV3CandidateState({
+			candidate: await readJson<MissionV3CandidateState>(
+				paths.activeCandidateStatePath,
+			),
+			canonicalDir: paths.activeCandidateDir,
+			legacyStatePath: existsSync(legacyStatePath)
+				? legacyStatePath
+				: undefined,
+		});
+	}
+	if (existsSync(legacyStatePath)) {
+		return normalizeMissionV3CandidateState({
+			candidate: await readJson<MissionV3CandidateState>(legacyStatePath),
+			canonicalDir: paths.activeCandidateDir,
+			legacyStatePath,
+		});
 	}
 	const generatedAt = nowIso();
 	await mkdir(join(paths.activeCandidateDir, "iterations"), {
@@ -1219,7 +1470,7 @@ async function ensureCandidateState(
 		mission_id: mission.mission_id,
 		state: "running",
 		rationale: "default single-candidate Mission V3 umbrella execution path",
-		workspace_root: mission.mission_root,
+		workspace_root: paths.activeCandidateDir,
 		proof_program_ref: relative(
 			paths.activeCandidateDir,
 			paths.proofProgramPath,
@@ -1285,7 +1536,12 @@ async function loadMissionV3CandidateStates(
 			"candidate-state.json",
 		);
 		if (!existsSync(statePath)) continue;
-		candidates.push(await readJson<MissionV3CandidateState>(statePath));
+		candidates.push(
+			await normalizeMissionV3CandidateState({
+				candidate: await readJson<MissionV3CandidateState>(statePath),
+				canonicalDir: join(paths.candidatesDir, entry.name),
+			}),
+		);
 	}
 	return candidates.sort((left, right) =>
 		left.candidate_id.localeCompare(right.candidate_id),
@@ -1331,6 +1587,78 @@ function candidateCanReceiveActiveWrites(
 	);
 }
 
+async function loadMissionV3ActiveWaivers(
+	paths: MissionV3ArtifactPaths,
+): Promise<MissionV3Waiver[]> {
+	const decisions = await loadJournal<Record<string, unknown>>(
+		paths.decisionLogPath,
+	);
+	return decisions
+		.flatMap((event) => {
+			const payload = event.payload as {
+				decision?: string;
+				waiver?: MissionV3Waiver;
+			};
+			if (payload.decision !== "waiver_created" || !payload.waiver) {
+				return [];
+			}
+			return [payload.waiver];
+		})
+		.filter((waiver) => new Date(waiver.expires_at).getTime() > Date.now());
+}
+
+function applyMissionV3PolicyWaivers(
+	blockers: string[],
+	waivers: MissionV3Waiver[],
+): string[] {
+	return blockers.filter(
+		(blocker) =>
+			!waivers.some((waiver) =>
+				waiver.policy_clause_ids.some((clauseId) =>
+					blocker.startsWith(`${clauseId}:`),
+				),
+			),
+	);
+}
+
+async function missionV3ContractAmendmentIndex(
+	paths: MissionV3ArtifactPaths,
+): Promise<{
+	global: string | null;
+	byObligationId: Map<string, string>;
+}> {
+	const events = await loadJournal<Record<string, unknown>>(
+		paths.contractAmendmentsPath,
+	);
+	let global: string | null = null;
+	const byObligationId = new Map<string, string>();
+	for (const event of events) {
+		const payload = event.payload as Partial<MissionV3ContractAmendment>;
+		const recordedAt = event.recorded_at;
+		const affectedObligations = payload.affected_obligation_ids ?? [];
+		const affectedPolicies = payload.affected_policy_clause_ids ?? [];
+		if (affectedObligations.length === 0 && affectedPolicies.length === 0) {
+			if (
+				global === null ||
+				new Date(global).getTime() < new Date(recordedAt).getTime()
+			) {
+				global = recordedAt;
+			}
+			continue;
+		}
+		for (const obligationId of affectedObligations) {
+			const current = byObligationId.get(obligationId);
+			if (
+				current === undefined ||
+				new Date(current).getTime() < new Date(recordedAt).getTime()
+			) {
+				byObligationId.set(obligationId, recordedAt);
+			}
+		}
+	}
+	return { global, byObligationId };
+}
+
 function resolveSelectedCandidateId(
 	mission: MissionState,
 	candidates: MissionV3CandidateState[],
@@ -1369,6 +1697,24 @@ function resolveActiveCandidateId(
 	const firstWritable =
 		candidates.find(candidateCanReceiveActiveWrites)?.candidate_id ?? null;
 	return firstWritable ?? fallbackCandidateId;
+}
+
+function resolveMissionV3RuntimeCandidate(
+	mission: MissionState,
+	candidates: MissionV3CandidateState[],
+	fallbackCandidate?: MissionV3CandidateState,
+): MissionV3CandidateState | null {
+	return (
+		candidates.find(
+			(candidate) => candidate.candidate_id === mission.active_candidate_id,
+		) ??
+		candidates.find(
+			(candidate) => candidate.candidate_id === mission.selected_candidate_id,
+		) ??
+		candidates.find(candidateCanReceiveActiveWrites) ??
+		fallbackCandidate ??
+		null
+	);
 }
 
 export async function assertMissionV3CandidateWritable(
@@ -1717,19 +2063,29 @@ async function buildImpactMap(
 function evidenceForObligation(
 	evidenceEvents: MissionV3JournalEvent<Record<string, unknown>>[],
 	obligationId: string,
+	candidateId: string | null,
 ) {
 	return evidenceEvents.filter((event) => {
 		const payload = event.payload as { obligation_ids?: string[] };
-		return payload.obligation_ids?.includes(obligationId) === true;
+		return (
+			(candidateId === null || event.candidate_id === candidateId) &&
+			payload.obligation_ids?.includes(obligationId) === true
+		);
 	});
 }
 
 function evaluateObligations(
 	assuranceContract: MissionV3AssuranceContract,
 	proofProgram: MissionV3ProofProgram,
+	candidateId: string | null,
 	environmentCurrent: MissionV3EnvironmentCurrent,
 	evidenceEvents: MissionV3JournalEvent<Record<string, unknown>>[],
 	policyBlockers: string[],
+	activeWaivers: MissionV3Waiver[],
+	contractAmendments: {
+		global: string | null;
+		byObligationId: Map<string, string>;
+	},
 ): {
 	obligations: Array<{
 		obligation_id: string;
@@ -1755,9 +2111,13 @@ function evaluateObligations(
 	}> = assuranceContract.obligations
 		.filter((obligation) => obligation.required_lane !== "adjudication")
 		.map((obligation) => {
+			const waiver = activeWaivers.find((entry) =>
+				entry.obligation_ids.includes(obligation.obligation_id),
+			);
 			const evidence = evidenceForObligation(
 				evidenceEvents,
 				obligation.obligation_id,
+				candidateId,
 			);
 			const support = evidence.filter(
 				(event) =>
@@ -1773,6 +2133,15 @@ function evaluateObligations(
 					state: "not_applicable" as const,
 					reason: obligation.not_applicable_reason,
 					evidence_refs: [],
+					blocking: obligation.blocking_severity === "blocking",
+				};
+			}
+			if (waiver) {
+				return {
+					obligation_id: obligation.obligation_id,
+					state: "waived" as const,
+					reason: `waived via ${waiver.waiver_id}`,
+					evidence_refs: waiver.evidence_refs,
 					blocking: obligation.blocking_severity === "blocking",
 				};
 			}
@@ -1803,6 +2172,22 @@ function evaluateObligations(
 			const freshnessExpiresAt = (
 				latest.payload as { freshness_expires_at?: string }
 			).freshness_expires_at;
+			const latestRelevantContractMutationAt =
+				contractAmendments.byObligationId.get(obligation.obligation_id) ??
+				contractAmendments.global;
+			if (
+				latestRelevantContractMutationAt &&
+				new Date(latest.recorded_at).getTime() <
+					new Date(latestRelevantContractMutationAt).getTime()
+			) {
+				return {
+					obligation_id: obligation.obligation_id,
+					state: "stale" as const,
+					reason: "contract amendment superseded the latest proof",
+					evidence_refs: [latest.event_id],
+					blocking: obligation.blocking_severity === "blocking",
+				};
+			}
 			if (environmentCurrent.parity !== "valid") {
 				return {
 					obligation_id: obligation.obligation_id,
@@ -1931,6 +2316,7 @@ function buildAdjudication(
 	candidateId: string | null,
 	evaluation: ReturnType<typeof evaluateObligations>,
 	policyBlockers: string[],
+	activeWaivers: MissionV3Waiver[],
 ): MissionV3Adjudication {
 	const proofReady =
 		candidateId !== null &&
@@ -1940,6 +2326,16 @@ function buildAdjudication(
 	if (mission.status === "failed") recommendedNextState = "failed";
 	else if (mission.status === "plateau") recommendedNextState = "plateau";
 	else if (mission.status === "cancelled") recommendedNextState = "cancelled";
+	else if (mission.lifecycle_state === "released")
+		recommendedNextState = "released";
+	else if (mission.lifecycle_state === "handed_off")
+		recommendedNextState = "handed_off";
+	else if (
+		mission.lifecycle_state === "promotion_ready" &&
+		proofReady &&
+		policyBlockers.length === 0
+	)
+		recommendedNextState = "promotion_ready";
 	else if (proofReady) recommendedNextState = "verified";
 	return {
 		schema_version: 1,
@@ -1954,7 +2350,9 @@ function buildAdjudication(
 			evidence_refs: result.evidence_refs,
 		})),
 		blocking_contradictions: evaluation.contradictions,
-		waiver_summary: [],
+		waiver_summary: activeWaivers.map(
+			(waiver) => `${waiver.waiver_id} (${waiver.scope})`,
+		),
 		stale_evidence_summary: evaluation.stale,
 		residual_risk_summary: policyBlockers,
 		recommended_next_state: recommendedNextState,
@@ -2006,6 +2404,7 @@ function buildQualityWatchdog(
 		open_uncertainties: Array<{ uncertainty_id: string }>;
 	},
 	promotionDecision: MissionV3PromotionDecision,
+	activeWaivers: MissionV3Waiver[],
 ) {
 	const contradictionCount = evaluation.contradictions.length;
 	const staleCount = evaluation.stale.length;
@@ -2019,7 +2418,7 @@ function buildQualityWatchdog(
 		contradiction_count: contradictionCount,
 		impacted_surface_count: impactMap.changed_surfaces.length,
 		validated_surface_count: validatedSurfaceCount,
-		waiver_count: 0,
+		waiver_count: activeWaivers.length,
 		uncertainty_burden: uncertaintyRegister.open_uncertainties.length,
 		policy_exception_count: policyBlockers.length,
 		candidate_spread: mission.candidate_ids.length,
@@ -2117,12 +2516,7 @@ function buildCandidateTournament(
 	adjudication: MissionV3Adjudication,
 	promotionDecision: MissionV3PromotionDecision,
 ) {
-	const selectedCandidateId =
-		mission.selected_candidate_id ??
-		candidates.find((candidate) => candidate.state === "selected")
-			?.candidate_id ??
-		candidates[0]?.candidate_id ??
-		null;
+	const selectedCandidateId = mission.selected_candidate_id ?? null;
 	const unresolvedRisk =
 		adjudication.blocking_contradictions.length +
 		adjudication.stale_evidence_summary.length +
@@ -2537,6 +2931,19 @@ async function updateMissionV3State(
 	return next;
 }
 
+async function updateMissionV3CandidateState(
+	candidate: MissionV3CandidateState,
+	update: Partial<MissionV3CandidateState>,
+): Promise<MissionV3CandidateState> {
+	const next = {
+		...candidate,
+		...update,
+		updated_at: nowIso(),
+	} satisfies MissionV3CandidateState;
+	await writeJson(join(candidate.workspace_root, "candidate-state.json"), next);
+	return next;
+}
+
 async function rebuildMissionV3DerivedState(params: {
 	mission: MissionState;
 	artifacts: MissionOrchestrationArtifacts;
@@ -2571,6 +2978,12 @@ async function rebuildMissionV3DerivedState(params: {
 		profile,
 		environmentCurrent,
 	);
+	const activeWaivers = await loadMissionV3ActiveWaivers(paths);
+	const effectivePolicyBlockers = applyMissionV3PolicyWaivers(
+		policy.blockers,
+		activeWaivers,
+	);
+	const contractAmendments = await missionV3ContractAmendmentIndex(paths);
 	const evidenceEvents = await loadJournal<Record<string, unknown>>(
 		paths.evidenceEventsPath,
 	);
@@ -2578,13 +2991,6 @@ async function rebuildMissionV3DerivedState(params: {
 		mission,
 		artifacts.sourcePack,
 		await latestSummary(mission),
-	);
-	const evaluation = evaluateObligations(
-		assuranceContract,
-		proofProgram,
-		environmentCurrent,
-		evidenceEvents,
-		policy.blockers,
 	);
 	const candidateMap = new Map(
 		(await loadMissionV3CandidateStates(paths)).map((entry) => [
@@ -2607,6 +3013,16 @@ async function rebuildMissionV3DerivedState(params: {
 		selectedCandidateId,
 		candidate.candidate_id,
 	);
+	const evaluation = evaluateObligations(
+		assuranceContract,
+		proofProgram,
+		selectedCandidateId,
+		environmentCurrent,
+		evidenceEvents,
+		effectivePolicyBlockers,
+		activeWaivers,
+		contractAmendments,
+	);
 	const evidenceGraph = await buildEvidenceGraph(
 		mission,
 		assuranceContract,
@@ -2617,41 +3033,60 @@ async function rebuildMissionV3DerivedState(params: {
 		mission,
 		selectedCandidateId,
 		evaluation,
-		policy.blockers,
+		effectivePolicyBlockers,
+		activeWaivers,
 	);
 	const promotionDecision = buildPromotionDecision(
 		mission,
 		selectedCandidateId,
 		adjudication,
-		policy.blockers,
+		effectivePolicyBlockers,
 	);
 	const uncertaintyRegister = await buildUncertaintyRegister(paths);
 	const qualityWatchdog = buildQualityWatchdog(
 		mission,
 		evaluation,
-		policy.blockers,
+		effectivePolicyBlockers,
 		impactMap,
 		uncertaintyRegister,
 		promotionDecision,
+		activeWaivers,
 	);
-	let lifecycleState: MissionV3LifecycleState =
-		preferredLifecycle ?? mission.lifecycle_state;
+	let lifecycleState: MissionV3LifecycleState;
 	if (mission.status === "failed") lifecycleState = "failed";
 	else if (mission.status === "plateau") lifecycleState = "plateau";
 	else if (mission.status === "cancelled") lifecycleState = "cancelled";
 	else if (
+		preferredLifecycle === "released" ||
+		preferredLifecycle === "handed_off"
+	)
+		lifecycleState = preferredLifecycle;
+	else if (
+		preferredLifecycle === "blocked_external" &&
+		artifacts.executionPlan.status !== "approved"
+	)
+		lifecycleState = "blocked_external";
+	else if (
+		preferredLifecycle === "executing" &&
+		mission.current_iteration > 0 &&
+		!adjudication.proof_ready
+	)
+		lifecycleState = "executing";
+	else if (
 		selectedCandidateId !== null &&
-		mission.status === "complete" &&
+		mission.lifecycle_state === "promotion_ready" &&
+		adjudication.proof_ready &&
 		promotionDecision.decision === "allow"
 	)
 		lifecycleState = "promotion_ready";
 	else if (
 		selectedCandidateId !== null &&
-		mission.status === "complete" &&
-		adjudication.proof_ready
+		adjudication.proof_ready &&
+		mission.status === "complete"
 	)
 		lifecycleState = "verified";
-	else if (preferredLifecycle) lifecycleState = preferredLifecycle;
+	else if (preferredLifecycle === "planning" && mission.current_iteration === 0)
+		lifecycleState = "planning";
 	else lifecycleState = mission.current_iteration > 0 ? "assuring" : "planning";
 	const compatStatus = compatibilityStatusForLifecycle(
 		lifecycleState,
@@ -2705,7 +3140,10 @@ async function rebuildMissionV3DerivedState(params: {
 		},
 		kernel_blockers: Array.from(
 			new Set([
-				...policy.blockers,
+				...(mission.kernel_blockers ?? []).filter((value) =>
+					value.startsWith("selection_rescinded:"),
+				),
+				...effectivePolicyBlockers,
 				...evaluation.blockingIds.map(
 					(obligationId) => `obligation:${obligationId}`,
 				),
@@ -2900,28 +3338,78 @@ export async function syncMissionV3Bootstrap(params: {
 		artifacts.sourcePack,
 		params.highRisk === true,
 	);
-	const assuranceContract = buildAssuranceContract(
+	const draftAssuranceContract = buildAssuranceContract(
 		mission,
 		artifacts,
 		profile,
 		paths,
 	);
-	const checkerLock = buildCheckerLock(
+	const assuranceContract = await persistMissionV3Contract({
+		path: paths.assuranceContractPath,
+		target: "assurance-contract",
+		missionId: mission.mission_id,
+		contractAmendmentsPath: paths.contractAmendmentsPath,
+		next: draftAssuranceContract,
+		authority: "mission-v3-bootstrap",
+		rationale:
+			"refresh assurance obligations after mission bootstrap reconciliation",
+		scope: "mission-bootstrap",
+		affectedObligationIds: draftAssuranceContract.obligations.map(
+			(obligation) => obligation.obligation_id,
+		),
+	});
+	const draftCheckerLock = buildCheckerLock(
 		mission,
 		profile,
 		requiredProofLanes(profile),
 	);
-	const environmentContract = await buildEnvironmentContract(mission, profile);
-	const proofProgram = buildProofProgram(
+	const checkerLock = await persistMissionV3Contract({
+		path: paths.checkerLockPath,
+		target: "checker-lock",
+		missionId: mission.mission_id,
+		contractAmendmentsPath: paths.contractAmendmentsPath,
+		next: draftCheckerLock,
+		authority: "mission-v3-bootstrap",
+		rationale: "refresh checker surface after mission bootstrap reconciliation",
+		scope: "mission-bootstrap",
+		affectedObligationIds: assuranceContract.obligations.map(
+			(obligation) => obligation.obligation_id,
+		),
+	});
+	const draftEnvironmentContract = await buildEnvironmentContract(
+		mission,
+		profile,
+	);
+	const environmentContract = await persistMissionV3Contract({
+		path: paths.environmentContractPath,
+		target: "environment-contract",
+		missionId: mission.mission_id,
+		contractAmendmentsPath: paths.contractAmendmentsPath,
+		next: draftEnvironmentContract,
+		authority: "environment-kernel",
+		rationale:
+			"refresh environment contract after mission bootstrap reconciliation",
+		scope: "mission-bootstrap",
+	});
+	const draftProofProgram = buildProofProgram(
 		mission,
 		assuranceContract,
 		checkerLock,
 		environmentContract,
 	);
-	await writeJson(paths.assuranceContractPath, assuranceContract);
-	await writeJson(paths.checkerLockPath, checkerLock);
-	await writeJson(paths.environmentContractPath, environmentContract);
-	await writeJson(paths.proofProgramPath, proofProgram);
+	const proofProgram = await persistMissionV3Contract({
+		path: paths.proofProgramPath,
+		target: "proof-program",
+		missionId: mission.mission_id,
+		contractAmendmentsPath: paths.contractAmendmentsPath,
+		next: draftProofProgram,
+		authority: "mission-v3-bootstrap",
+		rationale: "refresh proof program after contract or checker reconciliation",
+		scope: "mission-bootstrap",
+		affectedObligationIds: assuranceContract.obligations.map(
+			(obligation) => obligation.obligation_id,
+		),
+	});
 	const candidate = await ensureCandidateState(
 		mission,
 		params.artifactPaths,
@@ -3099,7 +3587,7 @@ export async function recordMissionV3LaneSummary(params: {
 			observed_at: summary.provenance.finished_at,
 		},
 	});
-	await appendJournalEvent(paths.evidenceEventsPath, {
+	const evidence = await appendJournalEvent(paths.evidenceEventsPath, {
 		journalType: "evidence-events",
 		missionId: mission.mission_id,
 		candidateId: candidate.candidate_id,
@@ -3132,6 +3620,14 @@ export async function recordMissionV3LaneSummary(params: {
 				: addSeconds(evidenceRecordedAt, 900),
 		},
 	});
+	const refreshedCandidate = await updateMissionV3CandidateState(candidate, {
+		latest_lane_run_refs: Array.from(
+			new Set([...candidate.latest_lane_run_refs, laneRun.event_id]),
+		).slice(-10),
+		latest_evidence_refs: Array.from(
+			new Set([...candidate.latest_evidence_refs, evidence.event_id]),
+		).slice(-10),
+	});
 	const nextMission = await updateMissionV3State(mission, {
 		lifecycle_state: ["audit", "re_audit"].includes(laneType)
 			? "assuring"
@@ -3143,7 +3639,7 @@ export async function recordMissionV3LaneSummary(params: {
 		artifactPaths: params.artifactPaths,
 		paths,
 		profile,
-		candidate,
+		candidate: refreshedCandidate,
 		assuranceContract,
 		proofProgram,
 		environmentContract,
@@ -3209,7 +3705,7 @@ export async function syncMissionV3AfterCommit(params: {
 			produced_artifact_hashes: [],
 		},
 	});
-	await appendJournalEvent(paths.evidenceEventsPath, {
+	const evidence = await appendJournalEvent(paths.evidenceEventsPath, {
 		journalType: "evidence-events",
 		missionId: mission.mission_id,
 		candidateId: candidate.candidate_id,
@@ -3238,6 +3734,11 @@ export async function syncMissionV3AfterCommit(params: {
 			),
 		},
 	});
+	const refreshedCandidate = await updateMissionV3CandidateState(candidate, {
+		latest_evidence_refs: Array.from(
+			new Set([...candidate.latest_evidence_refs, evidence.event_id]),
+		).slice(-10),
+	});
 	const preferredLifecycle: MissionV3LifecycleState = [
 		"complete",
 		"running",
@@ -3250,7 +3751,7 @@ export async function syncMissionV3AfterCommit(params: {
 		artifactPaths: params.artifactPaths,
 		paths,
 		profile,
-		candidate,
+		candidate: refreshedCandidate,
 		assuranceContract,
 		proofProgram,
 		environmentContract,
@@ -3365,16 +3866,36 @@ async function loadMissionV3Prerequisites(repoRoot: string, slug: string) {
 	};
 }
 
+async function loadMissionV3RuntimeContext(repoRoot: string, slug: string) {
+	const prerequisites = await loadMissionV3Prerequisites(repoRoot, slug);
+	const artifacts = await loadMissionOrchestrationArtifacts(
+		prerequisites.mission.mission_root,
+	);
+	if (!artifacts) {
+		throw new Error(`mission_orchestration_artifacts_missing:${slug}`);
+	}
+	return {
+		...prerequisites,
+		artifacts,
+		orchestrationPaths: missionOrchestrationArtifactPaths(
+			prerequisites.mission.mission_root,
+		),
+	};
+}
+
 export async function createMissionV3Candidate(
 	options: MissionV3CreateCandidateOptions,
 ): Promise<MissionV3CandidateState> {
 	const {
 		mission,
 		artifactPaths,
+		assuranceContract,
 		proofProgram,
 		environmentContract,
 		candidates,
-	} = await loadMissionV3Prerequisites(options.repoRoot, options.slug);
+		artifacts,
+		orchestrationPaths,
+	} = await loadMissionV3RuntimeContext(options.repoRoot, options.slug);
 	if (!candidateSpawnTriggerAllowed(options.trigger)) {
 		throw new Error(`mission_v3_candidate_trigger_invalid:${options.trigger}`);
 	}
@@ -3485,43 +4006,41 @@ export async function createMissionV3Candidate(
 					mission.candidate_ids.length) + 1,
 		},
 	});
-	const tournament = buildCandidateTournament(
+	const runtimeCandidate = resolveMissionV3RuntimeCandidate(
 		nextMission,
 		[...candidates, candidate],
-		{
-			schema_version: 1,
-			generated_at: generatedAt,
-			mission_id: mission.mission_id,
-			candidate_id: mission.selected_candidate_id,
-			obligation_status_table: [],
-			blocking_contradictions: [],
-			waiver_summary: [],
-			stale_evidence_summary: [],
-			residual_risk_summary: [],
-			recommended_next_state: nextMission.lifecycle_state,
-			proof_ready: false,
-		},
-		{
-			schema_version: 1,
-			generated_at: generatedAt,
-			mission_id: mission.mission_id,
-			candidate_id: mission.selected_candidate_id,
-			decision: "block",
-			reasons: [],
-			lifecycle_state: nextMission.lifecycle_state,
-			required_artifacts: [],
-			policy_blockers: [],
-		},
+		candidate,
 	);
-	await writeJson(artifactPaths.candidateTournamentPath, tournament);
+	if (runtimeCandidate) {
+		await rebuildMissionV3DerivedState({
+			mission: nextMission,
+			artifacts,
+			artifactPaths: orchestrationPaths,
+			paths: artifactPaths,
+			profile: nextMission.policy_profile as MissionV3PolicyProfile,
+			candidate: runtimeCandidate,
+			assuranceContract,
+			proofProgram,
+			environmentContract,
+			preferredLifecycle: nextMission.lifecycle_state,
+		});
+	}
 	return candidate;
 }
 
 export async function selectMissionV3Candidate(
 	options: MissionV3SelectionOptions,
 ): Promise<MissionState> {
-	const { mission, artifactPaths, candidates } =
-		await loadMissionV3Prerequisites(options.repoRoot, options.slug);
+	const {
+		mission,
+		artifactPaths,
+		candidates,
+		artifacts,
+		orchestrationPaths,
+		assuranceContract,
+		proofProgram,
+		environmentContract,
+	} = await loadMissionV3RuntimeContext(options.repoRoot, options.slug);
 	const selected = candidates.find(
 		(candidate) => candidate.candidate_id === options.candidateId,
 	);
@@ -3534,19 +4053,15 @@ export async function selectMissionV3Candidate(
 	for (const candidate of candidates) {
 		if (candidate.candidate_id === selected.candidate_id) continue;
 		if (candidate.state === "selected") {
-			await writeJson(join(candidate.workspace_root, "candidate-state.json"), {
-				...candidate,
+			await updateMissionV3CandidateState(candidate, {
 				state: "running",
 				selected_at: null,
-				updated_at: nowIso(),
 			});
 		}
 	}
-	await writeJson(join(selected.workspace_root, "candidate-state.json"), {
-		...selected,
+	const refreshedSelected = await updateMissionV3CandidateState(selected, {
 		state: "selected",
 		selected_at: nowIso(),
-		updated_at: nowIso(),
 	});
 	await appendJournalEvent(artifactPaths.decisionLogPath, {
 		journalType: "decision-log",
@@ -3560,17 +4075,44 @@ export async function selectMissionV3Candidate(
 			reason: options.reason,
 		},
 	});
-	return updateMissionV3State(mission, {
+	const nextMission = await updateMissionV3State(mission, {
 		active_candidate_id: selected.candidate_id,
 		selected_candidate_id: selected.candidate_id,
+		lifecycle_state:
+			mission.lifecycle_state === "promotion_ready" ||
+			mission.lifecycle_state === "verified"
+				? "assuring"
+				: mission.lifecycle_state,
 	});
+	return (
+		await rebuildMissionV3DerivedState({
+			mission: nextMission,
+			artifacts,
+			artifactPaths: orchestrationPaths,
+			paths: artifactPaths,
+			profile: nextMission.policy_profile as MissionV3PolicyProfile,
+			candidate: refreshedSelected,
+			assuranceContract,
+			proofProgram,
+			environmentContract,
+			preferredLifecycle: nextMission.lifecycle_state,
+		})
+	).mission;
 }
 
 export async function rescindMissionV3CandidateSelection(
 	options: MissionV3SelectionOptions,
 ): Promise<MissionState> {
-	const { mission, artifactPaths, candidates } =
-		await loadMissionV3Prerequisites(options.repoRoot, options.slug);
+	const {
+		mission,
+		artifactPaths,
+		candidates,
+		artifacts,
+		orchestrationPaths,
+		assuranceContract,
+		proofProgram,
+		environmentContract,
+	} = await loadMissionV3RuntimeContext(options.repoRoot, options.slug);
 	if (["released", "handed_off"].includes(mission.lifecycle_state)) {
 		throw new Error(
 			`mission_v3_candidate_rescission_forbidden:${mission.lifecycle_state}`,
@@ -3582,11 +4124,9 @@ export async function rescindMissionV3CandidateSelection(
 	if (!selected || selected.candidate_id !== mission.selected_candidate_id) {
 		throw new Error(`mission_v3_candidate_not_selected:${options.candidateId}`);
 	}
-	await writeJson(join(selected.workspace_root, "candidate-state.json"), {
-		...selected,
+	const rescindedCandidate = await updateMissionV3CandidateState(selected, {
 		state: "blocked",
 		selected_at: null,
-		updated_at: nowIso(),
 	});
 	await appendJournalEvent(artifactPaths.decisionLogPath, {
 		journalType: "decision-log",
@@ -3605,7 +4145,7 @@ export async function rescindMissionV3CandidateSelection(
 			candidate.candidate_id !== selected.candidate_id &&
 			candidateCanReceiveActiveWrites(candidate),
 	);
-	return updateMissionV3State(mission, {
+	const nextMission = await updateMissionV3State(mission, {
 		active_candidate_id: fallbackActiveCandidate?.candidate_id ?? null,
 		selected_candidate_id: null,
 		lifecycle_state:
@@ -3631,6 +4171,29 @@ export async function rescindMissionV3CandidateSelection(
 			]),
 		),
 	});
+	return (
+		await rebuildMissionV3DerivedState({
+			mission: nextMission,
+			artifacts,
+			artifactPaths: orchestrationPaths,
+			paths: artifactPaths,
+			profile: nextMission.policy_profile as MissionV3PolicyProfile,
+			candidate:
+				resolveMissionV3RuntimeCandidate(
+					nextMission,
+					candidates.map((candidate) =>
+						candidate.candidate_id === rescindedCandidate.candidate_id
+							? rescindedCandidate
+							: candidate,
+					),
+					fallbackActiveCandidate ?? rescindedCandidate,
+				) ?? rescindedCandidate,
+			assuranceContract,
+			proofProgram,
+			environmentContract,
+			preferredLifecycle: nextMission.lifecycle_state,
+		})
+	).mission;
 }
 
 export async function hybridizeMissionV3Candidates(
@@ -3648,11 +4211,17 @@ export async function hybridizeMissionV3Candidates(
 export async function recordMissionV3ReleaseAction(
 	options: MissionV3ReleaseOptions,
 ): Promise<MissionState> {
-	const { mission, artifactPaths } = await loadMissionV3Prerequisites(
-		options.repoRoot,
-		options.slug,
-	);
-	if (!["promotion_ready", "verified"].includes(mission.lifecycle_state)) {
+	const {
+		mission,
+		artifactPaths,
+		artifacts,
+		orchestrationPaths,
+		assuranceContract,
+		proofProgram,
+		environmentContract,
+		candidates,
+	} = await loadMissionV3RuntimeContext(options.repoRoot, options.slug);
+	if (mission.lifecycle_state !== "promotion_ready") {
 		throw new Error(
 			`mission_v3_release_requires_promotion_ready:${mission.lifecycle_state}`,
 		);
@@ -3700,7 +4269,7 @@ export async function recordMissionV3ReleaseAction(
 			destination: options.destination ?? null,
 		},
 	});
-	return updateMissionV3State(mission, {
+	const nextMission = await updateMissionV3State(mission, {
 		lifecycle_state: options.action,
 		status: "complete",
 		promotion_state: {
@@ -3711,6 +4280,316 @@ export async function recordMissionV3ReleaseAction(
 		},
 		final_reason: options.summary,
 	});
+	return (
+		await rebuildMissionV3DerivedState({
+			mission: nextMission,
+			artifacts,
+			artifactPaths: orchestrationPaths,
+			paths: artifactPaths,
+			profile: nextMission.policy_profile as MissionV3PolicyProfile,
+			candidate:
+				resolveMissionV3RuntimeCandidate(nextMission, candidates) ??
+				candidates[0]!,
+			assuranceContract,
+			proofProgram,
+			environmentContract,
+			preferredLifecycle: options.action,
+		})
+	).mission;
+}
+
+export async function promoteMissionV3Candidate(
+	options: MissionV3PromoteOptions,
+): Promise<MissionState> {
+	const {
+		mission,
+		artifactPaths,
+		artifacts,
+		orchestrationPaths,
+		assuranceContract,
+		proofProgram,
+		environmentContract,
+		candidates,
+	} = await loadMissionV3RuntimeContext(options.repoRoot, options.slug);
+	if (mission.lifecycle_state !== "verified") {
+		throw new Error(
+			`mission_v3_promote_requires_verified:${mission.lifecycle_state}`,
+		);
+	}
+	if (!mission.selected_candidate_id) {
+		throw new Error("mission_v3_promote_requires_selected_candidate");
+	}
+	const promotionDecision = await readJson<MissionV3PromotionDecision>(
+		artifactPaths.promotionDecisionPath,
+	);
+	if (promotionDecision.decision !== "allow") {
+		throw new Error("mission_v3_promote_requires_allow_decision");
+	}
+	const generatedAt = nowIso();
+	await appendJournalEvent(artifactPaths.promotionEventsPath, {
+		journalType: "promotion-events",
+		missionId: mission.mission_id,
+		candidateId: mission.selected_candidate_id,
+		actorPrincipal: options.actor,
+		idempotencyKey: `promotion-ready:${mission.selected_candidate_id}:${shortHash(options.summary)}`,
+		payload: {
+			action: "promotion_ready",
+			summary: options.summary,
+			required_artifacts: promotionDecision.required_artifacts,
+		},
+	});
+	await appendJournalEvent(artifactPaths.decisionLogPath, {
+		journalType: "decision-log",
+		missionId: mission.mission_id,
+		candidateId: mission.selected_candidate_id,
+		actorPrincipal: options.actor,
+		idempotencyKey: `decision:promotion-ready:${mission.selected_candidate_id}:${shortHash(options.summary)}`,
+		payload: {
+			decision: "promotion_ready",
+			summary: options.summary,
+			required_artifacts: promotionDecision.required_artifacts,
+		},
+	});
+	const nextMission = await updateMissionV3State(mission, {
+		lifecycle_state: "promotion_ready",
+		status: "complete",
+		promotion_state: {
+			...mission.promotion_state,
+			status: "ready",
+			blocking_reasons: [],
+			last_decision_at: generatedAt,
+			decision_ref: artifactPaths.promotionDecisionPath,
+		},
+		final_reason: options.summary,
+	});
+	return (
+		await rebuildMissionV3DerivedState({
+			mission: nextMission,
+			artifacts,
+			artifactPaths: orchestrationPaths,
+			paths: artifactPaths,
+			profile: nextMission.policy_profile as MissionV3PolicyProfile,
+			candidate:
+				resolveMissionV3RuntimeCandidate(nextMission, candidates) ??
+				candidates[0]!,
+			assuranceContract,
+			proofProgram,
+			environmentContract,
+			preferredLifecycle: "promotion_ready",
+		})
+	).mission;
+}
+
+export async function createMissionV3Waiver(
+	options: MissionV3WaiverOptions,
+): Promise<MissionV3Waiver> {
+	const {
+		mission,
+		artifactPaths,
+		artifacts,
+		orchestrationPaths,
+		assuranceContract,
+		proofProgram,
+		environmentContract,
+		candidates,
+	} = await loadMissionV3RuntimeContext(options.repoRoot, options.slug);
+	if (
+		(options.obligationIds?.length ?? 0) === 0 &&
+		(options.policyClauseIds?.length ?? 0) === 0
+	) {
+		throw new Error("mission_v3_waiver_requires_scope_targets");
+	}
+	const requestedObligationIds = options.obligationIds ?? [];
+	const requestedPolicyClauseIds = options.policyClauseIds ?? [];
+	const obligationsById = new Map(
+		assuranceContract.obligations.map((obligation) => [
+			obligation.obligation_id,
+			obligation,
+		]),
+	);
+	for (const obligationId of requestedObligationIds) {
+		const obligation = obligationsById.get(obligationId);
+		if (!obligation) {
+			throw new Error(`mission_v3_waiver_unknown_obligation:${obligationId}`);
+		}
+		if (!obligation.waiver_allowed) {
+			throw new Error(`mission_v3_waiver_forbidden:${obligationId}`);
+		}
+	}
+	if (requestedPolicyClauseIds.length > 0) {
+		if (!existsSync(artifactPaths.policySnapshotPath)) {
+			throw new Error("mission_v3_waiver_policy_snapshot_missing");
+		}
+		const policySnapshot = await readJson<{
+			clauses: Array<{ clause_id: string }>;
+		}>(artifactPaths.policySnapshotPath);
+		const knownClauseIds = new Set(
+			policySnapshot.clauses.map((clause) => clause.clause_id),
+		);
+		for (const clauseId of requestedPolicyClauseIds) {
+			if (!knownClauseIds.has(clauseId)) {
+				throw new Error(`mission_v3_waiver_unknown_policy_clause:${clauseId}`);
+			}
+		}
+	}
+	const waiver: MissionV3Waiver = {
+		waiver_id: `waiver:${shortHash(
+			stableJson({
+				scope: options.scope,
+				authority: options.authority,
+				rationale: options.rationale,
+				obligations: options.obligationIds ?? [],
+				policy: options.policyClauseIds ?? [],
+			}),
+		)}`,
+		obligation_ids: requestedObligationIds,
+		policy_clause_ids: requestedPolicyClauseIds,
+		scope: options.scope,
+		authority: options.authority,
+		rationale: options.rationale,
+		compensating_controls: options.compensatingControls ?? [],
+		expires_at: options.expiresAt ?? addSeconds(nowIso(), 3600),
+		evidence_refs: options.evidenceRefs ?? [],
+		created_at: nowIso(),
+	};
+	await appendJournalEvent(artifactPaths.decisionLogPath, {
+		journalType: "decision-log",
+		missionId: mission.mission_id,
+		candidateId: mission.selected_candidate_id ?? mission.active_candidate_id,
+		actorPrincipal: options.authority,
+		idempotencyKey: `decision:waiver:${waiver.waiver_id}`,
+		payload: {
+			decision: "waiver_created",
+			waiver,
+		},
+	});
+	const nextMission = await updateMissionV3State(mission, {
+		status: mission.status === "running" ? "complete" : mission.status,
+		lifecycle_state:
+			mission.lifecycle_state === "blocked_external"
+				? "assuring"
+				: mission.lifecycle_state,
+	});
+	await rebuildMissionV3DerivedState({
+		mission: nextMission,
+		artifacts,
+		artifactPaths: orchestrationPaths,
+		paths: artifactPaths,
+		profile: nextMission.policy_profile as MissionV3PolicyProfile,
+		candidate:
+			resolveMissionV3RuntimeCandidate(nextMission, candidates) ??
+			candidates[0]!,
+		assuranceContract,
+		proofProgram,
+		environmentContract,
+		preferredLifecycle: nextMission.lifecycle_state,
+	});
+	return waiver;
+}
+
+export async function appendMissionV3ContractAmendment(
+	options: MissionV3ContractAmendmentOptions,
+): Promise<MissionV3ContractAmendment> {
+	const {
+		mission,
+		artifactPaths,
+		artifacts,
+		orchestrationPaths,
+		assuranceContract,
+		proofProgram,
+		environmentContract,
+		candidates,
+	} = await loadMissionV3RuntimeContext(options.repoRoot, options.slug);
+	const targetPathMap: Record<MissionV3ContractTarget, string> = {
+		"assurance-contract": artifactPaths.assuranceContractPath,
+		"proof-program": artifactPaths.proofProgramPath,
+		"checker-lock": artifactPaths.checkerLockPath,
+		"environment-contract": artifactPaths.environmentContractPath,
+	};
+	const idempotencyKey = `contract-amendment:manual:${options.targetContract}:${shortHash(
+		stableJson({
+			rationale: options.rationale,
+			scope: options.scope,
+			authority: options.authority,
+		}),
+	)}`;
+	const existingAmendment = (
+		await loadJournal<Record<string, unknown>>(
+			artifactPaths.contractAmendmentsPath,
+		)
+	).find((event) => event.idempotency_key === idempotencyKey);
+	if (existingAmendment) {
+		return existingAmendment.payload as unknown as MissionV3ContractAmendment;
+	}
+	const targetPath = targetPathMap[options.targetContract];
+	const contract = await readJson<Record<string, unknown>>(targetPath);
+	const nextContract = {
+		...contract,
+		generated_at: nowIso(),
+		...(typeof contract.revision === "number"
+			? { revision: Number(contract.revision) + 1 }
+			: {}),
+	};
+	await writeMissionV3ContractWithSnapshot({
+		path: targetPath,
+		target: options.targetContract,
+		value: nextContract,
+	});
+	const amendment: MissionV3ContractAmendment = {
+		amendment_id: `amendment:${options.targetContract}:${shortHash(
+			stableJson({
+				rationale: options.rationale,
+				scope: options.scope,
+				authority: options.authority,
+			}),
+		)}`,
+		target_contract: options.targetContract,
+		rationale: options.rationale,
+		authority: options.authority,
+		scope: options.scope,
+		resulting_revision_ref: contractRevisionRef(
+			options.targetContract,
+			nextContract,
+		),
+		affected_obligation_ids: options.affectedObligationIds ?? [],
+		affected_policy_clause_ids: options.affectedPolicyClauseIds ?? [],
+		created_at: nowIso(),
+	};
+	await writeJson(targetPath, nextContract);
+	await appendJournalEvent(artifactPaths.contractAmendmentsPath, {
+		journalType: "contract-amendments",
+		missionId: mission.mission_id,
+		actorPrincipal: options.authority,
+		idempotencyKey,
+		payload: amendment,
+	});
+	await rebuildMissionV3DerivedState({
+		mission,
+		artifacts,
+		artifactPaths: orchestrationPaths,
+		paths: artifactPaths,
+		profile: mission.policy_profile as MissionV3PolicyProfile,
+		candidate:
+			resolveMissionV3RuntimeCandidate(mission, candidates) ?? candidates[0]!,
+		assuranceContract:
+			options.targetContract === "assurance-contract"
+				? await readJson<MissionV3AssuranceContract>(
+						artifactPaths.assuranceContractPath,
+					)
+				: assuranceContract,
+		proofProgram:
+			options.targetContract === "proof-program"
+				? await readJson<MissionV3ProofProgram>(artifactPaths.proofProgramPath)
+				: proofProgram,
+		environmentContract:
+			options.targetContract === "environment-contract"
+				? await readJson<MissionV3EnvironmentContract>(
+						artifactPaths.environmentContractPath,
+					)
+				: environmentContract,
+		preferredLifecycle: mission.lifecycle_state,
+	});
+	return amendment;
 }
 
 export async function loadMissionV3ArtifactRoles(
@@ -3729,12 +4608,18 @@ export async function loadMissionV3ArtifactRoles(
 		{ path: paths.checkerLockPath, role: "canonical" },
 		{ path: paths.environmentContractPath, role: "canonical" },
 		{ path: paths.activeCandidateStatePath, role: "authoritative" },
+		{ path: paths.contractAmendmentsPath, role: "append_only" },
 		{ path: paths.environmentAttestationsPath, role: "append_only" },
+		{ path: paths.runtimeObservationsPath, role: "append_only" },
 		{ path: paths.laneRunsPath, role: "append_only" },
 		{ path: paths.commandAttestationsPath, role: "append_only" },
 		{ path: paths.evidenceEventsPath, role: "append_only" },
 		{ path: paths.policyDecisionsPath, role: "append_only" },
 		{ path: paths.promotionEventsPath, role: "append_only" },
+		{ path: paths.decisionLogPath, role: "append_only" },
+		{ path: paths.uncertaintyEventsPath, role: "append_only" },
+		{ path: paths.compactionEventsPath, role: "append_only" },
+		{ path: paths.activeCandidateEventsPath, role: "append_only" },
 		{ path: paths.environmentCurrentPath, role: "derived" },
 		{ path: paths.policySnapshotPath, role: "derived" },
 		{ path: paths.impactMapPath, role: "derived" },
