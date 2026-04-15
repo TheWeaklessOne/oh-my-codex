@@ -476,6 +476,14 @@ function shortHash(input: string): string {
 	return hashValue(input).slice(0, 16);
 }
 
+function journalEventId(params: {
+	journalType: string;
+	missionId: string;
+	idempotencyKey: string;
+}): string {
+	return `${params.journalType}:${shortHash(`${params.missionId}:${params.idempotencyKey}`)}`;
+}
+
 function stableJson(value: unknown): string {
 	return JSON.stringify(value);
 }
@@ -633,20 +641,24 @@ async function appendJournalEvent<T extends object>(
 ): Promise<MissionV3JournalEvent<T>> {
 	if (existsSync(filePath)) {
 		const parsed = parseJournal<T>(await readFile(filePath, "utf-8"));
+		if (parsed.truncatedTail) {
+			await writeText(filePath, serializeJournal(parsed.events));
+		}
 		const duplicate = parsed.events.find(
 			(event) => event.idempotency_key === input.idempotencyKey,
 		);
 		if (duplicate) return duplicate;
-		if (parsed.truncatedTail) {
-			await writeText(filePath, serializeJournal(parsed.events));
-		}
 	}
 	const existing = await loadJournal<T>(filePath);
 	const previous = existing.at(-1);
 	const recordedAt = input.recordedAt ?? nowIso();
 	const payloadHash = `sha256:${hashValue(stableJson(input.payload))}`;
 	const next: MissionV3JournalEvent<T> = {
-		event_id: `${input.journalType}:${shortHash(`${input.missionId}:${input.idempotencyKey}:${existing.length + 1}`)}`,
+		event_id: journalEventId({
+			journalType: input.journalType,
+			missionId: input.missionId,
+			idempotencyKey: input.idempotencyKey,
+		}),
 		schema_version: 1,
 		journal_type: input.journalType,
 		sequence: (previous?.sequence ?? 0) + 1,
@@ -1717,6 +1729,25 @@ function resolveMissionV3RuntimeCandidate(
 	);
 }
 
+function requireMissionV3SelectedCandidateState(
+	mission: MissionState,
+	candidates: MissionV3CandidateState[],
+): MissionV3CandidateState {
+	const selectedCandidateId = mission.selected_candidate_id;
+	if (!selectedCandidateId) {
+		throw new Error("mission_v3_selected_candidate_missing");
+	}
+	const selectedCandidate = candidates.find(
+		(candidate) => candidate.candidate_id === selectedCandidateId,
+	);
+	if (!selectedCandidate) {
+		throw new Error(
+			`mission_v3_selected_candidate_state_missing:${selectedCandidateId}`,
+		);
+	}
+	return selectedCandidate;
+}
+
 export async function assertMissionV3CandidateWritable(
 	repoRoot: string,
 	slug: string,
@@ -1733,6 +1764,63 @@ export async function assertMissionV3CandidateWritable(
 		throw new Error(`mission_v3_candidate_stale:${candidate.state}`);
 	}
 	return candidate;
+}
+
+async function appendMissionV3CandidateEvent(params: {
+	candidate: MissionV3CandidateState;
+	actorPrincipal: string;
+	idempotencyKey: string;
+	payload: Record<string, unknown>;
+}): Promise<MissionV3JournalEvent<Record<string, unknown>>> {
+	return appendJournalEvent(
+		join(params.candidate.workspace_root, "candidate-events.ndjson"),
+		{
+			journalType: "candidate-events",
+			missionId: params.candidate.mission_id,
+			candidateId: params.candidate.candidate_id,
+			actorPrincipal: params.actorPrincipal,
+			idempotencyKey: params.idempotencyKey,
+			payload: params.payload,
+		},
+	);
+}
+
+function promotionArtifactEntries(paths: MissionV3ArtifactPaths): Array<{
+	name: string;
+	path: string;
+}> {
+	return [
+		{
+			name: "assurance-contract.json",
+			path: paths.assuranceContractPath,
+		},
+		{
+			name: "proof-program.json",
+			path: paths.proofProgramPath,
+		},
+		{
+			name: "checker-lock.json",
+			path: paths.checkerLockPath,
+		},
+		{
+			name: "environment-contract.json",
+			path: paths.environmentContractPath,
+		},
+		{
+			name: "adjudication.json",
+			path: paths.adjudicationPath,
+		},
+	];
+}
+
+function missingPromotionArtifacts(
+	paths: MissionV3ArtifactPaths,
+	knownPresentPaths: string[] = [],
+): string[] {
+	const knownPresent = new Set(knownPresentPaths);
+	return promotionArtifactEntries(paths)
+		.filter((entry) => !knownPresent.has(entry.path) && !existsSync(entry.path))
+		.map((entry) => entry.name);
 }
 
 async function buildPolicySnapshot(
@@ -2365,16 +2453,17 @@ function buildPromotionDecision(
 	candidateId: string | null,
 	adjudication: MissionV3Adjudication,
 	policyBlockers: string[],
+	paths: MissionV3ArtifactPaths,
 ): MissionV3PromotionDecision {
-	const requiredArtifacts = [
-		"assurance-contract.json",
-		"proof-program.json",
-		"checker-lock.json",
-		"environment-contract.json",
-		"adjudication.json",
-	];
+	const requiredArtifacts = promotionArtifactEntries(paths).map(
+		(entry) => entry.name,
+	);
+	const missingArtifacts = missingPromotionArtifacts(paths);
 	const reasons = [
 		...policyBlockers,
+		...missingArtifacts.map(
+			(artifact) => `required promotion artifact missing: ${artifact}`,
+		),
 		...(candidateId === null
 			? ["no selected candidate is available for promotion"]
 			: []),
@@ -3036,11 +3125,13 @@ async function rebuildMissionV3DerivedState(params: {
 		effectivePolicyBlockers,
 		activeWaivers,
 	);
+	await writeJson(paths.adjudicationPath, adjudication);
 	const promotionDecision = buildPromotionDecision(
 		mission,
 		selectedCandidateId,
 		adjudication,
 		effectivePolicyBlockers,
+		paths,
 	);
 	const uncertaintyRegister = await buildUncertaintyRegister(paths);
 	const qualityWatchdog = buildQualityWatchdog(
@@ -3497,48 +3588,18 @@ export async function recordMissionV3LaneSummary(params: {
 		? obligationIdsForLane(proofProgram, proofLane)
 		: [];
 	const evidenceRecordedAt = nowIso();
-	const laneRun = await appendJournalEvent(paths.laneRunsPath, {
-		journalType: "lane-runs",
-		missionId: mission.mission_id,
-		candidateId: candidate.candidate_id,
-		laneId: `${laneType}:${iteration}`,
-		actorPrincipal: `mission-lane:${laneType}`,
-		idempotencyKey: `lane-run:${candidate.candidate_id}:${iteration}:${laneType}`,
-		payload: {
-			lane_run_id: `lane-run:${laneType}:${iteration}`,
-			candidate_id: candidate.candidate_id,
-			lane_type: proofLane ?? laneType,
-			source_lane_type: laneType,
-			proof_program_id: proofProgram.proof_program_id,
-			attempt_index: 1,
-			matrix_target: "matrix:local-node",
-			env_attestation_ref:
-				(await loadJournal(paths.environmentAttestationsPath)).at(-1)
-					?.event_id ?? null,
-			checker_refs: proofLane
-				? proofProgram.bindings
-						.filter((binding) => binding.proof_lane === proofLane)
-						.flatMap((binding) => binding.checker_refs)
-				: [],
-			started_at: summary.provenance.started_at,
-			completed_at: summary.provenance.finished_at,
-			outcome: summary.verdict.toLowerCase(),
-			exit_summary: `${summary.verdict}/${summary.confidence}`,
-			produced_artifact_refs: [summaryPath],
-			command_attestation_refs: [],
-			obligation_ids: obligationIds,
-		},
-	});
+	const commandIdempotencyKey = `command-attestation:${candidate.candidate_id}:${iteration}:${laneType}`;
+	const laneRunId = `lane-run:${candidate.candidate_id}:${iteration}:${proofLane ?? laneType}`;
 	const command = await appendJournalEvent(paths.commandAttestationsPath, {
 		journalType: "command-attestations",
 		missionId: mission.mission_id,
 		candidateId: candidate.candidate_id,
 		laneId: `${laneType}:${iteration}`,
 		actorPrincipal: `mission-lane:${laneType}`,
-		idempotencyKey: `command-attestation:${candidate.candidate_id}:${iteration}:${laneType}`,
+		idempotencyKey: commandIdempotencyKey,
 		payload: {
 			command_attestation_id: `cmd:${laneType}:${iteration}`,
-			lane_run_id: laneRun.event_id,
+			lane_run_id: laneRunId,
 			checker_id: proofLane
 				? (proofProgram.bindings.find(
 						(binding) => binding.proof_lane === proofLane,
@@ -3569,6 +3630,38 @@ export async function recordMissionV3LaneSummary(params: {
 			stdout_hash: `sha256:${shortHash(stableJson(summary))}`,
 			stderr_hash: null,
 			produced_artifact_hashes: [`sha256:${shortHash(stableJson(summary))}`],
+		},
+	});
+	const laneRun = await appendJournalEvent(paths.laneRunsPath, {
+		journalType: "lane-runs",
+		missionId: mission.mission_id,
+		candidateId: candidate.candidate_id,
+		laneId: `${laneType}:${iteration}`,
+		actorPrincipal: `mission-lane:${laneType}`,
+		idempotencyKey: `lane-run:${candidate.candidate_id}:${iteration}:${laneType}`,
+		payload: {
+			lane_run_id: laneRunId,
+			candidate_id: candidate.candidate_id,
+			lane_type: proofLane ?? laneType,
+			source_lane_type: laneType,
+			proof_program_id: proofProgram.proof_program_id,
+			attempt_index: 1,
+			matrix_target: "matrix:local-node",
+			env_attestation_ref:
+				(await loadJournal(paths.environmentAttestationsPath)).at(-1)
+					?.event_id ?? null,
+			checker_refs: proofLane
+				? proofProgram.bindings
+						.filter((binding) => binding.proof_lane === proofLane)
+						.flatMap((binding) => binding.checker_refs)
+				: [],
+			started_at: summary.provenance.started_at,
+			completed_at: summary.provenance.finished_at,
+			outcome: summary.verdict.toLowerCase(),
+			exit_summary: `${summary.verdict}/${summary.confidence}`,
+			produced_artifact_refs: [summaryPath],
+			command_attestation_refs: [command.event_id],
+			obligation_ids: obligationIds,
 		},
 	});
 	await appendJournalEvent(paths.runtimeObservationsPath, {
@@ -3677,16 +3770,18 @@ export async function syncMissionV3AfterCommit(params: {
 		proofProgram,
 		"static-analysis",
 	);
+	const commandIdempotencyKey = `static-analysis:${candidate.candidate_id}:${iteration}:${safetyBaseline.focused_checks_green}`;
+	const laneRunId = `lane-run:${candidate.candidate_id}:${iteration}:static-analysis`;
 	const command = await appendJournalEvent(paths.commandAttestationsPath, {
 		journalType: "command-attestations",
 		missionId: mission.mission_id,
 		candidateId: candidate.candidate_id,
 		laneId: `static-analysis:${iteration}`,
 		actorPrincipal: "mission-kernel",
-		idempotencyKey: `static-analysis:${candidate.candidate_id}:${iteration}:${safetyBaseline.focused_checks_green}`,
+		idempotencyKey: commandIdempotencyKey,
 		payload: {
 			command_attestation_id: `cmd:static-analysis:${iteration}`,
-			lane_run_id: null,
+			lane_run_id: laneRunId,
 			checker_id:
 				proofProgram.bindings.find(
 					(binding) => binding.proof_lane === "static-analysis",
@@ -3705,6 +3800,42 @@ export async function syncMissionV3AfterCommit(params: {
 			produced_artifact_hashes: [],
 		},
 	});
+	const laneRun = await appendJournalEvent(paths.laneRunsPath, {
+		journalType: "lane-runs",
+		missionId: mission.mission_id,
+		candidateId: candidate.candidate_id,
+		laneId: `static-analysis:${iteration}`,
+		actorPrincipal: "mission-kernel",
+		idempotencyKey: `lane-run:${candidate.candidate_id}:${iteration}:static-analysis`,
+		payload: {
+			lane_run_id: laneRunId,
+			candidate_id: candidate.candidate_id,
+			lane_type: "static-analysis",
+			source_lane_type: "commit",
+			proof_program_id: proofProgram.proof_program_id,
+			attempt_index: 1,
+			matrix_target:
+				proofProgram.bindings.find(
+					(binding) => binding.proof_lane === "static-analysis",
+				)?.required_matrix_target ?? "matrix:local-node",
+			env_attestation_ref:
+				(await loadJournal(paths.environmentAttestationsPath)).at(-1)
+					?.event_id ?? null,
+			checker_refs:
+				proofProgram.bindings
+					.filter((binding) => binding.proof_lane === "static-analysis")
+					.flatMap((binding) => binding.checker_refs) ?? [],
+			started_at: mission.updated_at,
+			completed_at: nowIso(),
+			outcome: safetyBaseline.focused_checks_green ? "pass" : "fail",
+			exit_summary: safetyBaseline.focused_checks_green
+				? "PASS/high"
+				: "FAIL/high",
+			produced_artifact_refs: [],
+			command_attestation_refs: [command.event_id],
+			obligation_ids: staticAnalysisObligationIds,
+		},
+	});
 	const evidence = await appendJournalEvent(paths.evidenceEventsPath, {
 		journalType: "evidence-events",
 		missionId: mission.mission_id,
@@ -3715,7 +3846,7 @@ export async function syncMissionV3AfterCommit(params: {
 		payload: {
 			evidence_id: `evidence:static-analysis:${iteration}`,
 			candidate_id: candidate.candidate_id,
-			lane_run_ref: null,
+			lane_run_ref: laneRun.event_id,
 			command_attestation_refs: [command.event_id],
 			obligation_ids: staticAnalysisObligationIds,
 			evidence_kind: "focused_checks",
@@ -3735,6 +3866,9 @@ export async function syncMissionV3AfterCommit(params: {
 		},
 	});
 	const refreshedCandidate = await updateMissionV3CandidateState(candidate, {
+		latest_lane_run_refs: Array.from(
+			new Set([...candidate.latest_lane_run_refs, laneRun.event_id]),
+		).slice(-10),
 		latest_evidence_refs: Array.from(
 			new Set([...candidate.latest_evidence_refs, evidence.event_id]),
 		).slice(-10),
@@ -4050,18 +4184,56 @@ export async function selectMissionV3Candidate(
 	if (staleCandidateStates().includes(selected.state)) {
 		throw new Error(`mission_v3_candidate_not_selectable:${selected.state}`);
 	}
+	const revertedCandidates: MissionV3CandidateState[] = [];
 	for (const candidate of candidates) {
 		if (candidate.candidate_id === selected.candidate_id) continue;
 		if (candidate.state === "selected") {
-			await updateMissionV3CandidateState(candidate, {
-				state: "running",
-				selected_at: null,
-			});
+			revertedCandidates.push(
+				await updateMissionV3CandidateState(candidate, {
+					state: "running",
+					selected_at: null,
+				}),
+			);
 		}
 	}
 	const refreshedSelected = await updateMissionV3CandidateState(selected, {
 		state: "selected",
 		selected_at: nowIso(),
+	});
+	const nextMission = await updateMissionV3State(mission, {
+		active_candidate_id: selected.candidate_id,
+		selected_candidate_id: selected.candidate_id,
+		lifecycle_state:
+			mission.lifecycle_state === "promotion_ready" ||
+			mission.lifecycle_state === "verified"
+				? "assuring"
+				: mission.lifecycle_state,
+	});
+	for (const revertedCandidate of revertedCandidates) {
+		await appendMissionV3CandidateEvent({
+			candidate: revertedCandidate,
+			actorPrincipal: "mission-v3-portfolio",
+			idempotencyKey: `candidate-selection-cleared:${revertedCandidate.candidate_id}:${selected.candidate_id}:${shortHash(options.reason)}`,
+			payload: {
+				transition: "selection_cleared",
+				previous_state: "selected",
+				next_state: "running",
+				reason: options.reason,
+				selected_candidate_id: selected.candidate_id,
+			},
+		});
+	}
+	await appendMissionV3CandidateEvent({
+		candidate: refreshedSelected,
+		actorPrincipal: "mission-v3-portfolio",
+		idempotencyKey: `candidate-selected:${selected.candidate_id}:${shortHash(options.reason)}`,
+		payload: {
+			transition: "candidate_selected",
+			previous_state: selected.state,
+			next_state: "selected",
+			reason: options.reason,
+			selected_at: refreshedSelected.selected_at,
+		},
 	});
 	await appendJournalEvent(artifactPaths.decisionLogPath, {
 		journalType: "decision-log",
@@ -4074,15 +4246,6 @@ export async function selectMissionV3Candidate(
 			candidate_id: selected.candidate_id,
 			reason: options.reason,
 		},
-	});
-	const nextMission = await updateMissionV3State(mission, {
-		active_candidate_id: selected.candidate_id,
-		selected_candidate_id: selected.candidate_id,
-		lifecycle_state:
-			mission.lifecycle_state === "promotion_ready" ||
-			mission.lifecycle_state === "verified"
-				? "assuring"
-				: mission.lifecycle_state,
 	});
 	return (
 		await rebuildMissionV3DerivedState({
@@ -4128,18 +4291,6 @@ export async function rescindMissionV3CandidateSelection(
 		state: "blocked",
 		selected_at: null,
 	});
-	await appendJournalEvent(artifactPaths.decisionLogPath, {
-		journalType: "decision-log",
-		missionId: mission.mission_id,
-		candidateId: selected.candidate_id,
-		actorPrincipal: "mission-v3-portfolio",
-		idempotencyKey: `decision:candidate-rescinded:${selected.candidate_id}:${shortHash(options.reason)}`,
-		payload: {
-			decision: "candidate_rescinded",
-			candidate_id: selected.candidate_id,
-			reason: options.reason,
-		},
-	});
 	const fallbackActiveCandidate = candidates.find(
 		(candidate) =>
 			candidate.candidate_id !== selected.candidate_id &&
@@ -4170,6 +4321,29 @@ export async function rescindMissionV3CandidateSelection(
 				`selection_rescinded:${selected.candidate_id}`,
 			]),
 		),
+	});
+	await appendMissionV3CandidateEvent({
+		candidate: rescindedCandidate,
+		actorPrincipal: "mission-v3-portfolio",
+		idempotencyKey: `candidate-rescinded:${selected.candidate_id}:${shortHash(options.reason)}`,
+		payload: {
+			transition: "candidate_rescinded",
+			previous_state: selected.state,
+			next_state: "blocked",
+			reason: options.reason,
+		},
+	});
+	await appendJournalEvent(artifactPaths.decisionLogPath, {
+		journalType: "decision-log",
+		missionId: mission.mission_id,
+		candidateId: selected.candidate_id,
+		actorPrincipal: "mission-v3-portfolio",
+		idempotencyKey: `decision:candidate-rescinded:${selected.candidate_id}:${shortHash(options.reason)}`,
+		payload: {
+			decision: "candidate_rescinded",
+			candidate_id: selected.candidate_id,
+			reason: options.reason,
+		},
 	});
 	return (
 		await rebuildMissionV3DerivedState({
@@ -4229,20 +4403,36 @@ export async function recordMissionV3ReleaseAction(
 	if (!mission.selected_candidate_id) {
 		throw new Error("mission_v3_release_requires_selected_candidate");
 	}
+	const selectedCandidate = requireMissionV3SelectedCandidateState(
+		mission,
+		candidates,
+	);
 	const actionPath =
 		options.action === "released"
 			? artifactPaths.releaseRecordPath
 			: artifactPaths.handoffRecordPath;
 	const generatedAt = nowIso();
-	await writeJson(actionPath, {
-		schema_version: 1,
-		generated_at: generatedAt,
-		mission_id: mission.mission_id,
-		candidate_id: mission.selected_candidate_id,
-		action: options.action,
-		actor: options.actor,
-		summary: options.summary,
-		destination: options.destination ?? null,
+	const nextMission = await updateMissionV3State(mission, {
+		lifecycle_state: options.action,
+		status: "complete",
+		promotion_state: {
+			...mission.promotion_state,
+			status: options.action,
+			last_decision_at: generatedAt,
+			decision_ref: actionPath,
+		},
+		final_reason: options.summary,
+	});
+	await appendMissionV3CandidateEvent({
+		candidate: selectedCandidate,
+		actorPrincipal: options.actor,
+		idempotencyKey: `candidate-terminal-action:${options.action}:${mission.selected_candidate_id}:${shortHash(options.summary)}`,
+		payload: {
+			transition: options.action,
+			summary: options.summary,
+			destination: options.destination ?? null,
+			record_path: actionPath,
+		},
 	});
 	await appendJournalEvent(artifactPaths.promotionEventsPath, {
 		journalType: "promotion-events",
@@ -4269,16 +4459,15 @@ export async function recordMissionV3ReleaseAction(
 			destination: options.destination ?? null,
 		},
 	});
-	const nextMission = await updateMissionV3State(mission, {
-		lifecycle_state: options.action,
-		status: "complete",
-		promotion_state: {
-			...mission.promotion_state,
-			status: options.action,
-			last_decision_at: generatedAt,
-			decision_ref: actionPath,
-		},
-		final_reason: options.summary,
+	await writeJson(actionPath, {
+		schema_version: 1,
+		generated_at: generatedAt,
+		mission_id: mission.mission_id,
+		candidate_id: mission.selected_candidate_id,
+		action: options.action,
+		actor: options.actor,
+		summary: options.summary,
+		destination: options.destination ?? null,
 	});
 	return (
 		await rebuildMissionV3DerivedState({
@@ -4288,8 +4477,11 @@ export async function recordMissionV3ReleaseAction(
 			paths: artifactPaths,
 			profile: nextMission.policy_profile as MissionV3PolicyProfile,
 			candidate:
-				resolveMissionV3RuntimeCandidate(nextMission, candidates) ??
-				candidates[0]!,
+				resolveMissionV3RuntimeCandidate(
+					nextMission,
+					candidates,
+					selectedCandidate,
+				) ?? selectedCandidate,
 			assuranceContract,
 			proofProgram,
 			environmentContract,
@@ -4319,13 +4511,46 @@ export async function promoteMissionV3Candidate(
 	if (!mission.selected_candidate_id) {
 		throw new Error("mission_v3_promote_requires_selected_candidate");
 	}
+	const selectedCandidate = requireMissionV3SelectedCandidateState(
+		mission,
+		candidates,
+	);
 	const promotionDecision = await readJson<MissionV3PromotionDecision>(
 		artifactPaths.promotionDecisionPath,
 	);
 	if (promotionDecision.decision !== "allow") {
 		throw new Error("mission_v3_promote_requires_allow_decision");
 	}
+	const missingArtifacts = missingPromotionArtifacts(artifactPaths);
+	if (missingArtifacts.length > 0) {
+		throw new Error(
+			`mission_v3_promote_missing_artifacts:${missingArtifacts.join(",")}`,
+		);
+	}
 	const generatedAt = nowIso();
+	const nextMission = await updateMissionV3State(mission, {
+		lifecycle_state: "promotion_ready",
+		status: "complete",
+		promotion_state: {
+			...mission.promotion_state,
+			status: "ready",
+			blocking_reasons: [],
+			last_decision_at: generatedAt,
+			decision_ref: artifactPaths.promotionDecisionPath,
+		},
+		final_reason: options.summary,
+	});
+	await appendMissionV3CandidateEvent({
+		candidate: selectedCandidate,
+		actorPrincipal: options.actor,
+		idempotencyKey: `candidate-promotion-ready:${mission.selected_candidate_id}:${shortHash(options.summary)}`,
+		payload: {
+			transition: "promotion_ready",
+			candidate_id: mission.selected_candidate_id,
+			summary: options.summary,
+			required_artifacts: promotionDecision.required_artifacts,
+		},
+	});
 	await appendJournalEvent(artifactPaths.promotionEventsPath, {
 		journalType: "promotion-events",
 		missionId: mission.mission_id,
@@ -4350,18 +4575,6 @@ export async function promoteMissionV3Candidate(
 			required_artifacts: promotionDecision.required_artifacts,
 		},
 	});
-	const nextMission = await updateMissionV3State(mission, {
-		lifecycle_state: "promotion_ready",
-		status: "complete",
-		promotion_state: {
-			...mission.promotion_state,
-			status: "ready",
-			blocking_reasons: [],
-			last_decision_at: generatedAt,
-			decision_ref: artifactPaths.promotionDecisionPath,
-		},
-		final_reason: options.summary,
-	});
 	return (
 		await rebuildMissionV3DerivedState({
 			mission: nextMission,
@@ -4370,8 +4583,11 @@ export async function promoteMissionV3Candidate(
 			paths: artifactPaths,
 			profile: nextMission.policy_profile as MissionV3PolicyProfile,
 			candidate:
-				resolveMissionV3RuntimeCandidate(nextMission, candidates) ??
-				candidates[0]!,
+				resolveMissionV3RuntimeCandidate(
+					nextMission,
+					candidates,
+					selectedCandidate,
+				) ?? selectedCandidate,
 			assuranceContract,
 			proofProgram,
 			environmentContract,
@@ -4452,6 +4668,13 @@ export async function createMissionV3Waiver(
 		evidence_refs: options.evidenceRefs ?? [],
 		created_at: nowIso(),
 	};
+	const nextMission = await updateMissionV3State(mission, {
+		status: mission.status === "running" ? "complete" : mission.status,
+		lifecycle_state:
+			mission.lifecycle_state === "blocked_external"
+				? "assuring"
+				: mission.lifecycle_state,
+	});
 	await appendJournalEvent(artifactPaths.decisionLogPath, {
 		journalType: "decision-log",
 		missionId: mission.mission_id,
@@ -4462,13 +4685,6 @@ export async function createMissionV3Waiver(
 			decision: "waiver_created",
 			waiver,
 		},
-	});
-	const nextMission = await updateMissionV3State(mission, {
-		status: mission.status === "running" ? "complete" : mission.status,
-		lifecycle_state:
-			mission.lifecycle_state === "blocked_external"
-				? "assuring"
-				: mission.lifecycle_state,
 	});
 	await rebuildMissionV3DerivedState({
 		mission: nextMission,
