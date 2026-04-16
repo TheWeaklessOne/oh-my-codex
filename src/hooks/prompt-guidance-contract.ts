@@ -11,6 +11,8 @@ function rx(pattern: string): RegExp {
 const ROOT_TEMPLATE_PATTERNS = [
   rx('quality-first.*intent-deepening responses'),
   rx('clear, low-risk, reversible next steps'),
+  rx('do not ask or instruct humans.*ordinary non-destructive.*reversible actions'),
+  rx('OMX runtime manipulation.*agent responsibilities'),
   rx('local overrides?.*non-conflicting instructions'),
   rx('reflexive web/tool escalation'),
   rx('Choose the lane before acting'),

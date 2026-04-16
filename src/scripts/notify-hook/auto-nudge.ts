@@ -429,16 +429,26 @@ async function localTmuxInjectionDisabled(cwd) {
   return tmuxHookExplicitlyDisablesInjection(raw);
 }
 
-export function detectStallPattern(text, patterns, currentPhase = '') {
+function detectStallPatternWithOptions(text, patterns, currentPhase = '', options = {}) {
   if (!text || typeof text !== 'string') return false;
   const normalized = normalizeStallDetectionText(text);
   if (!normalized) return false;
   const normalizedPatterns = normalizePatternList(patterns);
   if (!matchesNormalizedPatterns(normalized, normalizedPatterns)) return false;
   if (!usesDefaultStallPatterns(patterns)) return true;
-  if (looksLikePermissionSeekingContinuation(normalized)) return false;
+  if (options.allowPermissionSeeking !== true && looksLikePermissionSeekingContinuation(normalized)) return false;
   if (safeString(currentPhase).trim().toLowerCase() === 'planning') return false;
   return !looksLikePlanningOnlyContinuation(normalized);
+}
+
+export function detectStallPattern(text, patterns, currentPhase = '') {
+  return detectStallPatternWithOptions(text, patterns, currentPhase);
+}
+
+export function detectNativeStopStallPattern(text, patterns, currentPhase = '') {
+  return detectStallPatternWithOptions(text, patterns, currentPhase, {
+    allowPermissionSeeking: true,
+  });
 }
 
 export async function capturePane(paneId, lines = 10) {

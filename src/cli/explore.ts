@@ -27,6 +27,8 @@ const PROMPT_FLAG = '--prompt';
 const PROMPT_FILE_FLAG = '--prompt-file';
 export const EXPLORE_BIN_ENV = EXPLORE_BIN_ENV_SHARED;
 const EXPLORE_SPARK_MODEL_ENV = 'OMX_EXPLORE_SPARK_MODEL';
+const WINDOWS_BUILTIN_EXPLORE_HARNESS_REASON =
+  'the built-in explore harness is not ready on Windows because its allowlist runtime relies on POSIX sh/bash wrappers. Set OMX_EXPLORE_BIN to a compatible custom harness, prefer `omx sparkshell` for shell-native read-only lookups, or run `omx doctor` for readiness details.';
 
 export interface ParsedExploreArgs {
   prompt?: string;
@@ -43,6 +45,23 @@ interface ExploreHarnessMetadata {
   binaryName?: string;
   platform?: string;
   arch?: string;
+}
+
+export function getBuiltinExploreHarnessUnsupportedReason(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (platform !== 'win32') return undefined;
+  if (env[EXPLORE_BIN_ENV]?.trim()) return undefined;
+  return WINDOWS_BUILTIN_EXPLORE_HARNESS_REASON;
+}
+
+export function assertBuiltinExploreHarnessSupported(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  const reason = getBuiltinExploreHarnessUnsupportedReason(platform, env);
+  if (reason) throw new Error(`[explore] ${reason}`);
 }
 
 
@@ -415,6 +434,7 @@ export async function exploreCommand(args: string[]): Promise<void> {
   }
 
   const packageRoot = getPackageRoot();
+  assertBuiltinExploreHarnessSupported(process.platform, process.env);
   const harness = await resolveExploreHarnessCommandWithHydration(packageRoot, process.env);
   const harnessArgs = [...harness.args, ...buildExploreHarnessArgs(prompt, process.cwd(), process.env, packageRoot)];
 

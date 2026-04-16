@@ -31,6 +31,7 @@ import { agentsCommand } from "./agents.js";
 import { sessionCommand } from "./session-search.js";
 import { autoresearchCommand } from "./autoresearch.js";
 import { mcpParityCommand } from "./mcp-parity.js";
+import { adaptCommand } from "./adapt.js";
 import {
   MADMAX_FLAG,
   CODEX_BYPASS_FLAG,
@@ -95,6 +96,7 @@ export { parseTmuxPaneSnapshot, isHudWatchPane, findHudWatchPaneIds } from "../h
 rememberOmxLaunchContext();
 import {
   classifySpawnError,
+  resolveTmuxBinaryForPlatform,
   spawnPlatformCommandSync,
 } from "../utils/platform-command.js";
 import { buildHookEvent } from "../hooks/extensibility/events.js";
@@ -146,6 +148,7 @@ Usage:
   omx cleanup   Kill orphaned OMX MCP server processes and remove stale OMX /tmp directories
   omx doctor --team  Check team/swarm runtime health diagnostics
   omx ask       Ask local provider CLI (claude|gemini) and write artifact output
+  omx adapt     Scaffold OMX-owned adapter foundations for persistent external targets
   omx resume    Resume a previous interactive Codex session
   omx explore   Default read-only exploration entrypoint (may adaptively use sparkshell backend)
   omx session   Search prior local session transcripts and history artifacts
@@ -260,6 +263,7 @@ type CliCommand =
   | "doctor"
   | "cleanup"
   | "ask"
+  | "adapt"
   | "explore"
   | "sparkshell"
   | "team"
@@ -280,6 +284,7 @@ type CliCommand =
 const NESTED_HELP_COMMANDS = new Set<CliCommand>([
   "ask",
   "cleanup",
+  "adapt",
   "autoresearch",
   "agents",
   "agents-init",
@@ -485,6 +490,20 @@ type ExecFileSyncFailure = NodeJS.ErrnoException & {
   status?: number | null;
   signal?: NodeJS.Signals | null;
 };
+
+function resolveTmuxExecutableForLaunch(): string {
+  return resolveTmuxBinaryForPlatform() || "tmux";
+}
+
+function execTmuxFileSync(
+  args: string[],
+  options?: Parameters<typeof execFileSync>[2],
+): string {
+  return execFileSync(resolveTmuxExecutableForLaunch(), args, {
+    ...(options ?? {}),
+    ...(process.platform === "win32" ? { windowsHide: true } : {}),
+  }) as string;
+}
 
 function hasErrnoCode(error: unknown, code: string): boolean {
   return Boolean(
@@ -701,6 +720,9 @@ export async function main(args: string[]): Promise<void> {
       }
       case "ask":
         await askCommand(args.slice(1));
+        break;
+      case "adapt":
+        await adaptCommand(args.slice(1));
         break;
       case "cleanup":
         await cleanupCommand(args.slice(1));
@@ -1243,12 +1265,19 @@ function extractIssueNumber(text: string): number | undefined {
   return generic ? Number.parseInt(generic[2], 10) : undefined;
 }
 
-function resolveNativeSessionName(cwd: string, sessionId: string): string {
-  if (process.env.TMUX) {
+export function resolveNativeSessionName(
+  cwd: string,
+  sessionId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  if (env.TMUX) {
     try {
-      const tmuxSession = execFileSync(
-        "tmux",
-        ["display-message", "-p", "#S"],
+      const tmuxPaneTarget = env.TMUX_PANE?.trim();
+      const displayArgs = tmuxPaneTarget
+        ? ["display-message", "-p", "-t", tmuxPaneTarget, "#S"]
+        : ["display-message", "-p", "#S"];
+      const tmuxSession = execTmuxFileSync(
+        displayArgs,
         {
           encoding: "utf-8",
           stdio: ["ignore", "pipe", "ignore"],
@@ -1458,10 +1487,9 @@ function parseWindowIndexFromTmuxOutput(rawOutput: string): string | null {
   return /^[0-9]+$/.test(windowIndex) ? windowIndex : null;
 }
 
-function detectDetachedSessionWindowIndex(sessionName: string): string | null {
+export function detectDetachedSessionWindowIndex(sessionName: string): string | null {
   try {
-    const output = execFileSync(
-      "tmux",
+    const output = execTmuxFileSync(
       ["display-message", "-p", "-t", sessionName, "#{window_index}"],
       { encoding: "utf-8" },
     );
@@ -1590,17 +1618,24 @@ function buildDetachedSessionLeaderCommand(
 ): string {
   const wrapped = [
     buildTmuxExtendedKeysAcquireShellSnippet(cwd),
+    'omx_codex_pid="";',
     "omx_detached_session_cleanup() {",
     "status=$?;",
     "trap - 0 INT TERM HUP;",
+    'if [ -n "$omx_codex_pid" ] && kill -0 "$omx_codex_pid" 2>/dev/null; then',
+    'kill -TERM "$omx_codex_pid" 2>/dev/null || true;',
+    'wait "$omx_codex_pid" 2>/dev/null || true;',
+    "fi;",
     buildTmuxExtendedKeysReleaseShellSnippet(cwd),
     'if [ "$status" -lt 128 ]; then',
     `tmux kill-session -t "${escapeShellDoubleQuotedValue(sessionName)}" >/dev/null 2>&1 || true;`,
     "fi;",
     "exit $status;",
     "};",
-    "trap omx_detached_session_cleanup 0;",
-    codexCmd,
+    "trap omx_detached_session_cleanup 0 INT TERM HUP;",
+    `${codexCmd} &`,
+    "omx_codex_pid=$!;",
+    'wait "$omx_codex_pid";',
   ].join(" ");
   return `/bin/sh -c ${quoteShellArg(wrapped)}`;
 }
@@ -1612,9 +1647,10 @@ function execTmuxSync(
   execFileSyncImpl: TmuxExecSync = (file, tmuxArgs) =>
     execFileSync(file, tmuxArgs, {
       encoding: "utf-8",
+      ...(process.platform === "win32" ? { windowsHide: true } : {}),
     }) as string,
 ): string {
-  return execFileSyncImpl("tmux", [...args]).trim();
+  return execFileSyncImpl(resolveTmuxExecutableForLaunch(), [...args]).trim();
 }
 
 export function acquireTmuxExtendedKeysLease(
@@ -1622,6 +1658,7 @@ export function acquireTmuxExtendedKeysLease(
   execFileSyncImpl: TmuxExecSync = (file, tmuxArgs) =>
     execFileSync(file, tmuxArgs, {
       encoding: "utf-8",
+      ...(process.platform === "win32" ? { windowsHide: true } : {}),
     }) as string,
 ): string | null {
   try {
@@ -1661,6 +1698,7 @@ export function releaseTmuxExtendedKeysLease(
   execFileSyncImpl: TmuxExecSync = (file, tmuxArgs) =>
     execFileSync(file, tmuxArgs, {
       encoding: "utf-8",
+      ...(process.platform === "win32" ? { windowsHide: true } : {}),
     }) as string,
 ): void {
   if (!leaseHandle.trim()) return;
@@ -1724,6 +1762,7 @@ export function withTmuxExtendedKeys<T>(
   execFileSyncImpl: TmuxExecSync = (file, tmuxArgs) =>
     execFileSync(file, tmuxArgs, {
       encoding: "utf-8",
+      ...(process.platform === "win32" ? { windowsHide: true } : {}),
     }) as string,
 ): T {
   const leaseHandle = acquireTmuxExtendedKeysLease(cwd, execFileSyncImpl);
@@ -2356,7 +2395,7 @@ function runCodex(
   }
   const hudCmd = nativeWindows
     ? buildWindowsPromptCommand("node", [omxBin, "hud", "--watch"])
-    : buildTmuxPaneCommand("node", [omxBin, "hud", "--watch"]);
+    : buildTmuxPaneCommand("env", [`OMX_SESSION_ID=${sessionId}`, "node", omxBin, "hud", "--watch"]);
   const inheritLeaderFlags = process.env[TEAM_INHERIT_LEADER_FLAGS_ENV] !== "0";
   const workerLaunchArgs = resolveTeamWorkerLaunchArgsEnv(
     process.env[TEAM_WORKER_LAUNCH_ARGS_ENV],
@@ -2415,7 +2454,7 @@ function runCodex(
         const displayArgs = tmuxPaneTarget
           ? ["display-message", "-p", "-t", tmuxPaneTarget, "#S"]
           : ["display-message", "-p", "#S"];
-        const tmuxSession = execFileSync("tmux", displayArgs, {
+        const tmuxSession = execTmuxFileSync(displayArgs, {
           encoding: "utf-8",
         }).trim();
         if (tmuxSession) enableMouseScrolling(tmuxSession);
@@ -2428,7 +2467,7 @@ function runCodex(
     const activePaneId = process.env.TMUX_PANE?.trim();
     if (activePaneId) {
       try {
-        execFileSync("tmux", ["display-message", "-p", "-t", activePaneId, "#S"], {
+        execTmuxFileSync(["display-message", "-p", "-t", activePaneId, "#S"], {
           encoding: "utf-8",
         });
       } catch {}
@@ -2476,7 +2515,7 @@ function runCodex(
         sessionId,
       );
       for (const step of bootstrapSteps) {
-        const output = execFileSync("tmux", step.args, {
+        const output = execTmuxFileSync(step.args, {
           stdio: "pipe",
           encoding: "utf-8",
         });
@@ -2536,7 +2575,7 @@ function runCodex(
             const stdio =
               finalizeStep.name === "attach-session" ? "inherit" : "ignore";
             try {
-              execFileSync("tmux", finalizeStep.args, { stdio });
+              execTmuxFileSync(finalizeStep.args, { stdio });
             } catch (err) {
               process.stderr.write(`[cli/index] operation failed: ${err}\n`);
               if (finalizeStep.name === "attach-session")
@@ -2571,7 +2610,7 @@ function runCodex(
         );
         for (const rollbackStep of rollbackSteps) {
           try {
-            execFileSync("tmux", rollbackStep.args, { stdio: "ignore" });
+            execTmuxFileSync(rollbackStep.args, { stdio: "ignore" });
           } catch (err) {
             process.stderr.write(`[cli/index] operation failed: ${err}\n`);
             // best-effort rollback only
@@ -2668,10 +2707,11 @@ function quotePowerShellArg(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
-function buildDetachedWindowsBootstrapScript(
+export function buildDetachedWindowsBootstrapScript(
   sessionName: string,
   commandText: string,
   delayMs: number = WINDOWS_DETACHED_BOOTSTRAP_DELAY_MS,
+  tmuxCommand: string = resolveTmuxExecutableForLaunch(),
 ): string {
   const delay =
     Number.isFinite(delayMs) && delayMs > 0
@@ -2679,12 +2719,14 @@ function buildDetachedWindowsBootstrapScript(
       : WINDOWS_DETACHED_BOOTSTRAP_DELAY_MS;
   const targetLiteral = JSON.stringify(`${sessionName}:0.0`);
   const commandLiteral = JSON.stringify(commandText);
+  const tmuxCommandLiteral = JSON.stringify(tmuxCommand);
 
   return [
     "const { execFileSync } = require('child_process');",
+    `const tmuxCommand = ${tmuxCommandLiteral};`,
     `setTimeout(() => {`,
-    `try { execFileSync('tmux', ['send-keys', '-t', ${targetLiteral}, '-l', '--', ${commandLiteral}], { stdio: 'ignore' }); } catch {}`,
-    `try { execFileSync('tmux', ['send-keys', '-t', ${targetLiteral}, 'C-m'], { stdio: 'ignore' }); } catch {}`,
+    `try { execFileSync(tmuxCommand, ['send-keys', '-t', ${targetLiteral}, '-l', '--', ${commandLiteral}], { stdio: 'ignore' }); } catch {}`,
+    `try { execFileSync(tmuxCommand, ['send-keys', '-t', ${targetLiteral}, 'C-m'], { stdio: 'ignore' }); } catch {}`,
     `}, ${delay});`,
   ].join("");
 }

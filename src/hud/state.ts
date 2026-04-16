@@ -13,7 +13,7 @@ import { omxStateDir } from '../utils/paths.js';
 import { findGitLayout, readGitLayoutFile } from '../utils/git-layout.js';
 import { getDefaultBridge, isBridgeEnabled } from '../runtime/bridge.js';
 import type { RuntimeSnapshot } from '../runtime/bridge.js';
-import { getReadScopedStateFilePaths, getReadScopedStatePaths } from '../mcp/state-paths.js';
+import { getReadScopedStateFilePaths, getReadScopedStatePaths, readCurrentSessionId } from '../mcp/state-paths.js';
 import { readUsableSessionState } from '../hooks/session.js';
 import { listActiveSkills, readVisibleSkillActiveState } from '../state/skill-active.js';
 import type {
@@ -46,9 +46,9 @@ async function readJsonFile<T>(path: string): Promise<T | null> {
 
 async function readSessionAwareModeState<T>(cwd: string, mode: string): Promise<T | null> {
   const candidates = await getReadScopedStatePaths(mode, cwd);
-  const session = await readSessionState(cwd);
+  const sessionId = await readCurrentSessionId(cwd);
 
-  if (session?.session_id) {
+  if (sessionId) {
     if (candidates.length === 0) return null;
     return readJsonFile<T>(candidates[0]);
   }
@@ -353,12 +353,13 @@ function mergePhase<T extends { active?: boolean; current_phase?: string }>(
 export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFAULT_HUD_CONFIG): Promise<HudRenderContext> {
   const version = readVersion();
   const gitBranch = buildGitBranchLabel(cwd, config);
-  const [metrics, hudNotify, session] = await Promise.all([
+  const [metrics, hudNotify, session, currentSessionId] = await Promise.all([
     readMetrics(cwd),
     readHudNotifyState(cwd),
     readSessionState(cwd),
+    readCurrentSessionId(cwd),
   ]);
-  const canonicalSkillState = await readVisibleSkillActiveState(cwd, session?.session_id);
+  const canonicalSkillState = await readVisibleSkillActiveState(cwd, currentSessionId);
   const canonicalSkills = new Map(
     listActiveSkills(canonicalSkillState).map((entry) => [entry.skill, entry] as const),
   );

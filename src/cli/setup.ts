@@ -143,6 +143,7 @@ const PROJECT_GITIGNORE_ENTRIES = [
   "!.codex/prompts/**",
 ] as const;
 const LEGACY_PROJECT_GITIGNORE_ENTRIES = [".codex/"] as const;
+const SETUP_ONLY_INSTALLABLE_SKILLS = new Set(["wiki"]);
 
 function applyScopePathRewritesToAgentsTemplate(
   content: string,
@@ -1476,6 +1477,11 @@ export async function installSkills(
     : null;
   const isInstallableStatus = (status: string | undefined): boolean =>
     status === "active" || status === "internal";
+  const isSetupInstallableSkill = (
+    skillName: string,
+    status: string | undefined,
+  ): boolean =>
+    isInstallableStatus(status) || SETUP_ONLY_INSTALLABLE_SKILLS.has(skillName);
   const entries = await readdir(srcDir, { withFileTypes: true });
   const staleCandidateSkillNames = new Set(
     manifest?.skills.map((skill) => skill.name) ?? [],
@@ -1484,7 +1490,7 @@ export async function installSkills(
     if (!entry.isDirectory()) continue;
     staleCandidateSkillNames.add(entry.name);
     const status = skillStatusByName?.get(entry.name);
-    if (skillStatusByName && !isInstallableStatus(status)) {
+    if (skillStatusByName && !isSetupInstallableSkill(entry.name, status)) {
       summary.skipped += 1;
       if (options.verbose) {
         const label = status ?? "unlisted";
@@ -1538,7 +1544,7 @@ export async function installSkills(
   if (options.force && manifest && existsSync(dstDir)) {
     for (const staleSkill of staleCandidateSkillNames) {
       const status = skillStatusByName?.get(staleSkill);
-      if (isInstallableStatus(status)) continue;
+      if (isSetupInstallableSkill(staleSkill, status)) continue;
 
       const staleSkillDir = join(dstDir, staleSkill);
       if (!existsSync(staleSkillDir)) continue;

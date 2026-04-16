@@ -528,6 +528,17 @@ function resolveRequestedWorkflowSkills(requestedWorkflowSkills: TrackedWorkflow
   };
 }
 
+function selectRootSkillStateCopy(
+  previousRoot: SkillActiveState | null,
+  nextState: SkillActiveState,
+  sessionId?: string,
+): SkillActiveState | null | undefined {
+  if (!sessionId) return nextState;
+  if (previousRoot) return previousRoot;
+  if (nextState.skill === 'ralph') return null;
+  return nextState;
+}
+
 export async function recordSkillActivation(input: RecordSkillActivationInput): Promise<SkillActiveState | null> {
   const match = detectPrimaryKeyword(input.text);
   if (!match) return null;
@@ -566,7 +577,7 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
         dirname(dirname(input.stateDir)),
         state,
         input.sessionId,
-        input.sessionId ? (previousRoot ?? state) : state,
+        selectRootSkillStateCopy(previousRoot, state, input.sessionId),
       );
       await persistDeepInterviewModeState(input.stateDir, state, nowIso, previous, input);
     } catch (error) {
@@ -734,7 +745,7 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
         dirname(dirname(input.stateDir)),
         nextState,
         input.sessionId,
-        input.sessionId ? (previousRoot ?? nextState) : nextState,
+        selectRootSkillStateCopy(previousRoot, nextState, input.sessionId),
       );
       await persistDeepInterviewModeState(input.stateDir, nextState, nowIso, previous, input);
       return nextState;
@@ -777,7 +788,7 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
       dirname(dirname(input.stateDir)),
       nextState,
       input.sessionId,
-      input.sessionId ? (previousRoot ?? nextState) : nextState,
+      selectRootSkillStateCopy(previousRoot, nextState, input.sessionId),
     );
     await persistDeepInterviewModeState(input.stateDir, nextState, nowIso, previous, input);
     return nextState;

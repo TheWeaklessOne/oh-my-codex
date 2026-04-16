@@ -31,7 +31,7 @@ describe('modes/base tmux pane capture', () => {
 
       await assert.rejects(
         () => startMode('autopilot', 'test', 1, wd),
-        /clear or repair state via `omx state clear --mode ralph` or the `omx_state\.\*` MCP tools/i,
+        /repair or clear that workflow state yourself via `omx state clear --mode ralph` or the `omx_state\.\*` MCP tools/i,
       );
     } finally {
       await rm(wd, { recursive: true, force: true });

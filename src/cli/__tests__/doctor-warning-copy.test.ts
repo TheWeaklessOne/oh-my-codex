@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { withPackagedExploreHarnessHidden, withPackagedExploreHarnessLock } from './packaged-explore-harness-lock.js';
+import { checkExploreHarness } from '../doctor.js';
 
 function runOmx(
   cwd: string,
@@ -33,6 +34,15 @@ function shouldSkipForSpawnPermissions(err?: string): boolean {
 }
 
 describe('omx doctor onboarding warning copy', () => {
+  it('warns that the built-in explore harness is not ready on Windows', () => {
+    const check = checkExploreHarness('win32', {} as NodeJS.ProcessEnv);
+
+    assert.equal(check.name, 'Explore Harness');
+    assert.equal(check.status, 'warn');
+    assert.match(check.message, /not ready on Windows/i);
+    assert.match(check.message, /OMX_EXPLORE_BIN/);
+  });
+
   it('explains first-setup expectation for config and MCP onboarding warnings', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-doctor-copy-'));
     try {
@@ -244,6 +254,102 @@ USE_OMX_EXPLORE_CMD = "off"
       assert.match(
         res.stdout,
         /Legacy skill roots: 1 overlapping skill names between .*\.codex[\\/]+skills and .*\.agents[\\/]+skills; 1 differ in SKILL\.md content; Codex Enable\/Disable Skills may show duplicates until ~\/\.agents\/skills is cleaned up/,
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('warns when hooks.json is missing OMX-managed native hook coverage', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-doctor-hooks-coverage-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(
+        join(codexDir, 'hooks.json'),
+        JSON.stringify(
+          {
+            hooks: {
+              SessionStart: [
+                {
+                  hooks: [
+                    {
+                      type: 'command',
+                      command: 'node "/repo/dist/scripts/codex-native-hook.js"',
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+          null,
+          2,
+        ) + '\n',
+      );
+
+      const res = runOmx(wd, ['doctor'], {
+        HOME: home,
+        CODEX_HOME: codexDir,
+      });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+      assert.match(
+        res.stdout,
+        /Native hooks: hooks\.json is missing OMX-managed coverage for PreToolUse, PostToolUse, UserPromptSubmit, Stop; run "omx setup --force" to restore native hooks/,
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('warns when hooks.json is missing after OMX config was already installed', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-doctor-hooks-missing-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(
+        join(codexDir, 'config.toml'),
+        `
+omx_enabled = true
+[mcp_servers.omx_state]
+command = "node"
+`.trimStart(),
+      );
+
+      const res = runOmx(wd, ['doctor'], {
+        HOME: home,
+        CODEX_HOME: codexDir,
+      });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+      assert.match(
+        res.stdout,
+        /Native hooks: hooks\.json not found even though config\.toml has OMX entries; run "omx setup --force" to restore native hook coverage/,
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails when hooks.json is invalid and native hook coverage cannot be read', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-doctor-hooks-invalid-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(join(codexDir, 'hooks.json'), '{invalid json\n');
+
+      const res = runOmx(wd, ['doctor'], {
+        HOME: home,
+        CODEX_HOME: codexDir,
+      });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+      assert.match(
+        res.stdout,
+        /\[XX\] Native hooks: invalid hooks\.json; Codex may skip OMX hook coverage until "omx setup --force" repairs it/,
       );
     } finally {
       await rm(wd, { recursive: true, force: true });

@@ -269,6 +269,13 @@ describe('notify-hook/auto-nudge – detectStallPattern', () => {
     assert.equal(detectStallPattern('Would you like me to proceed?', custom), false);
   });
 
+  it('keeps native Stop permission-seeking detection separate from default notify-hook detection', async () => {
+    const { detectStallPattern, detectNativeStopStallPattern, DEFAULT_STALL_PATTERNS } = await loadModule('notify-hook/auto-nudge.js');
+    const text = 'If you want, I can continue with the cleanup from here.';
+    assert.equal(detectStallPattern(text, DEFAULT_STALL_PATTERNS), false);
+    assert.equal(detectNativeStopStallPattern(text, DEFAULT_STALL_PATTERNS), true);
+  });
+
   it('ignores prior OMX injection lines so injected text cannot self-trigger detection', async () => {
     const { detectStallPattern, DEFAULT_STALL_PATTERNS } = await loadModule('notify-hook/auto-nudge.js');
     const text = 'Completed the change.\nyes, proceed [OMX_TMUX_INJECT]\nkeep going [OMX_TMUX_INJECT]';

@@ -40,6 +40,7 @@ describe('workflow transition rules', () => {
     assert.match(error, /Cannot start autopilot: team is already active\./);
     assert.match(error, /Unsupported workflow overlap: team \+ autopilot\./);
     assert.match(error, /Current state is unchanged\./);
+    assert.match(error, /Clear incompatible workflow state yourself via/);
     assert.match(error, /`omx state clear --mode <mode>`/);
     assert.match(error, /`omx_state\.\*` MCP tools/);
   });
@@ -63,6 +64,7 @@ describe('workflow transition rules', () => {
     const error = buildWorkflowTransitionError(['autopilot'], 'ralplan', 'start');
     assert.match(error, /Execution-to-planning rollback auto-complete is not allowed\./);
     assert.match(error, /First clear current state first and retry if this action is intended\./);
+    assert.match(error, /Clear incompatible workflow state yourself via/);
   });
 
   it('formats transition audit messages', () => {

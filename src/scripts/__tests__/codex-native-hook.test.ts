@@ -73,6 +73,7 @@ const TEAM_ENV_KEYS = [
   "OMX_TEAM_WORKER",
   "OMX_TEAM_STATE_ROOT",
   "OMX_TEAM_LEADER_CWD",
+  "OMX_SESSION_ID",
 ] as const;
 
 const priorTeamEnv = new Map<(typeof TEAM_ENV_KEYS)[number], string | undefined>();
@@ -104,6 +105,13 @@ describe("codex native hook config", () => {
       "UserPromptSubmit",
       "Stop",
     ]);
+
+    const sessionStart = config.hooks.SessionStart[0] as {
+      matcher?: string;
+      hooks?: Array<Record<string, unknown>>;
+    };
+    assert.equal(sessionStart.matcher, "startup|resume");
+    assert.equal(sessionStart.hooks?.[0]?.statusMessage, undefined);
 
     const preToolUse = config.hooks.PreToolUse[0] as {
       matcher?: string;
@@ -155,7 +163,7 @@ describe("codex native hook dispatch", () => {
     assert.equal(output.decision, "block");
     assert.equal(
       output.reason,
-      "OMX native hook received malformed JSON input. Preserve runtime state and inspect the emitting hook payload before retrying.",
+      "OMX native hook received malformed JSON input. Preserve runtime state, inspect the emitting hook payload yourself, and retry with valid JSON.",
     );
     assert.equal(output.hookSpecificOutput?.hookEventName, "Unknown");
     assert.match(
@@ -172,7 +180,7 @@ describe("codex native hook dispatch", () => {
     assert.equal(mapCodexHookEventToOmxEvent("Stop"), "stop");
   });
 
-  it("writes SessionStart state against the long-lived session owner pid", async () => {
+  it("writes SessionStart state against the long-lived session owner pid and stays quiet for clean sessions", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-session-start-"));
     try {
       const result = await dispatchCodexNativeHook(
@@ -188,13 +196,7 @@ describe("codex native hook dispatch", () => {
       );
 
       assert.equal(result.omxEventName, "session-start");
-      assert.deepEqual(result.outputJson, {
-        hookSpecificOutput: {
-          hookEventName: "SessionStart",
-          additionalContext:
-            "OMX native SessionStart detected. Load workspace conventions from AGENTS.md, restore relevant .omx runtime/project memory context, and continue from existing mode state before making changes.",
-        },
-      });
+      assert.equal(result.outputJson, null);
       const sessionState = JSON.parse(
         await readFile(join(cwd, ".omx", "state", "session.json"), "utf-8"),
       ) as { session_id?: string; native_session_id?: string; pid?: number };
@@ -379,6 +381,79 @@ describe("codex native hook dispatch", () => {
     }
   });
 
+  it("clarifies that prompt-side $ralph activation does not invoke the PRD-gated CLI path", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralph-routing-"));
+    try {
+      await mkdir(join(cwd, ".omx", "state"), { recursive: true });
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "UserPromptSubmit",
+          cwd,
+          session_id: "sess-ralph-msg",
+          thread_id: "thread-ralph-msg",
+          turn_id: "turn-ralph-msg",
+          prompt: "$ralph continue verification",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "keyword-detector");
+      assert.equal(result.skillState?.skill, "ralph");
+      const message = String(
+        (result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext || "",
+      );
+      assert.match(message, /\$ralph" -> ralph/);
+      assert.match(message, /skill: ralph activated and initial state initialized at \.omx\/state\/sessions\/sess-ralph-msg\/ralph-state\.json; write subsequent updates via omx_state MCP\./);
+      assert.match(message, /Prompt-side `\$ralph` activation seeds Ralph workflow state only; it does not invoke `omx ralph`\./);
+      assert.match(message, /Use `omx ralph --prd \.\.\.` only when you explicitly want the PRD-gated CLI startup path\./);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores generic wrapper fields so metadata cannot trigger workflow routing or Stop blocking", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-wrapper-metadata-"));
+    try {
+      await mkdir(join(cwd, ".omx", "state"), { recursive: true });
+      const promptResult = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "UserPromptSubmit",
+          cwd,
+          session_id: "sess-wrapper-meta-1",
+          thread_id: "thread-wrapper-meta-1",
+          turn_id: "turn-wrapper-meta-1",
+          input: "$ralplan hidden wrapper text should stay non-routing",
+          text: JSON.stringify({
+            hook_run_id: "native-stop-wrapper-1",
+            note: "cancel stop wrapper metadata must not be treated like user intent",
+          }),
+        },
+        { cwd },
+      );
+
+      assert.equal(promptResult.omxEventName, "keyword-detector");
+      assert.equal(promptResult.skillState, null);
+      assert.equal(promptResult.outputJson, null);
+      assert.equal(existsSync(join(cwd, ".omx", "state", "skill-active-state.json")), false);
+
+      const stopResult = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "sess-wrapper-meta-1",
+          thread_id: "thread-wrapper-meta-1",
+          turn_id: "turn-wrapper-meta-2",
+        },
+        { cwd },
+      );
+
+      assert.equal(stopResult.omxEventName, "stop");
+      assert.equal(stopResult.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("does not expose submitted prompt text to keyword-detector hook plugins", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-prompt-sanitized-"));
     try {
@@ -473,7 +548,7 @@ export async function onHookEvent(event) {
         /skill: team activated and initial state initialized at \.omx\/state\/team-state\.json; write subsequent updates via omx_state MCP\./,
       );
       assert.match(JSON.stringify(result.outputJson), /Use the durable OMX team runtime via `omx team \.\.\.`/);
-      assert.match(JSON.stringify(result.outputJson), /If you need help, run `omx team --help`\./);
+      assert.match(JSON.stringify(result.outputJson), /If you need runtime syntax, run `omx team --help` yourself\./);
 
       const state = JSON.parse(
         await readFile(join(cwd, ".omx", "state", "team-state.json"), "utf-8"),
@@ -713,6 +788,599 @@ esac
           tool_name: "Bash",
           tool_use_id: "tool-neutral",
           tool_input: { command: "pwd" },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks PreToolUse git commit when the inline message is not Lore-compliant", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-commit-invalid-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-commit-invalid",
+          tool_input: { command: 'git commit -m "fix tests"' },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason:
+          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          additionalContext: [
+            "Lore-format git commit enforcement triggered.",
+            "- Add a blank line after the subject before the narrative body.",
+            "- Add a narrative body paragraph explaining the decision context.",
+            "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+            "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          ].join("\n"),
+        },
+        systemMessage: [
+          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "- Add a blank line after the subject before the narrative body.",
+          "- Add a narrative body paragraph explaining the decision context.",
+          "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+        ].join("\n"),
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("stays silent on PreToolUse for `git help commit`", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-help-commit-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-help-commit",
+          tool_input: { command: "git help commit" },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("stays silent on PreToolUse for `git config alias.ci commit`", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-config-alias-commit-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-config-alias-commit",
+          tool_input: { command: "git config alias.ci commit" },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("stays silent on PreToolUse for `git tag commit`", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-tag-commit-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-tag-commit",
+          tool_input: { command: "git tag commit" },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks PreToolUse env-prefixed git commit when the inline message is not Lore-compliant", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-commit-env-invalid-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-commit-env-invalid",
+          tool_input: { command: 'HUSKY=0 git commit -m "fix tests"' },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason:
+          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          additionalContext: [
+            "Lore-format git commit enforcement triggered.",
+            "- Add a blank line after the subject before the narrative body.",
+            "- Add a narrative body paragraph explaining the decision context.",
+            "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+            "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          ].join("\n"),
+        },
+        systemMessage: [
+          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "- Add a blank line after the subject before the narrative body.",
+          "- Add a narrative body paragraph explaining the decision context.",
+          "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+        ].join("\n"),
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks PreToolUse git commit when git options appear before the real commit subcommand", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-commit-option-invalid-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-commit-option-invalid",
+          tool_input: { command: 'git -c core.editor=true commit -m "fix tests"' },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason:
+          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          additionalContext: [
+            "Lore-format git commit enforcement triggered.",
+            "- Add a blank line after the subject before the narrative body.",
+            "- Add a narrative body paragraph explaining the decision context.",
+            "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+            "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          ].join("\n"),
+        },
+        systemMessage: [
+          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "- Add a blank line after the subject before the narrative body.",
+          "- Add a narrative body paragraph explaining the decision context.",
+          "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+        ].join("\n"),
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks PreToolUse env wrapper-prefixed git.exe commit when the inline message is not Lore-compliant", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-exe-commit-env-wrapper-invalid-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-exe-commit-env-wrapper-invalid",
+          tool_input: { command: 'env git.exe commit -m "fix tests"' },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason:
+          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          additionalContext: [
+            "Lore-format git commit enforcement triggered.",
+            "- Add a blank line after the subject before the narrative body.",
+            "- Add a narrative body paragraph explaining the decision context.",
+            "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+            "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          ].join("\n"),
+        },
+        systemMessage: [
+          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "- Add a blank line after the subject before the narrative body.",
+          "- Add a narrative body paragraph explaining the decision context.",
+          "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+        ].join("\n"),
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks PreToolUse git.exe commit when the inline message is not Lore-compliant", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-exe-commit-invalid-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-exe-commit-invalid",
+          tool_input: { command: 'git.exe commit -m "fix tests"' },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason:
+          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          additionalContext: [
+            "Lore-format git commit enforcement triggered.",
+            "- Add a blank line after the subject before the narrative body.",
+            "- Add a narrative body paragraph explaining the decision context.",
+            "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+            "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          ].join("\n"),
+        },
+        systemMessage: [
+          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "- Add a blank line after the subject before the narrative body.",
+          "- Add a narrative body paragraph explaining the decision context.",
+          "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+        ].join("\n"),
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks PreToolUse env flag wrapper-prefixed git.exe commit when the inline message is not Lore-compliant", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-exe-commit-env-flag-wrapper-invalid-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-exe-commit-env-flag-wrapper-invalid",
+          tool_input: { command: 'env -i PATH=/usr/bin git.exe commit -m "fix tests"' },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason:
+          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          additionalContext: [
+            "Lore-format git commit enforcement triggered.",
+            "- Add a blank line after the subject before the narrative body.",
+            "- Add a narrative body paragraph explaining the decision context.",
+            "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+            "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          ].join("\n"),
+        },
+        systemMessage: [
+          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "- Add a blank line after the subject before the narrative body.",
+          "- Add a narrative body paragraph explaining the decision context.",
+          "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+        ].join("\n"),
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks PreToolUse env value-taking wrapper-prefixed git.exe commit when the inline message is not Lore-compliant", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-exe-commit-env-value-wrapper-invalid-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-exe-commit-env-value-wrapper-invalid",
+          tool_input: { command: 'env -u FOO git.exe commit -m "fix tests"' },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason:
+          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          additionalContext: [
+            "Lore-format git commit enforcement triggered.",
+            "- Add a blank line after the subject before the narrative body.",
+            "- Add a narrative body paragraph explaining the decision context.",
+            "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+            "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          ].join("\n"),
+        },
+        systemMessage: [
+          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "- Add a blank line after the subject before the narrative body.",
+          "- Add a narrative body paragraph explaining the decision context.",
+          "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+        ].join("\n"),
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks PreToolUse path-qualified Windows git.exe commit when the inline message is not Lore-compliant", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-exe-commit-windows-path-invalid-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-exe-commit-windows-path-invalid",
+          tool_input: { command: '"C:/Program Files/Git/cmd/git.exe" commit -m "fix tests"' },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason:
+          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          additionalContext: [
+            "Lore-format git commit enforcement triggered.",
+            "- Add a blank line after the subject before the narrative body.",
+            "- Add a narrative body paragraph explaining the decision context.",
+            "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+            "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          ].join("\n"),
+        },
+        systemMessage: [
+          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "- Add a blank line after the subject before the narrative body.",
+          "- Add a narrative body paragraph explaining the decision context.",
+          "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+        ].join("\n"),
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks PreToolUse quoted backslash Windows git.exe commit when the inline message is not Lore-compliant", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-exe-commit-windows-backslash-path-invalid-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-exe-commit-windows-backslash-path-invalid",
+          tool_input: { command: '"C:\\Program Files\\Git\\cmd\\git.exe" commit -m "fix tests"' },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason:
+          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          additionalContext: [
+            "Lore-format git commit enforcement triggered.",
+            "- Add a blank line after the subject before the narrative body.",
+            "- Add a narrative body paragraph explaining the decision context.",
+            "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+            "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          ].join("\n"),
+        },
+        systemMessage: [
+          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "- Add a blank line after the subject before the narrative body.",
+          "- Add a narrative body paragraph explaining the decision context.",
+          "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+        ].join("\n"),
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks PreToolUse path-qualified git commit when the inline message is not Lore-compliant", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-commit-path-invalid-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-commit-path-invalid",
+          tool_input: { command: '/usr/bin/git commit -m "fix tests"' },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason:
+          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          additionalContext: [
+            "Lore-format git commit enforcement triggered.",
+            "- Add a blank line after the subject before the narrative body.",
+            "- Add a narrative body paragraph explaining the decision context.",
+            "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+            "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          ].join("\n"),
+        },
+        systemMessage: [
+          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "- Add a blank line after the subject before the narrative body.",
+          "- Add a narrative body paragraph explaining the decision context.",
+          "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+        ].join("\n"),
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks PreToolUse git commit when the message comes from an external source", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-commit-file-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-commit-file",
+          tool_input: { command: "git commit -F .git/COMMIT_EDITMSG" },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason:
+          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          additionalContext: [
+            "Lore-format git commit enforcement triggered.",
+            "- Use inline `git commit -m ...` paragraphs for Lore-format commits in this path; file/editor/reuse/fixup message sources are not inspectable safely from pre-tool-use enforcement.",
+          ].join("\n"),
+        },
+        systemMessage: [
+          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "- Use inline `git commit -m ...` paragraphs for Lore-format commits in this path; file/editor/reuse/fixup message sources are not inspectable safely from pre-tool-use enforcement.",
+        ].join("\n"),
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks PreToolUse git commit when Lore trailers exist but the OmX co-author trailer is missing", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-commit-missing-omx-coauthor-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-commit-missing-omx-coauthor",
+          tool_input: {
+            command: [
+              'git commit',
+              '-m "Prevent invalid history from bypassing Lore enforcement"',
+              '-m "The native pre-tool-use hook now blocks inline git commit messages that skip Lore trailers or the required OmX co-author trailer."',
+              '-m "Constraint: Native PreToolUse can only inspect the Bash command text"',
+              '-m "Tested: node --test dist/scripts/__tests__/codex-native-hook.test.js"',
+            ].join(" "),
+          },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason:
+          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          additionalContext: [
+            "Lore-format git commit enforcement triggered.",
+            "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          ].join("\n"),
+        },
+        systemMessage: [
+          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+        ].join("\n"),
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("stays silent on PreToolUse for Lore-compliant git commit with OmX co-author trailer", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-commit-valid-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-commit-valid",
+          tool_input: {
+            command: [
+              'git commit',
+              '-m "Prevent invalid history from bypassing Lore enforcement"',
+              '-m "The native pre-tool-use hook now blocks inline git commit messages that skip Lore trailers or the required OmX co-author trailer."',
+              '-m "Constraint: Native PreToolUse can only inspect the Bash command text"',
+              '-m "Tested: node --test dist/scripts/__tests__/codex-native-hook.test.js"',
+              '-m "Co-authored-by: OmX <omx@oh-my-codex.dev>"',
+            ].join(" "),
+          },
         },
         { cwd },
       );
@@ -2226,6 +2894,7 @@ esac
     try {
       const stateDir = join(cwd, ".omx", "state");
       await mkdir(stateDir, { recursive: true });
+      process.env.OMX_SESSION_ID = "sess-stop-auto";
 
       const result = await dispatchCodexNativeHook(
         {
@@ -2255,6 +2924,7 @@ esac
     try {
       const stateDir = join(cwd, ".omx", "state");
       await mkdir(stateDir, { recursive: true });
+      process.env.OMX_SESSION_ID = "sess-stop-auto-once";
 
       await dispatchCodexNativeHook(
         {
@@ -2288,11 +2958,60 @@ esac
     }
   });
 
+  it("suppresses duplicate native auto-nudge replays across native/canonical session-id drift", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-auto-nudge-session-drift-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      await mkdir(stateDir, { recursive: true });
+      process.env.OMX_SESSION_ID = "omx-canonical";
+      await writeJson(join(stateDir, "session.json"), {
+        session_id: "omx-canonical",
+        native_session_id: "codex-native",
+      });
+
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "codex-native",
+          thread_id: "thread-stop-auto-drift",
+          turn_id: "turn-stop-auto-drift-1",
+          last_assistant_message: "Keep going and finish the cleanup.",
+        },
+        { cwd },
+      );
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "omx-canonical",
+          thread_id: "thread-stop-auto-drift",
+          turn_id: "turn-stop-auto-drift-1",
+          stop_hook_active: true,
+          last_assistant_message: "Keep going and finish the cleanup.",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal(result.outputJson, null);
+
+      const persisted = JSON.parse(
+        await readFile(join(stateDir, "native-stop-state.json"), "utf-8"),
+      ) as { sessions?: Record<string, unknown> };
+      assert.deepEqual(Object.keys(persisted.sessions ?? {}), ["omx-canonical"]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("re-fires native auto-nudge for a later fresh Stop reply even when stop_hook_active is true", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-auto-nudge-refire-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
       await mkdir(stateDir, { recursive: true });
+      process.env.OMX_SESSION_ID = "sess-stop-auto-refire";
 
       await dispatchCodexNativeHook(
         {
@@ -2332,10 +3051,11 @@ esac
     }
   });
 
-  it("does not auto-continue native Stop on permission-seeking prompts", async () => {
+  it("auto-continues native Stop on permission-seeking prompts", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-auto-nudge-permission-"));
     try {
       await mkdir(join(cwd, ".omx", "state"), { recursive: true });
+      process.env.OMX_SESSION_ID = "sess-stop-auto-permission";
 
       const result = await dispatchCodexNativeHook(
         {
@@ -2348,7 +3068,42 @@ esac
       );
 
       assert.equal(result.omxEventName, "stop");
-      assert.equal(result.outputJson, null);
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason: DEFAULT_AUTO_NUDGE_RESPONSE,
+        stopReason: "auto_nudge",
+        systemMessage:
+          "OMX native Stop detected a stall/permission-style handoff and continued the turn automatically.",
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("auto-continues native Stop on \"if you want\" permission-seeking prompts", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-auto-nudge-if-you-want-"));
+    try {
+      await mkdir(join(cwd, ".omx", "state"), { recursive: true });
+      process.env.OMX_SESSION_ID = "sess-stop-auto-if-you-want";
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "sess-stop-auto-if-you-want",
+          last_assistant_message: "If you want, I can continue with the cleanup from here.",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason: DEFAULT_AUTO_NUDGE_RESPONSE,
+        stopReason: "auto_nudge",
+        systemMessage:
+          "OMX native Stop detected a stall/permission-style handoff and continued the turn automatically.",
+      });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -2359,6 +3114,7 @@ esac
     try {
       const stateDir = join(cwd, ".omx", "state");
       await mkdir(join(stateDir, "sessions", "sess-stop-auto-question"), { recursive: true });
+      process.env.OMX_SESSION_ID = "sess-stop-auto-question";
       await writeJson(join(stateDir, "session.json"), { session_id: "sess-stop-auto-question" });
       await writeJson(join(stateDir, "sessions", "sess-stop-auto-question", "skill-active-state.json"), {
         version: 1,
@@ -2409,6 +3165,7 @@ esac
     try {
       const stateDir = join(cwd, ".omx", "state");
       await mkdir(join(stateDir, "sessions", "sess-stop-auto-interview"), { recursive: true });
+      process.env.OMX_SESSION_ID = "sess-stop-auto-interview";
       await writeJson(join(stateDir, "session.json"), { session_id: "sess-stop-auto-interview" });
       await writeJson(join(stateDir, "sessions", "sess-stop-auto-interview", "deep-interview-state.json"), {
         active: true,
@@ -2441,6 +3198,7 @@ esac
     try {
       const stateDir = join(cwd, ".omx", "state");
       await mkdir(stateDir, { recursive: true });
+      process.env.OMX_SESSION_ID = "sess-stop-auto-mode";
       await writeJson(join(stateDir, "deep-interview-state.json"), {
         active: true,
         mode: "deep-interview",
@@ -2469,6 +3227,7 @@ esac
     try {
       const stateDir = join(cwd, ".omx", "state");
       await mkdir(stateDir, { recursive: true });
+      process.env.OMX_SESSION_ID = "sess-stop-auto-stale-root-mode";
       await writeJson(join(stateDir, "deep-interview-state.json"), {
         active: true,
         mode: "deep-interview",
@@ -2505,6 +3264,7 @@ esac
     try {
       const stateDir = join(cwd, ".omx", "state");
       await mkdir(stateDir, { recursive: true });
+      process.env.OMX_SESSION_ID = "sess-stop-auto-stale-root-skill";
       await writeJson(join(stateDir, "skill-active-state.json"), {
         active: true,
         skill: "deep-interview",
@@ -2541,6 +3301,7 @@ esac
     try {
       const stateDir = join(cwd, ".omx", "state");
       await mkdir(stateDir, { recursive: true });
+      process.env.OMX_SESSION_ID = "sess-stop-auto-stale-root-lock";
       await writeJson(join(stateDir, "skill-active-state.json"), {
         active: true,
         skill: "deep-interview",
@@ -2583,6 +3344,7 @@ esac
     try {
       const stateDir = join(cwd, ".omx", "state");
       await mkdir(join(stateDir, "sessions", "sess-stop-auto-inactive-mode"), { recursive: true });
+      process.env.OMX_SESSION_ID = "sess-stop-auto-inactive-mode";
       await writeJson(join(stateDir, "session.json"), { session_id: "sess-stop-auto-inactive-mode" });
       await writeJson(join(stateDir, "sessions", "sess-stop-auto-inactive-mode", "deep-interview-state.json"), {
         active: false,
@@ -2615,6 +3377,40 @@ esac
         systemMessage:
           "OMX native Stop detected a stall/permission-style handoff and continued the turn automatically.",
       });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not auto-continue native Stop for a plain Codex session started outside OMX runtime", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-auto-nudge-plain-session-"));
+    try {
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: "plain-stop-session",
+        },
+        {
+          cwd,
+          sessionOwnerPid: process.pid,
+        },
+      );
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "plain-stop-session",
+          thread_id: "plain-thread",
+          turn_id: "plain-turn-1",
+          last_assistant_message: "Keep going and finish the cleanup.",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal(result.outputJson, null);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -2669,6 +3465,86 @@ esac
         stopReason: "team_team-verify",
         systemMessage: "OMX team pipeline is still active at phase team-verify.",
       });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("suppresses duplicate team Stop replays across native/canonical session-id drift", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-team-session-drift-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      await mkdir(join(stateDir, "sessions", "omx-canonical"), { recursive: true });
+      process.env.OMX_SESSION_ID = "omx-canonical";
+      await writeJson(join(stateDir, "session.json"), {
+        session_id: "omx-canonical",
+        native_session_id: "codex-native",
+      });
+      await writeJson(join(stateDir, "sessions", "omx-canonical", "team-state.json"), {
+        active: true,
+        current_phase: "starting",
+        team_name: "current-team",
+        session_id: "omx-canonical",
+      });
+      await writeJson(join(stateDir, "team", "current-team", "phase.json"), {
+        current_phase: "team-verify",
+        max_fix_attempts: 3,
+        current_fix_attempt: 1,
+        transitions: [],
+        updated_at: new Date().toISOString(),
+      });
+
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "codex-native",
+          thread_id: "thread-stop-team-drift",
+          turn_id: "turn-stop-team-drift-1",
+        },
+        { cwd },
+      );
+
+      const duplicate = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "omx-canonical",
+          thread_id: "thread-stop-team-drift",
+          turn_id: "turn-stop-team-drift-1",
+          stop_hook_active: true,
+        },
+        { cwd },
+      );
+
+      assert.equal(duplicate.omxEventName, "stop");
+      assert.equal(duplicate.outputJson, null);
+
+      const fresh = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "omx-canonical",
+          thread_id: "thread-stop-team-drift",
+          turn_id: "turn-stop-team-drift-2",
+          stop_hook_active: true,
+        },
+        { cwd },
+      );
+
+      assert.equal(fresh.omxEventName, "stop");
+      assert.deepEqual(fresh.outputJson, {
+        decision: "block",
+        reason:
+          `OMX team pipeline is still active (current-team) at phase team-verify; continue coordinating until the team reaches a terminal phase.${TEAM_STOP_COMMIT_GUIDANCE}`,
+        stopReason: "team_team-verify",
+        systemMessage: "OMX team pipeline is still active at phase team-verify.",
+      });
+
+      const persisted = JSON.parse(
+        await readFile(join(stateDir, "native-stop-state.json"), "utf-8"),
+      ) as { sessions?: Record<string, unknown> };
+      assert.deepEqual(Object.keys(persisted.sessions ?? {}), ["omx-canonical"]);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

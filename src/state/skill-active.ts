@@ -193,15 +193,18 @@ export async function writeSkillActiveStateCopies(
   cwd: string,
   state: SkillActiveStateLike,
   sessionId?: string,
-  rootState?: SkillActiveStateLike,
+  rootState?: SkillActiveStateLike | null,
 ): Promise<void> {
   const { rootPath, sessionPath } = getSkillActiveStatePaths(cwd, sessionId);
   const normalized = { version: 1, ...state };
-  const normalizedRoot = { version: 1, ...(rootState ?? normalized) };
-  const rootPayload = JSON.stringify(normalizedRoot, null, 2);
-
-  await mkdir(dirname(rootPath), { recursive: true });
-  await writeFile(rootPath, rootPayload);
+  const normalizedRoot = rootState === null
+    ? null
+    : { version: 1, ...(rootState ?? normalized) };
+  if (normalizedRoot !== null) {
+    const rootPayload = JSON.stringify(normalizedRoot, null, 2);
+    await mkdir(dirname(rootPath), { recursive: true });
+    await writeFile(rootPath, rootPayload);
+  }
 
   if (sessionPath) {
     const sessionPayload = JSON.stringify(normalized, null, 2);

@@ -358,6 +358,48 @@ describe('keyword detector skill-active-state lifecycle', () => {
     }
   });
 
+  it('keeps a session-scoped Ralph activation out of the root canonical state for other sessions', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-state-ralph-isolation-'));
+    const stateDir = join(cwd, '.omx', 'state');
+    try {
+      await mkdir(stateDir, { recursive: true });
+
+      const result = await recordSkillActivation({
+        stateDir,
+        text: '$ralph continue verification',
+        sessionId: 'sess-ralph-a',
+        threadId: 'thread-ralph-a',
+        turnId: 'turn-ralph-a',
+        nowIso: '2026-04-14T00:00:00.000Z',
+      });
+
+      assert.ok(result);
+
+      const rootSkillStatePath = join(stateDir, SKILL_ACTIVE_STATE_FILE);
+      assert.equal(
+        existsSync(rootSkillStatePath),
+        false,
+        'session-scoped prompt activation should not create a root canonical skill state',
+      );
+
+      const sessionScopedSkillState = JSON.parse(
+        await readFile(join(stateDir, 'sessions', 'sess-ralph-a', SKILL_ACTIVE_STATE_FILE), 'utf-8'),
+      ) as { active_skills?: Array<{ skill: string; session_id?: string }> };
+      assert.deepEqual(sessionScopedSkillState.active_skills, [{
+        skill: 'ralph',
+        phase: 'planning',
+        active: true,
+        activated_at: '2026-04-14T00:00:00.000Z',
+        updated_at: '2026-04-14T00:00:00.000Z',
+        session_id: 'sess-ralph-a',
+        thread_id: 'thread-ralph-a',
+        turn_id: 'turn-ralph-a',
+      }]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('hard-fails denied workflow overlaps without mutating current state', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-state-deny-'));
     const stateDir = join(cwd, '.omx', 'state');

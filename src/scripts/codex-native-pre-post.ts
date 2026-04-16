@@ -188,11 +188,387 @@ function buildOmxParityFallbackCommand(payload: CodexHookPayload, toolName: stri
   return `omx ${target.command} ${target.tool} --input ${shellSingleQuote(JSON.stringify(input))} --json`;
 }
 
+const LORE_TRAILER_PREFIXES = [
+  "Constraint:",
+  "Rejected:",
+  "Confidence:",
+  "Scope-risk:",
+  "Reversibility:",
+  "Directive:",
+  "Tested:",
+  "Not-tested:",
+  "Related:",
+] as const;
+
+const OMX_COAUTHOR_TRAILER = "Co-authored-by: OmX <omx@oh-my-codex.dev>";
+
+function isDoubleQuotedShellEscapeTarget(char: string | undefined): boolean {
+  return char === "\"" || char === "\\" || char === "$" || char === "`" || char === "\n";
+}
+
+function tokenizeShellCommand(commandText: string): string[] | null {
+  const trimmed = commandText.trim();
+  if (!trimmed) return null;
+
+  const tokens: string[] = [];
+  let current = "";
+  let quote: "'" | "\"" | null = null;
+  let escaping = false;
+
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const char = trimmed[index] ?? "";
+    if (escaping) {
+      current += char;
+      escaping = false;
+      continue;
+    }
+
+    if (quote === "'") {
+      if (char === "'") quote = null;
+      else current += char;
+      continue;
+    }
+
+    if (quote === "\"") {
+      if (char === "\"") quote = null;
+      else if (char === "\\") {
+        if (isDoubleQuotedShellEscapeTarget(trimmed[index + 1])) escaping = true;
+        else current += char;
+      }
+      else current += char;
+      continue;
+    }
+
+    if (/\s/.test(char)) {
+      if (current) {
+        tokens.push(current);
+        current = "";
+      }
+      continue;
+    }
+
+    if (char === "'" || char === "\"") {
+      quote = char;
+      continue;
+    }
+
+    if (char === "\\") {
+      escaping = true;
+      continue;
+    }
+
+    current += char;
+  }
+
+  if (escaping || quote) return null;
+  if (current) tokens.push(current);
+  return tokens.length > 0 ? tokens : null;
+}
+
+interface GitCommitCommandParseResult {
+  isGitCommit: boolean;
+  inlineMessage: string | null;
+  requiresExternalMessageSource: boolean;
+}
+
+function isInlineShellEnvAssignment(token: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*=.*$/u.test(token);
+}
+
+function isGitExecutableToken(token: string): boolean {
+  const lowerToken = token.toLowerCase();
+  if (lowerToken === "git" || lowerToken === "git.exe") return true;
+  const normalized = token.replaceAll("\\", "/");
+  const segments = normalized.split("/");
+  const basename = (segments[segments.length - 1] ?? "").toLowerCase();
+  return basename === "git" || basename === "git.exe";
+}
+
+function isEnvExecutableToken(token: string): boolean {
+  const lowerToken = token.toLowerCase();
+  if (lowerToken === "env") return true;
+  const normalized = token.replaceAll("\\", "/");
+  const segments = normalized.split("/");
+  const basename = (segments[segments.length - 1] ?? "").toLowerCase();
+  return basename === "env";
+}
+
+function envOptionConsumesNextValue(token: string): boolean {
+  return token === "-u"
+    || token === "--unset"
+    || token === "-C"
+    || token === "--chdir"
+    || token === "-S"
+    || token === "--split-string";
+}
+
+function findGitCommandTokenIndex(tokens: string[]): number {
+  let index = 0;
+
+  while (index < tokens.length && isInlineShellEnvAssignment(tokens[index] ?? "")) {
+    index += 1;
+  }
+
+  while (index < tokens.length && isEnvExecutableToken(tokens[index] ?? "")) {
+    index += 1;
+    while (index < tokens.length) {
+      const token = tokens[index] ?? "";
+      if (token === "--") {
+        index += 1;
+        break;
+      }
+      if (isInlineShellEnvAssignment(token) || token.startsWith("-")) {
+        if (envOptionConsumesNextValue(token)) {
+          index += 1;
+        }
+        index += 1;
+        continue;
+      }
+      break;
+    }
+    while (index < tokens.length && isInlineShellEnvAssignment(tokens[index] ?? "")) {
+      index += 1;
+    }
+  }
+
+  return index < tokens.length && isGitExecutableToken(tokens[index] ?? "")
+    ? index
+    : -1;
+}
+
+function gitOptionConsumesNextValue(token: string): boolean {
+  return token === "-c"
+    || token === "-C"
+    || token === "--git-dir"
+    || token === "--work-tree"
+    || token === "--namespace"
+    || token === "--super-prefix"
+    || token === "--exec-path"
+    || token === "--config-env"
+    || token === "--attr-source";
+}
+
+function gitOptionStopsBeforeSubcommand(token: string): boolean {
+  return token === "-h"
+    || token === "--help"
+    || token === "--version"
+    || token === "--html-path"
+    || token === "--man-path"
+    || token === "--info-path";
+}
+
+function findGitSubcommandIndex(tokens: string[], gitTokenIndex: number): number {
+  let index = gitTokenIndex + 1;
+
+  while (index < tokens.length) {
+    const token = tokens[index] ?? "";
+    if (!token) {
+      index += 1;
+      continue;
+    }
+    if (token === "--") {
+      index += 1;
+      break;
+    }
+    if (!token.startsWith("-")) break;
+    if (gitOptionStopsBeforeSubcommand(token)) return -1;
+    if (gitOptionConsumesNextValue(token)) {
+      index += 2;
+      continue;
+    }
+    index += 1;
+  }
+
+  return index < tokens.length ? index : -1;
+}
+
+function parseGitCommitCommand(commandText: string): GitCommitCommandParseResult {
+  const tokens = tokenizeShellCommand(commandText);
+  if (!tokens) {
+    return {
+      isGitCommit: false,
+      inlineMessage: null,
+      requiresExternalMessageSource: false,
+    };
+  }
+
+  const gitTokenIndex = findGitCommandTokenIndex(tokens);
+  if (gitTokenIndex < 0 || !isGitExecutableToken(tokens[gitTokenIndex] ?? "")) {
+    return {
+      isGitCommit: false,
+      inlineMessage: null,
+      requiresExternalMessageSource: false,
+    };
+  }
+
+  const subcommandIndex = findGitSubcommandIndex(tokens, gitTokenIndex);
+  if (subcommandIndex < 0 || tokens[subcommandIndex]?.toLowerCase() !== "commit") {
+    return {
+      isGitCommit: false,
+      inlineMessage: null,
+      requiresExternalMessageSource: false,
+    };
+  }
+
+  const messageParts: string[] = [];
+  let requiresExternalMessageSource = false;
+  const args = tokens.slice(subcommandIndex + 1);
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index] ?? "";
+    if (token === "-m" || token === "--message") {
+      const nextValue = args[index + 1];
+      if (typeof nextValue === "string") {
+        messageParts.push(nextValue);
+        index += 1;
+      }
+      continue;
+    }
+    if (token.startsWith("--message=")) {
+      messageParts.push(token.slice("--message=".length));
+      continue;
+    }
+    if (
+      token === "-F"
+      || token === "--file"
+      || token === "-c"
+      || token === "-C"
+      || token === "--reuse-message"
+      || token === "--reedit-message"
+      || token === "--fixup"
+      || token.startsWith("--fixup=")
+      || token === "--squash"
+      || token.startsWith("--squash=")
+      || token === "--template"
+      || token === "-t"
+      || token.startsWith("--file=")
+      || token.startsWith("--reuse-message=")
+      || token.startsWith("--reedit-message=")
+      || token.startsWith("--template=")
+    ) {
+      requiresExternalMessageSource = true;
+    }
+  }
+
+  return {
+    isGitCommit: true,
+    inlineMessage: messageParts.length > 0 ? messageParts.join("\n\n").trim() : null,
+    requiresExternalMessageSource,
+  };
+}
+
+function isLoreTrailerLine(line: string): boolean {
+  return line === OMX_COAUTHOR_TRAILER
+    || LORE_TRAILER_PREFIXES.some((prefix) => line.startsWith(prefix));
+}
+
+function splitParagraphs(text: string): string[] {
+  return text
+    .split(/\n\s*\n/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+}
+
+function splitBodyAndTrailerLines(text: string): {
+  bodyText: string;
+  trailerLines: string[];
+} {
+  const paragraphs = splitParagraphs(text);
+  let trailerStart = paragraphs.length;
+
+  while (trailerStart > 0) {
+    const paragraph = paragraphs[trailerStart - 1] ?? "";
+    const lines = paragraph
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (lines.length === 0 || !lines.every((line) => isLoreTrailerLine(line))) break;
+    trailerStart -= 1;
+  }
+
+  return {
+    bodyText: paragraphs.slice(0, trailerStart).join("\n\n").trim(),
+    trailerLines: paragraphs
+      .slice(trailerStart)
+      .flatMap((paragraph) => paragraph.split("\n"))
+      .map((line) => line.trim())
+      .filter(Boolean),
+  };
+}
+
+function buildGitCommitComplianceErrors(message: string | null): string[] {
+  if (!message) {
+    return [
+      "Provide the commit message inline with `git commit -m ...` so the pre-tool-use hook can validate Lore format before the command runs.",
+    ];
+  }
+
+  const normalized = message.replace(/\r\n?/g, "\n").trim();
+  if (!normalized) {
+    return [
+      "Provide a non-empty Lore-format commit message with an intent-first subject, narrative body, Lore trailers, and the OmX co-author trailer.",
+    ];
+  }
+
+  const lines = normalized.split("\n");
+  const errors: string[] = [];
+  if (lines[0]?.trim() === "") {
+    errors.push("Start the commit message with a non-empty intent-first subject line.");
+  }
+  if (lines.length < 2 || lines[1]?.trim() !== "") {
+    errors.push("Add a blank line after the subject before the narrative body.");
+  }
+
+  const { bodyText, trailerLines } = splitBodyAndTrailerLines(lines.slice(2).join("\n"));
+  if (!bodyText) {
+    errors.push("Add a narrative body paragraph explaining the decision context.");
+  }
+  if (!trailerLines.some((line) => LORE_TRAILER_PREFIXES.some((prefix) => line.startsWith(prefix)))) {
+    errors.push("Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.");
+  }
+  if (!trailerLines.includes(OMX_COAUTHOR_TRAILER)) {
+    errors.push(`Add the required co-author trailer: \`${OMX_COAUTHOR_TRAILER}\`.`);
+  }
+
+  return errors;
+}
+
+function buildGitCommitEnforcementOutput(commandText: string): Record<string, unknown> | null {
+  const parsed = parseGitCommitCommand(commandText);
+  if (!parsed.isGitCommit) return null;
+
+  const errors = parsed.requiresExternalMessageSource
+    ? [
+      "Use inline `git commit -m ...` paragraphs for Lore-format commits in this path; file/editor/reuse/fixup message sources are not inspectable safely from pre-tool-use enforcement.",
+    ]
+    : buildGitCommitComplianceErrors(parsed.inlineMessage);
+
+  if (errors.length === 0) return null;
+
+  return {
+    decision: "block",
+    reason:
+      "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      additionalContext: [
+        "Lore-format git commit enforcement triggered.",
+        ...errors.map((error) => `- ${error}`),
+      ].join("\n"),
+    },
+    systemMessage: [
+      "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+      ...errors.map((error) => `- ${error}`),
+    ].join("\n"),
+  };
+}
+
 export function buildNativePreToolUseOutput(
   payload: CodexHookPayload,
 ): Record<string, unknown> | null {
   const normalized = normalizePreToolUsePayload(payload);
   if (!normalized.isBash) return null;
+  const gitCommitEnforcement = buildGitCommitEnforcementOutput(normalized.normalizedCommand);
+  if (gitCommitEnforcement) return gitCommitEnforcement;
   if (!matchesDestructiveFixture(normalized.normalizedCommand)) return null;
 
   return {

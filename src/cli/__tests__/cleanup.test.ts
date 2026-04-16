@@ -150,11 +150,69 @@ describe('findCleanupCandidates', () => {
 });
 
 describe('listOmxProcesses', () => {
-  it('returns no processes on native Windows without shelling out to ps', () => {
+  it('parses valid Windows process discovery rows on win32', () => {
     const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
     Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
     try {
-      assert.deepEqual(listOmxProcesses(), []);
+      const processes = listOmxProcesses(() => [
+        JSON.stringify({ pid: 800, ppid: 1, command: 'node C:/tmp/oh-my-codex/dist/mcp/state-server.js' }),
+        JSON.stringify({ pid: 810, ppid: 42, command: 'node C:/tmp/oh-my-codex/dist/mcp/trace-server.js' }),
+      ].join('\n'));
+      assert.deepEqual(processes, [
+        { pid: 800, ppid: 1, command: 'node C:/tmp/oh-my-codex/dist/mcp/state-server.js' },
+        { pid: 810, ppid: 42, command: 'node C:/tmp/oh-my-codex/dist/mcp/trace-server.js' },
+      ]);
+    } finally {
+      if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
+    }
+  });
+
+  it('drops malformed Windows process discovery rows on win32', () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try {
+      const processes = listOmxProcesses(() => [
+        JSON.stringify({ pid: 800, ppid: 1, command: 'node C:/tmp/oh-my-codex/dist/mcp/state-server.js' }),
+        JSON.stringify({ pid: 'abc', ppid: 1, command: 'node malformed.js' }),
+        JSON.stringify({ pid: 901, ppid: -1, command: 'node malformed.js' }),
+        JSON.stringify({ pid: 902, ppid: 20, command: '   ' }),
+        '{bad json',
+      ].join('\n'));
+      assert.deepEqual(processes, [
+        { pid: 800, ppid: 1, command: 'node C:/tmp/oh-my-codex/dist/mcp/state-server.js' },
+      ]);
+    } finally {
+      if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
+    }
+  });
+
+  it('feeds parsed Windows rows through existing cleanup candidate selection unchanged', () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try {
+      const parsed = listOmxProcesses(() => [
+        JSON.stringify({ pid: 700, ppid: 500, command: 'codex' }),
+        JSON.stringify({ pid: 701, ppid: 700, command: 'node C:/repo/bin/omx.js cleanup --dry-run' }),
+        JSON.stringify({ pid: 710, ppid: 700, command: 'node C:/repo/dist/mcp/state-server.js' }),
+        JSON.stringify({ pid: 800, ppid: 1, command: 'node C:/tmp/oh-my-codex/dist/mcp/memory-server.js' }),
+        JSON.stringify({ pid: 810, ppid: 42, command: 'node C:/tmp/worktree/dist/mcp/trace-server.js' }),
+        JSON.stringify({ pid: 900, ppid: 1, command: 'node C:/tmp/not-omx/other-server.js' }),
+      ].join('\n'));
+
+      assert.deepEqual(findCleanupCandidates(parsed, 701), [
+        {
+          pid: 800,
+          ppid: 1,
+          command: 'node C:/tmp/oh-my-codex/dist/mcp/memory-server.js',
+          reason: 'ppid=1',
+        },
+        {
+          pid: 810,
+          ppid: 42,
+          command: 'node C:/tmp/worktree/dist/mcp/trace-server.js',
+          reason: 'outside-current-session',
+        },
+      ]);
     } finally {
       if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
     }

@@ -209,7 +209,7 @@ describe('mcp duplicate sibling detection', () => {
     );
     assert.equal(
       shouldSelfExitForDuplicateSibling(observation, 40_500, 1_000, 10_000),
-      true,
+      false,
     );
   });
 

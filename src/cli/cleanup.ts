@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from 'child_process';
 import { readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +20,16 @@ const OMX_MCP_SERVER_PATTERN = /(?:^|[\\/])dist[\\/]mcp[\\/](?:state|memory|code
 const CODEX_PROCESS_PATTERN = /(?:^|[\\/\s])codex(?:\.js)?(?:\s|$)|@openai[\\/]codex/i;
 const OMX_LAUNCH_PROCESS_PATTERN = /(?:^|[\\/\s])omx(?:\.js)?(?:\s|$)|(?:^|[\\/])(?:bin|dist[\\/]cli)[\\/]omx\.js(?:\s|$)|oh-my-codex[\\/]dist[\\/]cli[\\/]omx\.js/i;
 const OMX_TMP_DIRECTORY_PATTERN = /^(omc|omx|oh-my-codex)-/;
+const PROCESS_LIST_COMMAND_OPTIONS: ExecFileSyncOptionsWithStringEncoding = {
+  encoding: 'utf-8',
+  windowsHide: true,
+};
+const WINDOWS_PROCESS_DISCOVERY_SCRIPT = [
+  "$ErrorActionPreference = 'Stop'",
+  'Get-CimInstance Win32_Process | ForEach-Object {',
+  '  [PSCustomObject]@{ pid = $_.ProcessId; ppid = $_.ParentProcessId; command = $_.CommandLine } | ConvertTo-Json -Compress',
+  '}',
+].join('; ');
 
 export interface ProcessEntry {
   pid: number;
@@ -72,6 +82,15 @@ export interface CleanupCommandDependencies {
   cleanupTmpDirectories?: (args: readonly string[]) => Promise<number>;
 }
 
+type ProcessListCommandRunner = (
+  file: string,
+  args: readonly string[],
+  options: ExecFileSyncOptionsWithStringEncoding,
+) => string;
+
+const defaultProcessListCommandRunner: ProcessListCommandRunner = (file, args, options) =>
+  execFileSync(file, [...args], options);
+
 function normalizeCommand(command: string): string {
   return command.replace(/\\+/g, '/').trim();
 }
@@ -104,12 +123,58 @@ export function parsePsOutput(output: string): ProcessEntry[] {
     .filter((entry): entry is ProcessEntry => entry !== null);
 }
 
-export function listOmxProcesses(): ProcessEntry[] {
-  if (process.platform === 'win32') return [];
-  const output = execFileSync('ps', ['axww', '-o', 'pid=,ppid=,command='], {
-    encoding: 'utf-8',
-    windowsHide: true,
-  });
+function parseIntegerField(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isInteger(value)) return value;
+  if (typeof value === 'string' && /^-?\d+$/.test(value.trim())) {
+    return Number.parseInt(value, 10);
+  }
+  return null;
+}
+
+function parseWindowsProcessOutput(output: string): ProcessEntry[] {
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        return null;
+      }
+
+      if (typeof parsed !== 'object' || parsed === null) return null;
+      const record = parsed as Record<string, unknown>;
+      const pid = parseIntegerField(record.pid);
+      const ppid = parseIntegerField(record.ppid);
+      const command = typeof record.command === 'string'
+        ? record.command.trim()
+        : '';
+      if (!Number.isInteger(pid) || pid === null || pid <= 0) return null;
+      if (!Number.isInteger(ppid) || ppid === null || ppid < 0) return null;
+      if (!command) return null;
+      return { pid, ppid, command } satisfies ProcessEntry;
+    })
+    .filter((entry): entry is ProcessEntry => entry !== null);
+}
+
+function listWindowsOmxProcesses(
+  runCommand: ProcessListCommandRunner,
+): ProcessEntry[] {
+  const output = runCommand(
+    'powershell.exe',
+    ['-NoLogo', '-NoProfile', '-Command', WINDOWS_PROCESS_DISCOVERY_SCRIPT],
+    PROCESS_LIST_COMMAND_OPTIONS,
+  );
+  return parseWindowsProcessOutput(output);
+}
+
+export function listOmxProcesses(
+  runCommand: ProcessListCommandRunner = defaultProcessListCommandRunner,
+): ProcessEntry[] {
+  if (process.platform === 'win32') return listWindowsOmxProcesses(runCommand);
+  const output = runCommand('ps', ['axww', '-o', 'pid=,ppid=,command='], PROCESS_LIST_COMMAND_OPTIONS);
   return parsePsOutput(output);
 }
 

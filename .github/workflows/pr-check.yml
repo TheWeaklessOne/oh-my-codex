@@ -2,7 +2,7 @@ name: PR Check
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]
 
 jobs:
   size-label:
@@ -11,7 +11,7 @@ jobs:
     permissions:
       pull-requests: write
     steps:
-      - uses: actions/github-script@v8
+      - uses: actions/github-script@v9
         with:
           script: |
             const { additions, deletions } = context.payload.pull_request;
@@ -53,9 +53,25 @@ jobs:
     name: Draft Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/github-script@v8
+      - uses: actions/github-script@v9
         with:
           script: |
             if (context.payload.pull_request.draft) {
               core.notice('This PR is still in draft state.');
             }
+
+  base-branch-guidance:
+    name: PR Base Guidance
+    if: github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Remind contributors to target dev for normal contributions
+        run: |
+          message='Normal contributions should target `dev`. If this PR was opened against `main` by accident, please retarget it to `dev`. Maintainer-directed `main` PRs are still allowed.'
+          echo "::warning title=Retarget normal PRs to dev::$message"
+          {
+            echo '## PR base guidance'
+            echo
+            echo "$message"
+          } >> "$GITHUB_STEP_SUMMARY"

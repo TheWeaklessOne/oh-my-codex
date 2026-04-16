@@ -189,8 +189,25 @@ export interface ResolvedStateScope {
   stateDir: string;
 }
 
+function readSessionIdFromEnvironment(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const candidates = [env.OMX_SESSION_ID, env.CODEX_SESSION_ID, env.SESSION_ID];
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const trimmed = candidate.trim();
+    if (!trimmed) continue;
+    return validateSessionId(trimmed);
+  }
+  return undefined;
+}
+
 export async function readCurrentSessionId(workingDirectory?: string): Promise<string | undefined> {
   const cwd = resolveWorkingDirectoryForState(workingDirectory);
+  const envSessionId = readSessionIdFromEnvironment();
+  if (envSessionId) {
+    const envScopedDir = getStateDir(cwd, envSessionId);
+    if (existsSync(envScopedDir)) return envSessionId;
+  }
+
   return (await readUsableSessionState(cwd))?.session_id;
 }
 

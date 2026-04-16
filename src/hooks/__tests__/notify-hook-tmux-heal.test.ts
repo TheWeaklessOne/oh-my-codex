@@ -170,6 +170,132 @@ exit 1
     });
   });
 
+  it('does not revive a legacy root Ralph fallback when canonical skill state excludes Ralph', async () => {
+    await withTempWorkingDir(async (cwd) => {
+      const omxDir = join(cwd, '.omx');
+      const stateDir = join(omxDir, 'state');
+      const logsDir = join(omxDir, 'logs');
+      const sessionId = 'omx-abc123';
+      const sessionStateDir = join(stateDir, 'sessions', sessionId);
+      const configPath = join(omxDir, 'tmux-hook.json');
+      const hookStatePath = join(stateDir, 'tmux-hook-state.json');
+      const sessionStatePath = join(stateDir, 'session.json');
+      const fakeBinDir = join(cwd, 'fake-bin');
+      const fakeTmuxPath = join(fakeBinDir, 'tmux');
+      const tmuxLogPath = join(cwd, 'tmux.log');
+      const managedSessionName = buildTmuxSessionName(cwd, sessionId);
+
+      await mkdir(sessionStateDir, { recursive: true });
+      await mkdir(logsDir, { recursive: true });
+      await mkdir(fakeBinDir, { recursive: true });
+
+      await writeManagedSessionState(stateDir, cwd, sessionId);
+      const canonicalSessionState = JSON.parse(await readFile(sessionStatePath, 'utf-8')) as Record<string, unknown>;
+      await writeJson(join(stateDir, 'ralph-state.json'), { active: true, iteration: 0, tmux_pane_id: '%42' });
+      await writeJson(join(sessionStateDir, 'skill-active-state.json'), {
+        version: 1,
+        active: true,
+        skill: 'ralplan',
+        phase: 'planning',
+        session_id: sessionId,
+        active_skills: [
+          { skill: 'ralplan', phase: 'planning', active: true, session_id: sessionId },
+        ],
+      });
+      await writeJson(configPath, {
+        enabled: true,
+        target: { type: 'pane', value: '%42' },
+        allowed_modes: ['ralph'],
+        cooldown_ms: 0,
+        max_injections_per_session: 10,
+        prompt_template: 'Continue [OMX_TMUX_INJECT]',
+        marker: '[OMX_TMUX_INJECT]',
+        dry_run: false,
+        log_level: 'debug',
+      });
+
+      const fakeTmux = `#!/usr/bin/env bash
+set -eu
+echo "$@" >> "${tmuxLogPath}"
+cmd="$1"
+shift || true
+if [[ "$cmd" == "display-message" ]]; then
+  target=""
+  format=""
+  while (($#)); do
+    case "$1" in
+      -p) shift ;;
+      -t) target="$2"; shift 2 ;;
+      *) format="$1"; shift ;;
+    esac
+  done
+  if [[ "$format" == "#{pane_id}" && "$target" == "%42" ]]; then
+    echo "%42"
+    exit 0
+  fi
+  if [[ "$format" == "#{pane_current_command}" && "$target" == "%42" ]]; then
+    echo "codex"
+    exit 0
+  fi
+  if [[ "$format" == "#{pane_start_command}" && "$target" == "%42" ]]; then
+    echo "codex --model gpt-5"
+    exit 0
+  fi
+  if [[ "$format" == "#{pane_current_path}" && "$target" == "%42" ]]; then
+    echo "${cwd}"
+    exit 0
+  fi
+  if [[ "$format" == "#{pane_in_mode}" && "$target" == "%42" ]]; then
+    echo "0"
+    exit 0
+  fi
+  if [[ "$format" == "#S" && "$target" == "%42" ]]; then
+    echo "${managedSessionName}"
+    exit 0
+  fi
+fi
+if [[ "$cmd" == "send-keys" ]]; then
+  exit 0
+fi
+echo "unsupported tmux call: $cmd $*" >&2
+exit 1
+`;
+      await writeFile(fakeTmuxPath, fakeTmux);
+      await chmod(fakeTmuxPath, 0o755);
+
+      const payload = {
+        cwd,
+        type: 'agent-turn-complete',
+        session_id: sessionId,
+        'thread-id': 'thread-test-canonical-excludes-ralph',
+        'turn-id': 'turn-test-canonical-excludes-ralph',
+        'input-messages': ['no marker here'],
+        'last-assistant-message': 'output',
+      };
+
+      const previousPath = process.env.PATH;
+      const previousTeamWorker = process.env.OMX_TEAM_WORKER;
+      try {
+        process.env.PATH = `${fakeBinDir}:${process.env.PATH || ''}`;
+        process.env.OMX_TEAM_WORKER = '';
+        await handleTmuxInjection({ payload, cwd, stateDir, logsDir });
+      } finally {
+        if (typeof previousPath === 'string') process.env.PATH = previousPath;
+        else delete process.env.PATH;
+        if (typeof previousTeamWorker === 'string') process.env.OMX_TEAM_WORKER = previousTeamWorker;
+        else delete process.env.OMX_TEAM_WORKER;
+      }
+
+      const hookState = await readJson<Record<string, unknown>>(hookStatePath);
+      assert.equal(hookState.total_injections, 0);
+      assert.equal(hookState.last_reason, 'mode_not_allowed');
+      const persistedSessionState = JSON.parse(await readFile(sessionStatePath, 'utf-8')) as Record<string, unknown>;
+      assert.equal(persistedSessionState.session_id, canonicalSessionState.session_id);
+      const tmuxLog = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
+      assert.doesNotMatch(tmuxLog, /send-keys -t %42 -l/, 'legacy root Ralph state should not trigger a Ralph nudge when canonical skill state excludes Ralph');
+    });
+  });
+
   it('falls back to current tmux pane and heals stale session target', async () => {
     await withTempWorkingDir(async (cwd) => {
       const omxDir = join(cwd, '.omx');

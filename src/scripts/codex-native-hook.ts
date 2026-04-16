@@ -27,7 +27,7 @@ import {
   type SkillActiveState,
 } from "../hooks/keyword-detector.js";
 import {
-  detectStallPattern,
+  detectNativeStopStallPattern,
   loadAutoNudgeConfig,
   normalizeAutoNudgeSignatureText,
   resolveEffectiveAutoNudgeResponse,
@@ -44,6 +44,7 @@ import type { HookEventEnvelope } from "../hooks/extensibility/types.js";
 import { dispatchHookEvent } from "../hooks/extensibility/dispatcher.js";
 import { reconcileHudForPromptSubmit } from "../hud/reconcile.js";
 import { onSessionStart as buildWikiSessionStartContext } from "../wiki/lifecycle.js";
+import { sessionModelInstructionsPath } from "../hooks/agents-overlay.js";
 
 type CodexHookEventName =
   | "SessionStart"
@@ -138,10 +139,8 @@ export function mapCodexHookEventToOmxEvent(
 function readPromptText(payload: CodexHookPayload): string {
   const candidates = [
     payload.prompt,
-    payload.input,
     payload.user_prompt,
     payload.userPrompt,
-    payload.text,
   ];
   for (const candidate of candidates) {
     const value = safeString(candidate).trim();
@@ -378,10 +377,8 @@ async function ensureOmxGitignoreEntry(cwd: string): Promise<{ changed: boolean;
 async function buildSessionStartContext(
   cwd: string,
   sessionId: string,
-): Promise<string> {
-  const sections = [
-    "OMX native SessionStart detected. Load workspace conventions from AGENTS.md, restore relevant .omx runtime/project memory context, and continue from existing mode state before making changes.",
-  ];
+): Promise<string | null> {
+  const sections: string[] = [];
 
   const gitignoreResult = await ensureOmxGitignoreEntry(cwd);
   if (gitignoreResult.changed) {
@@ -457,7 +454,7 @@ async function buildSessionStartContext(
     sections.push(`[Subagents]\n- active subagent threads: ${subagentSummary.activeSubagentThreadIds.length}`);
   }
 
-  return sections.join("\n\n");
+  return sections.length > 0 ? sections.join("\n\n") : null;
 }
 
 function buildAdditionalContextMessage(prompt: string, skillState?: SkillActiveState | null): string | null {
@@ -475,6 +472,9 @@ function buildAdditionalContextMessage(prompt: string, skillState?: SkillActiveS
     ? skillState.deferred_skills
     : [];
   const teamDetected = activeSkills.includes("team");
+  const ralphPromptActivationNote = skillState?.initialized_mode === "ralph"
+    ? "Prompt-side `$ralph` activation seeds Ralph workflow state only; it does not invoke `omx ralph`. Use `omx ralph --prd ...` only when you explicitly want the PRD-gated CLI startup path."
+    : null;
   const combinedTransitionMessage = (() => {
     if (!skillState?.transition_message) return null;
     if (matches.length <= 1 || activeSkills.length <= 1) return skillState.transition_message;
@@ -505,7 +505,7 @@ function buildAdditionalContextMessage(prompt: string, skillState?: SkillActiveS
       teamDetected
         ? "Use the durable OMX team runtime via `omx team ...` for coordinated execution; do not replace it with in-process fanout."
         : null,
-      teamDetected ? "If you need help, run `omx team --help`." : null,
+      teamDetected ? "If you need runtime syntax, run `omx team --help` yourself." : null,
       'Follow AGENTS.md routing and preserve workflow transition and planning-safety rules.',
     ].filter(Boolean).join(' ');
   }
@@ -522,7 +522,7 @@ function buildAdditionalContextMessage(prompt: string, skillState?: SkillActiveS
         : null,
       initializedStateMessage,
       "Use the durable OMX team runtime via `omx team ...` for coordinated execution; do not replace it with in-process fanout.",
-      "If you need help, run `omx team --help`.",
+      "If you need runtime syntax, run `omx team --help` yourself.",
       "Follow AGENTS.md routing and preserve workflow transition and planning-safety rules.",
     ].filter(Boolean).join(" ");
   }
@@ -535,6 +535,7 @@ function buildAdditionalContextMessage(prompt: string, skillState?: SkillActiveS
         ? `planning preserved over simultaneous execution follow-up; deferred skills: ${deferredSkills.join(", ")}.`
         : null,
       `skill: ${skillState.initialized_mode} activated and initial state initialized at ${skillState.initialized_state_path}; write subsequent updates via omx_state MCP.`,
+      ralphPromptActivationNote,
       "Follow AGENTS.md routing and preserve workflow transition and planning-safety rules.",
     ].join(" ");
   }
@@ -878,29 +879,56 @@ async function readStopAutoNudgePhase(
   sessionId: string,
   threadId: string,
 ): Promise<string> {
-  if (!sessionId.trim()) return "";
+  const normalizedSessionId = sessionId.trim();
+  if (normalizedSessionId) {
+    const scopedModeState = await readStopSessionPinnedState("deep-interview-state.json", cwd, normalizedSessionId);
+    if (
+      scopedModeState?.active === true
+      && safeString(scopedModeState.current_phase).trim().toLowerCase() === "intent-first"
+    ) {
+      return "planning";
+    }
+  } else {
+    const rootModeState = await readJsonIfExists(join(cwd, ".omx", "state", "deep-interview-state.json"));
+    if (
+      rootModeState?.active === true
+      && safeString(rootModeState.current_phase).trim().toLowerCase() === "intent-first"
+    ) {
+      return "planning";
+    }
+  }
 
-  const canonicalState = await readVisibleSkillActiveState(cwd, sessionId);
+  if (!normalizedSessionId) return "";
+
+  const canonicalState = await readVisibleSkillActiveState(cwd, normalizedSessionId);
   const visibleEntries = canonicalState ? listActiveSkills(canonicalState) : [];
   const deepInterview = visibleEntries.find((entry) => (
     entry.skill === "deep-interview"
-    && matchesSkillStopContext(entry, canonicalState ?? {}, sessionId, threadId)
+    && matchesSkillStopContext(entry, canonicalState ?? {}, normalizedSessionId, threadId)
   ));
   if (!deepInterview) return "";
 
-  const modeState = await readStopSessionPinnedState("deep-interview-state.json", cwd, sessionId);
+  const modeState = await readStopSessionPinnedState("deep-interview-state.json", cwd, normalizedSessionId);
   if (!modeState || modeState.active !== true) return "";
 
   const modePhase = safeString(modeState.current_phase).trim().toLowerCase();
   return modePhase === "intent-first" ? "planning" : "";
 }
 
+function resolveRepeatableStopSessionId(
+  payload: CodexHookPayload,
+  canonicalSessionId?: string,
+): string {
+  return canonicalSessionId?.trim() || readPayloadSessionId(payload) || "";
+}
+
 function buildRepeatableStopSignature(
   payload: CodexHookPayload,
   kind: string,
   detail = "",
+  canonicalSessionId?: string,
 ): string {
-  const sessionId = readPayloadSessionId(payload) || "no-session";
+  const sessionId = resolveRepeatableStopSessionId(payload, canonicalSessionId) || "no-session";
   const threadId = readPayloadThreadId(payload) || "no-thread";
   const turnId = readPayloadTurnId(payload);
   const normalizedDetail = normalizeAutoNudgeSignatureText(detail) || safeString(detail).trim().toLowerCase();
@@ -929,8 +957,34 @@ function buildRepeatableStopSignature(
   ].join("|");
 }
 
-function readNativeStopSessionKey(payload: CodexHookPayload): string {
-  return readPayloadSessionId(payload) || readPayloadThreadId(payload) || "global";
+function readNativeStopSessionKey(
+  payload: CodexHookPayload,
+  canonicalSessionId?: string,
+): string {
+  return resolveRepeatableStopSessionId(payload, canonicalSessionId) || readPayloadThreadId(payload) || "global";
+}
+
+function hasManagedStopSessionEnv(sessionIds: string[]): boolean {
+  const envSessionId = safeString(process.env.OMX_SESSION_ID).trim();
+  if (!envSessionId) return false;
+  return sessionIds.length === 0 || sessionIds.includes(envSessionId);
+}
+
+async function hasManagedStopContext(
+  cwd: string,
+  payload: CodexHookPayload,
+  canonicalSessionId: string,
+): Promise<boolean> {
+  if (hasTeamWorkerContext()) return true;
+
+  const sessionIds = [...new Set([
+    canonicalSessionId,
+    readPayloadSessionId(payload),
+  ].map((value) => safeString(value).trim()).filter(Boolean))];
+
+  if (hasManagedStopSessionEnv(sessionIds)) return true;
+
+  return sessionIds.some((sessionId) => existsSync(sessionModelInstructionsPath(cwd, sessionId)));
 }
 
 function readPreviousNativeStopSignature(
@@ -946,12 +1000,13 @@ async function persistNativeStopSignature(
   stateDir: string,
   payload: CodexHookPayload,
   signature: string,
+  canonicalSessionId?: string,
 ): Promise<void> {
   if (!signature) return;
   const statePath = join(stateDir, NATIVE_STOP_STATE_FILE);
   const state = await readJsonIfExists(statePath) ?? {};
   const sessions = safeObject(state.sessions);
-  const sessionKey = readNativeStopSessionKey(payload);
+  const sessionKey = readNativeStopSessionKey(payload, canonicalSessionId);
   sessions[sessionKey] = {
     ...safeObject(sessions[sessionKey]),
     last_signature: signature,
@@ -969,17 +1024,21 @@ async function maybeReturnRepeatableStopOutput(
   stateDir: string,
   signature: string,
   output: Record<string, unknown> | null,
+  canonicalSessionId?: string,
 ): Promise<Record<string, unknown> | null> {
   if (!output) return null;
   const stopHookActive = payload.stop_hook_active === true || payload.stopHookActive === true;
   if (stopHookActive) {
     const state = await readJsonIfExists(join(stateDir, NATIVE_STOP_STATE_FILE)) ?? {};
-    const previousSignature = readPreviousNativeStopSignature(state, readNativeStopSessionKey(payload));
+    const previousSignature = readPreviousNativeStopSignature(
+      state,
+      readNativeStopSessionKey(payload, canonicalSessionId),
+    );
     if (!signature || previousSignature === signature) {
       return null;
     }
   }
-  await persistNativeStopSignature(stateDir, payload, signature);
+  await persistNativeStopSignature(stateDir, payload, signature, canonicalSessionId);
   return output;
 }
 
@@ -1071,6 +1130,7 @@ async function maybeBuildReleaseReadinessFinalizeStopOutput(
       stopReason: "release_readiness_auto_finalize",
       systemMessage: RELEASE_READINESS_FINALIZE_SYSTEM_MESSAGE,
     },
+    sessionId,
   );
   return { matched: true, output };
 }
@@ -1215,6 +1275,7 @@ async function buildStopHookOutput(
   const threadId = readPayloadThreadId(payload);
   const ralphState = await readActiveRalphState(stateDir, canonicalSessionId);
   const stopHookActive = payload.stop_hook_active === true || payload.stopHookActive === true;
+  const managedStopContext = await hasManagedStopContext(cwd, payload, canonicalSessionId);
   if (!ralphState) {
     const teamWorkerOutput = await buildTeamWorkerStopOutput(cwd);
     if (!stopHookActive && hasTeamWorkerContext()) return teamWorkerOutput;
@@ -1238,8 +1299,19 @@ async function buildStopHookOutput(
 
     const teamOutput = await buildTeamStopOutput(cwd, canonicalSessionId);
     if (teamOutput) {
-      const teamSignature = buildRepeatableStopSignature(payload, "team-stop", safeString(teamOutput.stopReason));
-      return await maybeReturnRepeatableStopOutput(payload, stateDir, teamSignature, teamOutput);
+      const teamSignature = buildRepeatableStopSignature(
+        payload,
+        "team-stop",
+        safeString(teamOutput.stopReason),
+        canonicalSessionId,
+      );
+      return await maybeReturnRepeatableStopOutput(
+        payload,
+        stateDir,
+        teamSignature,
+        teamOutput,
+        canonicalSessionId,
+      );
     }
 
     if (canonicalSessionId) {
@@ -1249,18 +1321,28 @@ async function buildStopHookOutput(
           canonicalTeam.teamName,
           canonicalTeam.phase,
         );
-        const canonicalTeamSignature = buildRepeatableStopSignature(payload, "team-stop", `${canonicalTeam.teamName}|${canonicalTeam.phase}`);
+        const canonicalTeamSignature = buildRepeatableStopSignature(
+          payload,
+          "team-stop",
+          `${canonicalTeam.teamName}|${canonicalTeam.phase}`,
+          canonicalSessionId,
+        );
         const repeatedCanonicalTeamOutput = await maybeReturnRepeatableStopOutput(
           payload,
           stateDir,
           canonicalTeamSignature,
           canonicalTeamOutput,
+          canonicalSessionId,
         );
         if (repeatedCanonicalTeamOutput) return repeatedCanonicalTeamOutput;
       }
 
       const skillOutput = await buildSkillStopOutput(cwd, canonicalSessionId, threadId);
       if (!stopHookActive && skillOutput) return skillOutput;
+    }
+
+    if (!managedStopContext) {
+      return null;
     }
 
     const lastAssistantMessage = safeString(
@@ -1271,13 +1353,13 @@ async function buildStopHookOutput(
 
     if (
       autoNudgeConfig.enabled
-      && detectStallPattern(lastAssistantMessage, autoNudgeConfig.patterns, autoNudgePhase)
+      && detectNativeStopStallPattern(lastAssistantMessage, autoNudgeConfig.patterns, autoNudgePhase)
     ) {
       const effectiveResponse = resolveEffectiveAutoNudgeResponse(autoNudgeConfig.response);
       return await maybeReturnRepeatableStopOutput(
         payload,
         stateDir,
-        buildRepeatableStopSignature(payload, "auto-nudge", lastAssistantMessage),
+        buildRepeatableStopSignature(payload, "auto-nudge", lastAssistantMessage, canonicalSessionId),
         {
           decision: "block",
           reason: effectiveResponse,
@@ -1285,6 +1367,7 @@ async function buildStopHookOutput(
           systemMessage:
             "OMX native Stop detected a stall/permission-style handoff and continued the turn automatically.",
         },
+        canonicalSessionId,
       );
     }
 
@@ -1438,7 +1521,7 @@ export async function runCodexNativeHookCli(): Promise<void> {
   if (parseError) {
     process.stdout.write(`${JSON.stringify({
       decision: "block",
-      reason: "OMX native hook received malformed JSON input. Preserve runtime state and inspect the emitting hook payload before retrying.",
+      reason: "OMX native hook received malformed JSON input. Preserve runtime state, inspect the emitting hook payload yourself, and retry with valid JSON.",
       hookSpecificOutput: {
         hookEventName: "Unknown",
         additionalContext:

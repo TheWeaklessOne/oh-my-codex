@@ -352,4 +352,55 @@ describe('state operations directory initialization', () => {
       await rm(wd, { recursive: true, force: true });
     }
   });
+
+  it('keeps session-scoped tracked state writable after root-state parse fallback on resume', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-resume-root-fallback-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionId = 'sess-resume-root-fallback';
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }, null, 2));
+      await writeFile(
+        join(stateDir, 'ralph-state.json'),
+        JSON.stringify({
+          active: true,
+          current_phase: 'executing',
+          owner_omx_session_id: 'stale-root-owner',
+        }, null, 2),
+      );
+      await writeFile(
+        join(sessionDir, 'ralph-state.json'),
+        JSON.stringify({
+          active: true,
+          current_phase: 'executing',
+          owner_omx_session_id: sessionId,
+        }, null, 2),
+      );
+
+      const writeResult = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        mode: 'ralph',
+        state: {
+          current_phase: 'verify',
+        },
+      });
+
+      assert.equal(writeResult.isError, undefined);
+      const sessionState = JSON.parse(
+        await readFile(join(sessionDir, 'ralph-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(sessionState.active, true);
+      assert.equal(sessionState.current_phase, 'verifying');
+      assert.equal(sessionState.owner_omx_session_id, sessionId);
+
+      const rootState = JSON.parse(
+        await readFile(join(stateDir, 'ralph-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(rootState.current_phase, 'executing');
+      assert.equal(rootState.owner_omx_session_id, 'stale-root-owner');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
 });

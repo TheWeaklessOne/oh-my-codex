@@ -75,10 +75,10 @@ That document defines the GPT-5.4 behavior contract contributors should preserve
 
 ## Workflow
 
-1. Create a branch from `main`.
+1. Create a branch from `dev` for normal contributions.
 2. Make focused changes.
 3. Run lint, build, and tests locally.
-4. Open a pull request using the provided template.
+4. Open a pull request targeting `dev` using the provided template. Use `main` only for maintainer-directed exceptions.
 
 ## Commit style
 

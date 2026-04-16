@@ -12,6 +12,8 @@ const CODEX_BIN_ENV: &str = "OMX_EXPLORE_CODEX_BIN";
 const HARNESS_ROOT_ENV: &str = "OMX_EXPLORE_ROOT";
 const INTERNAL_DIRECT_WRAPPER_FLAG: &str = "--internal-allowlist-direct";
 const INTERNAL_SHELL_WRAPPER_FLAG: &str = "--internal-allowlist-shell";
+const WINDOWS_UNSUPPORTED_ALLOWLIST_MESSAGE: &str =
+    "omx explore built-in harness is not ready on Windows because its allowlist runtime relies on POSIX sh/bash wrappers. Set OMX_EXPLORE_BIN to a compatible custom harness, prefer `omx sparkshell` for shell-native read-only lookups, or run `omx doctor` for readiness details.";
 
 const ALLOWED_DIRECT_COMMANDS: &[&str] = &[
     "rg", "grep", "ls", "find", "wc", "cat", "head", "tail", "pwd", "printf",
@@ -270,12 +272,32 @@ fn resolve_codex_binary() -> String {
 }
 
 fn codex_launch_for_binary(codex_binary: &str) -> Option<CodexLaunch> {
-    let interpreter = read_shebang_interpreter(Path::new(codex_binary))?;
+    let codex_path = Path::new(codex_binary);
+    if let Some(launch) = codex_launch_for_posix_node_shim(codex_path) {
+        return Some(launch);
+    }
+
+    let interpreter = read_shebang_interpreter(codex_path)?;
     let (program, mut leading_args) = resolve_shebang_launch(&interpreter)?;
     leading_args.push(codex_binary.to_string());
     Some(CodexLaunch {
         program,
         leading_args,
+    })
+}
+
+fn codex_launch_for_posix_node_shim(codex_path: &Path) -> Option<CodexLaunch> {
+    let shebang = read_shebang_interpreter(codex_path)?;
+    if !is_posix_shell_shebang(&shebang) {
+        return None;
+    }
+
+    let script = read_to_string(codex_path).ok()?;
+    let entrypoint = resolve_posix_node_shim_entrypoint(codex_path, &script)?;
+    let program = resolve_posix_node_shim_program(codex_path, &script)?;
+    Some(CodexLaunch {
+        program: program.display().to_string(),
+        leading_args: vec![entrypoint.display().to_string()],
     })
 }
 
@@ -291,6 +313,85 @@ fn read_shebang_interpreter(path: &Path) -> Option<String> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn is_posix_shell_shebang(shebang: &str) -> bool {
+    let parts: Vec<&str> = shebang.split_whitespace().collect();
+    let interpreter = *parts.first().unwrap_or(&"");
+    if interpreter.ends_with("/env") {
+        return parts
+            .get(1)
+            .is_some_and(|target| is_posix_shell_name(target));
+    }
+    is_posix_shell_name(interpreter)
+}
+
+fn is_posix_shell_name(value: &str) -> bool {
+    matches!(
+        Path::new(value).file_name().and_then(|name| name.to_str()),
+        Some("sh" | "bash" | "dash" | "ash" | "ksh" | "zsh")
+    )
+}
+
+fn resolve_posix_node_shim_entrypoint(codex_path: &Path, script: &str) -> Option<PathBuf> {
+    let basedir = codex_path.parent()?;
+    quoted_shell_segments(script)
+        .into_iter()
+        .filter_map(|segment| strip_basedir_prefix(&segment).map(ToOwned::to_owned))
+        .map(|relative| normalize_path(basedir.join(relative)))
+        .find(|candidate| is_node_entrypoint(candidate))
+}
+
+fn resolve_posix_node_shim_program(codex_path: &Path, script: &str) -> Option<PathBuf> {
+    let basedir = codex_path.parent()?;
+    if quoted_shell_segments(script)
+        .into_iter()
+        .any(|segment| matches!(strip_basedir_prefix(&segment), Some("node")))
+    {
+        let sibling_node = basedir.join("node");
+        if is_usable_host_command(&sibling_node) {
+            return Some(sibling_node);
+        }
+    }
+    resolve_host_command("node")
+}
+
+fn quoted_shell_segments(script: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut active_quote: Option<char> = None;
+    let mut current = String::new();
+
+    for ch in script.chars() {
+        if let Some(quote) = active_quote {
+            if ch == quote {
+                segments.push(std::mem::take(&mut current));
+                active_quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            active_quote = Some(ch);
+        }
+    }
+
+    segments
+}
+
+fn strip_basedir_prefix(segment: &str) -> Option<&str> {
+    segment
+        .strip_prefix("$basedir/")
+        .or_else(|| segment.strip_prefix("${basedir}/"))
+}
+
+fn is_node_entrypoint(path: &Path) -> bool {
+    path.is_file()
+        && matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("js" | "cjs" | "mjs")
+        )
 }
 
 fn resolve_shebang_launch(shebang: &str) -> Option<(String, Vec<String>)> {
@@ -366,6 +467,9 @@ fn compose_exec_prompt(user_prompt: &str, prompt_contract: &str) -> String {
 }
 
 fn prepare_allowlist_environment() -> Result<AllowlistEnvironment, String> {
+    if let Some(message) = allowlist_platform_diagnostic(env::consts::OS) {
+        return Err(message.to_string());
+    }
     let root = temp_allowlist_dir()?;
     let bin_dir = root.path.join("bin");
     create_dir_all(&bin_dir).map_err(|err| {
@@ -410,6 +514,13 @@ fn prepare_allowlist_environment() -> Result<AllowlistEnvironment, String> {
         shell_path,
         _root: root,
     })
+}
+
+fn allowlist_platform_diagnostic(os: &str) -> Option<&'static str> {
+    if os.eq_ignore_ascii_case("windows") {
+        return Some(WINDOWS_UNSUPPORTED_ALLOWLIST_MESSAGE);
+    }
+    None
 }
 
 fn temp_allowlist_dir() -> Result<TempDirGuard, String> {
@@ -469,18 +580,37 @@ fn build_direct_wrapper(self_exe: &Path, command: &str) -> Result<String, String
 
 fn resolve_host_command(command: &str) -> Option<PathBuf> {
     let candidate = Path::new(command);
-    if candidate.is_absolute() && candidate.exists() {
+    if candidate.is_absolute() && is_usable_host_command(candidate) {
         return Some(candidate.to_path_buf());
     }
 
     let path = env::var_os("PATH")?;
     for entry in env::split_paths(&path) {
         let resolved = entry.join(command);
-        if resolved.exists() {
+        if is_usable_host_command(&resolved) {
             return Some(resolved);
         }
     }
     None
+}
+
+fn is_usable_host_command(path: &Path) -> bool {
+    let metadata = match path.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return false,
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn shell_quote(value: &str) -> String {
@@ -885,6 +1015,7 @@ mod tests {
 
     #[test]
     fn codex_launch_for_env_node_shebang_uses_host_node_absolute_path() {
+        let _guard = env_lock();
         let root = temp_allowlist_dir().expect("temp root");
         let script_path = root.path.join("codex-script");
         write(&script_path, b"#!/usr/bin/env node\nconsole.log(\"ok\");\n").expect("write script");
@@ -893,6 +1024,162 @@ mod tests {
             .expect("launch config");
         let expected_node = resolve_host_command("node").expect("host node path");
         assert_eq!(launch.program, expected_node.display().to_string());
+        assert_eq!(launch.leading_args, vec![script_path.display().to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_launch_for_posix_package_manager_shim_uses_host_node_and_entrypoint() {
+        let _guard = env_lock();
+        let root = temp_allowlist_dir().expect("temp root");
+        let host_bin = root.path.join("host-bin");
+        let shim_dir = root.path.join("node_modules").join(".bin");
+        let entrypoint = root
+            .path
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("bin")
+            .join("codex.js");
+        create_dir_all(&host_bin).expect("create host bin");
+        create_dir_all(&shim_dir).expect("create shim dir");
+        create_dir_all(entrypoint.parent().expect("entrypoint parent"))
+            .expect("create entrypoint dir");
+
+        let fake_node = host_bin.join("node");
+        write_executable(&fake_node, "#!/bin/sh\nexit 0\n").expect("write fake node");
+        write(&entrypoint, "console.log('ok');\n").expect("write entrypoint");
+
+        let shim_path = shim_dir.join("codex");
+        write_executable(
+            &shim_path,
+            r#"#!/bin/sh
+basedir=$(dirname "$0")
+if [ -x "$basedir/node" ]; then
+  exec "$basedir/node" "$basedir/../@openai/codex/bin/codex.js" "$@"
+fi
+exec node "$basedir/../@openai/codex/bin/codex.js" "$@"
+"#,
+        )
+        .expect("write shim");
+
+        let original_path = env::var_os("PATH");
+        unsafe {
+            env::set_var("PATH", &host_bin);
+        }
+
+        let launch =
+            codex_launch_for_binary(shim_path.to_str().expect("shim path")).expect("launch config");
+
+        match original_path {
+            Some(value) => unsafe { env::set_var("PATH", value) },
+            None => unsafe { env::remove_var("PATH") },
+        }
+
+        assert_eq!(launch.program, fake_node.display().to_string());
+        assert_eq!(launch.leading_args, vec![entrypoint.display().to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_host_command_skips_directory_and_non_executable_path_entries() {
+        let _guard = env_lock();
+        let root = temp_allowlist_dir().expect("temp root");
+        let bad_bin = root.path.join("bad-bin");
+        let blocked_file_bin = root.path.join("blocked-file-bin");
+        let good_bin = root.path.join("good-bin");
+        create_dir_all(&bad_bin).expect("create bad bin");
+        create_dir_all(&blocked_file_bin).expect("create blocked file bin");
+        create_dir_all(&good_bin).expect("create good bin");
+
+        let blocked_directory = bad_bin.join("node");
+        create_dir_all(&blocked_directory).expect("create blocked directory");
+
+        let blocked_node = blocked_file_bin.join("node");
+        write(&blocked_node, "#!/bin/sh\nexit 0\n").expect("write blocked file node");
+        let executable_node = good_bin.join("node");
+        write_executable(&executable_node, "#!/bin/sh\nexit 0\n").expect("write executable node");
+
+        #[cfg(unix)]
+        {
+            use std::fs;
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&blocked_node)
+                .expect("stat blocked node")
+                .permissions();
+            perms.set_mode(0o644);
+            fs::set_permissions(&blocked_node, perms).expect("chmod blocked node");
+        }
+
+        let original_path = env::var_os("PATH");
+        unsafe {
+            env::set_var(
+                "PATH",
+                env::join_paths([
+                    bad_bin.as_path(),
+                    blocked_file_bin.as_path(),
+                    good_bin.as_path(),
+                ])
+                .expect("join path"),
+            );
+        }
+
+        let resolved = resolve_host_command("node");
+
+        match original_path {
+            Some(value) => unsafe { env::set_var("PATH", value) },
+            None => unsafe { env::remove_var("PATH") },
+        }
+
+        assert_eq!(resolved, Some(executable_node));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_launch_for_env_node_shebang_skips_non_executable_earlier_node_entry() {
+        let _guard = env_lock();
+        let root = temp_allowlist_dir().expect("temp root");
+        let bad_bin = root.path.join("bad-bin");
+        let good_bin = root.path.join("good-bin");
+        create_dir_all(&bad_bin).expect("create bad bin");
+        create_dir_all(&good_bin).expect("create good bin");
+
+        let blocked_node = bad_bin.join("node");
+        write(&blocked_node, "#!/bin/sh\nexit 0\n").expect("write blocked node");
+        let executable_node = good_bin.join("node");
+        write_executable(&executable_node, "#!/bin/sh\nexit 0\n").expect("write executable node");
+
+        #[cfg(unix)]
+        {
+            use std::fs;
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&blocked_node)
+                .expect("stat blocked node")
+                .permissions();
+            perms.set_mode(0o644);
+            fs::set_permissions(&blocked_node, perms).expect("chmod blocked node");
+        }
+
+        let script_path = root.path.join("codex-script");
+        write(&script_path, b"#!/usr/bin/env node\nconsole.log(\"ok\");\n").expect("write script");
+
+        let original_path = env::var_os("PATH");
+        unsafe {
+            env::set_var(
+                "PATH",
+                env::join_paths([bad_bin.as_path(), good_bin.as_path()]).expect("join path"),
+            );
+        }
+
+        let launch = codex_launch_for_binary(script_path.to_str().expect("script path"))
+            .expect("launch config");
+
+        match original_path {
+            Some(value) => unsafe { env::set_var("PATH", value) },
+            None => unsafe { env::remove_var("PATH") },
+        }
+
+        assert_eq!(launch.program, executable_node.display().to_string());
         assert_eq!(launch.leading_args, vec![script_path.display().to_string()]);
     }
 
@@ -972,6 +1259,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn prepare_allowlist_environment_preserves_present_command_wrapper_execution() {
+        let _guard = env_lock();
         let self_exe = env::current_exe().expect("current exe");
         let pwd = resolve_host_command("pwd").expect("host pwd path");
 
@@ -1045,6 +1333,15 @@ mod tests {
             validate_direct_command("sed", &["-n".into(), "1,20p".into(), "README.md".into()])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn allowlist_platform_diagnostic_blocks_windows_with_actionable_guidance() {
+        let diagnostic = allowlist_platform_diagnostic("windows").expect("windows diagnostic");
+
+        assert!(diagnostic.contains("not ready on Windows"));
+        assert!(diagnostic.contains("OMX_EXPLORE_BIN"));
+        assert!(allowlist_platform_diagnostic("linux").is_none());
     }
 
     #[test]

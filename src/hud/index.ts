@@ -255,11 +255,14 @@ export function buildTmuxSplitArgs(
   cwd: string,
   omxBin: string,
   preset?: string,
+  sessionId?: string,
 ): string[] {
   // Defense-in-depth: keep preset constrained even if this helper is reused.
   const safePreset = parseHudPreset(preset);
   const presetArg = safePreset ? ` --preset=${safePreset}` : '';
-  const cmd = `node ${shellEscape(omxBin)} hud --watch${presetArg}`;
+  const safeSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+  const sessionPrefix = safeSessionId ? `OMX_SESSION_ID=${shellEscape(safeSessionId)} ` : '';
+  const cmd = `${sessionPrefix}node ${shellEscape(omxBin)} hud --watch${presetArg}`;
   return ['split-window', '-v', '-l', String(HUD_TMUX_HEIGHT_LINES), '-c', cwd, cmd];
 }
 
@@ -275,7 +278,7 @@ async function launchTmuxPane(cwd: string, flags: HudFlags): Promise<void> {
     console.error('Failed to resolve OMX launcher path for tmux HUD startup.');
     process.exit(1);
   }
-  const args = buildTmuxSplitArgs(cwd, omxBin, flags.preset);
+  const args = buildTmuxSplitArgs(cwd, omxBin, flags.preset, process.env.OMX_SESSION_ID);
 
   try {
     // Split bottom pane, 4 lines tall, running omx hud --watch.

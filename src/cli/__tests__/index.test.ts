@@ -1,10 +1,11 @@
-import { describe, it } from "node:test";
+import { afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, readdir as fsReaddir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
+import { once } from "node:events";
 import {
   normalizeCodexLaunchArgs,
   buildTmuxShellCommand,
@@ -35,6 +36,7 @@ import {
   buildDetachedTmuxSessionName,
   buildDetachedSessionFinalizeSteps,
   buildDetachedSessionRollbackSteps,
+  detectDetachedSessionWindowIndex,
   resolveNotifyTempContract,
   buildNotifyTempStartupMessages,
   buildNotifyFallbackWatcherEnv,
@@ -48,7 +50,9 @@ import {
   resolveNotifyFallbackWatcherScript,
   resolveHookDerivedWatcherScript,
   resolveNotifyHookScript,
+  buildDetachedWindowsBootstrapScript,
   acquireTmuxExtendedKeysLease,
+  resolveNativeSessionName,
   releaseTmuxExtendedKeysLease,
   withTmuxExtendedKeys,
 } from "../index.js";
@@ -62,9 +66,16 @@ import {
 } from "../../config/models.js";
 import type { ProcessEntry } from "../cleanup.js";
 
+const testDir = dirname(fileURLToPath(import.meta.url));
+const repoRoot = join(testDir, "..", "..", "..");
+
 function expectedLowComplexityModel(codexHomeOverride?: string): string {
   return getTeamLowComplexityModel(codexHomeOverride);
 }
+
+afterEach(() => {
+  mock.restoreAll();
+});
 
 describe("normalizeCodexLaunchArgs", () => {
   it("maps --madmax to codex bypass flag", () => {
@@ -865,6 +876,7 @@ describe("resolveTeamWorkerLaunchArgsEnv (spark)", () => {
 describe("commandOwnsLocalHelp", () => {
   it("returns true for nested commands that render their own help output", () => {
     for (const command of [
+      "adapt",
       "agents-init",
       "ask",
       "autoresearch",
@@ -1425,7 +1437,7 @@ describe("detached tmux new-session sequencing", () => {
     const steps = buildDetachedSessionBootstrapSteps(
       "omx-demo",
       "/tmp/project",
-      "'codex' '--model' 'gpt-5'",
+      "'env' 'OMX_SESSION_ID=sess-detached-managed' 'codex' '--model' 'gpt-5'",
       "'node' '/tmp/omx.js' 'hud' '--watch'",
       null,
       undefined,
@@ -1439,6 +1451,14 @@ describe("detached tmux new-session sequencing", () => {
       newSession!.args.includes("-e") &&
         newSession!.args.some((arg) => arg === "OMX_SESSION_ID=sess-detached-managed"),
       true,
+    );
+  });
+
+  it("runCodex builds inside-tmux HUD command with OMX_SESSION_ID", async () => {
+    const source = await readFile(join(repoRoot, 'src', 'cli', 'index.ts'), 'utf-8');
+    assert.match(
+      source,
+      /buildTmuxPaneCommand\("env", \[`OMX_SESSION_ID=\$\{sessionId\}`, "node", omxBin, "hud", "--watch"\]\)/,
     );
   });
 
@@ -1464,6 +1484,18 @@ describe("detached tmux new-session sequencing", () => {
     assert.equal(steps[1]?.args.at(-1), hudCmd);
   });
 
+  it("buildDetachedWindowsBootstrapScript targets the resolved tmux-compatible command", () => {
+    const script = buildDetachedWindowsBootstrapScript(
+      "omx-demo",
+      "powershell.exe -NoLogo -NoExit -EncodedCommand abc",
+      2500,
+      "C:\\Program Files\\psmux\\psmux.exe",
+    );
+    assert.match(script, /const tmuxCommand = "C:\\\\Program Files\\\\psmux\\\\psmux\.exe";/);
+    assert.match(script, /execFileSync\(tmuxCommand, \['send-keys'/);
+    assert.doesNotMatch(script, /execFileSync\('tmux'/);
+  });
+
   it("buildDetachedSessionBootstrapSteps kills detached tmux session on normal shell exit", () => {
     const steps = buildDetachedSessionBootstrapSteps(
       "omx-demo",
@@ -1478,7 +1510,10 @@ describe("detached tmux new-session sequencing", () => {
     assert.doesNotMatch(leaderCmd!, /^\/bin\/sh -lc '/);
     assert.match(leaderCmd!, /acquireTmuxExtendedKeysLease/);
     assert.match(leaderCmd!, /omx_detached_session_cleanup\(\)/);
-    assert.match(leaderCmd!, /trap omx_detached_session_cleanup 0;/);
+    assert.match(leaderCmd!, /trap omx_detached_session_cleanup 0 INT TERM HUP;/);
+    assert.match(leaderCmd!, /omx_codex_pid=\$!;/);
+    assert.match(leaderCmd!, /wait "\$omx_codex_pid";/);
+    assert.match(leaderCmd!, /kill -TERM "\$omx_codex_pid"/);
     assert.match(leaderCmd!, /releaseTmuxExtendedKeysLease/);
     assert.match(leaderCmd!, /if \[ "\$status" -lt 128 \]; then/);
     assert.match(leaderCmd!, /tmux kill-session -t/);
@@ -1540,7 +1575,7 @@ exit 0
       const leaderCmd = steps[0]?.args.at(-1);
       assert.equal(typeof leaderCmd, "string");
 
-      execFileSync("/bin/sh", ["-c", leaderCmd!], {
+      (await import("node:child_process")).execFileSync("/bin/sh", ["-c", leaderCmd!], {
         cwd,
         env: {
           ...process.env,
@@ -1618,7 +1653,7 @@ exit 0
       const leaderCmd = steps[0]?.args.at(-1);
       assert.equal(typeof leaderCmd, "string");
 
-      const result = spawnSync("/bin/sh", ["-lc", leaderCmd!], {
+      const result = (await import("node:child_process")).spawnSync("/bin/sh", ["-lc", leaderCmd!], {
         cwd,
         env: {
           ...process.env,
@@ -1636,6 +1671,101 @@ exit 0
       assert.match(log, /tmux:set-option -sq extended-keys always/);
       assert.match(log, /tmux:set-option -sq extended-keys off/);
       assert.doesNotMatch(log, /tmux:kill-session -t omx-demo/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("detached leader command terminates codex child on external SIGHUP", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-detached-leader-hup-"));
+    const fakeBin = join(cwd, "bin");
+    const pidFile = join(cwd, "codex.pid");
+    try {
+      await mkdir(fakeBin, { recursive: true });
+      await writeFile(
+        join(fakeBin, "codex"),
+        `#!/bin/sh
+echo $$ > "${pidFile}"
+trap '' HUP
+while true; do sleep 1; done
+`,
+      );
+      await chmod(join(fakeBin, "codex"), 0o755);
+      await writeFile(
+        join(fakeBin, "tmux"),
+        `#!/bin/sh
+case "$1" in
+  display-message)
+    if [ "$3" = '#{socket_path}' ] || [ "$4" = '#{socket_path}' ]; then
+      printf '/tmp/tmux-test.sock\\n'
+    else
+      printf '0\\n'
+    fi
+    ;;
+  show-options) printf 'off\\n' ;;
+  set-option|kill-session) ;;
+esac
+exit 0
+`,
+      );
+      await chmod(join(fakeBin, "tmux"), 0o755);
+
+      const steps = buildDetachedSessionBootstrapSteps(
+        "omx-demo",
+        cwd,
+        buildTmuxPaneCommand("codex", [], "/bin/sh"),
+        "'node' '/tmp/omx.js' 'hud' '--watch'",
+        null,
+      );
+      const leaderCmd = steps[0]?.args.at(-1);
+      assert.equal(typeof leaderCmd, "string");
+
+      const { spawn } = await import("node:child_process");
+      const child = spawn("/bin/sh", ["-c", `exec ${leaderCmd!}`], {
+        cwd,
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}:/usr/bin:/bin`,
+          HOME: cwd,
+        },
+        stdio: "ignore",
+        detached: true,
+      });
+
+      try {
+        for (let i = 0; i < 20; i += 1) {
+          if (existsSync(pidFile)) break;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        assert.ok(existsSync(pidFile), "codex pid file not written");
+        const codexPid = Number.parseInt((await readFile(pidFile, "utf-8")).trim(), 10);
+        assert.ok(codexPid > 0, "codex pid must be positive");
+        assert.doesNotThrow(() => process.kill(codexPid, 0), "codex must be alive before signal");
+
+        const leaderExit = once(child, "exit");
+        process.kill(child.pid!, "SIGHUP");
+        await Promise.race([
+          leaderExit,
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("leader did not exit after SIGHUP")), 3000),
+          ),
+        ]);
+        assert.throws(
+          () => process.kill(codexPid, 0),
+          (err: unknown) =>
+            typeof err === "object" &&
+            err !== null &&
+            "code" in err &&
+            (err as NodeJS.ErrnoException).code === "ESRCH",
+          "codex child must be terminated after leader SIGHUP",
+        );
+      } finally {
+        try {
+          process.kill(child.pid!, "SIGKILL");
+        } catch {
+          /* already dead */
+        }
+      }
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -2027,6 +2157,79 @@ describe("buildDetachedTmuxSessionName", () => {
       "omx-1770992424158-abc123",
     );
     assert.equal(sessionName, "omx-my-repo-detached-1770992424158-abc123");
+  });
+});
+
+describe("native Windows psmux-compatible tmux resolution", () => {
+  it("resolveNativeSessionName uses the shared tmux-aware resolver for current session lookup", async () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+    const originalPath = process.env.PATH;
+    const originalPathext = process.env.PATHEXT;
+    const wd = await mkdtemp(join(tmpdir(), "omx-psmux-native-session-"));
+    const fakeBin = join(wd, "bin");
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+
+    try {
+      await mkdir(fakeBin, { recursive: true });
+      await writeFile(
+        join(fakeBin, "psmux.exe"),
+        `#!/bin/sh
+if [ "$1" = "display-message" ] && [ "$2" = "-p" ] && [ "$3" = "-t" ] && [ "$4" = "%7" ] && [ "$5" = "#S" ]; then
+  printf 'psmux-session\\n'
+  exit 0
+fi
+printf 'unexpected:%s\\n' "$*" >&2
+exit 1
+`,
+      );
+      await chmod(join(fakeBin, "psmux.exe"), 0o755);
+      process.env.PATH = fakeBin;
+      process.env.PATHEXT = ".EXE";
+      const sessionName = resolveNativeSessionName("/tmp/repo", "omx-abc123", {
+        ...process.env,
+        TMUX: "1",
+        TMUX_PANE: "%7",
+      });
+      assert.equal(sessionName, "psmux-session");
+    } finally {
+      process.env.PATH = originalPath;
+      process.env.PATHEXT = originalPathext;
+      if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("detectDetachedSessionWindowIndex uses the shared tmux-aware resolver on native Windows", async () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+    const originalPath = process.env.PATH;
+    const originalPathext = process.env.PATHEXT;
+    const wd = await mkdtemp(join(tmpdir(), "omx-psmux-window-index-"));
+    const fakeBin = join(wd, "bin");
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+
+    try {
+      await mkdir(fakeBin, { recursive: true });
+      await writeFile(
+        join(fakeBin, "psmux.exe"),
+        `#!/bin/sh
+if [ "$1" = "display-message" ] && [ "$2" = "-p" ] && [ "$3" = "-t" ] && [ "$4" = "omx-demo" ] && [ "$5" = "#{window_index}" ]; then
+  printf '3\\n'
+  exit 0
+fi
+printf 'unexpected:%s\\n' "$*" >&2
+exit 1
+`,
+      );
+      await chmod(join(fakeBin, "psmux.exe"), 0o755);
+      process.env.PATH = fakeBin;
+      process.env.PATHEXT = ".EXE";
+      assert.equal(detectDetachedSessionWindowIndex("omx-demo"), "3");
+    } finally {
+      process.env.PATH = originalPath;
+      process.env.PATHEXT = originalPathext;
+      if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+      await rm(wd, { recursive: true, force: true });
+    }
   });
 });
 
