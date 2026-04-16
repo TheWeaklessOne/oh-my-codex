@@ -12,12 +12,15 @@ dist/
 .claude/
 .claire/
 .agents/
+.codex/
+.playwright-mcp/
 coverage/
 target/
 bin/native/
 bin/omx-explore-harness
 bin/omx-explore-harness.exe
 bin/omx-explore-harness.meta.json
+.DS_Store
 
 # Local runtime bridge artifacts (generated)
 authority.json
@@ -29,11 +32,3 @@ mailbox.json
 readiness.json
 replay.json
 snapshot.json
-.codex/*
-!.codex/agents/
-!.codex/agents/**
-!.codex/skills/
-!.codex/skills/**
-.codex/skills/.system/**
-!.codex/prompts/
-!.codex/prompts/**
