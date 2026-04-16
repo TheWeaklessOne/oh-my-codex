@@ -22,6 +22,7 @@ import {
 	recordMissionV3ReleaseAction,
 	rescindMissionV3CandidateSelection,
 	selectMissionV3Candidate,
+	syncMissionV3AfterCommit,
 } from "../v3.js";
 
 async function initRepo(): Promise<string> {
@@ -277,7 +278,12 @@ describe("mission v3 surfaces", () => {
 						(event as { payload?: { lane_run_id?: string } }).payload
 							?.lane_run_id,
 					) === auditLaneRun.payload?.lane_run_id,
-			) as { event_id: string } | undefined;
+			) as
+				| {
+						event_id: string;
+						payload?: { cwd?: string };
+				  }
+				| undefined;
 			assert.ok(auditAttestation);
 			const auditEvidence = evidence.find(
 				(event) =>
@@ -290,6 +296,10 @@ describe("mission v3 surfaces", () => {
 			assert.deepEqual(auditLaneRun.payload?.command_attestation_refs, [
 				auditAttestation.event_id,
 			]);
+			assert.equal(
+				auditAttestation.payload?.cwd?.endsWith("summary.json"),
+				false,
+			);
 			assert.deepEqual(auditEvidence.payload?.command_attestation_refs, [
 				auditAttestation.event_id,
 			]);
@@ -372,6 +382,93 @@ describe("mission v3 surfaces", () => {
 			const refreshed = await loadMission(repo, "demo");
 			assert.equal(refreshed.status, "running");
 			assert.equal(refreshed.lifecycle_state, "assuring");
+			const policyDecisions = await readNdjson<{
+				payload?: {
+					clause_id?: string;
+					outcome?: string;
+					source_trust_summary?: Record<string, number>;
+				};
+			}>(runtime.v3Paths.policyDecisionsPath);
+			assert.equal(
+				policyDecisions.some(
+					(event) =>
+						event.payload?.clause_id === "policy:promotion-governor" &&
+						event.payload?.outcome === "require_revalidation",
+				),
+				true,
+			);
+			assert.equal(
+				typeof policyDecisions.find(
+					(event) => event.payload?.clause_id === "policy:promotion-governor",
+				)?.payload?.source_trust_summary,
+				"object",
+			);
+			const staleContextSnapshot = JSON.parse(
+				await readFile(runtime.v3Paths.currentContextSnapshotPath, "utf-8"),
+			) as {
+				stale_fact_markers?: { stale_obligation_ids?: string[] };
+			};
+			assert.equal(
+				(staleContextSnapshot.stale_fact_markers?.stale_obligation_ids
+					?.length ?? 0) > 0,
+				true,
+			);
+			const staleLearningProposal = JSON.parse(
+				await readFile(
+					join(runtime.v3Paths.learningProposalsDir, "current.json"),
+					"utf-8",
+				),
+			) as {
+				state?: string;
+				rollout_path?: {
+					current_state?: string;
+					next_allowed_states?: string[];
+				};
+			};
+			assert.equal(staleLearningProposal.state, "captured");
+			assert.equal(
+				staleLearningProposal.rollout_path?.current_state,
+				"captured",
+			);
+			assert.deepEqual(
+				staleLearningProposal.rollout_path?.next_allowed_states,
+				["shadow_evaluated", "rejected"],
+			);
+			const compactionEventsBeforeReplay = await readNdjson<{
+				payload?: {
+					snapshot_hash?: string;
+					stale_fact_markers?: { stale_obligation_ids?: string[] };
+				};
+			}>(runtime.v3Paths.compactionEventsPath);
+			const compactionCountBeforeReplay = compactionEventsBeforeReplay.length;
+			assert.equal(
+				(compactionEventsBeforeReplay.at(-1)?.payload?.stale_fact_markers
+					?.stale_obligation_ids?.length ?? 0) > 0,
+				true,
+			);
+			await syncMissionV3AfterCommit({
+				mission: committed.mission,
+				artifacts: runtime.artifacts,
+				artifactPaths: runtime.artifactPaths,
+				safetyBaseline: {
+					iteration_commit_succeeded: true,
+					no_unreconciled_lane_errors: true,
+					focused_checks_green: true,
+				},
+				iteration: 1,
+				strategyChanged: false,
+			});
+			const policyDecisionsAfterReplay = await readNdjson(
+				runtime.v3Paths.policyDecisionsPath,
+			);
+			const compactionEventsAfterReplay = await readNdjson(
+				runtime.v3Paths.compactionEventsPath,
+			);
+			assert.equal(policyDecisionsAfterReplay.length, policyDecisions.length);
+			assert.equal(
+				compactionEventsAfterReplay.length,
+				compactionCountBeforeReplay,
+			);
 		} finally {
 			await rm(repo, { recursive: true, force: true });
 		}
@@ -956,6 +1053,77 @@ describe("mission v3 surfaces", () => {
 			assert.equal(existsSync(runtime.v3Paths.postmortemPath), true);
 			assert.equal(
 				existsSync(join(runtime.v3Paths.learningProposalsDir, "current.json")),
+				true,
+			);
+			const contextSnapshot = JSON.parse(
+				await readFile(runtime.v3Paths.currentContextSnapshotPath, "utf-8"),
+			) as {
+				authoritative_refs?: { mission_state?: string };
+				derived_refs?: { trace_bundle?: string };
+				stale_fact_markers?: { stale_obligation_ids?: string[] };
+			};
+			assert.equal(
+				contextSnapshot.authoritative_refs?.mission_state,
+				"mission.json",
+			);
+			assert.equal(
+				contextSnapshot.derived_refs?.trace_bundle,
+				"traces/trace-bundle.json",
+			);
+			assert.deepEqual(
+				contextSnapshot.stale_fact_markers?.stale_obligation_ids ?? [],
+				[],
+			);
+			const learningProposal = JSON.parse(
+				await readFile(
+					join(runtime.v3Paths.learningProposalsDir, "current.json"),
+					"utf-8",
+				),
+			) as {
+				state?: string;
+				rollout_path?: {
+					current_state?: string;
+					valid_states?: string[];
+					audit_trail_refs?: string[];
+				};
+				source_trace_ref?: string;
+				source_eval_ref?: string;
+			};
+			assert.equal(learningProposal.state, "shadow_evaluated");
+			assert.equal(
+				learningProposal.rollout_path?.current_state,
+				"shadow_evaluated",
+			);
+			assert.deepEqual(learningProposal.rollout_path?.valid_states, [
+				"captured",
+				"shadow_evaluated",
+				"approved_for_rollout",
+				"rejected",
+				"superseded",
+			]);
+			assert.equal(
+				learningProposal.source_trace_ref,
+				"traces/trace-bundle.json",
+			);
+			assert.equal(learningProposal.source_eval_ref, "traces/eval-bundle.json");
+			assert.deepEqual(learningProposal.rollout_path?.audit_trail_refs, [
+				"traces/trace-bundle.json",
+				"traces/eval-bundle.json",
+			]);
+			const compactionEvents = await readNdjson<{
+				payload?: {
+					snapshot_hash?: string;
+					source_ranges_summarized?: string[];
+				};
+			}>(runtime.v3Paths.compactionEventsPath);
+			assert.equal(
+				typeof compactionEvents.at(-1)?.payload?.snapshot_hash,
+				"string",
+			);
+			assert.equal(
+				compactionEvents
+					.at(-1)
+					?.payload?.source_ranges_summarized?.includes("mission.json"),
 				true,
 			);
 			await createMissionV3Candidate({

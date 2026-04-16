@@ -1960,7 +1960,34 @@ function policyDecisionPayload(
 		outcome: clause.outcome,
 		rationale: clause.rationale,
 		profile: snapshot.profile,
+		source_trust_summary: snapshot.source_trust_summary,
 	}));
+}
+
+async function reconcilePolicyDecisions(params: {
+	mission: MissionState;
+	paths: MissionV3ArtifactPaths;
+	snapshot: Awaited<ReturnType<typeof buildPolicySnapshot>>["snapshot"];
+	candidateId: string | null;
+	actorPrincipal: string;
+}): Promise<void> {
+	for (const clause of policyDecisionPayload(params.snapshot)) {
+		await appendJournalEvent(params.paths.policyDecisionsPath, {
+			journalType: "policy-decisions",
+			missionId: params.mission.mission_id,
+			candidateId: params.candidateId,
+			actorPrincipal: params.actorPrincipal,
+			idempotencyKey: `policy:${clause.clause_id}:${shortHash(
+				stableJson({
+					outcome: clause.outcome,
+					rationale: clause.rationale,
+					profile: clause.profile,
+					source_trust_summary: params.snapshot.source_trust_summary,
+				}),
+			)}`,
+			payload: clause,
+		});
+	}
 }
 
 async function buildEnvironmentCurrent(
@@ -2734,7 +2761,55 @@ function buildContextSnapshot(
 			(item) => item.uncertainty_id,
 		),
 		promotion_decision: promotionDecision.decision,
+		authoritative_refs: {
+			mission_state: "mission.json",
+			candidate_states: candidates.map(
+				(candidate) =>
+					`candidates/${candidate.candidate_id}/candidate-state.json`,
+			),
+			assurance_contract_id: mission.assurance_contract_id,
+			proof_program_id: mission.proof_program_id,
+			checker_lock_id: mission.checker_lock_id,
+			environment_contract_id: mission.environment_contract_id,
+		},
+		derived_refs: {
+			policy_snapshot: "policy-snapshot.json",
+			evidence_graph: "evidence-graph.json",
+			adjudication: "adjudication.json",
+			promotion_decision: "promotion-decision.json",
+			status_ledger: "status-ledger.md",
+			trace_bundle: "traces/trace-bundle.json",
+			eval_bundle: "traces/eval-bundle.json",
+		},
+		stale_fact_markers: {
+			stale_obligation_ids: evidenceGraph.claims
+				.filter((claim) => claim.state === "stale")
+				.map((claim) => claim.obligation_id),
+			contradicted_obligation_ids: evidenceGraph.claims
+				.filter((claim) => claim.state === "contradicted")
+				.map((claim) => claim.obligation_id),
+		},
+		decision_boundaries: {
+			promotion_requires: [
+				"verified obligations",
+				"non-blocked promotion governor",
+				"required promotion artifacts",
+			],
+			policy_blockers: promotionDecision.policy_blockers,
+			selected_candidate_locked: mission.selected_candidate_id !== null,
+			allowed_terminal_actions:
+				mission.lifecycle_state === "promotion_ready"
+					? ["released", "handed_off"]
+					: [],
+		},
 	};
+}
+
+function stableContextSnapshotValue(
+	snapshot: ReturnType<typeof buildContextSnapshot>,
+) {
+	const { generated_at: _generatedAt, ...stableSnapshot } = snapshot;
+	return stableSnapshot;
 }
 
 async function buildTraceBundle(params: {
@@ -2858,6 +2933,9 @@ function buildLearningProposal(params: {
 	adjudication: MissionV3Adjudication;
 	evalBundle: ReturnType<typeof buildEvalBundle>;
 }) {
+	const currentState = params.adjudication.proof_ready
+		? "shadow_evaluated"
+		: "captured";
 	return {
 		schema_version: 1 as const,
 		generated_at: nowIso(),
@@ -2869,7 +2947,7 @@ function buildLearningProposal(params: {
 			}),
 		)}`,
 		mission_id: params.mission.mission_id,
-		state: params.adjudication.proof_ready ? "shadow_evaluated" : "captured",
+		state: currentState,
 		target_surface: "mission-v3-policy-and-assurance",
 		rationale:
 			params.adjudication.blocking_contradictions.length > 0
@@ -2878,8 +2956,28 @@ function buildLearningProposal(params: {
 		shadow_eval_required: true,
 		held_out_eval_required: true,
 		approval_required: true,
-		source_trace_ref: "trace-bundle.json",
-		source_eval_ref: "eval-bundle.json",
+		source_trace_ref: "traces/trace-bundle.json",
+		source_eval_ref: "traces/eval-bundle.json",
+		rollout_path: {
+			current_state: currentState,
+			valid_states: [
+				"captured",
+				"shadow_evaluated",
+				"approved_for_rollout",
+				"rejected",
+				"superseded",
+			],
+			next_allowed_states:
+				currentState === "captured"
+					? ["shadow_evaluated", "rejected"]
+					: ["approved_for_rollout", "rejected", "superseded"],
+			audit_trail_refs: ["traces/trace-bundle.json", "traces/eval-bundle.json"],
+			runtime_effect_blocked_until: [
+				"shadow evaluation",
+				"held-out evaluation",
+				"explicit approval",
+			],
+		},
 	};
 }
 
@@ -2930,7 +3028,10 @@ async function writeDerivedViews(params: {
 	promotionDecision: MissionV3PromotionDecision;
 	qualityWatchdog: ReturnType<typeof buildQualityWatchdog>;
 	uncertaintyRegister: Awaited<ReturnType<typeof buildUncertaintyRegister>>;
-}) {
+}): Promise<{
+	contextSnapshot: ReturnType<typeof buildContextSnapshot>;
+	learningProposal: ReturnType<typeof buildLearningProposal>;
+}> {
 	await writeJson(
 		params.paths.environmentCurrentPath,
 		params.environmentCurrent,
@@ -3005,6 +3106,10 @@ async function writeDerivedViews(params: {
 			params.environmentCurrent,
 		),
 	);
+	return {
+		contextSnapshot: snapshot,
+		learningProposal,
+	};
 }
 
 async function updateMissionV3State(
@@ -3298,7 +3403,15 @@ async function rebuildMissionV3DerivedState(params: {
 			refreshedCandidate,
 		);
 	}
-	await writeDerivedViews({
+	await reconcilePolicyDecisions({
+		mission: nextMission,
+		paths,
+		snapshot: policy.snapshot,
+		candidateId:
+			selectedCandidateId ?? activeCandidateId ?? candidate.candidate_id,
+		actorPrincipal: "control-plane",
+	});
+	const derivedArtifacts = await writeDerivedViews({
 		mission: nextMission,
 		candidates: refreshedCandidates,
 		paths,
@@ -3310,6 +3423,45 @@ async function rebuildMissionV3DerivedState(params: {
 		promotionDecision,
 		qualityWatchdog,
 		uncertaintyRegister,
+	});
+	const stableContextSnapshot = stableContextSnapshotValue(
+		derivedArtifacts.contextSnapshot,
+	);
+	await appendJournalEvent(paths.compactionEventsPath, {
+		journalType: "compaction-events",
+		missionId: nextMission.mission_id,
+		candidateId:
+			selectedCandidateId ?? activeCandidateId ?? candidate.candidate_id,
+		actorPrincipal: "context-compiler",
+		idempotencyKey: `context-snapshot:${shortHash(
+			stableJson(stableContextSnapshot),
+		)}`,
+		payload: {
+			snapshot_path: paths.currentContextSnapshotPath,
+			snapshot_hash: `sha256:${hashValue(stableJson(stableContextSnapshot))}`,
+			lifecycle_state: nextMission.lifecycle_state,
+			current_iteration: nextMission.current_iteration,
+			source_ranges_summarized: [
+				"mission.json",
+				"decision-log.ndjson",
+				"evidence-events.ndjson",
+				"uncertainty-events.ndjson",
+			],
+			unresolved_uncertainty_ids: uncertaintyRegister.open_uncertainties.map(
+				(item) => item.uncertainty_id,
+			),
+			stale_fact_markers: {
+				stale_obligation_ids:
+					nextMission.verification_state.stale_obligation_ids,
+				contradicted_obligation_ids:
+					nextMission.verification_state.contradicted_obligation_ids,
+			},
+			validation: {
+				latest_adjudication_ref:
+					nextMission.latest_authoritative_adjudication_ref,
+				promotion_decision_ref: paths.promotionDecisionPath,
+			},
+		},
 	});
 	return {
 		mission: nextMission,
@@ -3368,16 +3520,13 @@ async function seedBootstrapJournals(params: {
 		profile,
 		await buildEnvironmentCurrent(mission, paths, environmentContract),
 	);
-	for (const clause of policyDecisionPayload(policy.snapshot)) {
-		await appendJournalEvent(paths.policyDecisionsPath, {
-			journalType: "policy-decisions",
-			missionId: mission.mission_id,
-			candidateId: candidate.candidate_id,
-			actorPrincipal: "control-plane",
-			idempotencyKey: `policy:${clause.clause_id}:${clause.outcome}`,
-			payload: clause,
-		});
-	}
+	await reconcilePolicyDecisions({
+		mission,
+		paths,
+		snapshot: policy.snapshot,
+		candidateId: candidate.candidate_id,
+		actorPrincipal: "control-plane",
+	});
 	await appendJournalEvent(paths.decisionLogPath, {
 		journalType: "decision-log",
 		missionId: mission.mission_id,
@@ -3535,18 +3684,6 @@ export async function syncMissionV3Bootstrap(params: {
 		environmentContract,
 		preferredLifecycle,
 	});
-	await appendJournalEvent(paths.compactionEventsPath, {
-		journalType: "compaction-events",
-		missionId: mission.mission_id,
-		candidateId: candidate.candidate_id,
-		actorPrincipal: "context-compiler",
-		idempotencyKey: `context-snapshot:${result.mission.lifecycle_state}:${result.mission.current_iteration}`,
-		payload: {
-			snapshot_path: paths.currentContextSnapshotPath,
-			lifecycle_state: result.mission.lifecycle_state,
-			current_iteration: result.mission.current_iteration,
-		},
-	});
 	return result;
 }
 
@@ -3607,7 +3744,7 @@ export async function recordMissionV3LaneSummary(params: {
 				: null,
 			command_ref: `command:${proofLane ?? laneType}`,
 			normalized_argv: [`lane-summary:${laneType}`],
-			cwd: relative(mission.repo_root, summaryPath),
+			cwd: relative(mission.repo_root, dirname(summaryPath)),
 			env_hash: environmentContract.declared_environment_hash,
 			network_mode: "repo-local",
 			write_scope: relative(
