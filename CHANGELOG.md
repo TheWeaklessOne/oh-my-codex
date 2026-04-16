@@ -4,6 +4,45 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-04-16
+
+Minor release for the new `omx adapt` surface, stronger Ralph / runtime session authority, safer cross-platform launch behavior, and another broad pass over hook, HUD, notification, and release-process correctness.
+
+### Added
+- **OMX adapt foundations** — `omx adapt` now exposes OMX-owned adapter foundations for persistent external targets, with read-only probe/status/doctor surfaces, init/envelope output under `.omx/adapters/<target>/...`, planning artifact linkage, and target-specific OpenClaw and Hermes evidence. (PRs [#1600](https://github.com/Yeachan-Heo/oh-my-codex/pull/1600), [#1599](https://github.com/Yeachan-Heo/oh-my-codex/pull/1599), [#1598](https://github.com/Yeachan-Heo/oh-my-codex/pull/1598))
+- **Hermes runtime observation** — Hermes adaptation reports ACP, gateway, session-store, and bootstrap evidence without writing into the Hermes runtime. (PR [#1598](https://github.com/Yeachan-Heo/oh-my-codex/pull/1598))
+- **OpenClaw local observation** — OpenClaw adaptation summarizes local config, gateway, hook mapping, and lifecycle bridge evidence while keeping command gateways gated. (PR [#1599](https://github.com/Yeachan-Heo/oh-my-codex/pull/1599))
+
+### Fixed
+
+#### Ralph / runtime authority / workflow semantics
+- **Ralph session authority** — Ralph assignment and tmux Ralph nudges now stay scoped to the activating/current session instead of drifting across concurrent OMX sessions. (PRs [#1604](https://github.com/Yeachan-Heo/oh-my-codex/pull/1604), [#1591](https://github.com/Yeachan-Heo/oh-my-codex/pull/1591))
+- **Prompt-side Ralph vs PRD CLI startup** — prompt activation no longer pretends to be `omx ralph --prd`, and PRD story validation remains required on the explicit CLI path. (PR [#1608](https://github.com/Yeachan-Heo/oh-my-codex/pull/1608))
+- **Native Stop stability** — Stop handling is stable across session-id drift, permission-seeking handoffs resume automatically, and native hook metadata no longer hijacks routing. (PRs [#1590](https://github.com/Yeachan-Heo/oh-my-codex/pull/1590), [#1611](https://github.com/Yeachan-Heo/oh-my-codex/pull/1611); direct commit `4377e1e`)
+- **MCP state transport resilience** — resumed duplicate MCP state writers stay alive after reconcile/self-teardown paths. (PR [#1596](https://github.com/Yeachan-Heo/oh-my-codex/pull/1596))
+
+#### Launch / platform / worktree safety
+- **Explore harness resolution** — `omx explore` skips unusable PATH node entries, resolves POSIX Codex shims under sandboxed pnpm-style PATHs, and fails closed before Windows paths hit the POSIX allowlist wrapper. (PRs [#1562](https://github.com/Yeachan-Heo/oh-my-codex/pull/1562), [#1610](https://github.com/Yeachan-Heo/oh-my-codex/pull/1610); direct commit `72b1e5d`)
+- **Detached leader cleanup** — detached Codex children are terminated when their leader shell exits on signal, with regression coverage for the orphan path. (PR [#1605](https://github.com/Yeachan-Heo/oh-my-codex/pull/1605))
+- **Windows cleanup discovery** — Windows OMX cleanup finds real orphaned servers again. (PR [#1589](https://github.com/Yeachan-Heo/oh-my-codex/pull/1589))
+- **Stale worktree startup** — detached team startup no longer fails just because an old recorded worktree path is missing. (PR [#1582](https://github.com/Yeachan-Heo/oh-my-codex/pull/1582))
+
+#### Hooks / HUD / notifications
+- **HUD active-session binding** — HUD state stays bound to the live OMX session rather than falling back to stale root scope. (PR [#1573](https://github.com/Yeachan-Heo/oh-my-codex/pull/1573))
+- **macOS leader stale polling** — leader stale polling now reduces repeated git probes on macOS, lowering high-CPU polling churn in long-running sessions. (PR [#1619](https://github.com/Yeachan-Heo/oh-my-codex/pull/1619))
+- **Queued startup and dispatch regressions** — Codex startup banners, queued drafts, and dispatch-lock behavior are covered so inbox/worker startup cannot regress silently. (PR [#1595](https://github.com/Yeachan-Heo/oh-my-codex/pull/1595))
+- **Slack mention parsing** — Slack notification mention environment parsing has focused regression coverage. (PR [#1585](https://github.com/Yeachan-Heo/oh-my-codex/pull/1585))
+- **Receiving-agent ownership** — generated guidance now treats safe reversible OMX/runtime operations as the receiving agent's responsibility instead of asking the user to perform ordinary cleanup. (direct commit `76e808e`)
+
+#### Setup / docs / release workflow
+- **Wiki setup registration** — `omx setup` installs the shipped wiki skill/config assets consistently. (PR [#1571](https://github.com/Yeachan-Heo/oh-my-codex/pull/1571))
+- **Native hook doctor coverage** — doctor/config output now surfaces missing native-hook coverage before it looks like a broken OMX install. (PR [#1546](https://github.com/Yeachan-Heo/oh-my-codex/pull/1546))
+- **Contribution branch guardrail** — normal contribution guidance now makes `dev` the obvious PR base. (PR [#1567](https://github.com/Yeachan-Heo/oh-my-codex/pull/1567))
+
+### Changed
+- **Release workflow dependency refresh** — GitHub Actions and tooling dependencies are refreshed for the release pipeline and TypeScript/Biome baselines. (PRs [#1575](https://github.com/Yeachan-Heo/oh-my-codex/pull/1575), [#1576](https://github.com/Yeachan-Heo/oh-my-codex/pull/1576), [#1577](https://github.com/Yeachan-Heo/oh-my-codex/pull/1577), [#1578](https://github.com/Yeachan-Heo/oh-my-codex/pull/1578))
+- **Release metadata sync** — Node/Cargo package metadata, lockfiles, changelog, release body, release notes, and release-readiness docs aligned to `0.13.0`.
+
 ## [0.12.6] - 2026-04-13
 
 Wiki-first knowledge workflows, notification and hook delivery hardening, launch/worktree safety improvements, and automatic closure of explicitly linked issues after `dev` merges across 32 PRs.
