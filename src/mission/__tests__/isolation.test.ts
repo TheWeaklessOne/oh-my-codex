@@ -81,6 +81,15 @@ describe("mission verifier isolation", () => {
 			assert.equal(auditEnvelope?.read_only_enforced, true);
 			assert.equal(reAuditEnvelope?.read_only_enforced, true);
 			assert.equal(executionEnvelope?.read_only_enforced, false);
+			assert.equal(auditEnvelope?.candidate_id, "candidate-001");
+			assert.match(
+				auditEnvelope?.lane_root || "",
+				/\.omx\/missions\/demo\/candidates\/candidate-001\/iterations\/001\/audit$/,
+			);
+			assert.match(
+				executionEnvelope?.lane_root || "",
+				/\.omx\/missions\/demo\/candidates\/candidate-001\/iterations\/001\/execution$/,
+			);
 		} finally {
 			await rm(repo, { recursive: true, force: true });
 		}

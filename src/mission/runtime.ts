@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -206,16 +207,15 @@ function buildLanePlans(
 			laneType,
 			{
 				laneType,
-				laneDir: iteration.laneDirs[laneType],
-				summaryPath: laneSummaryPath(iteration.laneDirs[laneType]),
-				briefingPath: missionLaneBriefingPath(iteration.laneDirs[laneType]),
+				laneDir: envelopes[laneType].lane_root,
+				summaryPath: envelopes[laneType].lane_summary_path,
+				briefingPath: missionLaneBriefingPath(envelopes[laneType].lane_root),
 				missionBriefPath: artifactPaths.missionBriefPath,
 				acceptanceContractPath: artifactPaths.acceptanceContractPath,
 				executionPlanPath: artifactPaths.executionPlanPath,
-				executionEnvelopePath: missionLaneExecutionEnvelopePath(
-					missionRoot,
-					iteration.iteration,
-					laneType,
+				executionEnvelopePath: join(
+					envelopes[laneType].lane_root,
+					"execution-envelope.json",
 				),
 				executionEnvelope: envelopes[laneType],
 				...MISSION_LANE_POLICIES[laneType],
@@ -350,7 +350,13 @@ export async function prepareMissionRuntime(
 		paths,
 		envelopes,
 	);
-	await writeMissionLaneBriefings(iteration.laneDirs, artifacts, paths);
+	await writeMissionLaneBriefings(
+		Object.fromEntries(
+			Object.entries(lanePlans).map(([laneType, plan]) => [laneType, plan.laneDir]),
+		) as Record<MissionLaneType, string>,
+		artifacts,
+		paths,
+	);
 	const v3Result = await syncMissionV3Bootstrap({
 		mission: nextMission,
 		artifacts,
@@ -406,33 +412,61 @@ export async function recordMissionRuntimeLaneSummary(
 ): Promise<MissionRecordLaneResult> {
 	const mission = await loadMission(repoRoot, slug);
 	const artifacts = await loadArtifactsForMission(mission);
+	const expectedIteration = iteration ?? mission.current_iteration;
 	const envelope = await loadMissionLaneExecutionEnvelope(
 		mission.mission_root,
-		iteration ?? mission.current_iteration,
+		expectedIteration,
 		laneType,
 	);
+	const expectedCandidateId = mission.active_candidate_id ?? envelope.candidate_id;
+	if (envelope.candidate_id !== expectedCandidateId) {
+		throw new Error(
+			`lane_candidate_envelope_stale:${laneType}:${expectedIteration}:${envelope.candidate_id}:${expectedCandidateId}`,
+		);
+	}
+	const provenanceCandidateId = String(
+		summaryInput.provenance.candidate_id ?? envelope.candidate_id,
+	).trim();
+	if (!provenanceCandidateId) {
+		throw new Error(
+			`lane_candidate_id_required:${laneType}:${expectedIteration}`,
+		);
+	}
+	if (provenanceCandidateId !== envelope.candidate_id) {
+		throw new Error(
+			`lane_candidate_mismatch:${laneType}:${expectedIteration}:${provenanceCandidateId}:${envelope.candidate_id}`,
+		);
+	}
 	if (
 		envelope.read_only_enforced &&
-		summaryInput.provenance.run_token !== envelope.provenance_binding_token
+		`sha256:${createHash("sha256")
+			.update(String(summaryInput.provenance.run_token ?? ""))
+			.digest("hex")}` !== envelope.provenance_binding_token_hash
 	) {
 		throw new Error(
-			`lane_provenance_token_mismatch:${laneType}:${iteration ?? mission.current_iteration}`,
+			`lane_provenance_token_mismatch:${laneType}:${expectedIteration}`,
 		);
 	}
 	const result = await recordLaneSummary(
 		repoRoot,
 		slug,
-		iteration ?? mission.current_iteration,
+		expectedIteration,
 		laneType,
-		summaryInput,
+		{
+			...summaryInput,
+			provenance: {
+				...summaryInput.provenance,
+				candidate_id: provenanceCandidateId,
+			},
+		},
 	);
 	const nextMission = await loadMission(repoRoot, slug);
 	if (result.status === "written" && result.summary) {
 		await appendMissionLaneSummaryEvent(
 			nextMission,
-			iteration ?? mission.current_iteration,
+			expectedIteration,
 			laneType,
-			result.summaryPath,
+			envelope.lane_summary_path,
 			result.summary.verdict,
 			result.summary.confidence,
 		);
@@ -441,9 +475,9 @@ export async function recordMissionRuntimeLaneSummary(
 			artifacts: artifacts.artifacts,
 			artifactPaths: artifacts.paths,
 			laneType,
-			summaryPath: result.summaryPath,
+			summaryPath: envelope.lane_summary_path,
 			summary: result.summary,
-			iteration: iteration ?? mission.current_iteration,
+			iteration: expectedIteration,
 		});
 	}
 	const reconciledMission = await loadMission(repoRoot, slug);
@@ -457,7 +491,7 @@ export async function recordMissionRuntimeLaneSummary(
 		artifactPaths: artifacts.paths,
 		stage: "execution-loop",
 		detail: `Recorded ${laneType} lane summary for Mission V2.`,
-		iteration: iteration ?? mission.current_iteration,
+		iteration: expectedIteration,
 		laneType,
 	});
 	await syncMissionTelemetry(reconciledMission, artifacts.paths);

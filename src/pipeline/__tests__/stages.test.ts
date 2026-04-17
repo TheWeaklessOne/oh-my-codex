@@ -164,7 +164,7 @@ describe('Team Exec Stage', () => {
     const arts = result.artifacts as Record<string, unknown>;
     assert.equal(arts.workerCount, 2);
     assert.equal(arts.agentType, 'executor');
-    assert.equal(arts.residual_followup_required, true);
+    assert.equal(arts.residual_followup_required, false);
   });
 
   it('respects custom worker count and agent type', async () => {

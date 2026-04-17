@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -124,6 +124,62 @@ async function recordRequiredLaneSummaries(
 }
 
 describe("mission kernel", () => {
+	it("normalizes legacy Mission V2 state on load", async () => {
+		const repo = await initRepo();
+		try {
+			const missionRoot = join(repo, ".omx", "missions", "demo");
+			await mkdir(missionRoot, { recursive: true });
+			await writeFile(
+				join(missionRoot, "mission.json"),
+				JSON.stringify(
+					{
+						schema_version: 1,
+						mission_id: "legacy-demo",
+						slug: "demo",
+						repo_root: repo,
+						mission_root: missionRoot,
+						target_fingerprint: "repo:demo",
+						status: "running",
+						started_at: "2026-04-11T17:00:00.000Z",
+						updated_at: "2026-04-11T17:00:00.000Z",
+						current_iteration: 1,
+						current_stage: "idle",
+						active_lanes: [],
+						closure_policy: {},
+						plateau_policy: {},
+						latest_verdict: "AMBIGUOUS",
+						latest_summary_path: null,
+						latest_lane_provenance: [],
+						unchanged_iterations: 0,
+						ambiguous_iterations: 0,
+						oscillation_count: 0,
+						last_residual_fingerprint: null,
+						last_strategy_key: null,
+						final_reason: null,
+						experimental_extension: "keep-me",
+					},
+					null,
+					2,
+				),
+				"utf-8",
+			);
+			const before = await readFile(join(missionRoot, "mission.json"), "utf-8");
+
+			const mission = await loadMission(repo, "demo");
+			assert.equal(mission.mission_version, 2);
+			assert.equal(mission.lifecycle_state, "executing");
+			assert.deepEqual(mission.candidate_ids, []);
+			assert.equal(mission.verification_state.status, "pending");
+			assert.equal(mission.promotion_state.status, "blocked");
+			assert.equal(mission.plateau_strategy_state.candidate_expansions, 0);
+			const after = await readFile(join(missionRoot, "mission.json"), "utf-8");
+			assert.equal(after, before);
+			assert.match(after, /experimental_extension/);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
 	it("bootstraps mission state and rejects same-target collisions", async () => {
 		const repo = await initRepo();
 		try {

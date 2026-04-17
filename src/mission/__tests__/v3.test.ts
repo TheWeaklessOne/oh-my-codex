@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { describe, it } from "node:test";
 import type { MissionLaneSummaryInput } from "../contracts.js";
 import { loadMission } from "../kernel.js";
@@ -14,15 +14,19 @@ import {
 	recordMissionRuntimeLaneSummary,
 } from "../runtime.js";
 import {
+	assertMissionV3ExecutionAllowed,
 	appendMissionV3ContractAmendment,
 	createMissionV3Candidate,
 	createMissionV3Waiver,
 	hybridizeMissionV3Candidates,
 	promoteMissionV3Candidate,
+	recordMissionV3LearningHeldOutEval,
+	recordMissionV3LearningShadowEval,
 	recordMissionV3ReleaseAction,
 	rescindMissionV3CandidateSelection,
 	selectMissionV3Candidate,
 	syncMissionV3AfterCommit,
+	transitionMissionV3LearningProposalState,
 } from "../v3.js";
 
 async function initRepo(): Promise<string> {
@@ -142,7 +146,22 @@ async function readNdjson<T>(filePath: string): Promise<T[]> {
 }
 
 function journalEventHash(event: unknown): string {
-	return `sha256:${createHash("sha256").update(JSON.stringify(event)).digest("hex")}`;
+	const canonicalize = (value: unknown): unknown => {
+		if (Array.isArray(value)) return value.map((entry) => canonicalize(entry));
+		if (value && typeof value === "object") {
+			return Object.keys(value as Record<string, unknown>)
+				.sort((left, right) => left.localeCompare(right))
+				.reduce<Record<string, unknown>>((result, key) => {
+					const entry = (value as Record<string, unknown>)[key];
+					if (entry !== undefined) {
+						result[key] = canonicalize(entry);
+					}
+					return result;
+				}, {});
+		}
+		return value;
+	};
+	return `sha256:${createHash("sha256").update(JSON.stringify(canonicalize(event))).digest("hex")}`;
 }
 
 describe("mission v3 surfaces", () => {
@@ -308,6 +327,196 @@ describe("mission v3 surfaces", () => {
 		}
 	});
 
+	it("fails closed for policy path, network, secret-scope, command-binding, and source-trust violations", async () => {
+		const repo = await initRepo();
+		try {
+			const runtime = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "gate-demo",
+				targetFingerprint: "repo:gate-demo",
+				task: "Exercise Mission V3 execution guardrails",
+			});
+			const mission = await loadMission(repo, "gate-demo");
+			const candidate = JSON.parse(
+				await readFile(runtime.v3Paths.activeCandidateStatePath, "utf-8"),
+			) as { candidate_id: string; workspace_root: string };
+			const proofProgram = JSON.parse(
+				await readFile(runtime.v3Paths.proofProgramPath, "utf-8"),
+			) as { bindings: Array<{ proof_lane: string; command_refs: string[] }> };
+			const checkerLock = JSON.parse(
+				await readFile(runtime.v3Paths.checkerLockPath, "utf-8"),
+			) as { checkers: Array<{ checker_id: string }> };
+			const environmentContract = JSON.parse(
+				await readFile(runtime.v3Paths.environmentContractPath, "utf-8"),
+			) as {
+				declared_secret_scopes: string[];
+				declared_environment_hash: string;
+				setup_network_allowlist: string[];
+				runtime_network_allowlist: string[];
+			};
+			const policySnapshot = JSON.parse(
+				await readFile(runtime.v3Paths.policySnapshotPath, "utf-8"),
+			) as { source_trust_summary: Record<string, number> };
+			const validWriteScope = relative(
+				repo,
+				join(candidate.workspace_root, "iterations", "001", "audit"),
+			);
+
+			await assert.rejects(
+				assertMissionV3ExecutionAllowed({
+					mission,
+					paths: runtime.v3Paths,
+					candidate: candidate as never,
+					proofProgram: proofProgram as never,
+					checkerLock: checkerLock as never,
+					environmentContract: environmentContract as never,
+					sourceTrustSummary: policySnapshot.source_trust_summary as never,
+					laneType: "audit",
+					proofLane: "reproduction",
+					commandRef: "lane-summary:audit",
+					writeScope: "../outside",
+					networkMode: "repo-local",
+					secretScopes: ["verifier:read-only"],
+					actorPrincipal: "test-guardrails",
+					idempotencyKey: "path-block",
+				}),
+				/mission_v3_policy_path_blocked:audit:\.\.\/outside/,
+			);
+
+			await assert.rejects(
+				assertMissionV3ExecutionAllowed({
+					mission,
+					paths: runtime.v3Paths,
+					candidate: candidate as never,
+					proofProgram: proofProgram as never,
+					checkerLock: checkerLock as never,
+					environmentContract: environmentContract as never,
+					sourceTrustSummary: policySnapshot.source_trust_summary as never,
+					laneType: "audit",
+					proofLane: "reproduction",
+					commandRef: "lane-summary:audit",
+					writeScope: validWriteScope,
+					networkMode: "https://forbidden.example",
+					secretScopes: ["verifier:read-only"],
+					actorPrincipal: "test-guardrails",
+					idempotencyKey: "network-block",
+				}),
+				/mission_v3_policy_network_blocked:audit:https:\/\/forbidden\.example/,
+			);
+
+			await assert.rejects(
+				assertMissionV3ExecutionAllowed({
+					mission,
+					paths: runtime.v3Paths,
+					candidate: candidate as never,
+					proofProgram: proofProgram as never,
+					checkerLock: checkerLock as never,
+					environmentContract: environmentContract as never,
+					sourceTrustSummary: policySnapshot.source_trust_summary as never,
+					laneType: "audit",
+					proofLane: "reproduction",
+					commandRef: "lane-summary:audit",
+					writeScope: validWriteScope,
+					networkMode: "repo-local",
+					secretScopes: ["undeclared:scope"],
+					actorPrincipal: "test-guardrails",
+					idempotencyKey: "secret-block",
+				}),
+				/mission_v3_secret_scope_undeclared:audit:undeclared:scope/,
+			);
+
+			await assert.rejects(
+				assertMissionV3ExecutionAllowed({
+					mission,
+					paths: runtime.v3Paths,
+					candidate: candidate as never,
+					proofProgram: proofProgram as never,
+					checkerLock: checkerLock as never,
+					environmentContract: environmentContract as never,
+					sourceTrustSummary: policySnapshot.source_trust_summary as never,
+					laneType: "audit",
+					proofLane: "reproduction",
+					commandRef: "policy:security",
+					writeScope: validWriteScope,
+					networkMode: "repo-local",
+					secretScopes: ["verifier:read-only"],
+					actorPrincipal: "test-guardrails",
+					idempotencyKey: "command-block",
+				}),
+				/mission_v3_proof_command_ref_mismatch:reproduction:policy:security/,
+			);
+
+			const lowTrustRepo = await initRepo();
+			try {
+				const lowTrustRuntime = await prepareMissionRuntime({
+					repoRoot: lowTrustRepo,
+					slug: "source-trust-demo",
+					targetFingerprint: "repo:source-trust-demo",
+					task: "Exercise source trust rejection",
+					requirementSources: [
+						{
+							content: "External low-trust material",
+							origin: "external",
+							retrievalStatus: "captured",
+							trustLevel: "low",
+							title: "external-note",
+						},
+						],
+					});
+				const lowTrustMission = await loadMission(lowTrustRepo, "source-trust-demo");
+				const lowTrustCandidate = JSON.parse(
+					await readFile(
+						lowTrustRuntime.v3Paths.activeCandidateStatePath,
+						"utf-8",
+					),
+				) as { workspace_root: string };
+				const lowTrustProofProgram = JSON.parse(
+					await readFile(lowTrustRuntime.v3Paths.proofProgramPath, "utf-8"),
+				);
+				const lowTrustCheckerLock = JSON.parse(
+					await readFile(lowTrustRuntime.v3Paths.checkerLockPath, "utf-8"),
+				);
+				const lowTrustEnvironmentContract = JSON.parse(
+					await readFile(
+						lowTrustRuntime.v3Paths.environmentContractPath,
+						"utf-8",
+					),
+				);
+				const lowTrustPolicySnapshot = JSON.parse(
+					await readFile(lowTrustRuntime.v3Paths.policySnapshotPath, "utf-8"),
+				) as { source_trust_summary: Record<string, number> };
+				await assert.rejects(
+					assertMissionV3ExecutionAllowed({
+						mission: lowTrustMission,
+						paths: lowTrustRuntime.v3Paths,
+						candidate: lowTrustCandidate as never,
+						proofProgram: lowTrustProofProgram as never,
+						checkerLock: lowTrustCheckerLock as never,
+						environmentContract: lowTrustEnvironmentContract as never,
+						sourceTrustSummary:
+							lowTrustPolicySnapshot.source_trust_summary as never,
+						laneType: "audit",
+						proofLane: "reproduction",
+						commandRef: "lane-summary:audit",
+						writeScope: relative(
+							lowTrustRepo,
+							join(lowTrustCandidate.workspace_root, "iterations", "001", "audit"),
+						),
+						networkMode: "repo-local",
+						secretScopes: ["verifier:read-only"],
+						actorPrincipal: "test-guardrails",
+						idempotencyKey: "source-trust-block",
+					}),
+					/mission_v3_source_trust_forbidden:reproduction:execution_forbidden/,
+				);
+			} finally {
+				await rm(lowTrustRepo, { recursive: true, force: true });
+			}
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
 	it("fails closed on stale environment attestations even when the V2 kernel would otherwise close", async () => {
 		const repo = await initRepo();
 		try {
@@ -468,6 +677,148 @@ describe("mission v3 surfaces", () => {
 			assert.equal(
 				compactionEventsAfterReplay.length,
 				compactionCountBeforeReplay,
+			);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed when setup runs are missing or runtime observations contradict environment parity", async () => {
+		const repo = await initRepo();
+		try {
+			const runtime = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "environment-demo",
+				targetFingerprint: "repo:environment-demo",
+				task: "Exercise Mission V3 environment parity failure branches",
+			});
+
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"environment-demo",
+				"audit",
+				verifierSummary("audit", 1, "PASS", verifierToken(runtime, "audit")),
+			);
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"environment-demo",
+				"remediation",
+				workSummary("remediation", 1),
+			);
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"environment-demo",
+				"execution",
+				workSummary("execution", 1),
+			);
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"environment-demo",
+				"re_audit",
+				verifierSummary(
+					"re_audit",
+					1,
+					"PASS",
+					verifierToken(runtime, "re_audit"),
+				),
+			);
+			const originalSetupRuns = await readFile(
+				runtime.v3Paths.setupRunsPath,
+				"utf-8",
+			);
+			await writeFile(runtime.v3Paths.setupRunsPath, "", "utf-8");
+
+			const committed = await commitMissionRuntimeIteration(repo, "environment-demo", {
+				iteration_commit_succeeded: true,
+				no_unreconciled_lane_errors: true,
+				focused_checks_green: true,
+			});
+			assert.equal(committed.mission.lifecycle_state, "assuring");
+			assert.equal(
+				committed.mission.kernel_blockers.includes(
+					"environment:missing successful environment setup run",
+				),
+				true,
+			);
+			await writeFile(runtime.v3Paths.setupRunsPath, originalSetupRuns, "utf-8");
+
+			const observationEvents = await readNdjson<Array<Record<string, unknown>>>(
+				runtime.v3Paths.runtimeObservationsPath,
+			);
+			const lastObservation = observationEvents.at(-1) as
+				| {
+						event_id: string;
+						sequence: number;
+						journal_type: string;
+						recorded_at: string;
+						mission_id: string;
+						candidate_id?: string;
+						lane_id?: string;
+						actor_principal: string;
+						causation_ref?: string | null;
+						correlation_ref?: string | null;
+						idempotency_key: string;
+						payload_hash: string;
+						payload: Record<string, unknown>;
+				  }
+				| undefined;
+			assert.ok(lastObservation);
+			const contradictoryPayload = {
+				...(lastObservation?.payload ?? {}),
+				env_hash: "sha256:contradictory",
+			};
+			const canonicalize = (value: unknown): unknown => {
+				if (Array.isArray(value))
+					return value.map((entry) => canonicalize(entry));
+				if (value && typeof value === "object") {
+					return Object.keys(value as Record<string, unknown>)
+						.sort((left, right) => left.localeCompare(right))
+						.reduce<Record<string, unknown>>((result, key) => {
+							const entry = (value as Record<string, unknown>)[key];
+							if (entry !== undefined) result[key] = canonicalize(entry);
+							return result;
+						}, {});
+				}
+				return value;
+			};
+			const payloadHash = `sha256:${createHash("sha256")
+				.update(JSON.stringify(canonicalize(contradictoryPayload)))
+				.digest("hex")}`;
+			const contradictoryObservation = {
+				...lastObservation,
+				event_id: "runtime-observations:contradictory",
+				sequence: Number(lastObservation?.sequence ?? 0) + 1,
+				recorded_at: "2026-04-16T00:10:00.000Z",
+				idempotency_key: "runtime-observation:contradictory",
+				prev_event_hash: journalEventHash(lastObservation),
+				payload_hash: payloadHash,
+				payload: contradictoryPayload,
+			};
+			await writeFile(
+				runtime.v3Paths.runtimeObservationsPath,
+				`${(await readFile(runtime.v3Paths.runtimeObservationsPath, "utf-8")).trim()}\n${JSON.stringify(contradictoryObservation)}\n`,
+				"utf-8",
+			);
+
+			const amended = await appendMissionV3ContractAmendment({
+				repoRoot: repo,
+				slug: "environment-demo",
+				targetContract: "proof-program",
+				authority: "test-amendment-authority",
+				rationale: "Force a rebuild after environment contradiction.",
+				scope: "environment-contradiction",
+				affectedObligationIds: ["obl:reproduction"],
+			});
+			assert.equal(amended.target_contract, "proof-program");
+			const refreshed = await loadMission(repo, "environment-demo");
+			assert.equal(refreshed.lifecycle_state, "assuring");
+			assert.equal(
+				refreshed.kernel_blockers.some((value) =>
+					value.startsWith(
+						"environment:runtime observation contradicted environment parity",
+					),
+				),
+				true,
 			);
 		} finally {
 			await rm(repo, { recursive: true, force: true });
@@ -662,6 +1013,86 @@ describe("mission v3 surfaces", () => {
 		}
 	});
 
+	it("rejects late lane writes after candidate switching and refreshes envelopes for the new active candidate", async () => {
+		const repo = await initRepo();
+		try {
+			const runtime = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "candidate-switch-demo",
+				targetFingerprint: "repo:candidate-switch-demo",
+				task: "Reject stale candidate writes after selection changes.",
+				highRisk: true,
+			});
+			const candidate2 = await createMissionV3Candidate({
+				repoRoot: repo,
+				slug: "candidate-switch-demo",
+				rationale: "Promote an alternate candidate before old audit output lands.",
+				trigger: "ambiguity",
+			});
+			await selectMissionV3Candidate({
+				repoRoot: repo,
+				slug: "candidate-switch-demo",
+				candidateId: candidate2.candidate_id,
+				reason: "Candidate 002 is now the active execution branch.",
+			});
+			await assert.rejects(
+				recordMissionRuntimeLaneSummary(
+					repo,
+					"candidate-switch-demo",
+					"audit",
+					verifierSummary(
+						"audit",
+						1,
+						"PASS",
+						verifierToken(runtime, "audit"),
+					),
+				),
+				/lane_candidate_envelope_stale/i,
+			);
+			const refreshed = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "candidate-switch-demo",
+				targetFingerprint: "repo:candidate-switch-demo",
+				task: "Resume after candidate switch.",
+				highRisk: true,
+			});
+			assert.equal(
+				refreshed.lanePlans.audit?.executionEnvelope.candidate_id,
+				"candidate-002",
+			);
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"candidate-switch-demo",
+				"audit",
+				verifierSummary(
+					"audit",
+					1,
+					"PASS",
+					verifierToken(refreshed, "audit"),
+				),
+			);
+			assert.equal(
+				existsSync(
+					join(
+						repo,
+						".omx",
+						"missions",
+						"candidate-switch-demo",
+						"candidates",
+						"candidate-002",
+						"iterations",
+						"001",
+						"audit",
+						"summary.json",
+					),
+				),
+				true,
+			);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
 	it("records static-analysis lane runs during commit and blocks promotion when required artifacts disappear", async () => {
 		const repo = await initRepo();
 		try {
@@ -670,6 +1101,7 @@ describe("mission v3 surfaces", () => {
 				slug: "promotion-artifacts-demo",
 				targetFingerprint: "repo:promotion-artifacts-demo",
 				task: "Keep Mission V3 promotion artifact checks strict",
+				highRisk: true,
 			});
 			await recordMissionRuntimeLaneSummary(
 				repo,
@@ -762,6 +1194,28 @@ describe("mission v3 surfaces", () => {
 				}),
 				/mission_v3_promote_missing_artifacts:adjudication\.json/,
 			);
+			await writeFile(runtime.v3Paths.adjudicationPath, "{}", "utf-8");
+			await rm(runtime.v3Paths.releaseNotesPath, { force: true });
+			await assert.rejects(
+				promoteMissionV3Candidate({
+					repoRoot: repo,
+					slug: "promotion-artifacts-demo",
+					actor: "test-release-bot",
+					summary: "Attempt to promote with missing release notes.",
+				}),
+				/mission_v3_promote_missing_artifacts:release-notes\.md/,
+			);
+			await writeFile(runtime.v3Paths.releaseNotesPath, "# Release Notes\n", "utf-8");
+			await rm(runtime.v3Paths.rollbackPlanPath, { force: true });
+			await assert.rejects(
+				promoteMissionV3Candidate({
+					repoRoot: repo,
+					slug: "promotion-artifacts-demo",
+					actor: "test-release-bot",
+					summary: "Attempt to promote with missing rollback plan.",
+				}),
+				/mission_v3_promote_missing_artifacts:rollback-plan\.md/,
+			);
 		} finally {
 			await rm(repo, { recursive: true, force: true });
 		}
@@ -780,7 +1234,7 @@ describe("mission v3 surfaces", () => {
 				repoRoot: repo,
 				slug: "journal-recovery-demo",
 				scope: "temporary static-analysis exception",
-				authority: "test-waiver-authority",
+				authority: "mission-auto-policy",
 				rationale: "Use a deterministic waiver to test replay safety.",
 				obligationIds: ["obl:static-analysis"],
 			});
@@ -794,7 +1248,7 @@ describe("mission v3 surfaces", () => {
 				repoRoot: repo,
 				slug: "journal-recovery-demo",
 				scope: "temporary static-analysis exception",
-				authority: "test-waiver-authority",
+				authority: "mission-auto-policy",
 				rationale: "Use a deterministic waiver to test replay safety.",
 				obligationIds: ["obl:static-analysis"],
 			});
@@ -825,7 +1279,7 @@ describe("mission v3 surfaces", () => {
 				repoRoot: repo,
 				slug: "journal-recovery-demo",
 				scope: "secondary reproduction exception",
-				authority: "test-waiver-authority",
+				authority: "mission-auto-policy",
 				rationale: "Append another decision after replay repair.",
 				obligationIds: ["obl:reproduction"],
 			});
@@ -1089,10 +1543,10 @@ describe("mission v3 surfaces", () => {
 				source_trace_ref?: string;
 				source_eval_ref?: string;
 			};
-			assert.equal(learningProposal.state, "shadow_evaluated");
+			assert.equal(learningProposal.state, "captured");
 			assert.equal(
 				learningProposal.rollout_path?.current_state,
-				"shadow_evaluated",
+				"captured",
 			);
 			assert.deepEqual(learningProposal.rollout_path?.valid_states, [
 				"captured",
@@ -1416,7 +1870,7 @@ describe("mission v3 surfaces", () => {
 				repoRoot: repo,
 				slug: "waiver-demo",
 				scope: "expired static-analysis waiver",
-				authority: "test-waiver-authority",
+				authority: "mission-auto-policy",
 				rationale:
 					"This waiver is already expired and must not unblock proofs.",
 				obligationIds: ["obl:static-analysis"],
@@ -1436,7 +1890,7 @@ describe("mission v3 surfaces", () => {
 				repoRoot: repo,
 				slug: "waiver-demo",
 				scope: "temporary static-analysis exception",
-				authority: "test-waiver-authority",
+				authority: "mission-auto-policy",
 				rationale:
 					"Demonstrate first-class waiver handling for a blocking obligation.",
 				obligationIds: ["obl:static-analysis"],
@@ -1448,8 +1902,19 @@ describe("mission v3 surfaces", () => {
 				createMissionV3Waiver({
 					repoRoot: repo,
 					slug: "waiver-demo",
-					scope: "forbidden adjudication waiver",
+					scope: "wrong authority",
 					authority: "test-waiver-authority",
+					rationale: "Authority must match the obligation contract.",
+					obligationIds: ["obl:static-analysis"],
+				}),
+				/mission_v3_waiver_authority_mismatch:obl:static-analysis:mission-auto-policy/,
+			);
+			await assert.rejects(
+				createMissionV3Waiver({
+					repoRoot: repo,
+					slug: "waiver-demo",
+					scope: "forbidden adjudication waiver",
+					authority: "mission-auto-policy",
 					rationale: "Adjudication is not waivable.",
 					obligationIds: ["obl:adjudication"],
 				}),
@@ -1487,11 +1952,22 @@ describe("mission v3 surfaces", () => {
 					repoRoot: policyRepo,
 					slug: "policy-waiver-demo",
 					scope: "clear one policy blocker only",
-					authority: "test-waiver-authority",
+					authority: "mission-auto-policy",
 					rationale:
 						"Only waive third-party incorporation review for this test.",
 					policyClauseIds: ["policy:third-party-incorporation"],
 				});
+				await assert.rejects(
+					createMissionV3Waiver({
+						repoRoot: policyRepo,
+						slug: "policy-waiver-demo",
+						scope: "wrong policy authority",
+						authority: "test-waiver-authority",
+						rationale: "Policy waivers must use the profile authority.",
+						policyClauseIds: ["policy:third-party-incorporation"],
+					}),
+					/mission_v3_policy_waiver_authority_mismatch:mission-auto-policy/,
+				);
 				const policyMission = await loadMission(
 					policyRepo,
 					"policy-waiver-demo",
@@ -1597,6 +2073,68 @@ describe("mission v3 surfaces", () => {
 				demoted.verification_state.stale_obligation_ids.length > 0,
 				true,
 			);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("records learning shadow and held-out evaluations with gated state transitions", async () => {
+		const repo = await initRepo();
+		try {
+			const runtime = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "learning-demo",
+				targetFingerprint: "repo:learning-demo",
+				task: "Exercise Mission V3 learning proposal transitions",
+			});
+			await assert.rejects(
+				recordMissionV3LearningHeldOutEval({
+					repoRoot: repo,
+					slug: "learning-demo",
+					actor: "test-learning-bot",
+					summary: "Held-out should not run before shadow evaluation.",
+					approved: false,
+				}),
+				/mission_v3_learning_held_out_invalid_state:captured/,
+			);
+			const shadow = await recordMissionV3LearningShadowEval({
+				repoRoot: repo,
+				slug: "learning-demo",
+				actor: "test-learning-bot",
+				summary: "Shadow evaluation found reusable improvement signals.",
+				findings: ["shadow-pass"],
+			});
+			assert.equal(shadow.state, "shadow_evaluated");
+			assert.equal(existsSync(runtime.v3Paths.shadowEvalPath), true);
+			const refreshedShadow = await recordMissionV3LearningShadowEval({
+				repoRoot: repo,
+				slug: "learning-demo",
+				actor: "test-learning-bot",
+				summary: "Shadow evaluation refreshed after new evidence.",
+				findings: ["shadow-refresh"],
+			});
+			assert.equal(refreshedShadow.state, "shadow_evaluated");
+			assert.equal(refreshedShadow.latest_shadow_eval_ref, runtime.v3Paths.shadowEvalPath);
+
+			const approved = await recordMissionV3LearningHeldOutEval({
+				repoRoot: repo,
+				slug: "learning-demo",
+				actor: "test-learning-bot",
+				summary: "Held-out evaluation approved the rollout candidate.",
+				findings: ["held-out-pass"],
+				approved: true,
+			});
+			assert.equal(approved.state, "approved_for_rollout");
+			assert.equal(existsSync(runtime.v3Paths.heldOutEvalPath), true);
+
+			const superseded = await transitionMissionV3LearningProposalState({
+				repoRoot: repo,
+				slug: "learning-demo",
+				actor: "test-learning-bot",
+				nextState: "superseded",
+				note: "A fresher proposal replaced this rollout candidate.",
+			});
+			assert.equal(superseded.state, "superseded");
 		} finally {
 			await rm(repo, { recursive: true, force: true });
 		}

@@ -77,6 +77,7 @@ export interface MissionLaneProvenance {
   lane_id: string;
   session_id: string;
   lane_type: MissionLaneType;
+  candidate_id?: string;
   runner_type: 'team' | 'ralph' | 'direct';
   adapter_version: string;
   started_at: string;
@@ -477,6 +478,9 @@ export function normalizeLaneSummary(input: MissionLaneSummaryInput): MissionLan
       lane_id: String(input.provenance.lane_id || '').trim(),
       session_id: String(input.provenance.session_id || '').trim(),
       lane_type: input.provenance.lane_type,
+      ...(input.provenance.candidate_id
+        ? { candidate_id: String(input.provenance.candidate_id).trim() }
+        : {}),
       runner_type: input.provenance.runner_type,
       adapter_version: String(input.provenance.adapter_version || '').trim(),
       started_at: String(input.provenance.started_at || '').trim(),

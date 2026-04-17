@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rm } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { writeAtomic } from "../team/state/io.js";
 import {
 	canTransitionMissionStatus,
@@ -13,6 +13,7 @@ import {
 	MISSION_LANE_POLICIES,
 	MISSION_LANE_TYPES,
 	MISSION_REQUIRED_LANE_TYPES,
+	MISSION_STATUSES,
 	type MissionClosurePolicy,
 	type MissionLaneSummary,
 	type MissionLaneSummaryInput,
@@ -28,7 +29,7 @@ import { loadMissionLaneExecutionEnvelope } from "./isolation.js";
 
 export interface MissionState {
 	schema_version: 1;
-	mission_version: 3;
+	mission_version: 2 | 3;
 	mission_id: string;
 	slug: string;
 	repo_root: string;
@@ -216,14 +217,46 @@ function buildMissionLatestSnapshot(
 	mission: MissionState,
 ): MissionLatestSnapshot | null {
 	if (!mission.latest_summary_path) return null;
+	const latestVerifierFinishedAt =
+		[...mission.latest_lane_provenance]
+			.reverse()
+			.find((entry) => entry.lane_type === "re_audit")?.finished_at ??
+		mission.updated_at;
 	return {
 		mission_id: mission.mission_id,
 		current_iteration: mission.current_iteration,
 		latest_lane: "re_audit",
 		latest_verdict: mission.latest_verdict,
 		latest_summary_path: mission.latest_summary_path,
-		updated_at: mission.updated_at,
+		updated_at: latestVerifierFinishedAt,
 	};
+}
+
+function candidateIterationRoot(
+	repoRoot: string,
+	slug: string,
+	candidateId: string,
+	iteration: number,
+): string {
+	return join(
+		missionRoot(repoRoot, slug),
+		"candidates",
+		candidateId,
+		"iterations",
+		iterationId(iteration),
+	);
+}
+
+function resolveIterationRoot(
+	repoRoot: string,
+	slug: string,
+	iteration: number,
+	candidateId?: string | null,
+): string {
+	if (candidateId) {
+		return candidateIterationRoot(repoRoot, slug, candidateId, iteration);
+	}
+	return iterationRoot(repoRoot, slug, iteration);
 }
 
 function iterationsRoot(repoRoot: string, slug: string): string {
@@ -247,9 +280,10 @@ function laneSummaryPath(
 	slug: string,
 	iteration: number,
 	laneType: MissionLaneType,
+	candidateId?: string | null,
 ): string {
 	return join(
-		iterationRoot(repoRoot, slug, iteration),
+		resolveIterationRoot(repoRoot, slug, iteration, candidateId),
 		laneType,
 		"summary.json",
 	);
@@ -260,11 +294,16 @@ function deltaPath(repoRoot: string, slug: string, iteration: number): string {
 }
 
 function expectedLatestSummaryPath(
-	repoRoot: string,
-	slug: string,
+	mission: MissionState,
 	iteration: number,
 ): string {
-	return laneSummaryPath(repoRoot, slug, iteration, "re_audit");
+	return laneSummaryPath(
+		mission.repo_root,
+		mission.slug,
+		iteration,
+		"re_audit",
+		mission.active_candidate_id,
+	);
 }
 
 function hashValue(input: string): string {
@@ -285,6 +324,250 @@ async function readJsonFile<T>(filePath: string): Promise<T> {
 
 async function writeJsonFile(filePath: string, value: unknown): Promise<void> {
 	await writeAtomic(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function normalizeLifecycleState(
+	status: MissionStatus,
+	currentIteration: number,
+	raw: unknown,
+): MissionState["lifecycle_state"] {
+	if (
+		typeof raw === "string" &&
+		[
+			"bootstrapping",
+			"planning",
+			"blocked_external",
+			"executing",
+			"assuring",
+			"verified",
+			"promotion_ready",
+			"released",
+			"handed_off",
+			"plateau",
+			"failed",
+			"cancelled",
+		].includes(raw)
+	) {
+		return raw as MissionState["lifecycle_state"];
+	}
+	if (status === "failed") return "failed";
+	if (status === "plateau") return "plateau";
+	if (status === "cancelled") return "cancelled";
+	if (status === "complete") return "verified";
+	return currentIteration > 0 ? "executing" : "planning";
+}
+
+function defaultVerificationState(
+	raw: Partial<MissionState["verification_state"]> | undefined,
+): MissionState["verification_state"] {
+	return {
+		status: String(raw?.status ?? "pending"),
+		blocking_obligation_ids: Array.isArray(raw?.blocking_obligation_ids)
+			? raw!.blocking_obligation_ids.filter(Boolean)
+			: [],
+		satisfied_obligation_ids: Array.isArray(raw?.satisfied_obligation_ids)
+			? raw!.satisfied_obligation_ids.filter(Boolean)
+			: [],
+		contradicted_obligation_ids: Array.isArray(raw?.contradicted_obligation_ids)
+			? raw!.contradicted_obligation_ids.filter(Boolean)
+			: [],
+		stale_obligation_ids: Array.isArray(raw?.stale_obligation_ids)
+			? raw!.stale_obligation_ids.filter(Boolean)
+			: [],
+		adjudication_state: String(raw?.adjudication_state ?? "pending"),
+		last_verified_at:
+			typeof raw?.last_verified_at === "string" ? raw.last_verified_at : null,
+	};
+}
+
+function defaultPromotionState(
+	raw: Partial<MissionState["promotion_state"]> | undefined,
+): MissionState["promotion_state"] {
+	return {
+		status: String(raw?.status ?? "blocked"),
+		blocking_reasons: Array.isArray(raw?.blocking_reasons)
+			? raw!.blocking_reasons.filter(Boolean)
+			: ["mission not yet verified"],
+		last_decision_at:
+			typeof raw?.last_decision_at === "string" ? raw.last_decision_at : null,
+		decision_ref:
+			typeof raw?.decision_ref === "string" ? raw.decision_ref : null,
+	};
+}
+
+function defaultPlateauStrategyState(
+	raw: Partial<MissionState["plateau_strategy_state"]> | undefined,
+	candidateIds: string[],
+	lastStrategyKey: string | null,
+): MissionState["plateau_strategy_state"] {
+	return {
+		strategy_key:
+			typeof raw?.strategy_key === "string"
+				? raw.strategy_key
+				: lastStrategyKey,
+		mutation_attempts:
+			typeof raw?.mutation_attempts === "number" ? raw.mutation_attempts : 0,
+		candidate_expansions:
+			typeof raw?.candidate_expansions === "number"
+				? raw.candidate_expansions
+				: candidateIds.length,
+		exhausted: raw?.exhausted === true,
+	};
+}
+
+export function normalizeMissionState(
+	repoRoot: string,
+	slug: string,
+	raw: Partial<MissionState>,
+): MissionState {
+	const root = missionRoot(repoRoot, slug);
+	const targetFingerprint =
+		typeof raw.target_fingerprint === "string" && raw.target_fingerprint.trim()
+			? raw.target_fingerprint
+			: resolveTargetFingerprint({ repoRoot, slug });
+	const startedAt =
+		typeof raw.started_at === "string" && raw.started_at.trim()
+			? raw.started_at
+			: nowIso();
+	const updatedAt =
+		typeof raw.updated_at === "string" && raw.updated_at.trim()
+			? raw.updated_at
+			: startedAt;
+	const currentIteration =
+		typeof raw.current_iteration === "number" && raw.current_iteration > 0
+			? raw.current_iteration
+			: 1;
+	const status: MissionStatus =
+		typeof raw.status === "string" && MISSION_STATUSES.includes(raw.status as MissionStatus)
+			? (raw.status as MissionStatus)
+			: "running";
+	const candidateIds = Array.from(
+		new Set((raw.candidate_ids ?? []).filter(Boolean)),
+	);
+	const missionVersion =
+		raw.mission_version === 2 ||
+		(raw.mission_version !== 3 &&
+			!raw.active_candidate_id &&
+			!raw.selected_candidate_id &&
+			candidateIds.length === 0 &&
+			!raw.assurance_contract_id &&
+			!raw.proof_program_id &&
+			!raw.checker_lock_id &&
+			!raw.environment_contract_id)
+			? 2
+			: 3;
+	const lastStrategyKey =
+		typeof raw.last_strategy_key === "string" ? raw.last_strategy_key : null;
+	return {
+		schema_version: 1,
+		mission_version: missionVersion,
+		mission_id:
+			typeof raw.mission_id === "string" && raw.mission_id.trim()
+				? raw.mission_id
+				: `${slug}-${startedAt.replace(/[^0-9]/g, "").slice(0, 14)}-${hashValue(targetFingerprint)}`,
+		slug,
+		repo_root: repoRoot,
+		mission_root:
+			typeof raw.mission_root === "string" && raw.mission_root.trim()
+				? raw.mission_root
+				: root,
+		target_fingerprint: targetFingerprint,
+		status,
+		lifecycle_state: normalizeLifecycleState(
+			status,
+			currentIteration,
+			raw.lifecycle_state,
+		),
+		started_at: startedAt,
+		updated_at: updatedAt,
+		current_iteration: currentIteration,
+		current_stage:
+			raw.current_stage === "idle" ||
+			raw.current_stage === "judging" ||
+			MISSION_LANE_TYPES.includes(raw.current_stage as MissionLaneType)
+				? (raw.current_stage as MissionState["current_stage"])
+				: "idle",
+		active_lanes: Array.isArray(raw.active_lanes) ? raw.active_lanes : [],
+		closure_policy: {
+			...DEFAULT_MISSION_CLOSURE_POLICY,
+			...(raw.closure_policy ?? {}),
+		},
+		plateau_policy: {
+			...DEFAULT_MISSION_PLATEAU_POLICY,
+			...(raw.plateau_policy ?? {}),
+		},
+		latest_verdict:
+			typeof raw.latest_verdict === "string"
+			&& ["PASS", "PARTIAL", "FAIL", "AMBIGUOUS"].includes(raw.latest_verdict)
+				? (raw.latest_verdict as MissionVerdict)
+				: "AMBIGUOUS",
+		latest_summary_path:
+			typeof raw.latest_summary_path === "string" ? raw.latest_summary_path : null,
+		latest_lane_provenance: Array.isArray(raw.latest_lane_provenance)
+			? raw.latest_lane_provenance
+			: [],
+		unchanged_iterations:
+			typeof raw.unchanged_iterations === "number"
+				? raw.unchanged_iterations
+				: 0,
+		ambiguous_iterations:
+			typeof raw.ambiguous_iterations === "number"
+				? raw.ambiguous_iterations
+				: 0,
+		oscillation_count:
+			typeof raw.oscillation_count === "number" ? raw.oscillation_count : 0,
+		last_residual_fingerprint:
+			typeof raw.last_residual_fingerprint === "string"
+				? raw.last_residual_fingerprint
+				: null,
+		last_strategy_key: lastStrategyKey,
+		final_reason:
+			typeof raw.final_reason === "string" ? raw.final_reason : null,
+		active_candidate_id:
+			typeof raw.active_candidate_id === "string" ? raw.active_candidate_id : null,
+		selected_candidate_id:
+			typeof raw.selected_candidate_id === "string"
+				? raw.selected_candidate_id
+				: null,
+		candidate_ids: candidateIds,
+		assurance_contract_id:
+			typeof raw.assurance_contract_id === "string"
+				? raw.assurance_contract_id
+				: null,
+		proof_program_id:
+			typeof raw.proof_program_id === "string" ? raw.proof_program_id : null,
+		checker_lock_id:
+			typeof raw.checker_lock_id === "string" ? raw.checker_lock_id : null,
+		environment_contract_id:
+			typeof raw.environment_contract_id === "string"
+				? raw.environment_contract_id
+				: null,
+		policy_profile: {
+			risk_class: String(raw.policy_profile?.risk_class ?? "low-risk-local"),
+			assurance_profile: String(
+				raw.policy_profile?.assurance_profile ?? "balanced",
+			),
+			autonomy_profile: String(raw.policy_profile?.autonomy_profile ?? "guarded"),
+		},
+		verification_state: defaultVerificationState(raw.verification_state),
+		promotion_state: defaultPromotionState(raw.promotion_state),
+		plateau_strategy_state: defaultPlateauStrategyState(
+			raw.plateau_strategy_state,
+			candidateIds,
+			lastStrategyKey,
+		),
+		kernel_blockers: Array.isArray(raw.kernel_blockers)
+			? raw.kernel_blockers.filter(Boolean)
+			: [],
+		latest_authoritative_iteration_ref:
+			typeof raw.latest_authoritative_iteration_ref === "string"
+				? raw.latest_authoritative_iteration_ref
+				: null,
+		latest_authoritative_adjudication_ref:
+			typeof raw.latest_authoritative_adjudication_ref === "string"
+				? raw.latest_authoritative_adjudication_ref
+				: null,
+	};
 }
 
 async function listMissionJsonFiles(repoRoot: string): Promise<string[]> {
@@ -405,7 +688,9 @@ export async function loadMission(
 	repoRoot: string,
 	slug: string,
 ): Promise<MissionState> {
-	return readJsonFile<MissionState>(missionPath(repoRoot, slug));
+	const filePath = missionPath(repoRoot, slug);
+	const raw = await readJsonFile<Partial<MissionState>>(filePath);
+	return normalizeMissionState(repoRoot, slug, raw);
 }
 
 export async function resumeMission(
@@ -433,10 +718,13 @@ async function deriveActiveLanes(
 	repoRoot: string,
 	slug: string,
 	iteration: number,
+	candidateId?: string | null,
 ): Promise<MissionState["active_lanes"]> {
 	return MISSION_REQUIRED_LANE_TYPES.filter(
 		(laneType) =>
-			!existsSync(laneSummaryPath(repoRoot, slug, iteration, laneType)),
+			!existsSync(
+				laneSummaryPath(repoRoot, slug, iteration, laneType, candidateId),
+			),
 	).map((laneType) => buildActiveLaneEntry(iteration, laneType));
 }
 
@@ -454,8 +742,7 @@ async function isIterationCommitted(
 ): Promise<boolean> {
 	if (!existsSync(deltaPath(repoRoot, slug, iteration))) return false;
 	const expectedSummaryPath = expectedLatestSummaryPath(
-		repoRoot,
-		slug,
+		mission,
 		iteration,
 	);
 	if (mission.latest_summary_path !== expectedSummaryPath) return false;
@@ -536,6 +823,12 @@ export async function startIteration(
 	}
 
 	const activeLanes = await deriveActiveLanes(repoRoot, slug, iteration);
+	const candidateActiveLanes = await deriveActiveLanes(
+		repoRoot,
+		slug,
+		iteration,
+		mission.active_candidate_id,
+	);
 
 	const nextMission: MissionState = {
 		...mission,
@@ -543,7 +836,8 @@ export async function startIteration(
 		current_stage: nextStageFromActiveLanes(activeLanes),
 		updated_at: nowIso(),
 		last_strategy_key: strategyKey ?? mission.last_strategy_key ?? null,
-		active_lanes: activeLanes,
+		active_lanes:
+			mission.active_candidate_id == null ? activeLanes : candidateActiveLanes,
 	};
 	await writeJsonFile(missionPath(repoRoot, slug), nextMission);
 
@@ -576,10 +870,17 @@ export async function recordLaneSummary(
 	const mission = await loadMission(repoRoot, slug);
 	const invalidReason = validateLaneIteration(mission, iteration);
 	const summaryFile = laneSummaryPath(repoRoot, slug, iteration, laneType);
+	const candidateSummaryFile = laneSummaryPath(
+		repoRoot,
+		slug,
+		iteration,
+		laneType,
+		mission.active_candidate_id,
+	);
 	if (invalidReason) {
 		return {
 			status: "ignored",
-			summaryPath: summaryFile,
+			summaryPath: candidateSummaryFile,
 			reason: invalidReason,
 		};
 	}
@@ -590,28 +891,28 @@ export async function recordLaneSummary(
 		await writeJsonFile(missionPath(repoRoot, slug), nextMission);
 		return {
 			status: "ignored",
-			summaryPath: summaryFile,
+			summaryPath: candidateSummaryFile,
 			reason: "cancelled",
 			summary,
 		};
 	}
 
-	if (existsSync(summaryFile)) {
+	if (existsSync(candidateSummaryFile)) {
 		return {
 			status: "duplicate",
-			summaryPath: summaryFile,
+			summaryPath: candidateSummaryFile,
 			reason: "duplicate",
-			summary: await readJsonFile<MissionLaneSummary>(summaryFile),
+			summary: await readJsonFile<MissionLaneSummary>(candidateSummaryFile),
 		};
 	}
 
-	await mkdir(join(iterationRoot(repoRoot, slug, iteration), laneType), {
+	await mkdir(dirname(candidateSummaryFile), {
 		recursive: true,
 	});
-	await writeJsonFile(summaryFile, summary);
+	await writeJsonFile(candidateSummaryFile, summary);
 	const nextMission = removeActiveLane(mission, laneType, summary);
 	await writeJsonFile(missionPath(repoRoot, slug), nextMission);
-	return { status: "written", summaryPath: summaryFile, summary };
+	return { status: "written", summaryPath: candidateSummaryFile, summary };
 }
 
 function loadResidualHistory(deltaHistory: MissionDelta[]): Set<string> {
@@ -670,7 +971,11 @@ async function verifierRunTokenMatchesEnvelope(
 		iteration,
 		laneType,
 	);
-	return summary.provenance.run_token === envelope.provenance_binding_token;
+	return (
+		`sha256:${createHash("sha256")
+			.update(String(summary.provenance.run_token ?? ""))
+			.digest("hex")}` === envelope.provenance_binding_token_hash
+	);
 }
 
 async function validateFreshVerifierProvenance(
@@ -842,8 +1147,15 @@ export async function computeDelta(
 	slug: string,
 	iteration: number,
 ): Promise<MissionDelta> {
+	const mission = await loadMission(repoRoot, slug);
 	const current = await readJsonFile<MissionLaneSummary>(
-		laneSummaryPath(repoRoot, slug, iteration, "re_audit"),
+		laneSummaryPath(
+			repoRoot,
+			slug,
+			iteration,
+			"re_audit",
+			mission.active_candidate_id,
+		),
 	);
 	const previousLatestFile = latestPath(repoRoot, slug);
 	let previousSummary: MissionLaneSummary | null = null;
@@ -869,6 +1181,7 @@ async function readRequiredIterationSummaries(
 	repoRoot: string,
 	slug: string,
 	iteration: number,
+	candidateId?: string | null,
 ): Promise<MissionIterationSummaries> {
 	const summaries = {
 		hardening: null,
@@ -876,11 +1189,18 @@ async function readRequiredIterationSummaries(
 
 	for (const laneType of MISSION_REQUIRED_LANE_TYPES) {
 		const summaryFile = laneSummaryPath(repoRoot, slug, iteration, laneType);
-		if (!existsSync(summaryFile)) {
+		const candidateSummaryFile = laneSummaryPath(
+			repoRoot,
+			slug,
+			iteration,
+			laneType,
+			candidateId,
+		);
+		if (!existsSync(candidateSummaryFile)) {
 			throw new Error(`missing_iteration_lane_summary:${laneType}`);
 		}
 		summaries[laneType] = (await readJsonFile<MissionLaneSummary>(
-			summaryFile,
+			candidateSummaryFile,
 		)) as MissionIterationSummaries[typeof laneType];
 	}
 
@@ -889,6 +1209,7 @@ async function readRequiredIterationSummaries(
 		slug,
 		iteration,
 		"hardening",
+		candidateId,
 	);
 	if (existsSync(hardeningSummaryFile)) {
 		summaries.hardening =
@@ -1014,6 +1335,7 @@ export async function commitIteration(
 		repoRoot,
 		slug,
 		iteration,
+		mission.active_candidate_id,
 	);
 	const verifier = laneSummaries.re_audit;
 	const delta = await computeDelta(repoRoot, slug, iteration);
@@ -1045,7 +1367,13 @@ export async function commitIteration(
 		updated_at: nowIso(),
 		current_stage: judgement.nextStatus === "running" ? "judging" : "idle",
 		latest_verdict: verifier.verdict,
-		latest_summary_path: laneSummaryPath(repoRoot, slug, iteration, "re_audit"),
+		latest_summary_path: laneSummaryPath(
+			repoRoot,
+			slug,
+			iteration,
+			"re_audit",
+			mission.active_candidate_id,
+		),
 		unchanged_iterations:
 			delta.severity_rollup.unchanged > 0 &&
 			delta.severity_rollup.improved === 0 &&
@@ -1069,7 +1397,13 @@ export async function commitIteration(
 		current_iteration: iteration,
 		latest_lane: "re_audit",
 		latest_verdict: verifier.verdict,
-		latest_summary_path: laneSummaryPath(repoRoot, slug, iteration, "re_audit"),
+		latest_summary_path: laneSummaryPath(
+			repoRoot,
+			slug,
+			iteration,
+			"re_audit",
+			mission.active_candidate_id,
+		),
 		updated_at: nextMission.updated_at,
 	};
 

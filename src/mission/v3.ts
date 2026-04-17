@@ -6,7 +6,7 @@ import { basename, dirname, extname, join, relative } from "node:path";
 import { writeAtomic } from "../team/state/io.js";
 import type { MissionLaneSummary, MissionLaneType } from "./contracts.js";
 import { MISSION_LANE_TYPES } from "./contracts.js";
-import type { MissionSafetyBaseline, MissionState } from "./kernel.js";
+import { loadMission, type MissionSafetyBaseline, type MissionState } from "./kernel.js";
 import type {
 	MissionNormalizedSource,
 	MissionOrchestrationArtifactPaths,
@@ -111,6 +111,16 @@ export const MISSION_V3_CANDIDATE_STATES = [
 export type MissionV3CandidateStateValue =
 	(typeof MISSION_V3_CANDIDATE_STATES)[number];
 
+export const MISSION_V3_LEARNING_PROPOSAL_STATES = [
+	"captured",
+	"shadow_evaluated",
+	"approved_for_rollout",
+	"rejected",
+	"superseded",
+] as const;
+export type MissionV3LearningProposalState =
+	(typeof MISSION_V3_LEARNING_PROPOSAL_STATES)[number];
+
 export const MISSION_V3_PROOF_LANES = [
 	"reproduction",
 	"targeted-regression",
@@ -139,11 +149,14 @@ export interface MissionV3ArtifactPaths {
 	checkerLockPath: string;
 	contractAmendmentsPath: string;
 	environmentContractPath: string;
+	setupRunsPath: string;
 	environmentAttestationsPath: string;
 	runtimeObservationsPath: string;
+	secretGrantsPath: string;
 	environmentCurrentPath: string;
 	policyDecisionsPath: string;
 	policySnapshotPath: string;
+	laneCapabilityMatrixPath: string;
 	qualityWatchdogPath: string;
 	evidenceEventsPath: string;
 	laneRunsPath: string;
@@ -152,6 +165,11 @@ export interface MissionV3ArtifactPaths {
 	evidenceGraphPath: string;
 	promotionEventsPath: string;
 	promotionDecisionPath: string;
+	rollbackPlanPath: string;
+	observabilityDeltaPath: string;
+	releaseNotesPath: string;
+	handoffSummaryPath: string;
+	vcsTracePath: string;
 	decisionLogPath: string;
 	uncertaintyEventsPath: string;
 	uncertaintyRegisterPath: string;
@@ -160,6 +178,7 @@ export interface MissionV3ArtifactPaths {
 	currentContextSnapshotPath: string;
 	statusLedgerPath: string;
 	candidateTournamentPath: string;
+	candidateSchedulerPath: string;
 	adjudicationPath: string;
 	releaseRecordPath: string;
 	handoffRecordPath: string;
@@ -168,6 +187,9 @@ export interface MissionV3ArtifactPaths {
 	evalBundlePath: string;
 	postmortemPath: string;
 	learningProposalsDir: string;
+	learningCurrentPath: string;
+	shadowEvalPath: string;
+	heldOutEvalPath: string;
 	candidatesDir: string;
 	activeCandidateDir: string;
 	activeCandidateStatePath: string;
@@ -439,6 +461,52 @@ export interface MissionV3ContractAmendmentOptions {
 	affectedPolicyClauseIds?: string[];
 }
 
+export interface MissionV3LearningProposal {
+	schema_version: 1;
+	generated_at: string;
+	proposal_id: string;
+	mission_id: string;
+	state: MissionV3LearningProposalState;
+	target_surface: string;
+	rationale: string;
+	shadow_eval_required: boolean;
+	held_out_eval_required: boolean;
+	approval_required: boolean;
+	source_trace_ref: string;
+	source_eval_ref: string;
+	latest_shadow_eval_ref?: string | null;
+	latest_held_out_eval_ref?: string | null;
+	history?: Array<{
+		state: MissionV3LearningProposalState;
+		recorded_at: string;
+		actor: string;
+		note: string;
+	}>;
+	rollout_path: {
+		current_state: MissionV3LearningProposalState;
+		valid_states: MissionV3LearningProposalState[];
+		next_allowed_states: MissionV3LearningProposalState[];
+		audit_trail_refs: string[];
+		runtime_effect_blocked_until: string[];
+	};
+}
+
+export interface MissionV3LearningStateTransitionOptions {
+	repoRoot: string;
+	slug: string;
+	actor: string;
+	nextState: MissionV3LearningProposalState;
+	note: string;
+}
+
+export interface MissionV3LearningEvalOptions {
+	repoRoot: string;
+	slug: string;
+	actor: string;
+	summary: string;
+	findings?: string[];
+}
+
 type MissionV3ContractTarget =
 	| "assurance-contract"
 	| "proof-program"
@@ -464,6 +532,13 @@ interface MissionV3JournalEvent<T = Record<string, unknown>> {
 	payload: T;
 }
 
+interface MissionV3JournalMetadata {
+	schema_version: 1;
+	last_sequence: number;
+	last_event_hash: string | null;
+	known_idempotency_keys: string[];
+}
+
 function nowIso(): string {
 	return new Date().toISOString();
 }
@@ -485,7 +560,25 @@ function journalEventId(params: {
 }
 
 function stableJson(value: unknown): string {
-	return JSON.stringify(value);
+	return JSON.stringify(canonicalizeJson(value));
+}
+
+function canonicalizeJson(value: unknown): unknown {
+	if (Array.isArray(value)) {
+		return value.map((entry) => canonicalizeJson(entry));
+	}
+	if (value && typeof value === "object") {
+		return Object.keys(value as Record<string, unknown>)
+			.sort((left, right) => left.localeCompare(right))
+			.reduce<Record<string, unknown>>((result, key) => {
+				const entry = (value as Record<string, unknown>)[key];
+				if (entry !== undefined) {
+					result[key] = canonicalizeJson(entry);
+				}
+				return result;
+			}, {});
+	}
+	return value;
 }
 
 function missionStatePath(missionRoot: string): string {
@@ -520,8 +613,14 @@ async function hashFile(filePath: string): Promise<string | null> {
 	return `sha256:${hashValue(await readFile(filePath, "utf-8"))}`;
 }
 
-function eventHash(event: MissionV3JournalEvent): string {
+function eventHash<T = Record<string, unknown>>(
+	event: MissionV3JournalEvent<T>,
+): string {
 	return `sha256:${hashValue(stableJson(event))}`;
+}
+
+function journalMetadataPath(filePath: string): string {
+	return `${filePath}.meta.json`;
 }
 
 function parseJournal<T>(content: string): {
@@ -556,8 +655,122 @@ function serializeJournal<T>(events: MissionV3JournalEvent<T>[]): string {
 async function loadJournal<T>(
 	filePath: string,
 ): Promise<MissionV3JournalEvent<T>[]> {
-	if (!existsSync(filePath)) return [];
-	return parseJournal<T>(await readFile(filePath, "utf-8")).events;
+	return (await readJournalState<T>(filePath)).events;
+}
+
+async function loadJournalMetadata(
+	filePath: string,
+): Promise<MissionV3JournalMetadata | null> {
+	const metaPath = journalMetadataPath(filePath);
+	if (!existsSync(metaPath)) return null;
+	return readJson<MissionV3JournalMetadata>(metaPath);
+}
+
+function buildJournalMetadata<T>(
+	events: MissionV3JournalEvent<T>[],
+): MissionV3JournalMetadata {
+	return {
+		schema_version: 1,
+		last_sequence: events.at(-1)?.sequence ?? 0,
+		last_event_hash: events.at(-1) ? eventHash(events.at(-1)!) : null,
+		known_idempotency_keys: events.map((event) => event.idempotency_key),
+	};
+}
+
+async function quarantineCorruptedJournal(
+	filePath: string,
+	rawContent: string,
+	reason: string,
+): Promise<string> {
+	const quarantineDir = join(dirname(filePath), ".quarantine");
+	await mkdir(quarantineDir, { recursive: true });
+	const quarantinedPath = join(
+		quarantineDir,
+		`${basename(filePath)}.${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}.${shortHash(reason)}.corrupt`,
+	);
+	await writeText(
+		quarantinedPath,
+		rawContent.endsWith("\n") ? rawContent : `${rawContent}\n`,
+	);
+	return quarantinedPath;
+}
+
+function verifyJournalIntegrity<T>(events: MissionV3JournalEvent<T>[]): {
+	validEvents: MissionV3JournalEvent<T>[];
+	corrupted: boolean;
+	reason: string | null;
+} {
+	const validEvents: MissionV3JournalEvent<T>[] = [];
+	for (const event of events) {
+		const expectedSequence = validEvents.length + 1;
+		if (event.sequence !== expectedSequence) {
+			return {
+				validEvents,
+				corrupted: true,
+				reason: `sequence_mismatch:${event.event_id}:${event.sequence}:${expectedSequence}`,
+			};
+		}
+		const expectedPrevHash =
+			validEvents.length > 0 ? eventHash(validEvents.at(-1)!) : null;
+		if (event.prev_event_hash !== expectedPrevHash) {
+			return {
+				validEvents,
+				corrupted: true,
+				reason: `prev_hash_mismatch:${event.event_id}`,
+			};
+		}
+		const expectedPayloadHash = `sha256:${hashValue(stableJson(event.payload))}`;
+		if (event.payload_hash !== expectedPayloadHash) {
+			return {
+				validEvents,
+				corrupted: true,
+				reason: `payload_hash_mismatch:${event.event_id}`,
+			};
+		}
+		validEvents.push(event);
+	}
+	return {
+		validEvents,
+		corrupted: false,
+		reason: null,
+	};
+}
+
+async function readJournalState<T>(filePath: string): Promise<{
+	events: MissionV3JournalEvent<T>[];
+	truncatedTail: boolean;
+	quarantinedPath: string | null;
+}> {
+	if (!existsSync(filePath)) {
+		return {
+			events: [],
+			truncatedTail: false,
+			quarantinedPath: null,
+		};
+	}
+	const rawContent = await readFile(filePath, "utf-8");
+	const parsed = parseJournal<T>(rawContent);
+	const verified = verifyJournalIntegrity(parsed.events);
+	let quarantinedPath: string | null = null;
+	if (parsed.truncatedTail || verified.corrupted) {
+		if (verified.corrupted && rawContent.trim()) {
+			quarantinedPath = await quarantineCorruptedJournal(
+				filePath,
+				rawContent,
+				verified.reason ?? "journal_corruption_detected",
+			);
+		}
+		await writeText(filePath, serializeJournal(verified.validEvents));
+	}
+	await writeJson(
+		journalMetadataPath(filePath),
+		buildJournalMetadata(verified.validEvents),
+	);
+	return {
+		events: verified.validEvents,
+		truncatedTail: parsed.truncatedTail,
+		quarantinedPath,
+	};
 }
 
 function stripContractVolatileFields<T extends object>(
@@ -639,18 +852,19 @@ async function appendJournalEvent<T extends object>(
 		recoveryGenerated?: boolean;
 	},
 ): Promise<MissionV3JournalEvent<T>> {
-	if (existsSync(filePath)) {
-		const parsed = parseJournal<T>(await readFile(filePath, "utf-8"));
-		if (parsed.truncatedTail) {
-			await writeText(filePath, serializeJournal(parsed.events));
-		}
-		const duplicate = parsed.events.find(
+	let metadata = await loadJournalMetadata(filePath);
+	if (!metadata && existsSync(filePath)) {
+		await readJournalState<T>(filePath);
+		metadata = await loadJournalMetadata(filePath);
+	}
+	if (metadata?.known_idempotency_keys.includes(input.idempotencyKey)) {
+		const duplicate = (await loadJournal<T>(filePath)).find(
 			(event) => event.idempotency_key === input.idempotencyKey,
 		);
 		if (duplicate) return duplicate;
 	}
-	const existing = await loadJournal<T>(filePath);
-	const previous = existing.at(-1);
+	const previousHash = metadata?.last_event_hash ?? null;
+	const previousSequence = metadata?.last_sequence ?? 0;
 	const recordedAt = input.recordedAt ?? nowIso();
 	const payloadHash = `sha256:${hashValue(stableJson(input.payload))}`;
 	const next: MissionV3JournalEvent<T> = {
@@ -661,7 +875,7 @@ async function appendJournalEvent<T extends object>(
 		}),
 		schema_version: 1,
 		journal_type: input.journalType,
-		sequence: (previous?.sequence ?? 0) + 1,
+		sequence: previousSequence + 1,
 		recorded_at: recordedAt,
 		mission_id: input.missionId,
 		candidate_id: input.candidateId ?? undefined,
@@ -670,14 +884,21 @@ async function appendJournalEvent<T extends object>(
 		causation_ref: input.causationRef ?? null,
 		correlation_ref: input.correlationRef ?? null,
 		idempotency_key: input.idempotencyKey,
-		prev_event_hash: previous
-			? eventHash(previous as MissionV3JournalEvent)
-			: null,
+		prev_event_hash: previousHash,
 		payload_hash: payloadHash,
 		recovery_generated: input.recoveryGenerated,
 		payload: input.payload,
 	};
 	await appendFile(filePath, `${JSON.stringify(next)}\n`, "utf-8");
+	const nextMetadata: MissionV3JournalMetadata = {
+		schema_version: 1,
+		last_sequence: next.sequence,
+		last_event_hash: eventHash(next),
+		known_idempotency_keys: Array.from(
+			new Set([...(metadata?.known_idempotency_keys ?? []), input.idempotencyKey]),
+		),
+	};
+	await writeJson(journalMetadataPath(filePath), nextMetadata);
 	return next;
 }
 
@@ -881,6 +1102,58 @@ function requiredProofLanes(
 	return Array.from(new Set(lanes));
 }
 
+type MissionV3ProofLaneCapability = "implemented" | "synthetic" | "planned";
+
+function proofLaneCapability(
+	lane: MissionV3ProofLane,
+): MissionV3ProofLaneCapability {
+	switch (lane) {
+		case "reproduction":
+		case "targeted-regression":
+		case "impacted-tests":
+		case "static-analysis":
+		case "security":
+		case "release-smoke":
+		case "adjudication":
+			return "implemented";
+		case "ui-vision":
+		case "migration":
+		case "property-checks":
+			return "synthetic";
+		default:
+			return "planned";
+	}
+}
+
+function buildLaneCapabilityMatrix(
+	profile: MissionV3PolicyProfile,
+): {
+	schema_version: 1;
+	generated_at: string;
+	profile: MissionV3PolicyProfile;
+	lanes: Array<{
+		proof_lane: MissionV3ProofLane;
+		capability: MissionV3ProofLaneCapability;
+		blocking_in_current_profile: boolean;
+	}>;
+} {
+	const required = new Set(requiredProofLanes(profile));
+	return {
+		schema_version: 1,
+		generated_at: nowIso(),
+		profile,
+		lanes: MISSION_V3_PROOF_LANES.map((lane) => {
+			const capability = proofLaneCapability(lane);
+			return {
+				proof_lane: lane,
+				capability,
+				blocking_in_current_profile:
+					required.has(lane) && capability === "implemented",
+			};
+		}),
+	};
+}
+
 function buildAssuranceContract(
 	mission: MissionState,
 	artifacts: MissionOrchestrationArtifacts,
@@ -889,16 +1162,18 @@ function buildAssuranceContract(
 ): MissionV3AssuranceContract {
 	const obligations: MissionV3Obligation[] = requiredProofLanes(profile).map(
 		(lane) => {
+			const capability = proofLaneCapability(lane);
 			const base = {
 				freshness_ttl_seconds:
 					lane === "release-smoke" ? 600 : lane === "adjudication" ? 300 : 900,
 				required_env_profile: "mission-default",
-				waiver_allowed: lane !== "adjudication",
+				waiver_allowed: lane !== "adjudication" && capability !== "planned",
 				waiver_authority:
 					profile.autonomy_profile === "max-auto"
 						? "mission-auto-policy"
 						: "operator-review",
-				blocking_severity: "blocking" as const,
+				blocking_severity:
+					capability === "implemented" ? ("blocking" as const) : ("advisory" as const),
 			};
 			const obligationId = `obl:${lane}`;
 			switch (lane) {
@@ -1088,7 +1363,7 @@ function buildCheckerLock(
 					checker_version: "1",
 					runner_class: "impact-analysis",
 					expected_output_schema: "impact-map/v1",
-					allowed_command_templates: ["impact-map:derive"],
+					allowed_command_templates: ["impact-map:derive", "tests:impacted"],
 					required_capabilities: ["repo-read"],
 					required_env_profile: "mission-default",
 					allowed_source_trust_inputs: sourceTrustInputs,
@@ -1113,7 +1388,7 @@ function buildCheckerLock(
 					checker_version: "1",
 					runner_class: "policy-evaluator",
 					expected_output_schema: "policy-snapshot/v1",
-					allowed_command_templates: ["policy:security"],
+					allowed_command_templates: ["policy:security", "security:scan"],
 					required_capabilities: ["policy-read"],
 					required_env_profile: "mission-default",
 					allowed_source_trust_inputs: sourceTrustInputs,
@@ -1191,6 +1466,37 @@ function buildCheckerLock(
 		profile,
 		checkers,
 	};
+}
+
+function proofLaneCommandTemplates(
+	lane: MissionV3ProofLane,
+): string[] {
+	switch (lane) {
+		case "reproduction":
+			return ["lane-summary:audit"];
+		case "targeted-regression":
+			return ["lane-summary:re_audit"];
+		case "impacted-tests":
+			return ["impact-map:derive", "tests:impacted"];
+		case "static-analysis":
+			return ["focused-checks:green"];
+		case "security":
+			return ["policy:security", "security:scan"];
+		case "ui-vision":
+			return ["impact-map:ui"];
+		case "migration":
+			return ["environment:migration"];
+		case "release-smoke":
+			return ["promotion:release-smoke"];
+		case "property-checks":
+			return ["evidence:property-checks"];
+		case "adjudication":
+			return ["adjudication:derive"];
+		case "full-suite":
+			return ["tests:full-suite"];
+		case "performance":
+			return ["performance:smoke"];
+	}
 }
 
 async function buildEnvironmentContract(
@@ -1273,10 +1579,8 @@ function buildProofProgram(
 			lane,
 			checkerLock.checkers
 				.filter((checker) =>
-					checker.allowed_command_templates.some(
-						(template) =>
-							template.includes(lane) ||
-							(template.includes("adjudication") && lane === "adjudication"),
+					checker.allowed_command_templates.some((template) =>
+						proofLaneCommandTemplates(lane).includes(template),
 					),
 				)
 				.map((checker) => checker.checker_id),
@@ -1287,7 +1591,7 @@ function buildProofProgram(
 		obligation_id: obligation.obligation_id,
 		proof_lane: obligation.required_lane,
 		checker_refs: checkerByLane.get(obligation.required_lane) ?? [],
-		command_refs: [`command:${obligation.required_lane}`],
+		command_refs: proofLaneCommandTemplates(obligation.required_lane),
 		flake_reruns: obligation.required_lane === "targeted-regression" ? 1 : 0,
 		fail_closed: obligation.blocking_severity === "blocking",
 		admissible_evidence_kinds: obligation.required_evidence_kinds,
@@ -1341,14 +1645,17 @@ export function missionV3ArtifactPaths(
 		checkerLockPath: join(missionRoot, "checker-lock.json"),
 		contractAmendmentsPath: join(missionRoot, "contract-amendments.ndjson"),
 		environmentContractPath: join(missionRoot, "environment-contract.json"),
+		setupRunsPath: join(missionRoot, "setup-runs.ndjson"),
 		environmentAttestationsPath: join(
 			missionRoot,
 			"environment-attestations.ndjson",
 		),
 		runtimeObservationsPath: join(missionRoot, "runtime-observations.ndjson"),
+		secretGrantsPath: join(missionRoot, "secret-grants.ndjson"),
 		environmentCurrentPath: join(missionRoot, "environment-current.json"),
 		policyDecisionsPath: join(missionRoot, "policy-decisions.ndjson"),
 		policySnapshotPath: join(missionRoot, "policy-snapshot.json"),
+		laneCapabilityMatrixPath: join(missionRoot, "lane-capability-matrix.json"),
 		qualityWatchdogPath: join(missionRoot, "quality-watchdog.json"),
 		evidenceEventsPath: join(missionRoot, "evidence-events.ndjson"),
 		laneRunsPath: join(missionRoot, "lane-runs.ndjson"),
@@ -1357,6 +1664,11 @@ export function missionV3ArtifactPaths(
 		evidenceGraphPath: join(missionRoot, "evidence-graph.json"),
 		promotionEventsPath: join(missionRoot, "promotion-events.ndjson"),
 		promotionDecisionPath: join(missionRoot, "promotion-decision.json"),
+		rollbackPlanPath: join(missionRoot, "rollback-plan.md"),
+		observabilityDeltaPath: join(missionRoot, "observability-delta.md"),
+		releaseNotesPath: join(missionRoot, "release-notes.md"),
+		handoffSummaryPath: join(missionRoot, "handoff-summary.md"),
+		vcsTracePath: join(missionRoot, "vcs-trace.json"),
 		decisionLogPath: join(missionRoot, "decision-log.ndjson"),
 		uncertaintyEventsPath: join(missionRoot, "uncertainty-events.ndjson"),
 		uncertaintyRegisterPath: join(missionRoot, "uncertainty-register.json"),
@@ -1369,6 +1681,7 @@ export function missionV3ArtifactPaths(
 		),
 		statusLedgerPath: join(missionRoot, "status-ledger.md"),
 		candidateTournamentPath: join(missionRoot, "candidate-tournament.json"),
+		candidateSchedulerPath: join(missionRoot, "candidate-scheduler.json"),
 		adjudicationPath: join(missionRoot, "adjudication.json"),
 		releaseRecordPath: join(missionRoot, "release-record.json"),
 		handoffRecordPath: join(missionRoot, "handoff-record.json"),
@@ -1377,6 +1690,9 @@ export function missionV3ArtifactPaths(
 		evalBundlePath: join(tracesDir, "eval-bundle.json"),
 		postmortemPath: join(tracesDir, "postmortem.md"),
 		learningProposalsDir,
+		learningCurrentPath: join(learningProposalsDir, "current.json"),
+		shadowEvalPath: join(learningProposalsDir, "shadow-eval.json"),
+		heldOutEvalPath: join(learningProposalsDir, "held-out-eval.json"),
 		candidatesDir,
 		activeCandidateDir,
 		activeCandidateStatePath: join(activeCandidateDir, "candidate-state.json"),
@@ -1399,8 +1715,10 @@ async function ensureV3Layout(paths: MissionV3ArtifactPaths): Promise<void> {
 	await mkdir(paths.learningProposalsDir, { recursive: true });
 	for (const filePath of [
 		paths.contractAmendmentsPath,
+		paths.setupRunsPath,
 		paths.environmentAttestationsPath,
 		paths.runtimeObservationsPath,
+		paths.secretGrantsPath,
 		paths.policyDecisionsPath,
 		paths.evidenceEventsPath,
 		paths.laneRunsPath,
@@ -1633,6 +1951,14 @@ function applyMissionV3PolicyWaivers(
 	);
 }
 
+function policyWaiverAuthority(
+	profile: MissionV3PolicyProfile,
+): string {
+	return profile.autonomy_profile === "max-auto"
+		? "mission-auto-policy"
+		: "operator-review";
+}
+
 async function missionV3ContractAmendmentIndex(
 	paths: MissionV3ArtifactPaths,
 ): Promise<{
@@ -1785,11 +2111,14 @@ async function appendMissionV3CandidateEvent(params: {
 	);
 }
 
-function promotionArtifactEntries(paths: MissionV3ArtifactPaths): Array<{
+function promotionArtifactEntries(
+	paths: MissionV3ArtifactPaths,
+	profile: MissionV3PolicyProfile,
+): Array<{
 	name: string;
 	path: string;
 }> {
-	return [
+	const baseEntries = [
 		{
 			name: "assurance-contract.json",
 			path: paths.assuranceContractPath,
@@ -1810,15 +2139,52 @@ function promotionArtifactEntries(paths: MissionV3ArtifactPaths): Array<{
 			name: "adjudication.json",
 			path: paths.adjudicationPath,
 		},
+		{
+			name: "release-notes.md",
+			path: paths.releaseNotesPath,
+		},
+		{
+			name: "handoff-summary.md",
+			path: paths.handoffSummaryPath,
+		},
+		{
+			name: "vcs-trace.json",
+			path: paths.vcsTracePath,
+		},
 	];
+	if (
+		[
+			"cross-cutting-refactor",
+			"security-sensitive",
+			"migration-sensitive",
+			"release-blocking",
+		].includes(profile.risk_class)
+	) {
+		baseEntries.push({
+			name: "rollback-plan.md",
+			path: paths.rollbackPlanPath,
+		});
+	}
+	if (
+		["security-sensitive", "migration-sensitive", "release-blocking"].includes(
+			profile.risk_class,
+		)
+	) {
+		baseEntries.push({
+			name: "observability-delta.md",
+			path: paths.observabilityDeltaPath,
+		});
+	}
+	return baseEntries;
 }
 
 function missingPromotionArtifacts(
 	paths: MissionV3ArtifactPaths,
+	profile: MissionV3PolicyProfile,
 	knownPresentPaths: string[] = [],
 ): string[] {
 	const knownPresent = new Set(knownPresentPaths);
-	return promotionArtifactEntries(paths)
+	return promotionArtifactEntries(paths, profile)
 		.filter((entry) => !knownPresent.has(entry.path) && !existsSync(entry.path))
 		.map((entry) => entry.name);
 }
@@ -1995,6 +2361,7 @@ async function buildEnvironmentCurrent(
 	paths: MissionV3ArtifactPaths,
 	environmentContract: MissionV3EnvironmentContract,
 ): Promise<MissionV3EnvironmentCurrent> {
+	const setupRuns = await loadJournal<Record<string, unknown>>(paths.setupRunsPath);
 	const attestations = await loadJournal<Record<string, unknown>>(
 		paths.environmentAttestationsPath,
 	);
@@ -2014,6 +2381,13 @@ async function buildEnvironmentCurrent(
 	if (!latestAttestation || !attestationPayload) {
 		parity = "broken";
 		blockerReason = "missing environment attestation";
+	} else if (
+		!(
+			setupRuns.at(-1)?.payload as { success?: boolean } | undefined
+		)?.success
+	) {
+		parity = "broken";
+		blockerReason = "missing successful environment setup run";
 	} else if (
 		attestationPayload.achieved_hash !==
 		environmentContract.declared_environment_hash
@@ -2075,6 +2449,297 @@ function missionLaneToProofLane(
 		default:
 			return null;
 	}
+}
+
+function secretScopesForLane(
+	laneType: MissionLaneType | "commit" | "derived",
+	proofLane: MissionV3ProofLane | null,
+): string[] {
+	if (proofLane === "migration") return ["setup:toolchain"];
+	if (laneType === "audit" || laneType === "re_audit") {
+		return ["verifier:read-only"];
+	}
+	return ["runtime:mission"];
+}
+
+function activeSourceTrustClasses(
+	sourceTrustSummary: Record<MissionV3SourceTrustClass, number>,
+): MissionV3SourceTrustClass[] {
+	return MISSION_V3_SOURCE_TRUST_CLASSES.filter(
+		(trustClass) => (sourceTrustSummary[trustClass] ?? 0) > 0,
+	);
+}
+
+export async function assertMissionV3ExecutionAllowed(params: {
+	mission: MissionState;
+	paths: MissionV3ArtifactPaths;
+	candidate: MissionV3CandidateState;
+	proofProgram: MissionV3ProofProgram;
+	checkerLock: MissionV3CheckerLock;
+	environmentContract: MissionV3EnvironmentContract;
+	sourceTrustSummary: Record<MissionV3SourceTrustClass, number>;
+	laneType: MissionLaneType | "commit" | "derived";
+	proofLane: MissionV3ProofLane | null;
+	commandRef: string;
+	writeScope: string;
+	networkMode: string;
+	secretScopes: string[];
+	actorPrincipal: string;
+	idempotencyKey: string;
+}): Promise<{
+	binding: MissionV3ProofBinding | null;
+	checkers: MissionV3CheckerLockEntry[];
+}> {
+	const missionRootScope = relative(
+		params.mission.repo_root,
+		params.mission.mission_root,
+	);
+	const allowedWriteScopes = [
+		missionRootScope,
+		relative(params.mission.repo_root, params.candidate.workspace_root),
+	];
+	if (
+		!allowedWriteScopes.some(
+			(scope) =>
+				params.writeScope === scope || params.writeScope.startsWith(`${scope}/`),
+		)
+	) {
+		throw new Error(
+			`mission_v3_policy_path_blocked:${params.laneType}:${params.writeScope}`,
+		);
+	}
+	if (
+		params.networkMode !== "repo-local" &&
+		![
+			...params.environmentContract.setup_network_allowlist,
+			...params.environmentContract.runtime_network_allowlist,
+		].includes(params.networkMode)
+	) {
+		throw new Error(
+			`mission_v3_policy_network_blocked:${params.laneType}:${params.networkMode}`,
+		);
+	}
+	for (const secretScope of params.secretScopes) {
+		if (
+			!params.environmentContract.declared_secret_scopes.includes(secretScope)
+		) {
+			throw new Error(
+				`mission_v3_secret_scope_undeclared:${params.laneType}:${secretScope}`,
+			);
+		}
+	}
+	if (params.secretScopes.length > 0) {
+		await appendJournalEvent(params.paths.secretGrantsPath, {
+			journalType: "secret-grants",
+			missionId: params.mission.mission_id,
+			candidateId: params.candidate.candidate_id,
+			actorPrincipal: params.actorPrincipal,
+			idempotencyKey: `secret-grant:${params.idempotencyKey}`,
+			payload: {
+				candidate_id: params.candidate.candidate_id,
+				lane_type: params.laneType,
+				proof_lane: params.proofLane,
+				secret_scopes: params.secretScopes,
+				write_scope: params.writeScope,
+			},
+		});
+	}
+	if (!params.proofLane) {
+		return {
+			binding: null,
+			checkers: [],
+		};
+	}
+	const binding =
+		params.proofProgram.bindings.find(
+			(entry) => entry.proof_lane === params.proofLane,
+		) ?? null;
+	if (!binding) {
+		throw new Error(
+			`mission_v3_proof_binding_missing:${params.proofLane}:${params.laneType}`,
+		);
+	}
+	if (!binding.command_refs.includes(params.commandRef)) {
+		throw new Error(
+			`mission_v3_proof_command_ref_mismatch:${params.proofLane}:${params.commandRef}`,
+		);
+	}
+	const checkers = binding.checker_refs.map((checkerId) => {
+		const checker = params.checkerLock.checkers.find(
+			(entry) => entry.checker_id === checkerId,
+		);
+		if (!checker) {
+			throw new Error(`mission_v3_checker_lock_missing:${checkerId}`);
+		}
+		return checker;
+	});
+	const activeTrustClasses = activeSourceTrustClasses(params.sourceTrustSummary);
+	for (const checker of checkers) {
+		if (
+			!checker.allowed_command_templates.includes(params.commandRef)
+		) {
+			throw new Error(
+				`mission_v3_checker_command_forbidden:${checker.checker_id}:${params.commandRef}`,
+			);
+		}
+		const disallowedTrust = activeTrustClasses.filter(
+			(trustClass) =>
+				!checker.allowed_source_trust_inputs.includes(trustClass),
+		);
+		if (disallowedTrust.length > 0) {
+			if (params.laneType === "derived") {
+				continue;
+			}
+			throw new Error(
+				`mission_v3_source_trust_forbidden:${params.proofLane}:${disallowedTrust.join(",")}`,
+			);
+		}
+	}
+	return {
+		binding,
+		checkers,
+	};
+}
+
+async function appendDerivedMissionV3ProofLaneEvidence(params: {
+	mission: MissionState;
+	paths: MissionV3ArtifactPaths;
+	candidate: MissionV3CandidateState;
+	proofProgram: MissionV3ProofProgram;
+	checkerLock: MissionV3CheckerLock;
+	environmentContract: MissionV3EnvironmentContract;
+	sourceTrustSummary: Record<MissionV3SourceTrustClass, number>;
+	proofLane: MissionV3ProofLane;
+	iteration: number;
+	seed: string;
+	verdict: "supporting" | "contradicting";
+	summary: string;
+	artifactRefs: string[];
+	evidenceKind: string;
+	actorPrincipal: string;
+}): Promise<MissionV3CandidateState> {
+	const commandRef = proofLaneCommandTemplates(params.proofLane)[0]!;
+	const writeScope = relative(
+		params.mission.repo_root,
+		join(
+			params.candidate.workspace_root,
+			"assurance",
+			"lane-results",
+			params.proofLane,
+		),
+	);
+	const { binding, checkers } = await assertMissionV3ExecutionAllowed({
+		mission: params.mission,
+		paths: params.paths,
+		candidate: params.candidate,
+		proofProgram: params.proofProgram,
+		checkerLock: params.checkerLock,
+		environmentContract: params.environmentContract,
+		sourceTrustSummary: params.sourceTrustSummary,
+		laneType: "derived",
+		proofLane: params.proofLane,
+		commandRef,
+		writeScope,
+		networkMode: "repo-local",
+		secretScopes: secretScopesForLane("derived", params.proofLane),
+		actorPrincipal: params.actorPrincipal,
+		idempotencyKey: `${params.candidate.candidate_id}:${params.proofLane}:${params.seed}`,
+	});
+	const now = nowIso();
+	const laneRunId = `lane-run:${params.candidate.candidate_id}:${params.iteration}:${params.proofLane}:${shortHash(params.seed)}`;
+	const command = await appendJournalEvent(params.paths.commandAttestationsPath, {
+		journalType: "command-attestations",
+		missionId: params.mission.mission_id,
+		candidateId: params.candidate.candidate_id,
+		laneId: `${params.proofLane}:${params.iteration}`,
+		actorPrincipal: params.actorPrincipal,
+		idempotencyKey: `derived-command:${params.candidate.candidate_id}:${params.proofLane}:${params.seed}`,
+		payload: {
+			command_attestation_id: `cmd:${params.proofLane}:${shortHash(params.seed)}`,
+			lane_run_id: laneRunId,
+			checker_id: checkers[0]?.checker_id ?? null,
+			command_ref: commandRef,
+			normalized_argv: [commandRef],
+			cwd: relative(params.mission.repo_root, params.candidate.workspace_root),
+			env_hash: params.environmentContract.declared_environment_hash,
+			network_mode: "repo-local",
+			write_scope: writeScope,
+			started_at: now,
+			completed_at: now,
+			exit_code: params.verdict === "supporting" ? 0 : 1,
+			stdout_hash: `sha256:${shortHash(
+				stableJson({
+					summary: params.summary,
+					artifacts: params.artifactRefs,
+				}),
+			)}`,
+			stderr_hash: null,
+			produced_artifact_hashes: params.artifactRefs.map((ref) =>
+				`sha256:${shortHash(ref)}`,
+			),
+		},
+	});
+	const laneRun = await appendJournalEvent(params.paths.laneRunsPath, {
+		journalType: "lane-runs",
+		missionId: params.mission.mission_id,
+		candidateId: params.candidate.candidate_id,
+		laneId: `${params.proofLane}:${params.iteration}`,
+		actorPrincipal: params.actorPrincipal,
+		idempotencyKey: `derived-lane-run:${params.candidate.candidate_id}:${params.proofLane}:${params.seed}`,
+		payload: {
+			lane_run_id: laneRunId,
+			candidate_id: params.candidate.candidate_id,
+			lane_type: params.proofLane,
+			source_lane_type: "derived",
+			proof_program_id: params.proofProgram.proof_program_id,
+			attempt_index: 1,
+			matrix_target: binding?.required_matrix_target ?? "matrix:local-node",
+			env_attestation_ref:
+				(await loadJournal(params.paths.environmentAttestationsPath)).at(-1)
+					?.event_id ?? null,
+			checker_refs: checkers.map((checker) => checker.checker_id),
+			started_at: now,
+			completed_at: now,
+			outcome: params.verdict === "supporting" ? "pass" : "fail",
+			exit_summary: params.summary,
+			produced_artifact_refs: params.artifactRefs,
+			command_attestation_refs: [command.event_id],
+			obligation_ids:
+				binding?.obligation_id != null ? [binding.obligation_id] : [],
+		},
+	});
+	const evidence = await appendJournalEvent(params.paths.evidenceEventsPath, {
+		journalType: "evidence-events",
+		missionId: params.mission.mission_id,
+		candidateId: params.candidate.candidate_id,
+		laneId: `${params.proofLane}:${params.iteration}`,
+		actorPrincipal: params.actorPrincipal,
+		idempotencyKey: `derived-evidence:${params.candidate.candidate_id}:${params.proofLane}:${params.seed}`,
+		payload: {
+			evidence_id: `evidence:${params.proofLane}:${shortHash(params.seed)}`,
+			candidate_id: params.candidate.candidate_id,
+			lane_run_ref: laneRun.event_id,
+			command_attestation_refs: [command.event_id],
+			obligation_ids:
+				binding?.obligation_id != null ? [binding.obligation_id] : [],
+			evidence_kind: params.evidenceKind,
+			verdict: params.verdict,
+			summary: params.summary,
+			artifact_refs: params.artifactRefs,
+			freshness_expires_at: addSeconds(
+				now,
+				binding?.freshness_ttl_seconds ?? 900,
+			),
+		},
+	});
+	return updateMissionV3CandidateState(params.candidate, {
+		latest_lane_run_refs: Array.from(
+			new Set([...params.candidate.latest_lane_run_refs, laneRun.event_id]),
+		).slice(-10),
+		latest_evidence_refs: Array.from(
+			new Set([...params.candidate.latest_evidence_refs, evidence.event_id]),
+		).slice(-10),
+	});
 }
 
 async function writeMissionState(mission: MissionState): Promise<void> {
@@ -2173,6 +2838,143 @@ async function buildImpactMap(
 			.filter((entry) => entry.test_refs.length === 0)
 			.map((entry) => entry.touchpoint),
 	};
+}
+
+async function reconcileMissionV3DerivedProofLanes(params: {
+	mission: MissionState;
+	paths: MissionV3ArtifactPaths;
+	profile: MissionV3PolicyProfile;
+	candidate: MissionV3CandidateState;
+	proofProgram: MissionV3ProofProgram;
+	checkerLock: MissionV3CheckerLock;
+	environmentContract: MissionV3EnvironmentContract;
+	policySnapshot: Awaited<ReturnType<typeof buildPolicySnapshot>>["snapshot"];
+	impactMap: Awaited<ReturnType<typeof buildImpactMap>>;
+	iteration: number;
+}): Promise<MissionV3CandidateState> {
+	let candidate = params.candidate;
+	for (const proofLane of requiredProofLanes(params.profile)) {
+		if (
+			!["impacted-tests", "security", "release-smoke"].includes(proofLane)
+		) {
+			continue;
+		}
+		if (proofLaneCapability(proofLane) !== "implemented") {
+			continue;
+		}
+		if (proofLane === "impacted-tests") {
+			const blindSpots = params.impactMap.unresolved_blind_spots;
+			const regressionSlice = params.impactMap.required_regression_slice;
+			candidate = await appendDerivedMissionV3ProofLaneEvidence({
+				mission: params.mission,
+				paths: params.paths,
+				candidate,
+				proofProgram: params.proofProgram,
+				checkerLock: params.checkerLock,
+				environmentContract: params.environmentContract,
+				sourceTrustSummary: params.policySnapshot.source_trust_summary,
+				proofLane,
+				iteration: params.iteration,
+				seed: stableJson({
+					regressionSlice,
+					blindSpots,
+				}),
+				verdict:
+					blindSpots.length === 0 ? "supporting" : "contradicting",
+				summary:
+					blindSpots.length === 0
+						? `Impacted regression slice covers ${regressionSlice.length} test target(s).`
+						: `Impacted regression slice still has blind spots: ${blindSpots.join(", ")}`,
+				artifactRefs: [
+					params.paths.impactMapPath,
+					...regressionSlice.map((ref) => join(params.mission.repo_root, ref)),
+				],
+				evidenceKind: "impact-map",
+				actorPrincipal: "mission-proof-lane:impacted-tests",
+			});
+		}
+		if (proofLane === "security") {
+			const securityBlockers = params.policySnapshot.clauses
+				.filter((clause) =>
+					["policy:source-trust", "policy:third-party-incorporation"].includes(
+						clause.clause_id,
+					),
+				)
+				.filter((clause) =>
+					["deny", "require_review", "require_waiver"].includes(clause.outcome),
+				)
+				.map((clause) => `${clause.clause_id}:${clause.outcome}`);
+			candidate = await appendDerivedMissionV3ProofLaneEvidence({
+				mission: params.mission,
+				paths: params.paths,
+				candidate,
+				proofProgram: params.proofProgram,
+				checkerLock: params.checkerLock,
+				environmentContract: params.environmentContract,
+				sourceTrustSummary: params.policySnapshot.source_trust_summary,
+				proofLane,
+				iteration: params.iteration,
+				seed: stableJson({
+					securityBlockers,
+					sourceTrustSummary: params.policySnapshot.source_trust_summary,
+				}),
+				verdict:
+					securityBlockers.length === 0 ? "supporting" : "contradicting",
+				summary:
+					securityBlockers.length === 0
+						? "Security policy scan found no blocking source-trust or third-party issues."
+						: `Security policy scan blocked by ${securityBlockers.join(", ")}`,
+				artifactRefs: [params.paths.policySnapshotPath],
+				evidenceKind: "policy_decision",
+				actorPrincipal: "mission-proof-lane:security",
+			});
+		}
+		if (proofLane === "release-smoke") {
+			const missingArtifacts = missingPromotionArtifacts(
+				params.paths,
+				params.profile,
+				[
+					params.paths.adjudicationPath,
+					params.paths.promotionDecisionPath,
+					params.paths.releaseNotesPath,
+					params.paths.handoffSummaryPath,
+					params.paths.vcsTracePath,
+					params.paths.rollbackPlanPath,
+					params.paths.observabilityDeltaPath,
+				],
+			);
+			candidate = await appendDerivedMissionV3ProofLaneEvidence({
+				mission: params.mission,
+				paths: params.paths,
+				candidate,
+				proofProgram: params.proofProgram,
+				checkerLock: params.checkerLock,
+				environmentContract: params.environmentContract,
+				sourceTrustSummary: params.policySnapshot.source_trust_summary,
+				proofLane,
+				iteration: params.iteration,
+				seed: stableJson({
+					parity: params.environmentContract.declared_environment_hash,
+					missingArtifacts,
+				}),
+				verdict:
+					missingArtifacts.length === 0 ? "supporting" : "contradicting",
+				summary:
+					missingArtifacts.length === 0
+						? "Release-smoke gate found the required promotion package footprint."
+						: `Release-smoke gate is waiting on ${missingArtifacts.join(", ")}`,
+				artifactRefs: [
+					params.paths.environmentContractPath,
+					params.paths.releaseNotesPath,
+					params.paths.handoffSummaryPath,
+					params.paths.vcsTracePath,
+				],
+				evidenceKind: "release_smoke",
+				actorPrincipal: "mission-proof-lane:release-smoke",
+			});
+		}
+	}
+	return candidate;
 }
 
 function evidenceForObligation(
@@ -2426,6 +3228,55 @@ async function buildEvidenceGraph(
 	};
 }
 
+async function buildCandidateAssuranceView(params: {
+	mission: MissionState;
+	candidateId: string | null;
+	assuranceContract: MissionV3AssuranceContract;
+	proofProgram: MissionV3ProofProgram;
+	environmentCurrent: MissionV3EnvironmentCurrent;
+	evidenceEvents: MissionV3JournalEvent<Record<string, unknown>>[];
+	policyBlockers: string[];
+	activeWaivers: MissionV3Waiver[];
+	contractAmendments: {
+		global: string | null;
+		byObligationId: Map<string, string>;
+	};
+	impactMap: Awaited<ReturnType<typeof buildImpactMap>>;
+}): Promise<{
+	evaluation: ReturnType<typeof evaluateObligations>;
+	evidenceGraph: Awaited<ReturnType<typeof buildEvidenceGraph>>;
+	adjudication: MissionV3Adjudication;
+}> {
+	const evaluation = evaluateObligations(
+		params.assuranceContract,
+		params.proofProgram,
+		params.candidateId,
+		params.environmentCurrent,
+		params.evidenceEvents,
+		params.policyBlockers,
+		params.activeWaivers,
+		params.contractAmendments,
+	);
+	const evidenceGraph = await buildEvidenceGraph(
+		params.mission,
+		params.assuranceContract,
+		evaluation,
+		params.impactMap,
+	);
+	const adjudication = buildAdjudication(
+		params.mission,
+		params.candidateId,
+		evaluation,
+		params.policyBlockers,
+		params.activeWaivers,
+	);
+	return {
+		evaluation,
+		evidenceGraph,
+		adjudication,
+	};
+}
+
 function buildAdjudication(
 	mission: MissionState,
 	candidateId: string | null,
@@ -2481,11 +3332,12 @@ function buildPromotionDecision(
 	adjudication: MissionV3Adjudication,
 	policyBlockers: string[],
 	paths: MissionV3ArtifactPaths,
+	profile: MissionV3PolicyProfile,
 ): MissionV3PromotionDecision {
-	const requiredArtifacts = promotionArtifactEntries(paths).map(
+	const requiredArtifacts = promotionArtifactEntries(paths, profile).map(
 		(entry) => entry.name,
 	);
-	const missingArtifacts = missingPromotionArtifacts(paths);
+	const missingArtifacts = missingPromotionArtifacts(paths, profile);
 	const reasons = [
 		...policyBlockers,
 		...missingArtifacts.map(
@@ -2629,49 +3481,47 @@ async function buildUncertaintyRegister(paths: MissionV3ArtifactPaths) {
 function buildCandidateTournament(
 	mission: MissionState,
 	candidates: MissionV3CandidateState[],
-	adjudication: MissionV3Adjudication,
+	candidateAdjudications: Map<string, MissionV3Adjudication>,
 	promotionDecision: MissionV3PromotionDecision,
 ) {
 	const selectedCandidateId = mission.selected_candidate_id ?? null;
-	const unresolvedRisk =
-		adjudication.blocking_contradictions.length +
-		adjudication.stale_evidence_summary.length +
-		adjudication.residual_risk_summary.length;
 	return {
 		schema_version: 1 as const,
 		generated_at: nowIso(),
 		mission_id: mission.mission_id,
 		selected_candidate_id: selectedCandidateId,
-		candidates: candidates.map((candidate) => ({
-			candidate_id: candidate.candidate_id,
-			state: candidate.state,
-			parent_candidate_ids: candidate.parent_candidate_ids,
-			hard_vetoes:
-				candidate.candidate_id === selectedCandidateId
-					? adjudication.blocking_contradictions
-					: staleCandidateStates().includes(candidate.state)
-						? ["candidate not writable"]
-						: [],
-			comparison_vector: {
-				proof_completeness:
-					candidate.candidate_id === selectedCandidateId &&
-					adjudication.proof_ready
-						? 1
-						: 0,
-				regression_safety:
-					candidate.candidate_id === selectedCandidateId &&
-					adjudication.blocking_contradictions.length === 0
-						? 1
-						: 0,
-				release_readiness:
-					candidate.candidate_id === selectedCandidateId &&
-					promotionDecision.decision === "allow"
-						? 1
-						: 0,
-				residual_uncertainty:
-					candidate.candidate_id === selectedCandidateId ? unresolvedRisk : 1,
-			},
-		})),
+		candidates: candidates.map((candidate) => {
+			const candidateAdjudication =
+				candidateAdjudications.get(candidate.candidate_id) ?? null;
+			const unresolvedRisk =
+				(candidateAdjudication?.blocking_contradictions.length ?? 0) +
+				(candidateAdjudication?.stale_evidence_summary.length ?? 0) +
+				(candidateAdjudication?.residual_risk_summary.length ?? 0);
+			return {
+				candidate_id: candidate.candidate_id,
+				state: candidate.state,
+				parent_candidate_ids: candidate.parent_candidate_ids,
+				hard_vetoes:
+					candidateAdjudication
+						? candidateAdjudication.blocking_contradictions
+						: staleCandidateStates().includes(candidate.state)
+							? ["candidate not writable"]
+							: [],
+				comparison_vector: {
+					proof_completeness: candidateAdjudication?.proof_ready ? 1 : 0,
+					regression_safety:
+						(candidateAdjudication?.blocking_contradictions.length ?? 1) === 0
+							? 1
+							: 0,
+					release_readiness:
+						candidate.candidate_id === selectedCandidateId &&
+						promotionDecision.decision === "allow"
+							? 1
+							: 0,
+					residual_uncertainty: unresolvedRisk,
+				},
+			};
+		}),
 		selection_strategy:
 			candidates.length > 1
 				? "structured-hard-veto-then-lexicographic"
@@ -2680,6 +3530,173 @@ function buildCandidateTournament(
 			candidates.length > 1
 				? "require explicit selection or hybridization"
 				: null,
+	};
+}
+
+function candidateDerivedPaths(candidate: MissionV3CandidateState) {
+	const assuranceDir = join(candidate.workspace_root, "assurance");
+	const contextDir = join(assuranceDir, "context");
+	return {
+		assuranceDir,
+		contextDir,
+		evidenceGraphPath: join(assuranceDir, "evidence-graph.json"),
+		adjudicationPath: join(assuranceDir, "adjudication.json"),
+		contextSnapshotPath: join(assuranceDir, "context-snapshot.json"),
+		statusLedgerPath: join(assuranceDir, "status-ledger.md"),
+	};
+}
+
+function buildCandidateScheduler(
+	mission: MissionState,
+	candidates: MissionV3CandidateState[],
+) {
+	return {
+		schema_version: 1 as const,
+		generated_at: nowIso(),
+		mission_id: mission.mission_id,
+		active_candidate_id: mission.active_candidate_id,
+		selected_candidate_id: mission.selected_candidate_id,
+		active_queue: candidates
+			.filter(
+				(candidate) =>
+					candidate.candidate_id === mission.active_candidate_id &&
+					candidateCanReceiveActiveWrites(candidate),
+			)
+			.map((candidate) => ({
+				candidate_id: candidate.candidate_id,
+				state: candidate.state,
+				workspace_root: candidate.workspace_root,
+			})),
+		pending_queue: candidates
+			.filter(
+				(candidate) =>
+					candidate.candidate_id !== mission.active_candidate_id &&
+					candidateCanReceiveActiveWrites(candidate),
+			)
+			.map((candidate) => ({
+				candidate_id: candidate.candidate_id,
+				state: candidate.state,
+				workspace_root: candidate.workspace_root,
+			})),
+		blocked_candidates: candidates
+			.filter((candidate) => !candidateCanReceiveActiveWrites(candidate))
+			.map((candidate) => ({
+				candidate_id: candidate.candidate_id,
+				state: candidate.state,
+			})),
+	};
+}
+
+function buildRollbackPlan(params: {
+	mission: MissionState;
+	promotionDecision: MissionV3PromotionDecision;
+}) {
+	return [
+		"# Mission V3 Rollback Plan",
+		"",
+		`- Mission ID: \`${params.mission.mission_id}\``,
+		`- Selected candidate: \`${params.mission.selected_candidate_id ?? "(none)"}\``,
+		"",
+		"## Trigger conditions",
+		"- Contradictory post-release proof",
+		"- Environment parity regression",
+		"- Policy blocker escalation after promotion",
+		"",
+		"## Actions",
+		"1. Freeze further candidate promotion actions.",
+		"2. Revert to the last verified candidate/worktree snapshot.",
+		"3. Re-run targeted-regression, security, and release-smoke lanes.",
+		"4. Capture the rollback decision in promotion-events and decision-log.",
+		"",
+		"## Current blockers",
+		params.promotionDecision.reasons.length > 0
+			? params.promotionDecision.reasons.map((reason) => `- ${reason}`).join("\n")
+			: "- None",
+	].join("\n");
+}
+
+function buildObservabilityDelta(params: {
+	mission: MissionState;
+	qualityWatchdog: ReturnType<typeof buildQualityWatchdog>;
+}) {
+	return [
+		"# Mission V3 Observability Delta",
+		"",
+		`- Mission ID: \`${params.mission.mission_id}\``,
+		"",
+		"## Signals to watch",
+		`- Unresolved blocking obligations: ${params.qualityWatchdog.metrics.unresolved_blocking_obligations}`,
+		`- Stale evidence count: ${params.qualityWatchdog.metrics.stale_evidence_count}`,
+		`- Contradiction count: ${params.qualityWatchdog.metrics.contradiction_count}`,
+		`- Policy exception count: ${params.qualityWatchdog.metrics.policy_exception_count}`,
+		"",
+		"## Escalation posture",
+		params.qualityWatchdog.reasons.length > 0
+			? params.qualityWatchdog.reasons.map((reason) => `- ${reason}`).join("\n")
+			: "- No additional escalation notes",
+	].join("\n");
+}
+
+function buildReleaseNotes(params: {
+	mission: MissionState;
+	adjudication: MissionV3Adjudication;
+	promotionDecision: MissionV3PromotionDecision;
+}) {
+	return [
+		"# Mission V3 Release Notes",
+		"",
+		`- Mission ID: \`${params.mission.mission_id}\``,
+		`- Lifecycle: \`${params.mission.lifecycle_state}\``,
+		`- Promotion decision: \`${params.promotionDecision.decision}\``,
+		"",
+		"## Proof status",
+		`- Proof ready: ${params.adjudication.proof_ready}`,
+		`- Blocking contradictions: ${params.adjudication.blocking_contradictions.length}`,
+		`- Stale evidence: ${params.adjudication.stale_evidence_summary.length}`,
+	].join("\n");
+}
+
+function buildHandoffSummary(params: {
+	mission: MissionState;
+	adjudication: MissionV3Adjudication;
+	uncertaintyRegister: Awaited<ReturnType<typeof buildUncertaintyRegister>>;
+}) {
+	return [
+		"# Mission V3 Handoff Summary",
+		"",
+		`- Mission ID: \`${params.mission.mission_id}\``,
+		`- Selected candidate: \`${params.mission.selected_candidate_id ?? "(none)"}\``,
+		`- Recommended next state: \`${params.adjudication.recommended_next_state}\``,
+		"",
+		"## Open uncertainties",
+		params.uncertaintyRegister.open_uncertainties.length > 0
+			? params.uncertaintyRegister.open_uncertainties
+					.map(
+						(item) => `- ${item.uncertainty_id}: ${item.statement}`,
+					)
+					.join("\n")
+			: "- None",
+	].join("\n");
+}
+
+function buildVcsTrace(params: {
+	mission: MissionState;
+	candidates: MissionV3CandidateState[];
+}) {
+	return {
+		schema_version: 1 as const,
+		generated_at: nowIso(),
+		mission_id: params.mission.mission_id,
+		selected_candidate_id: params.mission.selected_candidate_id,
+		active_candidate_id: params.mission.active_candidate_id,
+		latest_summary_path: params.mission.latest_summary_path,
+		candidates: params.candidates.map((candidate) => ({
+			candidate_id: candidate.candidate_id,
+			state: candidate.state,
+			workspace_root: candidate.workspace_root,
+			latest_lane_run_refs: candidate.latest_lane_run_refs,
+			latest_evidence_refs: candidate.latest_evidence_refs,
+		})),
 	};
 }
 
@@ -2932,10 +3949,8 @@ function buildLearningProposal(params: {
 	mission: MissionState;
 	adjudication: MissionV3Adjudication;
 	evalBundle: ReturnType<typeof buildEvalBundle>;
-}) {
-	const currentState = params.adjudication.proof_ready
-		? "shadow_evaluated"
-		: "captured";
+}): MissionV3LearningProposal {
+	const currentState: MissionV3LearningProposalState = "captured";
 	return {
 		schema_version: 1 as const,
 		generated_at: nowIso(),
@@ -2958,6 +3973,16 @@ function buildLearningProposal(params: {
 		approval_required: true,
 		source_trace_ref: "traces/trace-bundle.json",
 		source_eval_ref: "traces/eval-bundle.json",
+		latest_shadow_eval_ref: null,
+		latest_held_out_eval_ref: null,
+		history: [
+			{
+				state: currentState,
+				recorded_at: nowIso(),
+				actor: "mission-v3-learning",
+				note: "Initial learning proposal captured from trace/eval bundle synthesis.",
+			},
+		],
 		rollout_path: {
 			current_state: currentState,
 			valid_states: [
@@ -3016,18 +4041,53 @@ function buildPostmortem(params: {
 	].join("\n");
 }
 
+function allowedLearningNextStates(
+	state: MissionV3LearningProposalState,
+): MissionV3LearningProposalState[] {
+	switch (state) {
+		case "captured":
+			return ["shadow_evaluated", "rejected"];
+		case "shadow_evaluated":
+			return [
+				"shadow_evaluated",
+				"approved_for_rollout",
+				"rejected",
+				"superseded",
+			];
+		case "approved_for_rollout":
+			return ["superseded"];
+		case "rejected":
+			return ["superseded"];
+		case "superseded":
+			return [];
+	}
+}
+
+async function loadMissionV3LearningProposal(
+	paths: MissionV3ArtifactPaths,
+): Promise<MissionV3LearningProposal> {
+	return readJson<MissionV3LearningProposal>(paths.learningCurrentPath);
+}
+
 async function writeDerivedViews(params: {
 	mission: MissionState;
 	candidates: MissionV3CandidateState[];
 	paths: MissionV3ArtifactPaths;
+	laneCapabilityMatrix: ReturnType<typeof buildLaneCapabilityMatrix>;
 	environmentCurrent: MissionV3EnvironmentCurrent;
 	policySnapshot: Awaited<ReturnType<typeof buildPolicySnapshot>>["snapshot"];
 	impactMap: Awaited<ReturnType<typeof buildImpactMap>>;
 	evidenceGraph: Awaited<ReturnType<typeof buildEvidenceGraph>>;
+	candidateEvidenceGraphs: Map<
+		string,
+		Awaited<ReturnType<typeof buildEvidenceGraph>>
+	>;
 	adjudication: MissionV3Adjudication;
+	candidateAdjudications: Map<string, MissionV3Adjudication>;
 	promotionDecision: MissionV3PromotionDecision;
 	qualityWatchdog: ReturnType<typeof buildQualityWatchdog>;
 	uncertaintyRegister: Awaited<ReturnType<typeof buildUncertaintyRegister>>;
+	preserveLearningProposalState?: boolean;
 }): Promise<{
 	contextSnapshot: ReturnType<typeof buildContextSnapshot>;
 	learningProposal: ReturnType<typeof buildLearningProposal>;
@@ -3037,6 +4097,10 @@ async function writeDerivedViews(params: {
 		params.environmentCurrent,
 	);
 	await writeJson(params.paths.policySnapshotPath, params.policySnapshot);
+	await writeJson(
+		params.paths.laneCapabilityMatrixPath,
+		params.laneCapabilityMatrix,
+	);
 	await writeJson(params.paths.impactMapPath, params.impactMap);
 	await writeJson(params.paths.evidenceGraphPath, params.evidenceGraph);
 	await writeJson(params.paths.adjudicationPath, params.adjudication);
@@ -3067,10 +4131,15 @@ async function writeDerivedViews(params: {
 	const tournament = buildCandidateTournament(
 		params.mission,
 		params.candidates,
-		params.adjudication,
+		params.candidateAdjudications,
 		params.promotionDecision,
 	);
+	const candidateScheduler = buildCandidateScheduler(
+		params.mission,
+		params.candidates,
+	);
 	await writeJson(params.paths.candidateTournamentPath, tournament);
+	await writeJson(params.paths.candidateSchedulerPath, candidateScheduler);
 	const snapshot = buildContextSnapshot(
 		params.mission,
 		params.candidates,
@@ -3082,9 +4151,48 @@ async function writeDerivedViews(params: {
 	await writeJson(params.paths.currentContextSnapshotPath, snapshot);
 	await writeJson(params.paths.traceBundlePath, traceBundle);
 	await writeJson(params.paths.evalBundlePath, evalBundle);
+	if (!params.preserveLearningProposalState) {
+		await writeJson(
+			params.paths.learningCurrentPath,
+			learningProposal,
+		);
+	}
+	await writeText(
+		params.paths.rollbackPlanPath,
+		buildRollbackPlan({
+			mission: params.mission,
+			promotionDecision: params.promotionDecision,
+		}),
+	);
+	await writeText(
+		params.paths.observabilityDeltaPath,
+		buildObservabilityDelta({
+			mission: params.mission,
+			qualityWatchdog: params.qualityWatchdog,
+		}),
+	);
+	await writeText(
+		params.paths.releaseNotesPath,
+		buildReleaseNotes({
+			mission: params.mission,
+			adjudication: params.adjudication,
+			promotionDecision: params.promotionDecision,
+		}),
+	);
+	await writeText(
+		params.paths.handoffSummaryPath,
+		buildHandoffSummary({
+			mission: params.mission,
+			adjudication: params.adjudication,
+			uncertaintyRegister: params.uncertaintyRegister,
+		}),
+	);
 	await writeJson(
-		join(params.paths.learningProposalsDir, "current.json"),
-		learningProposal,
+		params.paths.vcsTracePath,
+		buildVcsTrace({
+			mission: params.mission,
+			candidates: params.candidates,
+		}),
 	);
 	await writeText(
 		params.paths.postmortemPath,
@@ -3106,9 +4214,63 @@ async function writeDerivedViews(params: {
 			params.environmentCurrent,
 		),
 	);
+	for (const candidate of params.candidates) {
+		const derivedPaths = candidateDerivedPaths(candidate);
+		await mkdir(derivedPaths.contextDir, { recursive: true });
+		const candidateAdjudication =
+			params.candidateAdjudications.get(candidate.candidate_id) ??
+			params.adjudication;
+		const candidateEvidenceGraph =
+			params.candidateEvidenceGraphs.get(candidate.candidate_id) ??
+			params.evidenceGraph;
+		await writeJson(derivedPaths.adjudicationPath, candidateAdjudication);
+		await writeJson(derivedPaths.evidenceGraphPath, candidateEvidenceGraph);
+		const candidateSnapshot = buildContextSnapshot(
+			params.mission,
+			params.candidates,
+			candidateAdjudication,
+			params.promotionDecision,
+			params.uncertaintyRegister,
+			candidateEvidenceGraph,
+		);
+		await writeJson(derivedPaths.contextSnapshotPath, candidateSnapshot);
+		await writeText(
+			derivedPaths.statusLedgerPath,
+			buildStatusLedger(
+				params.mission,
+				params.candidates,
+				candidateAdjudication,
+				params.promotionDecision,
+				params.qualityWatchdog,
+				params.uncertaintyRegister,
+				params.environmentCurrent,
+			),
+		);
+		for (const lane of requiredProofLanes(params.mission.policy_profile as MissionV3PolicyProfile)) {
+			await writeJson(join(derivedPaths.contextDir, `${lane}.json`), {
+				schema_version: 1,
+				generated_at: nowIso(),
+				mission_id: params.mission.mission_id,
+				candidate_id: candidate.candidate_id,
+				proof_lane: lane,
+				authoritative_refs: candidateSnapshot.authoritative_refs,
+				derived_refs: candidateSnapshot.derived_refs,
+				stale_fact_markers: candidateSnapshot.stale_fact_markers,
+				decision_boundaries: candidateSnapshot.decision_boundaries,
+				relevant_claims: candidateEvidenceGraph.claims.filter((claim) =>
+					claim.obligation_id === `obl:${lane}`,
+				),
+			});
+		}
+	}
 	return {
 		contextSnapshot: snapshot,
-		learningProposal,
+		learningProposal:
+			params.preserveLearningProposalState && existsSync(params.paths.learningCurrentPath)
+				? await readJson<MissionV3LearningProposal>(
+						params.paths.learningCurrentPath,
+					)
+				: learningProposal,
 	};
 }
 
@@ -3116,6 +4278,18 @@ async function updateMissionV3State(
 	mission: MissionState,
 	update: Partial<MissionState>,
 ): Promise<MissionState> {
+	const comparableCurrent = stableJson({
+		...mission,
+		updated_at: undefined,
+	});
+	const comparableNext = stableJson({
+		...mission,
+		...update,
+		updated_at: undefined,
+	});
+	if (comparableCurrent === comparableNext) {
+		return mission;
+	}
 	const next = {
 		...mission,
 		...update,
@@ -3129,6 +4303,18 @@ async function updateMissionV3CandidateState(
 	candidate: MissionV3CandidateState,
 	update: Partial<MissionV3CandidateState>,
 ): Promise<MissionV3CandidateState> {
+	const comparableCurrent = stableJson({
+		...candidate,
+		updated_at: undefined,
+	});
+	const comparableNext = stableJson({
+		...candidate,
+		...update,
+		updated_at: undefined,
+	});
+	if (comparableCurrent === comparableNext) {
+		return candidate;
+	}
 	const next = {
 		...candidate,
 		...update,
@@ -3149,6 +4335,7 @@ async function rebuildMissionV3DerivedState(params: {
 	proofProgram: MissionV3ProofProgram;
 	environmentContract: MissionV3EnvironmentContract;
 	preferredLifecycle?: MissionV3LifecycleState;
+	preserveAuthoritativeArtifacts?: boolean;
 }): Promise<MissionV3SyncResult> {
 	const {
 		mission,
@@ -3161,6 +4348,10 @@ async function rebuildMissionV3DerivedState(params: {
 		environmentContract,
 		preferredLifecycle,
 	} = params;
+	const checkerLock = await readJson<MissionV3CheckerLock>(
+		paths.checkerLockPath,
+	);
+	const laneCapabilityMatrix = buildLaneCapabilityMatrix(profile);
 	const environmentCurrent = await buildEnvironmentCurrent(
 		mission,
 		paths,
@@ -3178,9 +4369,6 @@ async function rebuildMissionV3DerivedState(params: {
 		activeWaivers,
 	);
 	const contractAmendments = await missionV3ContractAmendmentIndex(paths);
-	const evidenceEvents = await loadJournal<Record<string, unknown>>(
-		paths.evidenceEventsPath,
-	);
 	const impactMap = await buildImpactMap(
 		mission,
 		artifacts.sourcePack,
@@ -3193,6 +4381,24 @@ async function rebuildMissionV3DerivedState(params: {
 		]),
 	);
 	candidateMap.set(candidate.candidate_id, candidate);
+	for (const candidateEntry of candidateMap.values()) {
+		if (!candidateCanReceiveActiveWrites(candidateEntry)) continue;
+		candidateMap.set(
+			candidateEntry.candidate_id,
+			await reconcileMissionV3DerivedProofLanes({
+				mission,
+				paths,
+				profile,
+				candidate: candidateEntry,
+				proofProgram,
+				checkerLock,
+				environmentContract,
+				policySnapshot: policy.snapshot,
+				impactMap,
+				iteration: mission.current_iteration,
+			}),
+		);
+	}
 	const knownCandidates = Array.from(candidateMap.values()).sort(
 		(left, right) => left.candidate_id.localeCompare(right.candidate_id),
 	);
@@ -3207,36 +4413,86 @@ async function rebuildMissionV3DerivedState(params: {
 		selectedCandidateId,
 		candidate.candidate_id,
 	);
-	const evaluation = evaluateObligations(
-		assuranceContract,
-		proofProgram,
-		selectedCandidateId,
-		environmentCurrent,
-		evidenceEvents,
-		effectivePolicyBlockers,
-		activeWaivers,
-		contractAmendments,
+	const evidenceEvents = await loadJournal<Record<string, unknown>>(
+		paths.evidenceEventsPath,
 	);
-	const evidenceGraph = await buildEvidenceGraph(
-		mission,
-		assuranceContract,
-		evaluation,
-		impactMap,
-	);
-	const adjudication = buildAdjudication(
-		mission,
-		selectedCandidateId,
-		evaluation,
-		effectivePolicyBlockers,
-		activeWaivers,
-	);
-	await writeJson(paths.adjudicationPath, adjudication);
+	const candidateEvidenceGraphs = new Map<
+		string,
+		Awaited<ReturnType<typeof buildEvidenceGraph>>
+	>();
+	const candidateAdjudications = new Map<string, MissionV3Adjudication>();
+	const candidateEvaluations = new Map<
+		string,
+		ReturnType<typeof evaluateObligations>
+	>();
+	for (const candidateEntry of knownCandidates) {
+		const candidateView = await buildCandidateAssuranceView({
+			mission,
+			candidateId: candidateEntry.candidate_id,
+			assuranceContract,
+			proofProgram,
+			environmentCurrent,
+			evidenceEvents,
+			policyBlockers: effectivePolicyBlockers,
+			activeWaivers,
+			contractAmendments,
+			impactMap,
+		});
+		candidateEvidenceGraphs.set(
+			candidateEntry.candidate_id,
+			candidateView.evidenceGraph,
+		);
+		candidateAdjudications.set(
+			candidateEntry.candidate_id,
+			candidateView.adjudication,
+		);
+		candidateEvaluations.set(
+			candidateEntry.candidate_id,
+			candidateView.evaluation,
+		);
+	}
+	const primaryCandidateId =
+		selectedCandidateId ?? activeCandidateId ?? candidate.candidate_id;
+	const evaluation =
+		candidateEvaluations.get(primaryCandidateId) ??
+		(
+			await buildCandidateAssuranceView({
+				mission,
+				candidateId: primaryCandidateId,
+				assuranceContract,
+				proofProgram,
+				environmentCurrent,
+				evidenceEvents,
+				policyBlockers: effectivePolicyBlockers,
+				activeWaivers,
+				contractAmendments,
+				impactMap,
+			})
+		).evaluation;
+	const evidenceGraph =
+		candidateEvidenceGraphs.get(primaryCandidateId) ??
+		(await buildEvidenceGraph(
+			mission,
+			assuranceContract,
+			evaluation,
+			impactMap,
+		));
+	const adjudication =
+		candidateAdjudications.get(primaryCandidateId) ??
+		buildAdjudication(
+			mission,
+			primaryCandidateId,
+			evaluation,
+			effectivePolicyBlockers,
+			activeWaivers,
+		);
 	const promotionDecision = buildPromotionDecision(
 		mission,
 		selectedCandidateId,
 		adjudication,
 		effectivePolicyBlockers,
 		paths,
+		profile,
 	);
 	const uncertaintyRegister = await buildUncertaintyRegister(paths);
 	const qualityWatchdog = buildQualityWatchdog(
@@ -3415,14 +4671,18 @@ async function rebuildMissionV3DerivedState(params: {
 		mission: nextMission,
 		candidates: refreshedCandidates,
 		paths,
+		laneCapabilityMatrix,
 		environmentCurrent,
 		policySnapshot: policy.snapshot,
 		impactMap,
 		evidenceGraph,
+		candidateEvidenceGraphs,
 		adjudication,
+		candidateAdjudications,
 		promotionDecision,
 		qualityWatchdog,
 		uncertaintyRegister,
+		preserveLearningProposalState: params.preserveAuthoritativeArtifacts,
 	});
 	const stableContextSnapshot = stableContextSnapshotValue(
 		derivedArtifacts.contextSnapshot,
@@ -3489,6 +4749,29 @@ async function seedBootstrapJournals(params: {
 		proofProgram,
 		candidate,
 	} = params;
+	const setupRun = await appendJournalEvent(paths.setupRunsPath, {
+		journalType: "setup-runs",
+		missionId: mission.mission_id,
+		candidateId: candidate.candidate_id,
+		actorPrincipal: "environment-kernel",
+		idempotencyKey: `setup-run:${candidate.candidate_id}:${environmentContract.env_contract_id}`,
+		payload: {
+			setup_run_id: `setup:${shortHash(
+				stableJson({
+					candidate_id: candidate.candidate_id,
+					env_contract_id: environmentContract.env_contract_id,
+				}),
+			)}`,
+			candidate_id: candidate.candidate_id,
+			env_contract_id: environmentContract.env_contract_id,
+			toolchain_versions: environmentContract.toolchain_versions,
+			service_inventory: environmentContract.service_inventory,
+			secret_scopes: environmentContract.declared_secret_scopes,
+			setup_network_allowlist: environmentContract.setup_network_allowlist,
+			success: true,
+			materialized_at: nowIso(),
+		},
+	});
 	await appendJournalEvent(paths.environmentAttestationsPath, {
 		journalType: "environment-attestations",
 		missionId: mission.mission_id,
@@ -3499,7 +4782,9 @@ async function seedBootstrapJournals(params: {
 			attestation_id: `env-attestation:${shortHash(environmentContract.env_contract_id)}`,
 			candidate_id: candidate.candidate_id,
 			lane_id: null,
-			setup_run_id: "bootstrap",
+			setup_run_id:
+				(setupRun.payload as { setup_run_id?: string }).setup_run_id ??
+				"bootstrap",
 			declared_hash: environmentContract.declared_environment_hash,
 			achieved_hash: environmentContract.declared_environment_hash,
 			base_image_digest: environmentContract.runtime_base_id,
@@ -3707,12 +4992,18 @@ export async function recordMissionV3LaneSummary(params: {
 	const assuranceContract = await readJson<MissionV3AssuranceContract>(
 		paths.assuranceContractPath,
 	);
+	const checkerLock = await readJson<MissionV3CheckerLock>(
+		paths.checkerLockPath,
+	);
 	const proofProgram = await readJson<MissionV3ProofProgram>(
 		paths.proofProgramPath,
 	);
 	const environmentContract = await readJson<MissionV3EnvironmentContract>(
 		paths.environmentContractPath,
 	);
+	const policySnapshot = await readJson<Awaited<
+		ReturnType<typeof buildPolicySnapshot>
+	>["snapshot"]>(paths.policySnapshotPath);
 	const candidate = await ensureCandidateState(
 		mission,
 		params.artifactPaths,
@@ -3721,9 +5012,27 @@ export async function recordMissionV3LaneSummary(params: {
 		environmentContract,
 	);
 	const proofLane = missionLaneToProofLane(laneType);
-	const obligationIds = proofLane
-		? obligationIdsForLane(proofProgram, proofLane)
-		: [];
+	const commandRef = proofLane
+		? proofLaneCommandTemplates(proofLane)[0]!
+		: `lane-summary:${laneType}`;
+	const { binding, checkers } = await assertMissionV3ExecutionAllowed({
+		mission,
+		paths,
+		candidate,
+		proofProgram,
+		checkerLock,
+		environmentContract,
+		sourceTrustSummary: policySnapshot.source_trust_summary,
+		laneType,
+		proofLane,
+		commandRef,
+		writeScope: relative(mission.repo_root, dirname(summaryPath)),
+		networkMode: "repo-local",
+		secretScopes: secretScopesForLane(laneType, proofLane),
+		actorPrincipal: `mission-lane:${laneType}`,
+		idempotencyKey: `${candidate.candidate_id}:${iteration}:${laneType}`,
+	});
+	const obligationIds = binding?.obligation_id ? [binding.obligation_id] : [];
 	const evidenceRecordedAt = nowIso();
 	const commandIdempotencyKey = `command-attestation:${candidate.candidate_id}:${iteration}:${laneType}`;
 	const laneRunId = `lane-run:${candidate.candidate_id}:${iteration}:${proofLane ?? laneType}`;
@@ -3737,12 +5046,8 @@ export async function recordMissionV3LaneSummary(params: {
 		payload: {
 			command_attestation_id: `cmd:${laneType}:${iteration}`,
 			lane_run_id: laneRunId,
-			checker_id: proofLane
-				? (proofProgram.bindings.find(
-						(binding) => binding.proof_lane === proofLane,
-					)?.checker_refs[0] ?? null)
-				: null,
-			command_ref: `command:${proofLane ?? laneType}`,
+			checker_id: checkers[0]?.checker_id ?? null,
+			command_ref: commandRef,
 			normalized_argv: [`lane-summary:${laneType}`],
 			cwd: relative(mission.repo_root, dirname(summaryPath)),
 			env_hash: environmentContract.declared_environment_hash,
@@ -3783,15 +5088,11 @@ export async function recordMissionV3LaneSummary(params: {
 			source_lane_type: laneType,
 			proof_program_id: proofProgram.proof_program_id,
 			attempt_index: 1,
-			matrix_target: "matrix:local-node",
+			matrix_target: binding?.required_matrix_target ?? "matrix:local-node",
 			env_attestation_ref:
 				(await loadJournal(paths.environmentAttestationsPath)).at(-1)
 					?.event_id ?? null,
-			checker_refs: proofLane
-				? proofProgram.bindings
-						.filter((binding) => binding.proof_lane === proofLane)
-						.flatMap((binding) => binding.checker_refs)
-				: [],
+			checker_refs: checkers.map((checker) => checker.checker_id),
 			started_at: summary.provenance.started_at,
 			completed_at: summary.provenance.finished_at,
 			outcome: summary.verdict.toLowerCase(),
@@ -3840,14 +5141,10 @@ export async function recordMissionV3LaneSummary(params: {
 						: "contradicting",
 			summary: `${laneType} lane recorded ${summary.verdict} (${summary.confidence})`,
 			artifact_refs: [summaryPath, ...summary.evidence_refs],
-			freshness_expires_at: proofLane
-				? addSeconds(
-						evidenceRecordedAt,
-						proofProgram.bindings.find(
-							(binding) => binding.proof_lane === proofLane,
-						)?.freshness_ttl_seconds ?? 900,
-					)
-				: addSeconds(evidenceRecordedAt, 900),
+			freshness_expires_at: addSeconds(
+				evidenceRecordedAt,
+				binding?.freshness_ttl_seconds ?? 900,
+			),
 		},
 	});
 	const refreshedCandidate = await updateMissionV3CandidateState(candidate, {
@@ -3894,19 +5191,43 @@ export async function syncMissionV3AfterCommit(params: {
 	const assuranceContract = await readJson<MissionV3AssuranceContract>(
 		paths.assuranceContractPath,
 	);
+	const checkerLock = await readJson<MissionV3CheckerLock>(
+		paths.checkerLockPath,
+	);
 	const proofProgram = await readJson<MissionV3ProofProgram>(
 		paths.proofProgramPath,
 	);
 	const environmentContract = await readJson<MissionV3EnvironmentContract>(
 		paths.environmentContractPath,
 	);
+	const policySnapshot = await readJson<Awaited<
+		ReturnType<typeof buildPolicySnapshot>
+	>["snapshot"]>(paths.policySnapshotPath);
 	const candidate = await readJson<MissionV3CandidateState>(
 		paths.activeCandidateStatePath,
 	);
-	const staticAnalysisObligationIds = obligationIdsForLane(
+	const staticAnalysisCommandRef =
+		proofLaneCommandTemplates("static-analysis")[0]!;
+	const { binding, checkers } = await assertMissionV3ExecutionAllowed({
+		mission,
+		paths,
+		candidate,
 		proofProgram,
-		"static-analysis",
-	);
+		checkerLock,
+		environmentContract,
+		sourceTrustSummary: policySnapshot.source_trust_summary,
+		laneType: "commit",
+		proofLane: "static-analysis",
+		commandRef: staticAnalysisCommandRef,
+		writeScope: relative(mission.repo_root, mission.mission_root),
+		networkMode: "repo-local",
+		secretScopes: secretScopesForLane("commit", "static-analysis"),
+		actorPrincipal: "mission-kernel",
+		idempotencyKey: `${candidate.candidate_id}:${iteration}:static-analysis:${safetyBaseline.focused_checks_green}`,
+	});
+	const staticAnalysisObligationIds = binding?.obligation_id
+		? [binding.obligation_id]
+		: [];
 	const commandIdempotencyKey = `static-analysis:${candidate.candidate_id}:${iteration}:${safetyBaseline.focused_checks_green}`;
 	const laneRunId = `lane-run:${candidate.candidate_id}:${iteration}:static-analysis`;
 	const command = await appendJournalEvent(paths.commandAttestationsPath, {
@@ -3919,11 +5240,8 @@ export async function syncMissionV3AfterCommit(params: {
 		payload: {
 			command_attestation_id: `cmd:static-analysis:${iteration}`,
 			lane_run_id: laneRunId,
-			checker_id:
-				proofProgram.bindings.find(
-					(binding) => binding.proof_lane === "static-analysis",
-				)?.checker_refs[0] ?? "checker:mission-static-analysis",
-			command_ref: "command:static-analysis",
+			checker_id: checkers[0]?.checker_id ?? "checker:mission-static-analysis",
+			command_ref: staticAnalysisCommandRef,
 			normalized_argv: ["focused-checks"],
 			cwd: relative(mission.repo_root, mission.mission_root),
 			env_hash: environmentContract.declared_environment_hash,
@@ -3951,17 +5269,11 @@ export async function syncMissionV3AfterCommit(params: {
 			source_lane_type: "commit",
 			proof_program_id: proofProgram.proof_program_id,
 			attempt_index: 1,
-			matrix_target:
-				proofProgram.bindings.find(
-					(binding) => binding.proof_lane === "static-analysis",
-				)?.required_matrix_target ?? "matrix:local-node",
+			matrix_target: binding?.required_matrix_target ?? "matrix:local-node",
 			env_attestation_ref:
 				(await loadJournal(paths.environmentAttestationsPath)).at(-1)
 					?.event_id ?? null,
-			checker_refs:
-				proofProgram.bindings
-					.filter((binding) => binding.proof_lane === "static-analysis")
-					.flatMap((binding) => binding.checker_refs) ?? [],
+			checker_refs: checkers.map((checker) => checker.checker_id),
 			started_at: mission.updated_at,
 			completed_at: nowIso(),
 			outcome: safetyBaseline.focused_checks_green ? "pass" : "fail",
@@ -3996,9 +5308,7 @@ export async function syncMissionV3AfterCommit(params: {
 			artifact_refs: [],
 			freshness_expires_at: addSeconds(
 				nowIso(),
-				proofProgram.bindings.find(
-					(binding) => binding.proof_lane === "static-analysis",
-				)?.freshness_ttl_seconds ?? 900,
+				binding?.freshness_ttl_seconds ?? 900,
 			),
 		},
 	});
@@ -4110,9 +5420,7 @@ export async function syncMissionV3AfterCancel(params: {
 }
 
 async function loadMissionV3Prerequisites(repoRoot: string, slug: string) {
-	const mission = await readJson<MissionState>(
-		missionStatePath(join(repoRoot, ".omx", "missions", slug)),
-	);
+	const mission = await loadMission(repoRoot, slug);
 	const artifactPaths = missionV3ArtifactPaths(
 		mission.mission_root,
 		mission.active_candidate_id ?? missionV3CandidateId(),
@@ -4152,6 +5460,295 @@ async function loadMissionV3RuntimeContext(repoRoot: string, slug: string) {
 			prerequisites.mission.mission_root,
 		),
 	};
+}
+
+export interface MissionV3RecoveryResult {
+	mission: MissionState;
+	paths: MissionV3ArtifactPaths;
+	driftDetected: boolean;
+	repairedPaths: string[];
+}
+
+async function missionV3RecoveryArtifactPaths(
+	mission: MissionState,
+	paths: MissionV3ArtifactPaths,
+	candidates: MissionV3CandidateState[],
+): Promise<string[]> {
+	const basePaths = (
+		await loadMissionV3ArtifactRoles(
+			mission.mission_root,
+			mission.active_candidate_id ?? missionV3CandidateId(),
+		)
+	)
+		.filter((entry) => entry.role === "derived")
+		.map((entry) => entry.path);
+	const candidatePaths = candidates.flatMap((candidate) => {
+		const derivedPaths = candidateDerivedPaths(candidate);
+		return [
+			derivedPaths.adjudicationPath,
+			derivedPaths.evidenceGraphPath,
+			derivedPaths.contextSnapshotPath,
+			derivedPaths.statusLedgerPath,
+			...requiredProofLanes(mission.policy_profile as MissionV3PolicyProfile).map(
+				(lane) => join(derivedPaths.contextDir, `${lane}.json`),
+			),
+		];
+	});
+	return Array.from(new Set([...basePaths, ...candidatePaths]));
+}
+
+export async function rebuildMissionV3DerivedStateFromDisk(
+	repoRoot: string,
+	slug: string,
+): Promise<MissionV3RecoveryResult> {
+	const mission = await loadMission(repoRoot, slug);
+	const paths = missionV3ArtifactPaths(
+		mission.mission_root,
+		mission.active_candidate_id ?? missionV3CandidateId(),
+	);
+	if (mission.mission_version < 3) {
+		return {
+			mission,
+			paths,
+			driftDetected: false,
+			repairedPaths: [],
+		};
+	}
+	const artifacts = await loadMissionOrchestrationArtifacts(mission.mission_root);
+	if (!artifacts) {
+		throw new Error(`mission_orchestration_artifacts_missing:${slug}`);
+	}
+	await ensureV3Layout(paths);
+	const assuranceContract = await readJson<MissionV3AssuranceContract>(
+		paths.assuranceContractPath,
+	);
+	const proofProgram = await readJson<MissionV3ProofProgram>(
+		paths.proofProgramPath,
+	);
+	const environmentContract = await readJson<MissionV3EnvironmentContract>(
+		paths.environmentContractPath,
+	);
+	const candidate = await ensureCandidateState(
+		mission,
+		missionOrchestrationArtifactPaths(mission.mission_root),
+		paths,
+		proofProgram,
+		environmentContract,
+	);
+	const candidatesBefore = await loadMissionV3CandidateStates(paths);
+	const beforeArtifacts = await missionV3RecoveryArtifactPaths(
+		mission,
+		paths,
+		candidatesBefore.length > 0 ? candidatesBefore : [candidate],
+	);
+	const missingBefore = new Set(
+		beforeArtifacts.filter((artifactPath) => !existsSync(artifactPath)),
+	);
+	const result = await rebuildMissionV3DerivedState({
+		mission,
+		artifacts,
+		artifactPaths: missionOrchestrationArtifactPaths(mission.mission_root),
+		paths,
+		profile: mission.policy_profile as MissionV3PolicyProfile,
+		candidate,
+		assuranceContract,
+		proofProgram,
+		environmentContract,
+		preferredLifecycle: mission.lifecycle_state,
+		preserveAuthoritativeArtifacts: true,
+	});
+	const candidatesAfter = await loadMissionV3CandidateStates(paths);
+	const afterArtifacts = await missionV3RecoveryArtifactPaths(
+		result.mission,
+		paths,
+		candidatesAfter.length > 0 ? candidatesAfter : [candidate],
+	);
+	const repairedPaths: string[] = [];
+	for (const artifactPath of Array.from(new Set([...beforeArtifacts, ...afterArtifacts]))) {
+		if (missingBefore.has(artifactPath) && existsSync(artifactPath)) {
+			repairedPaths.push(artifactPath);
+		}
+	}
+	return {
+		mission: result.mission,
+		paths,
+		driftDetected: repairedPaths.length > 0,
+		repairedPaths,
+	};
+}
+
+export async function transitionMissionV3LearningProposalState(
+	options: MissionV3LearningStateTransitionOptions,
+): Promise<MissionV3LearningProposal> {
+	const { mission, artifactPaths } = await loadMissionV3Prerequisites(
+		options.repoRoot,
+		options.slug,
+	);
+	const proposal = await loadMissionV3LearningProposal(artifactPaths);
+	if (!allowedLearningNextStates(proposal.state).includes(options.nextState)) {
+		throw new Error(
+			`mission_v3_learning_transition_invalid:${proposal.state}->${options.nextState}`,
+		);
+	}
+	const updated: MissionV3LearningProposal = {
+		...proposal,
+		generated_at: nowIso(),
+		state: options.nextState,
+		history: [
+			...(proposal.history ?? []),
+			{
+				state: options.nextState,
+				recorded_at: nowIso(),
+				actor: options.actor,
+				note: options.note,
+			},
+		],
+		rollout_path: {
+			...proposal.rollout_path,
+			current_state: options.nextState,
+			next_allowed_states: allowedLearningNextStates(options.nextState),
+		},
+	};
+	await writeJson(artifactPaths.learningCurrentPath, updated);
+	await appendJournalEvent(artifactPaths.decisionLogPath, {
+		journalType: "decision-log",
+		missionId: mission.mission_id,
+		candidateId: mission.selected_candidate_id ?? mission.active_candidate_id,
+		actorPrincipal: options.actor,
+		idempotencyKey: `decision:learning:${proposal.proposal_id}:${options.nextState}:${shortHash(options.note)}`,
+		payload: {
+			decision: "learning_state_transition",
+			proposal_id: proposal.proposal_id,
+			previous_state: proposal.state,
+			next_state: options.nextState,
+			note: options.note,
+		},
+	});
+	return updated;
+}
+
+export async function recordMissionV3LearningShadowEval(
+	options: MissionV3LearningEvalOptions,
+): Promise<MissionV3LearningProposal> {
+	const { mission, artifactPaths } = await loadMissionV3Prerequisites(
+		options.repoRoot,
+		options.slug,
+	);
+	const proposal = await loadMissionV3LearningProposal(artifactPaths);
+	if (!["captured", "shadow_evaluated"].includes(proposal.state)) {
+		throw new Error(
+			`mission_v3_learning_shadow_eval_invalid_state:${proposal.state}`,
+		);
+	}
+	const report = {
+		schema_version: 1,
+		recorded_at: nowIso(),
+		mission_id: mission.mission_id,
+		actor: options.actor,
+		summary: options.summary,
+		findings: options.findings ?? [],
+	};
+	await writeJson(artifactPaths.shadowEvalPath, report);
+	await appendJournalEvent(artifactPaths.decisionLogPath, {
+		journalType: "decision-log",
+		missionId: mission.mission_id,
+		candidateId: mission.selected_candidate_id ?? mission.active_candidate_id,
+		actorPrincipal: options.actor,
+		idempotencyKey: `decision:learning-shadow:${shortHash(stableJson(report))}`,
+		payload: {
+			decision: "learning_shadow_evaluated",
+			report_path: artifactPaths.shadowEvalPath,
+			summary: options.summary,
+		},
+	});
+	const next =
+		proposal.state === "shadow_evaluated"
+			? proposal
+			: await transitionMissionV3LearningProposalState({
+					repoRoot: options.repoRoot,
+					slug: options.slug,
+					actor: options.actor,
+					nextState: "shadow_evaluated",
+					note: options.summary,
+				});
+	const updated: MissionV3LearningProposal = {
+		...next,
+		generated_at: nowIso(),
+		latest_shadow_eval_ref: artifactPaths.shadowEvalPath,
+		history: [
+			...(next.history ?? []),
+			...(proposal.state === "shadow_evaluated"
+				? [
+						{
+							state: "shadow_evaluated" as const,
+							recorded_at: nowIso(),
+							actor: options.actor,
+							note: `Shadow evaluation refreshed: ${options.summary}`,
+						},
+					]
+				: []),
+		],
+	};
+	await writeJson(artifactPaths.learningCurrentPath, updated);
+	return updated;
+}
+
+export async function recordMissionV3LearningHeldOutEval(
+	options: MissionV3LearningEvalOptions & { approved: boolean },
+): Promise<MissionV3LearningProposal> {
+	const { mission, artifactPaths } = await loadMissionV3Prerequisites(
+		options.repoRoot,
+		options.slug,
+	);
+	const proposal = await loadMissionV3LearningProposal(artifactPaths);
+	if (proposal.state !== "shadow_evaluated") {
+		throw new Error(
+			`mission_v3_learning_held_out_invalid_state:${proposal.state}`,
+		);
+	}
+	if (
+		!proposal.latest_shadow_eval_ref ||
+		!existsSync(proposal.latest_shadow_eval_ref)
+	) {
+		throw new Error("mission_v3_learning_shadow_eval_required");
+	}
+	const report = {
+		schema_version: 1,
+		recorded_at: nowIso(),
+		mission_id: mission.mission_id,
+		actor: options.actor,
+		summary: options.summary,
+		findings: options.findings ?? [],
+		approved: options.approved,
+	};
+	await writeJson(artifactPaths.heldOutEvalPath, report);
+	await appendJournalEvent(artifactPaths.decisionLogPath, {
+		journalType: "decision-log",
+		missionId: mission.mission_id,
+		candidateId: mission.selected_candidate_id ?? mission.active_candidate_id,
+		actorPrincipal: options.actor,
+		idempotencyKey: `decision:learning-held-out:${shortHash(stableJson(report))}`,
+		payload: {
+			decision: "learning_held_out_evaluated",
+			report_path: artifactPaths.heldOutEvalPath,
+			summary: options.summary,
+			approved: options.approved,
+		},
+	});
+	const transitioned = await transitionMissionV3LearningProposalState({
+		repoRoot: options.repoRoot,
+		slug: options.slug,
+		actor: options.actor,
+		nextState: options.approved ? "approved_for_rollout" : "rejected",
+		note: options.summary,
+	});
+	const updated = {
+		...transitioned,
+		latest_shadow_eval_ref: proposal.latest_shadow_eval_ref,
+		latest_held_out_eval_ref: artifactPaths.heldOutEvalPath,
+	};
+	await writeJson(artifactPaths.learningCurrentPath, updated);
+	return updated;
 }
 
 export async function createMissionV3Candidate(
@@ -4658,7 +6255,10 @@ export async function promoteMissionV3Candidate(
 	if (promotionDecision.decision !== "allow") {
 		throw new Error("mission_v3_promote_requires_allow_decision");
 	}
-	const missingArtifacts = missingPromotionArtifacts(artifactPaths);
+	const missingArtifacts = missingPromotionArtifacts(
+		artifactPaths,
+		mission.policy_profile as MissionV3PolicyProfile,
+	);
 	if (missingArtifacts.length > 0) {
 		throw new Error(
 			`mission_v3_promote_missing_artifacts:${missingArtifacts.join(",")}`,
@@ -4768,6 +6368,11 @@ export async function createMissionV3Waiver(
 		if (!obligation.waiver_allowed) {
 			throw new Error(`mission_v3_waiver_forbidden:${obligationId}`);
 		}
+		if (obligation.waiver_authority !== options.authority) {
+			throw new Error(
+				`mission_v3_waiver_authority_mismatch:${obligationId}:${obligation.waiver_authority}`,
+			);
+		}
 	}
 	if (requestedPolicyClauseIds.length > 0) {
 		if (!existsSync(artifactPaths.policySnapshotPath)) {
@@ -4783,6 +6388,14 @@ export async function createMissionV3Waiver(
 			if (!knownClauseIds.has(clauseId)) {
 				throw new Error(`mission_v3_waiver_unknown_policy_clause:${clauseId}`);
 			}
+		}
+		const requiredAuthority = policyWaiverAuthority(
+			mission.policy_profile as MissionV3PolicyProfile,
+		);
+		if (options.authority !== requiredAuthority) {
+			throw new Error(
+				`mission_v3_policy_waiver_authority_mismatch:${requiredAuthority}`,
+			);
 		}
 	}
 	const waiver: MissionV3Waiver = {
@@ -4962,8 +6575,10 @@ export async function loadMissionV3ArtifactRoles(
 		{ path: paths.environmentContractPath, role: "canonical" },
 		{ path: paths.activeCandidateStatePath, role: "authoritative" },
 		{ path: paths.contractAmendmentsPath, role: "append_only" },
+		{ path: paths.setupRunsPath, role: "append_only" },
 		{ path: paths.environmentAttestationsPath, role: "append_only" },
 		{ path: paths.runtimeObservationsPath, role: "append_only" },
+		{ path: paths.secretGrantsPath, role: "append_only" },
 		{ path: paths.laneRunsPath, role: "append_only" },
 		{ path: paths.commandAttestationsPath, role: "append_only" },
 		{ path: paths.evidenceEventsPath, role: "append_only" },
@@ -4975,10 +6590,16 @@ export async function loadMissionV3ArtifactRoles(
 		{ path: paths.activeCandidateEventsPath, role: "append_only" },
 		{ path: paths.environmentCurrentPath, role: "derived" },
 		{ path: paths.policySnapshotPath, role: "derived" },
+		{ path: paths.laneCapabilityMatrixPath, role: "derived" },
 		{ path: paths.impactMapPath, role: "derived" },
 		{ path: paths.evidenceGraphPath, role: "derived" },
 		{ path: paths.adjudicationPath, role: "derived" },
 		{ path: paths.promotionDecisionPath, role: "derived" },
+		{ path: paths.rollbackPlanPath, role: "derived" },
+		{ path: paths.observabilityDeltaPath, role: "derived" },
+		{ path: paths.releaseNotesPath, role: "derived" },
+		{ path: paths.handoffSummaryPath, role: "derived" },
+		{ path: paths.vcsTracePath, role: "derived" },
 		{ path: paths.releaseRecordPath, role: "derived" },
 		{ path: paths.handoffRecordPath, role: "derived" },
 		{ path: paths.qualityWatchdogPath, role: "derived" },
@@ -4986,9 +6607,12 @@ export async function loadMissionV3ArtifactRoles(
 		{ path: paths.currentContextSnapshotPath, role: "derived" },
 		{ path: paths.statusLedgerPath, role: "derived" },
 		{ path: paths.candidateTournamentPath, role: "derived" },
+		{ path: paths.candidateSchedulerPath, role: "derived" },
 		{ path: paths.traceBundlePath, role: "derived" },
 		{ path: paths.evalBundlePath, role: "derived" },
 		{ path: paths.postmortemPath, role: "derived" },
-		{ path: join(paths.learningProposalsDir, "current.json"), role: "derived" },
+		{ path: paths.learningCurrentPath, role: "authoritative" },
+		{ path: paths.shadowEvalPath, role: "authoritative" },
+		{ path: paths.heldOutEvalPath, role: "authoritative" },
 	];
 }

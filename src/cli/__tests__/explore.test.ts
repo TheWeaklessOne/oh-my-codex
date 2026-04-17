@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { chmod, mkdtemp, readFile, rm, mkdir, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
@@ -97,7 +97,8 @@ async function runExploreCommandForTest(
 }
 
 async function createExploreTestPath(wd: string): Promise<string> {
-  const binDir = join(wd, 'test-bin');
+  const root = realpathSync(wd);
+  const binDir = join(root, 'test-bin');
   await mkdir(binDir, { recursive: true });
   const rgPath = join(binDir, process.platform === 'win32' ? 'rg.cmd' : 'rg');
   const lines = process.platform === 'win32'
@@ -111,12 +112,14 @@ async function createExploreTestPath(wd: string): Promise<string> {
 }
 
 async function writeEnvNodeCodexStub(wd: string, capturePath: string): Promise<string> {
-  const stub = join(wd, 'codex-stub.sh');
-  const argvPath = join(wd, 'codex-argv.txt');
-  const allowedStdoutPath = join(wd, 'allowed.stdout.txt');
-  const allowedStderrPath = join(wd, 'allowed.stderr.txt');
-  const blockedStdoutPath = join(wd, 'blocked.stdout.txt');
-  const blockedStderrPath = join(wd, 'blocked.stderr.txt');
+  const root = realpathSync(wd);
+  const stub = join(root, 'codex-stub.sh');
+  const argvPath = join(root, 'codex-argv.txt');
+  const allowedStdoutPath = join(root, 'allowed.stdout.txt');
+  const allowedStderrPath = join(root, 'allowed.stderr.txt');
+  const blockedStdoutPath = join(root, 'blocked.stdout.txt');
+  const blockedStderrPath = join(root, 'blocked.stderr.txt');
+  const canonicalCapturePath = join(root, realpathSync(dirname(capturePath)) === root ? capturePath.slice((wd.endsWith('/') ? wd : `${wd}/`).length) : 'capture.json');
   await writeFile(
     stub,
     `#!/bin/sh
@@ -160,7 +163,7 @@ set -e
   cat ${JSON.stringify(blockedStdoutPath)}
   printf -- '--BLOCKED_STDERR--\n'
   cat ${JSON.stringify(blockedStderrPath)}
-} > ${JSON.stringify(capturePath)}
+} > ${JSON.stringify(canonicalCapturePath)}
 
 printf '# Answer\nHarness completed\n' > "$output_path"
 `,
@@ -170,10 +173,12 @@ printf '# Answer\nHarness completed\n' > "$output_path"
 }
 
 async function writePosixPackageManagerCodexShim(wd: string, capturePath: string): Promise<string> {
-  const packageRoot = join(wd, 'node_modules', '@openai', 'codex');
-  const binDir = join(wd, 'node_modules', '.bin');
+  const root = realpathSync(wd);
+  const packageRoot = join(root, 'node_modules', '@openai', 'codex');
+  const binDir = join(root, 'node_modules', '.bin');
   const entrypointPath = join(packageRoot, 'bin', 'codex.js');
   const shimPath = join(binDir, 'codex');
+  const nodeShimPath = join(binDir, 'node');
   await mkdir(join(packageRoot, 'bin'), { recursive: true });
   await mkdir(binDir, { recursive: true });
   await writeFile(
@@ -201,21 +206,25 @@ const payload = [
   'PATH=' + (process.env.PATH || ''),
   'SHELL=' + (process.env.SHELL || ''),
 ].join('\\n') + '\\n';
-fs.writeFileSync(${JSON.stringify(capturePath)}, payload);
+fs.writeFileSync(${JSON.stringify(join(root, 'capture.txt'))}, payload);
 fs.writeFileSync(outputPath, '# Answer\\nHarness completed\\n');
 `,
   );
   await writeFile(
     shimPath,
     `#!/bin/sh
-basedir=$(dirname "$0")
-if [ -x "$basedir/node" ]; then
-  exec "$basedir/node" "$basedir/../@openai/codex/bin/codex.js" "$@"
+if [ -x ${JSON.stringify(nodeShimPath)} ]; then
+  exec ${JSON.stringify(nodeShimPath)} ${JSON.stringify(entrypointPath)} "$@"
 fi
-exec node "$basedir/../@openai/codex/bin/codex.js" "$@"
+exec ${JSON.stringify(process.execPath)} ${JSON.stringify(entrypointPath)} "$@"
 `,
   );
   await chmod(shimPath, 0o755);
+  await writeFile(
+    nodeShimPath,
+    `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`,
+  );
+  await chmod(nodeShimPath, 0o755);
   return shimPath;
 }
 
@@ -535,7 +544,8 @@ describe('resolveExploreHarnessCommand', () => {
       await writeFile(binaryPath, '#!/bin/sh\necho hydrated-explore\n');
       await chmod(binaryPath, 0o755);
 
-      const archivePath = join(assetRoot, 'omx-explore-harness-x86_64-unknown-linux-musl.tar.gz');
+      const archiveName = `omx-explore-harness-${process.platform}-${process.arch}.tar.gz`;
+      const archivePath = join(assetRoot, archiveName);
       const archive = spawnSync('tar', ['-czf', archivePath, '-C', stagingDir, packagedExploreHarnessBinaryName()], { encoding: 'utf-8' });
       assert.equal(archive.status, 0, archive.stderr || archive.stdout);
       const archiveBuffer = await readFile(archivePath);
@@ -569,14 +579,14 @@ describe('resolveExploreHarnessCommand', () => {
           assets: [{
             product: 'omx-explore-harness',
             version: '0.8.15',
-            platform: 'linux',
-            arch: 'x64',
-            archive: 'omx-explore-harness-x86_64-unknown-linux-musl.tar.gz',
+            platform: process.platform,
+            arch: process.arch,
+            archive: archiveName,
             binary: 'omx-explore-harness',
             binary_path: 'omx-explore-harness',
             sha256: checksum,
             size: archiveBuffer.length,
-            download_url: `${server.baseUrl}/omx-explore-harness-x86_64-unknown-linux-musl.tar.gz`,
+            download_url: `${server.baseUrl}/${archiveName}`,
           }],
         }, null, 2));
 

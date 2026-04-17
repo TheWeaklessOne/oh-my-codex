@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import type { MissionLaneType } from "./contracts.js";
 import type { MissionState } from "./kernel.js";
@@ -18,17 +19,23 @@ export type MissionLaneCapabilityClass =
 	| "hardening_executor";
 
 export interface MissionLaneExecutionEnvelope {
-	schema_version: 1;
+	schema_version: 2;
 	mission_id: string;
 	slug: string;
 	iteration: number;
 	lane_type: MissionLaneType;
+	candidate_id: string;
+	candidate_workspace_root: string;
+	lane_root: string;
+	lane_summary_path: string;
 	workspace_path: string;
 	isolation_kind: MissionLaneIsolationKind;
 	write_policy: MissionLaneWritePolicy;
 	capability_class: MissionLaneCapabilityClass;
 	base_ref: string;
-	provenance_binding_token: string;
+	provenance_binding_token?: string;
+	provenance_binding_token_hash: string;
+	provenance_binding_token_path: string | null;
 	read_only_enforced: boolean;
 }
 
@@ -50,12 +57,7 @@ function sanitize(value: string): string {
 }
 
 function hashValue(input: string): string {
-	let hash = 0;
-	for (let i = 0; i < input.length; i += 1) {
-		hash = ((hash << 5) - hash) + input.charCodeAt(i);
-		hash |= 0;
-	}
-	return Math.abs(hash).toString(16);
+	return createHash("sha256").update(input).digest("hex");
 }
 
 function verifierWorktreePath(repoRoot: string, mission: MissionState, iteration: number, laneType: MissionLaneType): string {
@@ -75,6 +77,45 @@ function verifierSnapshotPath(
 		String(iteration).padStart(3, "0"),
 		laneType,
 		"isolated-workspace",
+	);
+}
+
+function candidateWorkspaceRoot(
+	mission: MissionState,
+	candidateId: string,
+): string {
+	return join(mission.mission_root, "candidates", candidateId);
+}
+
+function candidateIterationRoot(
+	mission: MissionState,
+	candidateId: string,
+	iteration: number,
+): string {
+	return join(
+		candidateWorkspaceRoot(mission, candidateId),
+		"iterations",
+		String(iteration).padStart(3, "0"),
+	);
+}
+
+function candidateLaneRoot(
+	mission: MissionState,
+	candidateId: string,
+	iteration: number,
+	laneType: MissionLaneType,
+): string {
+	return join(candidateIterationRoot(mission, candidateId, iteration), laneType);
+}
+
+function provenanceBindingTokenPath(
+	workspacePath: string,
+	laneType: MissionLaneType,
+	iteration: number,
+): string {
+	return join(
+		workspacePath,
+		`.omx-mission-${laneType}-${String(iteration).padStart(3, "0")}.token`,
 	);
 }
 
@@ -155,18 +196,36 @@ function envelopeFilePath(missionRoot: string, iteration: number, laneType: Miss
 	);
 }
 
+function candidateEnvelopeFilePath(
+	mission: MissionState,
+	candidateId: string,
+	iteration: number,
+	laneType: MissionLaneType,
+): string {
+	return join(
+		candidateLaneRoot(mission, candidateId, iteration, laneType),
+		"execution-envelope.json",
+	);
+}
+
+interface PreparedMissionLaneEnvelope {
+	envelope: MissionLaneExecutionEnvelope;
+	provenanceToken: string | null;
+}
+
 function buildLaneEnvelope(
 	mission: MissionState,
 	repoRoot: string,
 	iteration: number,
 	laneType: MissionLaneType,
 	baseRef: string,
-): MissionLaneExecutionEnvelope {
+): PreparedMissionLaneEnvelope {
+	const candidateId = mission.active_candidate_id ?? "candidate-001";
+	const laneRoot = candidateLaneRoot(mission, candidateId, iteration, laneType);
 	const verifierLane = laneType === "audit" || laneType === "re_audit";
 	const sharedExecutionLane = laneType === "execution";
 	let workspacePath = resolve(repoRoot);
 	let isolationKind: MissionLaneIsolationKind = "shared_repo";
-	let effectiveBaseRef = baseRef;
 	if (verifierLane) {
 		try {
 			workspacePath = ensureDetachedWorktree(
@@ -184,25 +243,43 @@ function buildLaneEnvelope(
 			isolationKind = "isolated_snapshot";
 		}
 	}
+	const provenanceToken = verifierLane
+		? randomBytes(24).toString("hex")
+		: null;
+	const tokenPath = verifierLane
+		? provenanceBindingTokenPath(workspacePath, laneType, iteration)
+		: null;
 	return {
-		schema_version: 1,
-		mission_id: mission.mission_id,
-		slug: mission.slug,
-		iteration,
-		lane_type: laneType,
-		workspace_path: workspacePath,
-		isolation_kind: isolationKind,
-		write_policy: verifierLane ? "read_only" : "read_write",
-		capability_class: verifierLane
-			? "verifier_read_only"
-			: sharedExecutionLane
-				? "team_executor"
-				: laneType === "hardening"
-					? "hardening_executor"
-					: "direct_executor",
-		base_ref: effectiveBaseRef,
-		provenance_binding_token: `lane-token:${hashValue(`${mission.mission_id}:${iteration}:${laneType}:${workspacePath}`)}`,
-		read_only_enforced: verifierLane,
+		envelope: {
+			schema_version: 2,
+			mission_id: mission.mission_id,
+			slug: mission.slug,
+			iteration,
+			lane_type: laneType,
+			candidate_id: candidateId,
+			candidate_workspace_root: candidateWorkspaceRoot(mission, candidateId),
+			lane_root: laneRoot,
+			lane_summary_path: join(laneRoot, "summary.json"),
+			workspace_path: workspacePath,
+			isolation_kind: isolationKind,
+			write_policy: verifierLane ? "read_only" : "read_write",
+			capability_class: verifierLane
+				? "verifier_read_only"
+				: sharedExecutionLane
+					? "team_executor"
+					: laneType === "hardening"
+						? "hardening_executor"
+						: "direct_executor",
+			base_ref: baseRef,
+			...(provenanceToken != null
+				? { provenance_binding_token: provenanceToken }
+				: {}),
+			provenance_binding_token_hash:
+				provenanceToken != null ? `sha256:${hashValue(provenanceToken)}` : "",
+			provenance_binding_token_path: tokenPath,
+			read_only_enforced: verifierLane,
+		},
+		provenanceToken,
 	};
 }
 
@@ -224,19 +301,59 @@ export async function prepareMissionLaneExecutionEnvelopes(
 		"hardening",
 		"re_audit",
 	];
-	const envelopes = Object.fromEntries(
+	const preparedEnvelopes = Object.fromEntries(
 		laneTypes.map((laneType) => [
 			laneType,
 			buildLaneEnvelope(mission, repoRoot, iteration, laneType, baseRef),
 		]),
-	) as Record<MissionLaneType, MissionLaneExecutionEnvelope>;
-	for (const [laneType, envelope] of Object.entries(envelopes) as Array<[MissionLaneType, MissionLaneExecutionEnvelope]>) {
+	) as Record<MissionLaneType, PreparedMissionLaneEnvelope>;
+	for (const [laneType, prepared] of Object.entries(preparedEnvelopes) as Array<[MissionLaneType, PreparedMissionLaneEnvelope]>) {
+		const { envelope, provenanceToken } = prepared;
+		const persistedEnvelope = {
+			...envelope,
+			provenance_binding_token: undefined,
+		};
+		mkdirSync(dirname(candidateEnvelopeFilePath(mission, envelope.candidate_id, iteration, laneType)), {
+			recursive: true,
+		});
 		await writeAtomic(
 			envelopeFilePath(mission.mission_root, iteration, laneType),
-			`${JSON.stringify(envelope, null, 2)}\n`,
+			`${JSON.stringify(persistedEnvelope, null, 2)}\n`,
 		);
+		await writeAtomic(
+			candidateEnvelopeFilePath(
+				mission,
+			envelope.candidate_id,
+			iteration,
+			laneType,
+			),
+			`${JSON.stringify(persistedEnvelope, null, 2)}\n`,
+		);
+		if (
+			envelope.read_only_enforced &&
+			envelope.provenance_binding_token_path &&
+			provenanceToken != null
+		) {
+			await writeFile(
+				envelope.provenance_binding_token_path,
+				`${provenanceToken}\n`,
+			);
+		}
 	}
-	return envelopes;
+	return Object.fromEntries(
+		Object.entries(preparedEnvelopes).map(([laneType, prepared]) => [
+			laneType,
+			prepared.envelope,
+		]),
+	) as Record<MissionLaneType, MissionLaneExecutionEnvelope>;
+}
+
+export async function loadMissionLaneProvenanceToken(
+	envelope: MissionLaneExecutionEnvelope,
+): Promise<string | null> {
+	if (!envelope.provenance_binding_token_path) return null;
+	if (!existsSync(envelope.provenance_binding_token_path)) return null;
+	return (await readFile(envelope.provenance_binding_token_path, "utf-8")).trim();
 }
 
 export async function loadMissionLaneExecutionEnvelope(

@@ -42,6 +42,9 @@ const VALUE_TAKING_FLAGS = new Set([
 	"--model",
 	"--provider",
 	"--config",
+	"--custom",
+	"--worktree",
+	"-w",
 	"-c",
 	"-i",
 	"--images-dir",
@@ -554,10 +557,15 @@ export async function missionCommand(
 	)(cwd, parsed);
 
 	const previousAppendix = process.env[MISSION_APPEND_ENV];
+	const previousRalphAppendix = process.env.OMX_RALPH_APPEND_INSTRUCTIONS_FILE;
+	const previousAutoresearchAppendix =
+		process.env.OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE;
 	const appendixPath = await (
 		dependencies.writeAppendixFile ?? writeMissionAppendixFile
 	)(cwd, task, runtime);
 	process.env[MISSION_APPEND_ENV] = appendixPath;
+	delete process.env.OMX_RALPH_APPEND_INSTRUCTIONS_FILE;
+	delete process.env.OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE;
 
 	try {
 		const launchWithHud =
@@ -569,5 +577,12 @@ export async function missionCommand(
 		if (typeof previousAppendix === "string")
 			process.env[MISSION_APPEND_ENV] = previousAppendix;
 		else delete process.env[MISSION_APPEND_ENV];
+		if (typeof previousRalphAppendix === "string")
+			process.env.OMX_RALPH_APPEND_INSTRUCTIONS_FILE = previousRalphAppendix;
+		else delete process.env.OMX_RALPH_APPEND_INSTRUCTIONS_FILE;
+		if (typeof previousAutoresearchAppendix === "string")
+			process.env.OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE =
+				previousAutoresearchAppendix;
+		else delete process.env.OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE;
 	}
 }

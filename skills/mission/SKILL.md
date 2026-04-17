@@ -19,6 +19,7 @@ Use it when the user wants OMX to keep iterating until an **independent audit/re
 - **Thin supervisor**: keep only mission state, concise summaries, policies, and lane provenance in the long-lived context.
 - **Fresh lanes**: audit and re-audit must run in fresh OMX sessions/lane identities; they must not reuse the execution lane context.
 - **Kernel owns truth**: lifecycle transitions, iteration bookkeeping, delta judgment, plateau detection, resume, cancel, and latest-read-model updates live in `src/mission/kernel.ts`.
+- **Mission V3 overlay is real but still incremental**: the V2 kernel still owns iteration/commit closure, while V3 owns assurance contracts, proof programs, policy, candidate portfolio state, promotion artifacts, recovery of derived assurance views, and learning traces.
 - **Contract-first artifacts**: mission state persists under `.omx/missions/<slug>/` with:
   - `events.ndjson` as the append-only mission audit trail
   - `source-pack.json`
@@ -29,6 +30,7 @@ Use it when the user wants OMX to keep iterating until an **independent audit/re
   - `workflow.json` (derived Mission V2 stage + strategy history read model)
   - `budget.json`, `run-metrics.json`, and `watchdog.json` for runtime telemetry / expensive-failure controls
   - `iterations/<n>/*/execution-envelope.json` for lane workspace / write-policy / provenance binding
+  - `candidates/<candidate-id>/iterations/<n>/*` for candidate-scoped execution roots and mirrored lane summaries
   - `mission.json`
   - read models should be rebuildable from `mission.json` + `events.ndjson`; snapshots are not authoritative
   - `latest.json` (read model only; never authoritative)
@@ -37,6 +39,25 @@ Use it when the user wants OMX to keep iterating until an **independent audit/re
   - `iterations/<n>/hardening/summary.json` only when the bounded hardening fallback runs
   - `iterations/<n>/delta.json`
   - `closeout.md` once the kernel reaches a terminal state
+
+## Mission V3 runtime notes
+
+- **Implemented / authoritative now**
+  - candidate-bound execution envelopes and stale-write rejection
+  - candidate-scoped lane roots under `candidates/<candidate-id>/iterations/...`
+  - V3 derived-state recovery (`evidence-graph`, `adjudication`, `promotion-decision`, context snapshots, candidate-local assurance views, scheduler/tournament views)
+  - checker-lock / proof-program / policy enforcement at mission proof-lane write boundaries
+  - environment setup runs + secret-scope grant journaling
+  - promotion package artifacts (`rollback-plan`, `observability-delta`, `release-notes`, `handoff-summary`, `vcs-trace`)
+- **Synthetic but explicitly marked**
+  - `ui-vision`
+  - `migration`
+  - `property-checks`
+- **Planned / not yet first-class executors**
+  - `full-suite`
+  - `performance`
+
+Treat the synthetic/planned lanes as informative surfaces, not as proof that a real executor already exists for them.
 
 ## Default routing policy
 

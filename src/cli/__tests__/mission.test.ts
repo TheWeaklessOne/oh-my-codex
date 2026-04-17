@@ -67,6 +67,25 @@ describe("omx mission", () => {
 		assert.equal(parsed.bootstrap.highRisk, true);
 	});
 
+	it("keeps supported value-taking launch flags out of mission text", () => {
+		const parsed = parseMissionCliArgs([
+			"--custom",
+			"discord",
+			"--worktree",
+			"feature-x",
+			"fix",
+			"bug",
+		]);
+
+		assert.equal(parsed.task, "fix bug");
+		assert.deepEqual(parsed.launchArgs, [
+			"--custom",
+			"discord",
+			"--worktree",
+			"feature-x",
+		]);
+	});
+
 	it("documents mission in top-level help", async () => {
 		const cwd = await mkdtemp(join(tmpdir(), "omx-mission-help-"));
 		try {
@@ -150,6 +169,52 @@ describe("omx mission", () => {
 			if (typeof previousAppendix === "string")
 				process.env.OMX_MISSION_APPEND_INSTRUCTIONS_FILE = previousAppendix;
 			else delete process.env.OMX_MISSION_APPEND_INSTRUCTIONS_FILE;
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("prefers the mission appendix over inherited Ralph/autoresearch appendices during launch", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "omx-mission-appendix-precedence-"));
+		const originalCwd = process.cwd();
+		const previousMission = process.env.OMX_MISSION_APPEND_INSTRUCTIONS_FILE;
+		const previousRalph = process.env.OMX_RALPH_APPEND_INSTRUCTIONS_FILE;
+		const previousAutoresearch =
+			process.env.OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE;
+
+		try {
+			process.chdir(cwd);
+			process.env.OMX_RALPH_APPEND_INSTRUCTIONS_FILE = "/tmp/ralph-appendix.md";
+			process.env.OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE =
+				"/tmp/autoresearch-appendix.md";
+
+			await missionCommand(["close", "the", "mission"], {
+				async launchWithHud() {
+					assert.equal(
+						process.env.OMX_RALPH_APPEND_INSTRUCTIONS_FILE,
+						undefined,
+					);
+					assert.equal(
+						process.env.OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE,
+						undefined,
+					);
+					assert.match(
+						process.env.OMX_MISSION_APPEND_INSTRUCTIONS_FILE || "",
+						/\.omx\/mission\/session-instructions\.md$/,
+					);
+				},
+			});
+		} finally {
+			process.chdir(originalCwd);
+			if (typeof previousMission === "string")
+				process.env.OMX_MISSION_APPEND_INSTRUCTIONS_FILE = previousMission;
+			else delete process.env.OMX_MISSION_APPEND_INSTRUCTIONS_FILE;
+			if (typeof previousRalph === "string")
+				process.env.OMX_RALPH_APPEND_INSTRUCTIONS_FILE = previousRalph;
+			else delete process.env.OMX_RALPH_APPEND_INSTRUCTIONS_FILE;
+			if (typeof previousAutoresearch === "string")
+				process.env.OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE =
+					previousAutoresearch;
+			else delete process.env.OMX_AUTORESEARCH_APPEND_INSTRUCTIONS_FILE;
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});

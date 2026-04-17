@@ -27,8 +27,8 @@ export interface TeamExecStageOptions {
 
   /**
    * Whether this execution pass should request the bounded Ralph follow-up
-   * stage. Defaults to true so the fallback remains reachable unless the
-   * caller explicitly opts out.
+   * stage. Defaults to false; the fallback should only be requested once
+   * residual work is explicitly detected.
    */
   residualFollowupRequired?: boolean;
 }
@@ -44,7 +44,7 @@ export interface TeamExecStageOptions {
 export function createTeamExecStage(options: TeamExecStageOptions = {}): PipelineStage {
   const workerCount = options.workerCount ?? 2;
   const agentType = options.agentType ?? 'executor';
-  const residualFollowupRequired = options.residualFollowupRequired ?? true;
+  const residualFollowupRequired = options.residualFollowupRequired ?? false;
 
   return {
     name: 'team-exec',

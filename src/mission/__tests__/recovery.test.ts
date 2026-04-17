@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
 	appendFile,
+	mkdir,
 	mkdtemp,
 	readFile,
 	rm,
@@ -74,6 +75,52 @@ function verifierSummary(
 }
 
 describe("mission recovery", () => {
+	it("keeps legacy Mission V2 recovery on the non-V3 path", async () => {
+		const repo = await initRepo();
+		try {
+			const missionRoot = join(repo, ".omx", "missions", "legacy-demo");
+			await mkdir(missionRoot, { recursive: true });
+			await writeFile(
+				join(missionRoot, "mission.json"),
+				JSON.stringify(
+					{
+						schema_version: 1,
+						mission_id: "legacy-demo",
+						slug: "legacy-demo",
+						repo_root: repo,
+						mission_root: missionRoot,
+						target_fingerprint: "repo:legacy-demo",
+						status: "running",
+						started_at: "2026-04-13T00:00:00.000Z",
+						updated_at: "2026-04-13T00:00:00.000Z",
+						current_iteration: 1,
+						current_stage: "idle",
+						active_lanes: [],
+						closure_policy: {},
+						plateau_policy: {},
+						latest_verdict: "AMBIGUOUS",
+						latest_summary_path: null,
+						latest_lane_provenance: [],
+						unchanged_iterations: 0,
+						ambiguous_iterations: 0,
+						oscillation_count: 0,
+						last_residual_fingerprint: null,
+						last_strategy_key: null,
+						final_reason: null,
+					},
+					null,
+					2,
+				),
+				"utf-8",
+			);
+
+			const recovered = await recoverMissionReadModels(repo, "legacy-demo");
+			assert.equal(recovered.v3, null);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
 	it("rebuilds workflow and telemetry after snapshot drift during an active mission", async () => {
 		const repo = await initRepo();
 		try {
@@ -270,6 +317,111 @@ describe("mission recovery", () => {
 			assert.equal(recoveryEvent.payload.workflow_drift, true);
 			assert.equal(recoveryEvent.payload.latest_drift, false);
 			assert.equal(existsSync(artifactPaths.runMetricsPath), true);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("rebuilds missing Mission V3 derived artifacts during recovery", async () => {
+		const repo = await initRepo();
+		try {
+			const runtime = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "v3-recovery-demo",
+				targetFingerprint: "repo:v3-recovery-demo",
+				task: "Recover missing Mission V3 derived artifacts",
+			});
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"v3-recovery-demo",
+				"audit",
+				verifierSummary(runtime, "audit", 1, "PASS"),
+			);
+			await recordMissionRuntimeLaneSummary(repo, "v3-recovery-demo", "remediation", {
+				verdict: "PASS",
+				confidence: "high",
+				residuals: [],
+				evidence_refs: ["logs/remediation.txt"],
+				recommended_next_action: "execute",
+				provenance: {
+					lane_id: "remediation-lane-1",
+					session_id: "remediation-session-1",
+					lane_type: "remediation",
+					runner_type: "direct",
+					adapter_version: "mission-adapter/v1",
+					started_at: "2026-04-13T00:00:00.000Z",
+					finished_at: "2026-04-13T00:05:00.000Z",
+					parent_iteration: 1,
+					trigger_reason: "remediation",
+				},
+			});
+			await recordMissionRuntimeLaneSummary(repo, "v3-recovery-demo", "execution", {
+				verdict: "PASS",
+				confidence: "high",
+				residuals: [],
+				evidence_refs: ["logs/execution.txt"],
+				recommended_next_action: "re-audit",
+				provenance: {
+					lane_id: "execution-lane-1",
+					session_id: "execution-session-1",
+					lane_type: "execution",
+					runner_type: "team",
+					adapter_version: "mission-adapter/v1",
+					started_at: "2026-04-13T00:00:00.000Z",
+					finished_at: "2026-04-13T00:05:00.000Z",
+					parent_iteration: 1,
+					trigger_reason: "execution",
+				},
+			});
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"v3-recovery-demo",
+				"re_audit",
+				verifierSummary(runtime, "re_audit", 1, "PASS"),
+			);
+			await commitMissionRuntimeIteration(repo, "v3-recovery-demo", {
+				iteration_commit_succeeded: true,
+				no_unreconciled_lane_errors: true,
+				focused_checks_green: true,
+			});
+
+			await unlink(runtime.v3Paths.evidenceGraphPath);
+			await unlink(runtime.v3Paths.promotionDecisionPath);
+			await unlink(runtime.v3Paths.learningCurrentPath);
+			await unlink(
+				join(
+					repo,
+					".omx",
+					"missions",
+					"v3-recovery-demo",
+					"candidates",
+					"candidate-001",
+					"assurance",
+					"adjudication.json",
+				),
+			);
+
+			const recovered = await recoverMissionReadModels(repo, "v3-recovery-demo");
+			assert.equal(recovered.driftDetected, true);
+			assert.equal(recovered.v3?.driftDetected, true);
+			assert.equal(existsSync(runtime.v3Paths.evidenceGraphPath), true);
+			assert.equal(existsSync(runtime.v3Paths.promotionDecisionPath), true);
+			assert.equal(existsSync(runtime.v3Paths.learningCurrentPath), false);
+			assert.equal(
+				existsSync(
+					join(
+						repo,
+						".omx",
+						"missions",
+						"v3-recovery-demo",
+						"candidates",
+						"candidate-001",
+						"assurance",
+						"adjudication.json",
+					),
+				),
+				true,
+			);
 		} finally {
 			await rm(repo, { recursive: true, force: true });
 		}

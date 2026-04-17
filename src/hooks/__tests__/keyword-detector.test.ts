@@ -263,6 +263,19 @@ describe('keyword detector swarm/team compatibility', () => {
 
     assert.equal(detectPrimaryKeyword('ㅁㅔㅔ로 처리해줘'), null);
   });
+
+  it('does not trigger mission from incidental prose mentions', () => {
+    assert.equal(
+      detectPrimaryKeyword('Can you summarize the mission statement in this README?'),
+      null,
+    );
+  });
+
+  it('still triggers mission for explicit closure-loop phrases', () => {
+    const match = detectPrimaryKeyword('please run a closure loop for this fix');
+    assert.ok(match);
+    assert.equal(match.skill, 'mission');
+  });
 });
 
 describe('autoresearch keyword detection', () => {
