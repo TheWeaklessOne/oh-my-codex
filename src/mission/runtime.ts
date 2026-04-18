@@ -19,7 +19,6 @@ import {
 import {
 	loadMissionLaneExecutionEnvelope,
 	type MissionLaneExecutionEnvelope,
-	missionLaneExecutionEnvelopePath,
 	prepareMissionLaneExecutionEnvelopes,
 } from "./isolation.js";
 import {
@@ -52,7 +51,6 @@ import {
 import { syncMissionTelemetry } from "./telemetry.js";
 import {
 	type MissionV3ArtifactPaths,
-	missionV3ArtifactPaths,
 	recordMissionV3LaneSummary,
 	syncMissionV3AfterCancel,
 	syncMissionV3AfterCommit,
@@ -133,10 +131,6 @@ function deltaFile(iterationDir: string): string {
 	return join(iterationDir, "delta.json");
 }
 
-function laneSummaryPath(laneDir: string): string {
-	return join(laneDir, "summary.json");
-}
-
 async function ensureMissionState(
 	options: MissionCreateOptions,
 ): Promise<{ mission: MissionState; created: boolean }> {
@@ -197,8 +191,6 @@ function hasBootstrapInputs(options: PrepareMissionRuntimeOptions): boolean {
 }
 
 function buildLanePlans(
-	missionRoot: string,
-	iteration: MissionIterationHandle,
 	artifactPaths: MissionOrchestrationArtifactPaths,
 	envelopes: Record<MissionLaneType, MissionLaneExecutionEnvelope>,
 ): Record<MissionLaneType, MissionLaneRuntimePlan> {
@@ -345,8 +337,6 @@ export async function prepareMissionRuntime(
 		iteration.iteration,
 	);
 	const lanePlans = buildLanePlans(
-		nextMission.mission_root,
-		iteration,
 		paths,
 		envelopes,
 	);

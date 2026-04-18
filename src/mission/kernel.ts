@@ -869,7 +869,6 @@ export async function recordLaneSummary(
 ): Promise<MissionRecordLaneResult> {
 	const mission = await loadMission(repoRoot, slug);
 	const invalidReason = validateLaneIteration(mission, iteration);
-	const summaryFile = laneSummaryPath(repoRoot, slug, iteration, laneType);
 	const candidateSummaryFile = laneSummaryPath(
 		repoRoot,
 		slug,
@@ -1188,7 +1187,6 @@ async function readRequiredIterationSummaries(
 	} as MissionIterationSummaries;
 
 	for (const laneType of MISSION_REQUIRED_LANE_TYPES) {
-		const summaryFile = laneSummaryPath(repoRoot, slug, iteration, laneType);
 		const candidateSummaryFile = laneSummaryPath(
 			repoRoot,
 			slug,

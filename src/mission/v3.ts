@@ -5,7 +5,7 @@ import { arch, platform, release } from "node:os";
 import { basename, dirname, extname, join, relative } from "node:path";
 import { writeAtomic } from "../team/state/io.js";
 import type { MissionLaneSummary, MissionLaneType } from "./contracts.js";
-import { DEFAULT_MISSION_CLOSURE_MATRIX, MISSION_LANE_TYPES } from "./contracts.js";
+import { DEFAULT_MISSION_CLOSURE_MATRIX } from "./contracts.js";
 import {
 	loadMission,
 	type MissionJudgement,
@@ -1169,7 +1169,6 @@ function buildAssuranceContract(
 	mission: MissionState,
 	artifacts: MissionOrchestrationArtifacts,
 	profile: MissionV3PolicyProfile,
-	v3Paths: MissionV3ArtifactPaths,
 ): MissionV3AssuranceContract {
 	const obligations: MissionV3Obligation[] = requiredProofLanes(profile).map(
 		(lane) => {
@@ -2438,15 +2437,6 @@ async function buildEnvironmentCurrent(
 			(target) => target.matrix_target_id,
 		),
 	};
-}
-
-function obligationIdsForLane(
-	proofProgram: MissionV3ProofProgram,
-	lane: MissionV3ProofLane,
-): string[] {
-	return proofProgram.bindings
-		.filter((binding) => binding.proof_lane === lane)
-		.map((binding) => binding.obligation_id);
 }
 
 function missionLaneToProofLane(
@@ -3806,7 +3796,6 @@ function buildStatusLedger(
 function buildContextSnapshot(
 	mission: MissionState,
 	candidates: MissionV3CandidateState[],
-	adjudication: MissionV3Adjudication,
 	promotionDecision: MissionV3PromotionDecision,
 	uncertaintyRegister: Awaited<ReturnType<typeof buildUncertaintyRegister>>,
 	evidenceGraph: Awaited<ReturnType<typeof buildEvidenceGraph>>,
@@ -4193,7 +4182,6 @@ async function writeDerivedViews(params: {
 	const snapshot = buildContextSnapshot(
 		params.mission,
 		params.candidates,
-		params.adjudication,
 		params.promotionDecision,
 		params.uncertaintyRegister,
 		params.evidenceGraph,
@@ -4278,13 +4266,12 @@ async function writeDerivedViews(params: {
 			params.evidenceGraph;
 		await writeJson(derivedPaths.adjudicationPath, candidateAdjudication);
 		await writeJson(derivedPaths.evidenceGraphPath, candidateEvidenceGraph);
-		const candidateSnapshot = buildContextSnapshot(
-			params.mission,
-			params.candidates,
-			candidateAdjudication,
-			params.promotionDecision,
-			params.uncertaintyRegister,
-			candidateEvidenceGraph,
+			const candidateSnapshot = buildContextSnapshot(
+				params.mission,
+				params.candidates,
+				params.promotionDecision,
+				params.uncertaintyRegister,
+				candidateEvidenceGraph,
 		);
 		await writeJson(derivedPaths.contextSnapshotPath, candidateSnapshot);
 		await writeText(
@@ -4940,7 +4927,6 @@ export async function syncMissionV3Bootstrap(params: {
 		mission,
 		artifacts,
 		profile,
-		paths,
 	);
 	const assuranceContract = await persistMissionV3Contract({
 		path: paths.assuranceContractPath,
@@ -5538,7 +5524,6 @@ export interface MissionV3RecoveryResult {
 
 async function missionV3RecoveryArtifactPaths(
 	mission: MissionState,
-	paths: MissionV3ArtifactPaths,
 	candidates: MissionV3CandidateState[],
 ): Promise<string[]> {
 	const basePaths = (
@@ -5605,7 +5590,6 @@ export async function rebuildMissionV3DerivedStateFromDisk(
 	const candidatesBefore = await loadMissionV3CandidateStates(paths);
 	const beforeArtifacts = await missionV3RecoveryArtifactPaths(
 		mission,
-		paths,
 		candidatesBefore.length > 0 ? candidatesBefore : [candidate],
 	);
 	const missingBefore = new Set(
@@ -5627,7 +5611,6 @@ export async function rebuildMissionV3DerivedStateFromDisk(
 	const candidatesAfter = await loadMissionV3CandidateStates(paths);
 	const afterArtifacts = await missionV3RecoveryArtifactPaths(
 		result.mission,
-		paths,
 		candidatesAfter.length > 0 ? candidatesAfter : [candidate],
 	);
 	const repairedPaths: string[] = [];
