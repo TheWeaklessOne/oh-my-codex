@@ -28,6 +28,7 @@ import {
   resolveManagedPaneFromAnchor,
   resolveManagedSessionPane,
   resolveInvocationSessionId,
+  verifyManagedPaneTarget,
 } from './managed-tmux.js';
 
 export const SKILL_ACTIVE_STATE_FILE = 'skill-active-state.json';
@@ -479,6 +480,10 @@ export async function resolveNudgePaneTarget(stateDir: any, cwd = '', payload: a
         if (!anchoredPane) continue;
         const managedPane = await resolveManagedPaneFromAnchor(anchoredPane, cwd, payload, { allowTeamWorker });
         if (managedPane) return managedPane;
+        if (allowTeamWorker) {
+          const verdict = await verifyManagedPaneTarget(anchoredPane, cwd, payload, { allowTeamWorker });
+          if (verdict.ok) return anchoredPane;
+        }
       } catch {
         // skip malformed state
       }
