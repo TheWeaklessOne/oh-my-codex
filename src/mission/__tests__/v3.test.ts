@@ -9,6 +9,10 @@ import { describe, it } from "node:test";
 import type { MissionLaneSummaryInput } from "../contracts.js";
 import { loadMission } from "../kernel.js";
 import {
+	loadMissionOrchestrationArtifacts,
+	missionOrchestrationArtifactPaths,
+} from "../orchestration.js";
+import {
 	commitMissionRuntimeIteration,
 	prepareMissionRuntime,
 	recordMissionRuntimeLaneSummary,
@@ -23,6 +27,7 @@ import {
 	recordMissionV3LearningHeldOutEval,
 	recordMissionV3LearningShadowEval,
 	recordMissionV3ReleaseAction,
+	rebuildMissionV3DerivedStateFromDisk,
 	rescindMissionV3CandidateSelection,
 	selectMissionV3Candidate,
 	syncMissionV3AfterCommit,
@@ -241,6 +246,9 @@ describe("mission v3 surfaces", () => {
 				"audit",
 				verifierSummary("audit", 1, "PARTIAL", verifierToken(runtime, "audit")),
 			);
+			const activeCandidate = JSON.parse(
+				await readFile(runtime.v3Paths.activeCandidateStatePath, "utf-8"),
+			) as { workspace_root: string };
 
 			const laneRuns = await readNdjson<Array<Record<string, unknown>>>(
 				runtime.v3Paths.laneRunsPath,
@@ -300,7 +308,7 @@ describe("mission v3 surfaces", () => {
 			) as
 				| {
 						event_id: string;
-						payload?: { cwd?: string };
+						payload?: { cwd?: string; write_scope?: string };
 				  }
 				| undefined;
 			assert.ok(auditAttestation);
@@ -318,6 +326,13 @@ describe("mission v3 surfaces", () => {
 			assert.equal(
 				auditAttestation.payload?.cwd?.endsWith("summary.json"),
 				false,
+			);
+			assert.equal(
+				auditAttestation.payload?.write_scope,
+				relative(
+					repo,
+					join(activeCandidate.workspace_root, "iterations", "001", "audit"),
+				),
 			);
 			assert.deepEqual(auditEvidence.payload?.command_attestation_refs, [
 				auditAttestation.event_id,
@@ -361,6 +376,12 @@ describe("mission v3 surfaces", () => {
 				repo,
 				join(candidate.workspace_root, "iterations", "001", "audit"),
 			);
+			const siblingCandidate = await createMissionV3Candidate({
+				repoRoot: repo,
+				slug: "gate-demo",
+				rationale: "Alternative candidate to exercise sibling path blocking",
+				trigger: "architecture_fork",
+			});
 
 			await assert.rejects(
 				assertMissionV3ExecutionAllowed({
@@ -381,6 +402,81 @@ describe("mission v3 surfaces", () => {
 					idempotencyKey: "path-block",
 				}),
 				/mission_v3_policy_path_blocked:audit:\.\.\/outside/,
+			);
+
+			await assert.rejects(
+				assertMissionV3ExecutionAllowed({
+					mission,
+					paths: runtime.v3Paths,
+					candidate: candidate as never,
+					proofProgram: proofProgram as never,
+					checkerLock: checkerLock as never,
+					environmentContract: environmentContract as never,
+					sourceTrustSummary: policySnapshot.source_trust_summary as never,
+					laneType: "audit",
+					proofLane: "reproduction",
+					commandRef: "lane-summary:audit",
+					writeScope: relative(
+						repo,
+						join(siblingCandidate.workspace_root, "iterations", "001", "audit"),
+					),
+					networkMode: "repo-local",
+					secretScopes: ["verifier:read-only"],
+					actorPrincipal: "test-guardrails",
+					idempotencyKey: "sibling-candidate-block",
+				}),
+				/mission_v3_policy_path_blocked:audit:/,
+			);
+
+			await assert.rejects(
+				assertMissionV3ExecutionAllowed({
+					mission,
+					paths: runtime.v3Paths,
+					candidate: candidate as never,
+					proofProgram: proofProgram as never,
+					checkerLock: checkerLock as never,
+					environmentContract: environmentContract as never,
+					sourceTrustSummary: policySnapshot.source_trust_summary as never,
+					laneType: "audit",
+					proofLane: "reproduction",
+					commandRef: "lane-summary:audit",
+					writeScope: relative(
+						repo,
+						join(repo, ".omx", "missions", "gate-demo", "mission.json"),
+					),
+					networkMode: "repo-local",
+					secretScopes: ["verifier:read-only"],
+					actorPrincipal: "test-guardrails",
+					idempotencyKey: "mission-root-block",
+				}),
+				/mission_v3_policy_path_blocked:audit:/,
+			);
+
+			const staticBinding = proofProgram.bindings.find(
+				(entry) => entry.proof_lane === "static-analysis",
+			) as { command_refs: string[] } | undefined;
+			assert.ok(staticBinding);
+			await assert.doesNotReject(
+				assertMissionV3ExecutionAllowed({
+					mission,
+					paths: runtime.v3Paths,
+					candidate: candidate as never,
+					proofProgram: proofProgram as never,
+					checkerLock: checkerLock as never,
+					environmentContract: environmentContract as never,
+					sourceTrustSummary: policySnapshot.source_trust_summary as never,
+					laneType: "commit",
+					proofLane: "static-analysis",
+					commandRef: staticBinding.command_refs[0]!,
+					writeScope: relative(
+						repo,
+						join(repo, ".omx", "missions", "gate-demo"),
+					),
+					networkMode: "repo-local",
+					secretScopes: ["runtime:mission"],
+					actorPrincipal: "test-guardrails",
+					idempotencyKey: "commit-mission-root-allowed",
+				}),
 			);
 
 			await assert.rejects(
@@ -512,6 +608,152 @@ describe("mission v3 surfaces", () => {
 			} finally {
 				await rm(lowTrustRepo, { recursive: true, force: true });
 			}
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("treats proof-ready selected candidates as V3-verified even when the legacy compatibility status is still running", async () => {
+		const repo = await initRepo();
+		try {
+			const runtime = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "v3-proof-authority-demo",
+				targetFingerprint: "repo:v3-proof-authority-demo",
+				task: "Keep V3 closure authoritative over the proof program.",
+			});
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"v3-proof-authority-demo",
+				"audit",
+				verifierSummary("audit", 1, "PASS", verifierToken(runtime, "audit")),
+			);
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"v3-proof-authority-demo",
+				"remediation",
+				workSummary("remediation", 1),
+			);
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"v3-proof-authority-demo",
+				"execution",
+				workSummary("execution", 1),
+			);
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"v3-proof-authority-demo",
+				"re_audit",
+				verifierSummary(
+					"re_audit",
+					1,
+					"PASS",
+					verifierToken(runtime, "re_audit"),
+				),
+			);
+			const committed = await commitMissionRuntimeIteration(
+				repo,
+				"v3-proof-authority-demo",
+				{
+					iteration_commit_succeeded: true,
+					no_unreconciled_lane_errors: true,
+					focused_checks_green: true,
+				},
+			);
+			assert.equal(committed.mission.lifecycle_state, "verified");
+
+			const orchestrationArtifacts = await loadMissionOrchestrationArtifacts(
+				committed.mission.mission_root,
+			);
+			assert.ok(orchestrationArtifacts);
+			const rechecked = await syncMissionV3AfterCommit({
+				mission: {
+					...committed.mission,
+					status: "running",
+					lifecycle_state: "assuring",
+				},
+				artifacts: orchestrationArtifacts!,
+				artifactPaths: missionOrchestrationArtifactPaths(
+					committed.mission.mission_root,
+				),
+				safetyBaseline: {
+					iteration_commit_succeeded: true,
+					no_unreconciled_lane_errors: true,
+					focused_checks_green: true,
+				},
+				iteration: 1,
+				strategyChanged: false,
+				kernelJudgement: committed.judgement,
+			});
+			assert.equal(rechecked.mission.lifecycle_state, "verified");
+			assert.equal(rechecked.mission.status, "complete");
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves non-waivable legacy kernel blockers when V3 derived state is rebuilt from disk", async () => {
+		const repo = await initRepo();
+		try {
+			const runtime = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "v3-kernel-blocker-demo",
+				targetFingerprint: "repo:v3-kernel-blocker-demo",
+				task: "Keep kernel closure blockers sticky across V3 rebuilds.",
+			});
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"v3-kernel-blocker-demo",
+				"audit",
+				verifierSummary("audit", 1, "PASS", verifierToken(runtime, "audit")),
+			);
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"v3-kernel-blocker-demo",
+				"remediation",
+				workSummary("remediation", 1),
+			);
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"v3-kernel-blocker-demo",
+				"execution",
+				workSummary("execution", 1),
+			);
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"v3-kernel-blocker-demo",
+				"re_audit",
+				verifierSummary(
+					"re_audit",
+					1,
+					"PASS",
+					verifierToken(runtime, "re_audit"),
+				),
+			);
+			const committed = await commitMissionRuntimeIteration(
+				repo,
+				"v3-kernel-blocker-demo",
+				{
+					iteration_commit_succeeded: true,
+					no_unreconciled_lane_errors: true,
+					focused_checks_green: false,
+				},
+			);
+			assert.ok(
+				committed.mission.kernel_blockers.includes(
+					"legacy-kernel:green oracle without green local safety baseline cannot close",
+				),
+			);
+
+			const rebuilt = await rebuildMissionV3DerivedStateFromDisk(
+				repo,
+				"v3-kernel-blocker-demo",
+			);
+			assert.ok(
+				rebuilt.mission.kernel_blockers.includes(
+					"legacy-kernel:green oracle without green local safety baseline cannot close",
+				),
+			);
 		} finally {
 			await rm(repo, { recursive: true, force: true });
 		}
@@ -1142,6 +1384,28 @@ describe("mission v3 surfaces", () => {
 				},
 			);
 			assert.equal(committed.mission.lifecycle_state, "verified");
+			const vcsTrace = JSON.parse(
+				await readFile(runtime.v3Paths.vcsTracePath, "utf-8"),
+			) as {
+				lifecycle_state: string;
+				compatibility_status: string;
+				adjudication_ref: string;
+				promotion_decision_ref: string;
+				evidence_graph_ref: string;
+				trace_bundle_ref: string;
+				adjudication_proof_ready: boolean;
+				promotion_decision: string;
+				candidates: Array<{ selected_at: string | null }>;
+			};
+			assert.equal(vcsTrace.lifecycle_state, "verified");
+			assert.equal(vcsTrace.compatibility_status, "complete");
+			assert.equal(vcsTrace.adjudication_ref, "adjudication.json");
+			assert.equal(vcsTrace.promotion_decision_ref, "promotion-decision.json");
+			assert.equal(vcsTrace.evidence_graph_ref, "evidence-graph.json");
+			assert.equal(vcsTrace.trace_bundle_ref, join("traces", "trace-bundle.json"));
+			assert.equal(vcsTrace.adjudication_proof_ready, true);
+			assert.equal(vcsTrace.promotion_decision, "allow");
+			assert.equal(vcsTrace.candidates[0]?.selected_at !== null, true);
 
 			const laneRuns = await readNdjson<{
 				event_id: string;
@@ -1814,7 +2078,7 @@ describe("mission v3 surfaces", () => {
 		}
 	});
 
-	it("supports waiver-driven verification and stale-proof demotion after contract amendments", async () => {
+	it("supports waivers without clearing non-waivable kernel blockers and still demotes stale proofs after contract amendments", async () => {
 		const repo = await initRepo();
 		try {
 			const runtime = await prepareMissionRuntime({
@@ -1921,11 +2185,17 @@ describe("mission v3 surfaces", () => {
 				/mission_v3_waiver_forbidden:obl:adjudication/,
 			);
 
-			const verified = await loadMission(repo, "waiver-demo");
-			assert.equal(verified.lifecycle_state, "verified");
+			const afterWaiver = await loadMission(repo, "waiver-demo");
+			assert.equal(afterWaiver.lifecycle_state, "assuring");
 			assert.equal(
-				verified.verification_state.satisfied_obligation_ids.includes(
-					"obl:adjudication",
+				afterWaiver.verification_state.blocking_obligation_ids.includes(
+					"obl:static-analysis",
+				),
+				false,
+			);
+			assert.equal(
+				afterWaiver.kernel_blockers.includes(
+					"legacy-kernel:green oracle without green local safety baseline cannot close",
 				),
 				true,
 			);
@@ -1987,10 +2257,66 @@ describe("mission v3 surfaces", () => {
 			} finally {
 				await rm(policyRepo, { recursive: true, force: true });
 			}
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+
+		const verifiedRepo = await initRepo();
+		try {
+			const verifiedRuntime = await prepareMissionRuntime({
+				repoRoot: verifiedRepo,
+				slug: "amendment-demo",
+				targetFingerprint: "repo:amendment-demo",
+				task: "Exercise Mission V3 proof demotion after contract amendments.",
+			});
+			await recordMissionRuntimeLaneSummary(
+				verifiedRepo,
+				"amendment-demo",
+				"audit",
+				verifierSummary(
+					"audit",
+					1,
+					"PASS",
+					verifierToken(verifiedRuntime, "audit"),
+				),
+			);
+			await recordMissionRuntimeLaneSummary(
+				verifiedRepo,
+				"amendment-demo",
+				"remediation",
+				workSummary("remediation", 1),
+			);
+			await recordMissionRuntimeLaneSummary(
+				verifiedRepo,
+				"amendment-demo",
+				"execution",
+				workSummary("execution", 1),
+			);
+			await recordMissionRuntimeLaneSummary(
+				verifiedRepo,
+				"amendment-demo",
+				"re_audit",
+				verifierSummary(
+					"re_audit",
+					1,
+					"PASS",
+					verifierToken(verifiedRuntime, "re_audit"),
+				),
+			);
+			const verifiedCommit = await commitMissionRuntimeIteration(
+				verifiedRepo,
+				"amendment-demo",
+				{
+					iteration_commit_succeeded: true,
+					no_unreconciled_lane_errors: true,
+					focused_checks_green: true,
+				},
+			);
+			assert.equal(verifiedCommit.mission.lifecycle_state, "verified");
 
 			const unrelatedAmendment = await appendMissionV3ContractAmendment({
-				repoRoot: repo,
-				slug: "waiver-demo",
+				repoRoot: verifiedRepo,
+				slug: "amendment-demo",
 				targetContract: "proof-program",
 				authority: "test-amendment-authority",
 				rationale: "Change an unrelated proof-program binding.",
@@ -1998,11 +2324,11 @@ describe("mission v3 surfaces", () => {
 				affectedObligationIds: ["obl:release-smoke"],
 			});
 			assert.equal(unrelatedAmendment.target_contract, "proof-program");
-			const stillVerified = await loadMission(repo, "waiver-demo");
+			const stillVerified = await loadMission(verifiedRepo, "amendment-demo");
 			assert.equal(stillVerified.lifecycle_state, "verified");
 			const amendment = await appendMissionV3ContractAmendment({
-				repoRoot: repo,
-				slug: "waiver-demo",
+				repoRoot: verifiedRepo,
+				slug: "amendment-demo",
 				targetContract: "proof-program",
 				authority: "test-amendment-authority",
 				rationale:
@@ -2012,15 +2338,15 @@ describe("mission v3 surfaces", () => {
 			});
 			assert.equal(amendment.target_contract, "proof-program");
 			const beforeRetryContract = JSON.parse(
-				await readFile(runtime.v3Paths.proofProgramPath, "utf-8"),
+				await readFile(verifiedRuntime.v3Paths.proofProgramPath, "utf-8"),
 			) as { revision?: number };
 			assert.equal(
 				existsSync(
 					join(
-						repo,
+						verifiedRepo,
 						".omx",
 						"missions",
-						"waiver-demo",
+						"amendment-demo",
 						"contract-revisions",
 						"proof-program",
 						"revision-001.json",
@@ -2029,8 +2355,8 @@ describe("mission v3 surfaces", () => {
 				true,
 			);
 			const retriedAmendment = await appendMissionV3ContractAmendment({
-				repoRoot: repo,
-				slug: "waiver-demo",
+				repoRoot: verifiedRepo,
+				slug: "amendment-demo",
 				targetContract: "proof-program",
 				authority: "test-amendment-authority",
 				rationale:
@@ -2039,17 +2365,17 @@ describe("mission v3 surfaces", () => {
 				affectedObligationIds: ["obl:reproduction", "obl:targeted-regression"],
 			});
 			const afterRetryContract = JSON.parse(
-				await readFile(runtime.v3Paths.proofProgramPath, "utf-8"),
+				await readFile(verifiedRuntime.v3Paths.proofProgramPath, "utf-8"),
 			) as { revision?: number };
 			assert.equal(retriedAmendment.amendment_id, amendment.amendment_id);
 			assert.equal(afterRetryContract.revision, beforeRetryContract.revision);
 			assert.equal(
 				existsSync(
 					join(
-						repo,
+						verifiedRepo,
 						".omx",
 						"missions",
-						"waiver-demo",
+						"amendment-demo",
 						"contract-revisions",
 						"proof-program",
 						`revision-${String(beforeRetryContract.revision ?? 0).padStart(3, "0")}.json`,
@@ -2059,7 +2385,7 @@ describe("mission v3 surfaces", () => {
 			);
 			const amendmentEvents = await readNdjson<{
 				payload?: { amendment_id?: string };
-			}>(runtime.v3Paths.contractAmendmentsPath);
+			}>(verifiedRuntime.v3Paths.contractAmendmentsPath);
 			assert.equal(
 				amendmentEvents.filter(
 					(event) => event.payload?.amendment_id === amendment.amendment_id,
@@ -2067,14 +2393,14 @@ describe("mission v3 surfaces", () => {
 				1,
 			);
 
-			const demoted = await loadMission(repo, "waiver-demo");
+			const demoted = await loadMission(verifiedRepo, "amendment-demo");
 			assert.equal(demoted.lifecycle_state, "assuring");
 			assert.equal(
 				demoted.verification_state.stale_obligation_ids.length > 0,
 				true,
 			);
 		} finally {
-			await rm(repo, { recursive: true, force: true });
+			await rm(verifiedRepo, { recursive: true, force: true });
 		}
 	});
 

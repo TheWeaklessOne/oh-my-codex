@@ -526,6 +526,7 @@ export async function commitMissionRuntimeIteration(
 		safetyBaseline,
 		iteration: iteration ?? mission.current_iteration,
 		strategyChanged,
+		kernelJudgement: result.judgement,
 	});
 	const closeout = await syncMissionCloseout(v3Result.mission);
 	if (closeout) {

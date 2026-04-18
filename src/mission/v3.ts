@@ -5,8 +5,13 @@ import { arch, platform, release } from "node:os";
 import { basename, dirname, extname, join, relative } from "node:path";
 import { writeAtomic } from "../team/state/io.js";
 import type { MissionLaneSummary, MissionLaneType } from "./contracts.js";
-import { MISSION_LANE_TYPES } from "./contracts.js";
-import { loadMission, type MissionSafetyBaseline, type MissionState } from "./kernel.js";
+import { DEFAULT_MISSION_CLOSURE_MATRIX, MISSION_LANE_TYPES } from "./contracts.js";
+import {
+	loadMission,
+	type MissionJudgement,
+	type MissionSafetyBaseline,
+	type MissionState,
+} from "./kernel.js";
 import type {
 	MissionNormalizedSource,
 	MissionOrchestrationArtifactPaths,
@@ -120,6 +125,12 @@ export const MISSION_V3_LEARNING_PROPOSAL_STATES = [
 ] as const;
 export type MissionV3LearningProposalState =
 	(typeof MISSION_V3_LEARNING_PROPOSAL_STATES)[number];
+
+const LEGACY_KERNEL_COMPLETE_REASONS = new Set(
+	DEFAULT_MISSION_CLOSURE_MATRIX.filter(
+		(entry) => entry.outcome === "complete",
+	).map((entry) => entry.reason),
+);
 
 export const MISSION_V3_PROOF_LANES = [
 	"reproduction",
@@ -2494,10 +2505,14 @@ export async function assertMissionV3ExecutionAllowed(params: {
 		params.mission.repo_root,
 		params.mission.mission_root,
 	);
-	const allowedWriteScopes = [
-		missionRootScope,
-		relative(params.mission.repo_root, params.candidate.workspace_root),
-	];
+	const candidateScope = relative(
+		params.mission.repo_root,
+		params.candidate.workspace_root,
+	);
+	const allowedWriteScopes = [candidateScope];
+	if (params.laneType === "commit") {
+		allowedWriteScopes.push(missionRootScope);
+	}
 	if (
 		!allowedWriteScopes.some(
 			(scope) =>
@@ -3682,18 +3697,53 @@ function buildHandoffSummary(params: {
 function buildVcsTrace(params: {
 	mission: MissionState;
 	candidates: MissionV3CandidateState[];
+	paths: MissionV3ArtifactPaths;
+	adjudication: MissionV3Adjudication;
+	promotionDecision: MissionV3PromotionDecision;
 }) {
 	return {
 		schema_version: 1 as const,
 		generated_at: nowIso(),
 		mission_id: params.mission.mission_id,
+		compatibility_status: params.mission.status,
+		lifecycle_state: params.mission.lifecycle_state,
 		selected_candidate_id: params.mission.selected_candidate_id,
 		active_candidate_id: params.mission.active_candidate_id,
+		assurance_contract_id: params.mission.assurance_contract_id,
+		proof_program_id: params.mission.proof_program_id,
+		environment_contract_id: params.mission.environment_contract_id,
+		latest_authoritative_iteration_ref:
+			params.mission.latest_authoritative_iteration_ref,
+		latest_authoritative_adjudication_ref:
+			params.mission.latest_authoritative_adjudication_ref,
+		verification_state: params.mission.verification_state,
+		promotion_state: params.mission.promotion_state,
+		adjudication_ref: relative(
+			params.mission.mission_root,
+			params.paths.adjudicationPath,
+		),
+		promotion_decision_ref: relative(
+			params.mission.mission_root,
+			params.paths.promotionDecisionPath,
+		),
+		evidence_graph_ref: relative(
+			params.mission.mission_root,
+			params.paths.evidenceGraphPath,
+		),
+		trace_bundle_ref: relative(
+			params.mission.mission_root,
+			params.paths.traceBundlePath,
+		),
 		latest_summary_path: params.mission.latest_summary_path,
+		latest_lane_provenance: params.mission.latest_lane_provenance,
+		adjudication_proof_ready: params.adjudication.proof_ready,
+		promotion_decision: params.promotionDecision.decision,
 		candidates: params.candidates.map((candidate) => ({
 			candidate_id: candidate.candidate_id,
 			state: candidate.state,
 			workspace_root: candidate.workspace_root,
+			parent_candidate_ids: candidate.parent_candidate_ids,
+			selected_at: candidate.selected_at,
 			latest_lane_run_refs: candidate.latest_lane_run_refs,
 			latest_evidence_refs: candidate.latest_evidence_refs,
 		})),
@@ -4192,6 +4242,9 @@ async function writeDerivedViews(params: {
 		buildVcsTrace({
 			mission: params.mission,
 			candidates: params.candidates,
+			paths: params.paths,
+			adjudication: params.adjudication,
+			promotionDecision: params.promotionDecision,
 		}),
 	);
 	await writeText(
@@ -4334,6 +4387,7 @@ async function rebuildMissionV3DerivedState(params: {
 	assuranceContract: MissionV3AssuranceContract;
 	proofProgram: MissionV3ProofProgram;
 	environmentContract: MissionV3EnvironmentContract;
+	kernelJudgement?: MissionJudgement | null;
 	preferredLifecycle?: MissionV3LifecycleState;
 	preserveAuthoritativeArtifacts?: boolean;
 }): Promise<MissionV3SyncResult> {
@@ -4346,6 +4400,7 @@ async function rebuildMissionV3DerivedState(params: {
 		assuranceContract,
 		proofProgram,
 		environmentContract,
+		kernelJudgement,
 		preferredLifecycle,
 	} = params;
 	const checkerLock = await readJson<MissionV3CheckerLock>(
@@ -4364,9 +4419,24 @@ async function rebuildMissionV3DerivedState(params: {
 		environmentCurrent,
 	);
 	const activeWaivers = await loadMissionV3ActiveWaivers(paths);
-	const effectivePolicyBlockers = applyMissionV3PolicyWaivers(
-		policy.blockers,
-		activeWaivers,
+	const legacyKernelReason =
+		kernelJudgement?.reason ?? mission.final_reason ?? null;
+	const persistedLegacyKernelBlockers = kernelJudgement
+		? []
+		: (mission.kernel_blockers ?? []).filter((value) =>
+				value.startsWith("legacy-kernel:"),
+			);
+	const nonWaivableKernelBlockers =
+		((kernelJudgement?.nextStatus ?? mission.status) !== "complete") &&
+		legacyKernelReason &&
+		!LEGACY_KERNEL_COMPLETE_REASONS.has(legacyKernelReason)
+			? [`legacy-kernel:${legacyKernelReason}`]
+			: persistedLegacyKernelBlockers;
+	const effectivePolicyBlockers = Array.from(
+		new Set([
+			...applyMissionV3PolicyWaivers(policy.blockers, activeWaivers),
+			...nonWaivableKernelBlockers,
+		]),
 	);
 	const contractAmendments = await missionV3ContractAmendmentIndex(paths);
 	const impactMap = await buildImpactMap(
@@ -4533,9 +4603,12 @@ async function rebuildMissionV3DerivedState(params: {
 		lifecycleState = "promotion_ready";
 	else if (
 		selectedCandidateId !== null &&
-		adjudication.proof_ready &&
-		mission.status === "complete"
+		adjudication.proof_ready
 	)
+		// Mission V3 proof closure should not remain subordinate to the legacy V2
+		// compatibility status.  Once a selected candidate satisfies the blocking
+		// proof obligations, the mission becomes V3-verified; the V2 `status`
+		// continues to exist only as a compatibility view.
 		lifecycleState = "verified";
 	else if (preferredLifecycle === "planning" && mission.current_iteration === 0)
 		lifecycleState = "planning";
@@ -5052,15 +5125,7 @@ export async function recordMissionV3LaneSummary(params: {
 			cwd: relative(mission.repo_root, dirname(summaryPath)),
 			env_hash: environmentContract.declared_environment_hash,
 			network_mode: "repo-local",
-			write_scope: relative(
-				mission.repo_root,
-				join(
-					mission.mission_root,
-					"iterations",
-					String(iteration).padStart(3, "0"),
-					laneType,
-				),
-			),
+			write_scope: relative(mission.repo_root, dirname(summaryPath)),
 			started_at: summary.provenance.started_at,
 			completed_at: summary.provenance.finished_at,
 			exit_code:
@@ -5181,6 +5246,7 @@ export async function syncMissionV3AfterCommit(params: {
 	safetyBaseline: MissionSafetyBaseline;
 	iteration: number;
 	strategyChanged: boolean;
+	kernelJudgement?: MissionJudgement | null;
 }): Promise<MissionV3SyncResult> {
 	const { mission, artifacts, safetyBaseline, iteration } = params;
 	const paths = missionV3ArtifactPaths(
@@ -5336,6 +5402,7 @@ export async function syncMissionV3AfterCommit(params: {
 		assuranceContract,
 		proofProgram,
 		environmentContract,
+		kernelJudgement: params.kernelJudgement,
 		preferredLifecycle,
 	});
 	await appendJournalEvent(paths.promotionEventsPath, {
