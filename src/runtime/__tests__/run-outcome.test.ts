@@ -7,6 +7,11 @@ import {
   isTerminalRunOutcome,
   normalizeRunOutcome,
 } from '../run-outcome.js';
+import {
+  inferTerminalLifecycleOutcome,
+  normalizeTerminalLifecycleOutcome,
+  preferredRunOutcomeForLifecycleOutcome,
+} from '../terminal-lifecycle.js';
 import { shouldContinueRun } from '../run-loop.js';
 
 describe('run outcome contract', () => {
@@ -76,5 +81,40 @@ describe('run outcome contract', () => {
       current_phase: 'executing',
       run_outcome: 'continue',
     }), true);
+  });
+
+  it('normalizes canonical terminal lifecycle outcomes and legacy aliases', () => {
+    assert.deepEqual(normalizeTerminalLifecycleOutcome('askuserQuestion'), {
+      outcome: 'askuserQuestion',
+    });
+    assert.deepEqual(normalizeTerminalLifecycleOutcome('complete'), {
+      outcome: 'finished',
+      warning: 'normalized legacy lifecycle outcome "complete" -> "finished"',
+    });
+    assert.deepEqual(normalizeTerminalLifecycleOutcome('cancelled'), {
+      outcome: 'userinterlude',
+      warning: 'normalized legacy lifecycle outcome "cancelled" -> "userinterlude"',
+    });
+  });
+
+  it('infers terminal lifecycle outcome from legacy run_outcome when no canonical field exists', () => {
+    assert.deepEqual(inferTerminalLifecycleOutcome({ run_outcome: 'finish' }), {
+      outcome: 'finished',
+    });
+    assert.deepEqual(inferTerminalLifecycleOutcome({ run_outcome: 'blocked_on_user' }), {
+      outcome: 'blocked',
+    });
+    assert.deepEqual(inferTerminalLifecycleOutcome({ run_outcome: 'cancelled' }), {
+      outcome: 'userinterlude',
+      warning: 'normalized legacy run outcome "cancelled" -> "userinterlude"',
+    });
+  });
+
+  it('maps canonical lifecycle outcomes to compatibility run_outcome values', () => {
+    assert.equal(preferredRunOutcomeForLifecycleOutcome('finished'), 'finish');
+    assert.equal(preferredRunOutcomeForLifecycleOutcome('blocked'), 'blocked_on_user');
+    assert.equal(preferredRunOutcomeForLifecycleOutcome('failed'), 'failed');
+    assert.equal(preferredRunOutcomeForLifecycleOutcome('userinterlude'), 'cancelled');
+    assert.equal(preferredRunOutcomeForLifecycleOutcome('askuserQuestion'), 'blocked_on_user');
   });
 });
