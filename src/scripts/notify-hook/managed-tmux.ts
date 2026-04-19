@@ -343,7 +343,7 @@ export async function resolveManagedSessionPane(cwd: string, payload: any): Prom
       ['list-panes', '-s', '-t', expectedSession, '-F', '#{pane_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_start_command}'],
       2000,
     );
-    return selectManagedSessionPane(parseManagedSessionPaneRows(panesResult.stdout), { allowWrapperFallback: true });
+    return selectManagedSessionPane(parseManagedSessionPaneRows(panesResult.stdout));
   } catch {
     // best effort only
   }

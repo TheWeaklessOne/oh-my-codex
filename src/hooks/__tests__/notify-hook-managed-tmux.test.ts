@@ -375,7 +375,7 @@ exit 1
     }
   });
 
-  it('accepts a wrapper-launched node pane when detached managed-session fallback has no stricter codex candidate', async () => {
+  it('fails closed for anchorless managed-session recovery when only a wrapper-launched node pane exists', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-managed-wrapper-node-session-pane-'));
     const originalPath = process.env.PATH;
     try {
@@ -447,7 +447,7 @@ exit 1
       process.env.OMX_TEAM_WORKER = '';
 
       const paneId = await resolveManagedSessionPane(cwd, { session_id: sessionId });
-      assert.equal(paneId, '%42');
+      assert.equal(paneId, '');
     } finally {
       process.env.PATH = originalPath;
       await rm(cwd, { recursive: true, force: true });
