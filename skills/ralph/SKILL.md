@@ -82,7 +82,7 @@ Complex tasks often fail silently: partial implementations get declared "done", 
    - After Step 7 passes, run `oh-my-codex:ai-slop-cleaner` on **all files changed during the Ralph session**.
    - Scope the cleaner to **changed files only**; do not widen the pass beyond Ralph-owned edits.
    - Run the cleaner in **standard mode** (not `--review`).
-   - If the prompt contains `--no-deslop`, skip Step 7.5 entirely and proceed with the most recent successful verification evidence.
+   - If the prompt contains `--no-deslop`, skip Step 7.5 entirely and proceed with the most recent successful verification evidence **unless** a Mission hardening gate explicitly marks deslop as required; in Mission hardening mode, the gate requirement overrides the opt-out.
 7.6 **Regression Re-verification**:
    - After the deslop pass, re-run all tests/build/lint and read the output to confirm they still pass.
    - If post-deslop regression fails, roll back cleaner changes or fix and retry. Then rerun Step 7.5 and Step 7.6 until the regression is green.
@@ -199,7 +199,7 @@ explicit PRD-gated path.
 
 ### Detecting `--no-deslop`
 Check if `{{PROMPT}}` contains `--no-deslop`.
-If `--no-deslop` is present, skip the deslop pass entirely after Step 7 and continue using the latest successful pre-deslop verification evidence.
+If `--no-deslop` is present, skip the deslop pass entirely after Step 7 and continue using the latest successful pre-deslop verification evidence, unless the active Mission hardening gate explicitly requires deslop.
 
 ### Visual Reference Flags (Optional)
 Ralph execution supports visual reference flags for screenshot tasks:

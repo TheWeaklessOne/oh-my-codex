@@ -5,10 +5,15 @@ import { join, relative } from "node:path";
 import { writeAtomic } from "../team/state/io.js";
 import type {
 	MissionConfidence,
+	MissionHardeningGatePolicy,
 	MissionLaneSummary,
 	MissionLaneType,
 	MissionVerdict,
 } from "./contracts.js";
+import {
+	deriveMissionHardeningGatePolicy,
+	missionHardeningArtifactPaths,
+} from "./hardening.js";
 import type {
 	MissionDelta,
 	MissionLatestSnapshot,
@@ -171,6 +176,11 @@ export interface MissionAcceptanceContract {
 export interface MissionExecutionPlanOptions {
 	planningMode?: MissionPlanningMode;
 	highRisk?: boolean;
+	policyProfile?: {
+		risk_class?: string | null;
+		assurance_profile?: string | null;
+		autonomy_profile?: string | null;
+	};
 }
 
 export interface MissionExecutionPlan {
@@ -191,6 +201,7 @@ export interface MissionExecutionPlan {
 	lane_expectations: string[];
 	verification_checkpoints: string[];
 	strategy_change_triggers: string[];
+	hardening_gate: MissionHardeningGatePolicy;
 	optional_hardening_rules: string[];
 }
 
@@ -414,6 +425,40 @@ function writeJson(filePath: string, value: unknown): Promise<void> {
 
 async function readJson<T>(filePath: string): Promise<T> {
 	return JSON.parse(await readFile(filePath, "utf-8")) as T;
+}
+
+function normalizeMissionExecutionPlan(
+	plan: MissionExecutionPlan,
+	policyProfile?: {
+		risk_class?: string | null;
+		assurance_profile?: string | null;
+		autonomy_profile?: string | null;
+	} | null,
+): MissionExecutionPlan {
+	if (plan.hardening_gate) {
+		return plan;
+	}
+	const gatePolicy = deriveMissionHardeningGatePolicy({
+		policyProfile: policyProfile ?? null,
+	});
+	return {
+		...plan,
+		hardening_gate: gatePolicy,
+		optional_hardening_rules:
+			gatePolicy.mode === "required"
+				? [
+						"Hardening is mandatory for this Mission profile before the final authoritative re-audit may close the iteration.",
+						"Run the hardening coordinator inside the Ralph lane and fail fast if the required review engine is unavailable with no explicit fallback policy.",
+					]
+				: gatePolicy.mode === "off"
+					? [
+							"Hardening is disabled for this Mission plan unless a later plan revision explicitly enables it.",
+						]
+					: [
+							"Skip hardening when audit + execution + re-audit already satisfy the contract.",
+							"Use hardening only for narrow stubborn residuals that benefit from a bounded Ralph follow-up.",
+						],
+	};
 }
 
 function missionIterationDir(missionRoot: string, iteration: number): string {
@@ -735,6 +780,24 @@ export function buildMissionExecutionPlan(
 		touchpoints: brief.project_touchpoints,
 	});
 	const planId = `plan:${hashValue(planSeed)}`;
+	const hardeningGate = deriveMissionHardeningGatePolicy({
+		policyProfile: options.policyProfile ?? null,
+		highRisk: options.highRisk,
+	});
+	const optionalHardeningRules =
+		hardeningGate.mode === "required"
+			? [
+					"Hardening is mandatory for this Mission profile before the final authoritative re-audit may close the iteration.",
+					"Run the hardening coordinator inside the Ralph lane and fail fast if the required review engine is unavailable with no explicit fallback policy.",
+				]
+			: hardeningGate.mode === "off"
+				? [
+						"Hardening is disabled for this Mission plan unless a later plan revision explicitly enables it.",
+					]
+				: [
+						"Skip hardening when audit + execution + re-audit already satisfy the contract.",
+						"Use hardening only for narrow stubborn residuals that benefit from a bounded Ralph follow-up.",
+					];
 	const next: MissionExecutionPlan = {
 		schema_version: MISSION_V2_ARTIFACT_VERSION,
 		generated_at: nowIso(),
@@ -759,13 +822,17 @@ export function buildMissionExecutionPlan(
 			"Use the mission brief and acceptance contract as the pre-loop source of truth.",
 			"Run the initial audit before broad execution.",
 			"Shape remediation and execute the approved plan.",
-			"Only request hardening when residuals justify a bounded stubborn follow-up.",
+			hardeningGate.mode === "required"
+				? "Run the required hardening coordinator before the final authoritative re-audit."
+				: "Only request hardening when residuals justify a bounded stubborn follow-up.",
 			"Run a fresh re-audit and let the kernel decide closure, plateau, failure, or continuation.",
 		],
 		lane_expectations: [
 			"audit/re_audit remain fresh read-only verifier lanes grounded in the acceptance contract",
 			"execution follows the approved plan and emits evidence references for the verifier",
-			"hardening stays optional and only applies to bounded stubborn residuals",
+			hardeningGate.mode === "required"
+				? "hardening remains a bounded Ralph coordinator lane and must complete successfully before the final authoritative re-audit"
+				: "hardening stays optional and only applies to bounded stubborn residuals",
 		],
 		verification_checkpoints: [
 			...contract.acceptance_criteria,
@@ -775,12 +842,12 @@ export function buildMissionExecutionPlan(
 		strategy_change_triggers: [
 			"Residual set stays unchanged across iterations after a meaningful plan update.",
 			"Audit or re-audit exposes a missing acceptance criterion or invariant.",
-			"Optional hardening is no longer warranted by the residual shape.",
+			hardeningGate.mode === "required"
+				? "Required hardening fails to reach a green gate result."
+				: "Optional hardening is no longer warranted by the residual shape.",
 		],
-		optional_hardening_rules: [
-			"Skip hardening when audit + execution + re-audit already satisfy the contract.",
-			"Use hardening only for narrow stubborn residuals that benefit from a bounded Ralph follow-up.",
-		],
+		hardening_gate: hardeningGate,
+		optional_hardening_rules: optionalHardeningRules,
 	};
 	if (!previous) return next;
 
@@ -795,6 +862,7 @@ export function buildMissionExecutionPlan(
 		lane_expectations: previous.lane_expectations,
 		verification_checkpoints: previous.verification_checkpoints,
 		strategy_change_triggers: previous.strategy_change_triggers,
+		hardening_gate: previous.hardening_gate,
 		optional_hardening_rules: previous.optional_hardening_rules,
 	};
 	const nextComparable = {
@@ -808,6 +876,7 @@ export function buildMissionExecutionPlan(
 		lane_expectations: next.lane_expectations,
 		verification_checkpoints: next.verification_checkpoints,
 		strategy_change_triggers: next.strategy_change_triggers,
+		hardening_gate: next.hardening_gate,
 		optional_hardening_rules: next.optional_hardening_rules,
 	};
 	if (stableJson(previousComparable) === stableJson(nextComparable)) {
@@ -944,6 +1013,18 @@ function formatMissionExecutionPlanMarkdown(
 		"## Strategy-change triggers",
 		markdownList(plan.strategy_change_triggers),
 		"",
+		"## Hardening gate",
+		`- Mode: \`${plan.hardening_gate.mode}\``,
+		`- Review engine: \`${plan.hardening_gate.review_engine}\``,
+		`- Allowed fallback review engines: ${
+			plan.hardening_gate.fallback_review_engines.length > 0
+				? plan.hardening_gate.fallback_review_engines.join(", ")
+				: "_none_"
+		}`,
+		`- Max review/fix cycles: ${plan.hardening_gate.max_review_fix_cycles}`,
+		`- Deslop policy: \`${plan.hardening_gate.deslop_policy}\``,
+		`- Final sanity review: \`${plan.hardening_gate.final_sanity_review}\``,
+		"",
 		"## Optional hardening rules",
 		markdownList(plan.optional_hardening_rules),
 		"",
@@ -1033,6 +1114,11 @@ async function archiveSupersededPlanningTransactions(
 
 export async function loadMissionOrchestrationArtifacts(
 	missionRoot: string,
+	policyProfile?: {
+		risk_class?: string | null;
+		assurance_profile?: string | null;
+		autonomy_profile?: string | null;
+	} | null,
 ): Promise<MissionOrchestrationArtifacts | null> {
 	const paths = missionOrchestrationArtifactPaths(missionRoot);
 	if (
@@ -1051,8 +1137,9 @@ export async function loadMissionOrchestrationArtifacts(
 		acceptanceContract: await readJson<MissionAcceptanceContract>(
 			paths.acceptanceContractPath,
 		),
-		executionPlan: await readJson<MissionExecutionPlan>(
-			paths.executionPlanStatePath,
+		executionPlan: normalizeMissionExecutionPlan(
+			await readJson<MissionExecutionPlan>(paths.executionPlanStatePath),
+			policyProfile ?? null,
 		),
 		planningTransaction: await readJson<MissionPlanningTransaction>(
 			paths.planningTransactionPath,
@@ -1066,6 +1153,7 @@ export async function prepareMissionOrchestrationArtifacts(
 ): Promise<MissionOrchestrationArtifactUpdate> {
 	const existing = await loadMissionOrchestrationArtifacts(
 		mission.mission_root,
+		mission.policy_profile,
 	);
 	if (existing && options.forceRebuild !== true) {
 		return {
@@ -1100,7 +1188,10 @@ export async function prepareMissionOrchestrationArtifacts(
 		sourcePack,
 		brief,
 		acceptanceContract,
-		options,
+		{
+			...options,
+			policyProfile: options.policyProfile ?? mission.policy_profile,
+		},
 		existing?.executionPlan ?? null,
 	);
 	const planningTransaction = buildMissionPlanningTransaction(
@@ -1179,6 +1270,7 @@ export async function writeMissionLaneBriefings(
 		const briefRef = relative(laneDir, artifactPaths.missionBriefPath);
 		const contractRef = relative(laneDir, artifactPaths.acceptanceContractPath);
 		const planRef = relative(laneDir, artifactPaths.executionPlanPath);
+		const hardeningArtifacts = missionHardeningArtifactPaths(laneDir);
 		const laneSpecificSection =
 			laneType === "audit" || laneType === "re_audit"
 				? [
@@ -1193,7 +1285,36 @@ export async function writeMissionLaneBriefings(
 							...artifacts.acceptanceContract.required_operational_evidence,
 						]),
 					].join("\n")
-				: [
+				: laneType === "hardening"
+					? [
+							"## Hardening coordinator protocol",
+							markdownList([
+								`Mission hardening gate mode: ${artifacts.executionPlan.hardening_gate.mode}`,
+								`Review engine: ${artifacts.executionPlan.hardening_gate.review_engine}`,
+								`Max review/fix cycles: ${artifacts.executionPlan.hardening_gate.max_review_fix_cycles}`,
+								`Deslop policy: ${artifacts.executionPlan.hardening_gate.deslop_policy}`,
+								`Final sanity review: ${artifacts.executionPlan.hardening_gate.final_sanity_review}`,
+								"Keep the outer Mission supervisor thin; the hardening lane owns the bounded review -> fix -> verify -> deslop -> verify -> final sanity review loop.",
+								"Preserve lane ownership: execution=team, hardening=ralph, re_audit=fresh direct verifier.",
+								"Fail fast if the required review engine is unavailable and no explicit fallback policy exists.",
+							]),
+							"",
+							"## Hardening artifacts",
+							markdownList([
+								`\`${relative(laneDir, hardeningArtifacts.reviewCyclePath(1))}\` ... \`${relative(laneDir, hardeningArtifacts.reviewCyclePath(artifacts.executionPlan.hardening_gate.max_review_fix_cycles))}\``,
+								`\`${relative(laneDir, hardeningArtifacts.deslopReportPath)}\``,
+								`\`${relative(laneDir, hardeningArtifacts.finalReviewPath)}\``,
+								`\`${relative(laneDir, hardeningArtifacts.gateResultPath)}\``,
+								`\`${relative(laneDir, hardeningArtifacts.summaryPath)}\``,
+							]),
+							"",
+							"## Wrapper surface",
+							markdownList([
+								"Use the repo-owned `skills/mission-hardening/SKILL.md` wrapper as the hardening coordinator contract.",
+								"Keep `summary.json` compact and store detailed loop evidence in the sidecar artifacts above.",
+							]),
+						].join("\n")
+					: [
 						"## Plan-guided execution",
 						markdownList([
 							...artifacts.executionPlan.execution_order,
@@ -1240,11 +1361,33 @@ async function readLatestSummary(
 	return readJson<MissionLaneSummary>(mission.latest_summary_path);
 }
 
+function missionCurrentIterationRoot(mission: MissionState): string {
+	const iterationId = String(mission.current_iteration).padStart(3, "0");
+	if (mission.active_candidate_id) {
+		return join(
+			mission.mission_root,
+			"candidates",
+			mission.active_candidate_id,
+			"iterations",
+			iterationId,
+		);
+	}
+	return join(mission.mission_root, "iterations", iterationId);
+}
+
 export async function buildMissionCloseout(
 	mission: MissionState,
 ): Promise<MissionCloseout> {
 	const artifactPaths = missionOrchestrationArtifactPaths(mission.mission_root);
 	const latestSummary = await readLatestSummary(mission);
+	const hardeningSummaryPath = join(
+		missionCurrentIterationRoot(mission),
+		"hardening",
+		"summary.json",
+	);
+	const hardeningSummary = existsSync(hardeningSummaryPath)
+		? await readJson<MissionLaneSummary>(hardeningSummaryPath)
+		: null;
 	const latestSnapshot = existsSync(missionLatestPath(mission.mission_root))
 		? await readJson<MissionLatestSnapshot>(
 				missionLatestPath(mission.mission_root),
@@ -1257,7 +1400,10 @@ export async function buildMissionCloseout(
 				missionDeltaPath(mission.mission_root, mission.current_iteration),
 			)
 		: null;
-	const evidenceRefs = normalizeList(latestSummary?.evidence_refs ?? []);
+	const evidenceRefs = normalizeList([
+		...(latestSummary?.evidence_refs ?? []),
+		...(hardeningSummary?.evidence_refs ?? []),
+	]);
 	const residualIds =
 		latestSummary?.residuals.map((residual) => residual.stable_id) ?? [];
 	const followUps =
@@ -1287,6 +1433,7 @@ export async function buildMissionCloseout(
 		evidence_index: normalizeList([
 			...evidenceRefs,
 			latestSnapshot?.latest_summary_path ?? mission.latest_summary_path ?? "",
+			hardeningSummaryPath,
 			delta
 				? missionDeltaPath(mission.mission_root, mission.current_iteration)
 				: "",

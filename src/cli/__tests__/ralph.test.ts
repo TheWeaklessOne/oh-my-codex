@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -12,6 +12,7 @@ import {
   filterRalphCodexArgs,
   isRalphPrdMode,
   normalizeRalphCliArgs,
+  ralphCommand,
 } from '../ralph.js';
 import type { ApprovedExecutionLaunchHint } from '../../planning/artifacts.js';
 
@@ -51,6 +52,7 @@ describe('RALPH_HELP', () => {
   it('clarifies that prompt-side $ralph activation is separate from CLI --prd mode', () => {
     assert.match(RALPH_HELP, /Prompt-side `\$ralph` activation is separate from this CLI entrypoint/i);
     assert.match(RALPH_HELP, /does not imply `--prd` or the PRD\.json startup gate/i);
+    assert.match(RALPH_HELP, /unless a Mission hardening gate marks deslop as required/i);
   });
 });
 
@@ -212,6 +214,46 @@ describe('ralph deslop launch wiring', () => {
     assert.match(instructions, /latest successful pre-deslop verification evidence/i);
   });
 
+  it('includes mission hardening review-loop context when provided', () => {
+    const instructions = buildRalphAppendInstructions('run mission hardening', {
+      changedFilesPath: '.omx/ralph/changed-files.txt',
+      noDeslop: false,
+      approvedHint: null,
+      hardening: {
+        gateMode: 'required',
+        reviewEngine: 'codex-parallel-review',
+        maxReviewFixCycles: 2,
+        changedFilesPath: '.omx/ralph/changed-files.txt',
+        reportPaths: ['review-cycle-1.json', 'final-review.json', 'gate-result.json'],
+        requireDeslop: true,
+      },
+    });
+    assert.match(instructions, /Mission hardening context/i);
+    assert.match(instructions, /review engine: codex-parallel-review/i);
+    assert.match(instructions, /max review\/fix cycles: 2/i);
+    assert.match(instructions, /report artifacts: review-cycle-1\.json, final-review\.json, gate-result\.json/i);
+    assert.match(instructions, /hardening coordinator/i);
+  });
+
+  it('disables --no-deslop when the mission hardening gate requires deslop', () => {
+    const instructions = buildRalphAppendInstructions('run mission hardening', {
+      changedFilesPath: '.omx/ralph/changed-files.txt',
+      noDeslop: true,
+      approvedHint: null,
+      hardening: {
+        gateMode: 'required',
+        reviewEngine: 'codex-parallel-review',
+        maxReviewFixCycles: 2,
+        changedFilesPath: '.omx/ralph/changed-files.txt',
+        reportPaths: ['gate-result.json'],
+        requireDeslop: true,
+      },
+    });
+    assert.match(instructions, /requires the deslop pass/i);
+    assert.match(instructions, /ignore the opt-out/i);
+    assert.match(instructions, /must rerun tests\/build\/lint after the mandatory hardening deslop pass/i);
+  });
+
 
 
   it('includes approved plan and deep-interview handoff context when available', () => {
@@ -232,5 +274,145 @@ describe('ralph deslop launch wiring', () => {
     assert.match(seed, /mandatory final ai-slop-cleaner pass/i);
     assert.match(seed, /one repo-relative path per line/i);
     assert.match(seed, /strictly scoped/i);
+  });
+
+  it('wires mission hardening context into the real ralph launch appendix', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralph-hardening-launch-'));
+    const previousCwd = process.cwd();
+    const previousAppendix = process.env.OMX_RALPH_APPEND_INSTRUCTIONS_FILE;
+    try {
+      process.chdir(cwd);
+      const missionRoot = join(cwd, '.omx', 'missions', 'demo');
+      await mkdir(missionRoot, { recursive: true });
+      await writeFile(
+        join(missionRoot, 'mission.json'),
+        `${JSON.stringify({
+          schema_version: 1,
+          mission_version: 3,
+          mission_id: 'demo-20260418-hardening',
+          slug: 'demo',
+          repo_root: cwd,
+          mission_root: missionRoot,
+          target_fingerprint: 'repo:demo',
+          status: 'running',
+          lifecycle_state: 'executing',
+          started_at: '2026-04-18T18:00:00.000Z',
+          updated_at: '2026-04-18T18:00:00.000Z',
+          current_iteration: 1,
+          current_stage: 'hardening',
+          active_lanes: [],
+          closure_policy: {
+            require_fresh_verifier: true,
+            allowed_completion_confidence: ['high', 'medium'],
+            require_safety_baseline: true,
+            regression_outcome: 'iterate',
+            ambiguous_outcome: 'iterate',
+          },
+          plateau_policy: {
+            max_unchanged_iterations: 2,
+            require_strategy_change_before_plateau: true,
+            oscillation_window: 2,
+            max_ambiguous_iterations: 2,
+          },
+          latest_verdict: 'AMBIGUOUS',
+          latest_summary_path: null,
+          latest_lane_provenance: [],
+          unchanged_iterations: 0,
+          ambiguous_iterations: 0,
+          oscillation_count: 0,
+          last_residual_fingerprint: null,
+          last_strategy_key: null,
+          final_reason: null,
+          active_candidate_id: 'candidate-001',
+          selected_candidate_id: 'candidate-001',
+          candidate_ids: ['candidate-001'],
+          assurance_contract_id: null,
+          proof_program_id: null,
+          checker_lock_id: null,
+          environment_contract_id: null,
+          policy_profile: {
+            risk_class: 'security-sensitive',
+            assurance_profile: 'max-quality',
+            autonomy_profile: 'semi-auto',
+          },
+          verification_state: {
+            status: 'pending',
+            blocking_obligation_ids: [],
+            satisfied_obligation_ids: [],
+            contradicted_obligation_ids: [],
+            stale_obligation_ids: [],
+            adjudication_state: 'pending',
+            last_verified_at: null,
+          },
+          promotion_state: {
+            status: 'blocked',
+            blocking_reasons: [],
+            last_decision_at: null,
+            decision_ref: null,
+          },
+          plateau_strategy_state: {
+            strategy_key: null,
+            mutation_attempts: 0,
+            candidate_expansions: 0,
+            exhausted: false,
+          },
+          kernel_blockers: [],
+          latest_authoritative_iteration_ref: null,
+          latest_authoritative_adjudication_ref: null,
+        }, null, 2)}\n`,
+      );
+      await writeFile(
+        join(missionRoot, 'execution-plan.json'),
+        `${JSON.stringify({
+          schema_version: 1,
+          generated_at: '2026-04-18T18:00:00.000Z',
+          plan_id: 'plan:demo',
+          plan_revision: 1,
+          previous_plan_id: null,
+          strategy_key: 'strategy:demo',
+          planning_mode: 'direct',
+          handoff_surface: 'plan',
+          status: 'approved',
+          blocking_reason: null,
+          approval_basis: 'test',
+          approved_at: '2026-04-18T18:00:00.000Z',
+          summary: 'demo',
+          execution_order: [],
+          lane_expectations: [],
+          verification_checkpoints: [],
+          strategy_change_triggers: [],
+          hardening_gate: {
+            mode: 'required',
+            review_engine: 'codex-parallel-review',
+            fallback_review_engines: [],
+            max_review_fix_cycles: 2,
+            deslop_policy: 'changed-files-final-pass',
+            final_sanity_review: 'required',
+          },
+          optional_hardening_rules: [],
+        }, null, 2)}\n`,
+      );
+
+      const launches: string[][] = [];
+      await ralphCommand(['--no-deslop', 'run', 'mission', 'hardening'], {
+        async launchWithHud(args) {
+          launches.push(args);
+          const appendixPath = process.env.OMX_RALPH_APPEND_INSTRUCTIONS_FILE;
+          assert.ok(typeof appendixPath === 'string');
+          const appendix = await readFile(appendixPath!, 'utf-8');
+          assert.match(appendix, /Mission hardening context:/);
+          assert.match(appendix, /hardening gate mode: required/i);
+          assert.match(appendix, /review engine: codex-parallel-review/i);
+          assert.match(appendix, /ignore the opt-out and run the mandatory changed-files ai-slop-cleaner pass/i);
+          assert.match(appendix, /report artifacts: .*hardening\/gate-result\.json/i);
+        },
+      });
+      assert.deepEqual(launches, [['run', 'mission', 'hardening']]);
+    } finally {
+      process.chdir(previousCwd);
+      if (typeof previousAppendix === 'string') process.env.OMX_RALPH_APPEND_INSTRUCTIONS_FILE = previousAppendix;
+      else delete process.env.OMX_RALPH_APPEND_INSTRUCTIONS_FILE;
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 });

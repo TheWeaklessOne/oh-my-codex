@@ -9,6 +9,10 @@ import {
 	MISSION_LANE_POLICIES,
 	type MissionLaneSummaryInput,
 } from "../contracts.js";
+import {
+	deriveMissionHardeningGatePolicy,
+	missionHardeningArtifactPaths,
+} from "../hardening.js";
 import { prepareMissionLaneExecutionEnvelopes } from "../isolation.js";
 import {
 	cancelMission,
@@ -121,6 +125,124 @@ async function recordRequiredLaneSummaries(
 		);
 	}
 	await recordLaneSummary(repo, slug, iteration, "re_audit", reAuditInput);
+}
+
+async function setMissionPolicyProfile(
+	repo: string,
+	slug: string,
+	overrides: Partial<{
+		risk_class: string;
+		assurance_profile: string;
+		autonomy_profile: string;
+	}>,
+): Promise<void> {
+	const missionPath = join(repo, ".omx", "missions", slug, "mission.json");
+	const mission = JSON.parse(await readFile(missionPath, "utf-8")) as {
+		policy_profile: {
+			risk_class: string;
+			assurance_profile: string;
+			autonomy_profile: string;
+		};
+	};
+	await writeFile(
+		missionPath,
+		`${JSON.stringify(
+			{
+				...mission,
+				policy_profile: {
+					...mission.policy_profile,
+					...overrides,
+				},
+			},
+			null,
+			2,
+		)}\n`,
+		"utf-8",
+	);
+}
+
+async function writeHardeningGateReport(
+	repo: string,
+	slug: string,
+	iteration: number,
+	overrides: Partial<Record<string, unknown>> = {},
+): Promise<void> {
+	const laneRoot = join(
+		repo,
+		".omx",
+		"missions",
+		slug,
+		"iterations",
+		String(iteration).padStart(3, "0"),
+		"hardening",
+	);
+	const paths = missionHardeningArtifactPaths(laneRoot);
+	await mkdir(laneRoot, { recursive: true });
+	await writeFile(paths.reviewCyclePath(1), JSON.stringify({ cycle: 1 }, null, 2));
+	await writeFile(paths.deslopReportPath, "# deslop\n", "utf-8");
+	await writeFile(
+		paths.finalReviewPath,
+		JSON.stringify({ status: "pass" }, null, 2),
+		"utf-8",
+	);
+	await writeFile(
+		paths.gateResultPath,
+		JSON.stringify(
+			{
+				schema_version: 1,
+				generated_at: "2026-04-18T18:00:00.000Z",
+				gate_policy: deriveMissionHardeningGatePolicy({
+					policyProfile: {
+						risk_class: "security-sensitive",
+						assurance_profile: "max-quality",
+					},
+				}),
+				status: "passed",
+				failure_reason: null,
+				changed_files_ref: ".omx/ralph/changed-files.txt",
+				review_cycles: [
+					{
+						cycle_number: 1,
+						review_engine: "codex-parallel-review",
+						review_report_ref: "review-cycle-1.json",
+						blocking_findings: 0,
+						verification: {
+							status: "pass",
+							command_refs: ["npm run build"],
+							evidence_refs: ["logs/build.txt"],
+							completed_at: "2026-04-18T18:02:00.000Z",
+						},
+						completed_at: "2026-04-18T18:02:00.000Z",
+					},
+				],
+				deslop_report_ref: "deslop-report.md",
+				post_deslop_verification: {
+					status: "pass",
+					command_refs: ["npm run lint"],
+					evidence_refs: ["logs/lint.txt"],
+					completed_at: "2026-04-18T18:03:00.000Z",
+				},
+				final_review: {
+					review_engine: "codex-parallel-review",
+					review_report_ref: "final-review.json",
+					blocking_findings: 0,
+					status: "pass",
+					completed_at: "2026-04-18T18:04:00.000Z",
+				},
+				blocking_findings_remaining: 0,
+				completed_at: "2026-04-18T18:04:00.000Z",
+				artifact_refs: [
+					"review-cycle-1.json",
+					"deslop-report.md",
+					"final-review.json",
+				],
+				...overrides,
+			},
+			null,
+			2,
+		),
+		"utf-8",
+	);
 }
 
 describe("mission kernel", () => {
@@ -394,6 +516,475 @@ describe("mission kernel", () => {
 					readOnly: true,
 				}),
 			);
+
+			const committed = await commitIteration(repo, "demo", 1, {
+				iteration_commit_succeeded: true,
+				no_unreconciled_lane_errors: true,
+				focused_checks_green: true,
+			});
+
+			assert.equal(committed.mission.status, "complete");
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects required hardening when the gate report is missing", async () => {
+		const repo = await initRepo();
+		try {
+			await createMission({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+			});
+			await setMissionPolicyProfile(repo, "demo", {
+				risk_class: "security-sensitive",
+				assurance_profile: "max-quality",
+			});
+			await startIteration(repo, "demo", "required-hardening");
+			await recordRequiredLaneSummaries(
+				repo,
+				"demo",
+				1,
+				laneSummary("re_audit", 1, {
+					verdict: "PASS",
+					confidence: "high",
+					readOnly: true,
+				}),
+				{ includeHardening: true },
+			);
+
+			const committed = await commitIteration(repo, "demo", 1, {
+				iteration_commit_succeeded: true,
+				no_unreconciled_lane_errors: true,
+				focused_checks_green: true,
+			});
+
+			assert.equal(committed.mission.status, "running");
+			assert.match(committed.judgement.reason, /hardening_gate_incomplete/i);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects required hardening when blocking findings remain in the gate result", async () => {
+		const repo = await initRepo();
+		try {
+			await createMission({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+			});
+			await setMissionPolicyProfile(repo, "demo", {
+				risk_class: "security-sensitive",
+				assurance_profile: "max-quality",
+			});
+			await startIteration(repo, "demo", "required-hardening");
+			await recordRequiredLaneSummaries(
+				repo,
+				"demo",
+				1,
+				laneSummary("re_audit", 1, {
+					verdict: "PASS",
+					confidence: "high",
+					readOnly: true,
+				}),
+				{ includeHardening: true },
+			);
+			await writeHardeningGateReport(repo, "demo", 1, {
+				blocking_findings_remaining: 2,
+			});
+
+			const committed = await commitIteration(repo, "demo", 1, {
+				iteration_commit_succeeded: true,
+				no_unreconciled_lane_errors: true,
+				focused_checks_green: true,
+			});
+
+			assert.equal(committed.mission.status, "running");
+			assert.match(
+				committed.judgement.reason,
+				/hardening_gate_blocking_findings/i,
+			);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects required hardening when the hardening lane did not run under Ralph provenance", async () => {
+		const repo = await initRepo();
+		try {
+			await createMission({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+			});
+			await setMissionPolicyProfile(repo, "demo", {
+				risk_class: "security-sensitive",
+				assurance_profile: "max-quality",
+			});
+			await startIteration(repo, "demo", "required-hardening");
+			await recordLaneSummary(
+				repo,
+				"demo",
+				1,
+				"audit",
+				laneSummary("audit", 1, { verdict: "PASS", readOnly: true }),
+			);
+			await recordLaneSummary(
+				repo,
+				"demo",
+				1,
+				"remediation",
+				laneSummary("remediation", 1, { verdict: "PASS" }),
+			);
+			await recordLaneSummary(
+				repo,
+				"demo",
+				1,
+				"execution",
+				laneSummary("execution", 1, { verdict: "PASS" }),
+			);
+			await recordLaneSummary(repo, "demo", 1, "hardening", {
+				...laneSummary("hardening", 1, { verdict: "PASS" }),
+				provenance: {
+					...laneSummary("hardening", 1, { verdict: "PASS" }).provenance,
+					runner_type: "direct",
+				},
+			});
+			await writeHardeningGateReport(repo, "demo", 1);
+			await recordLaneSummary(repo, "demo", 1, "re_audit", {
+				...laneSummary("re_audit", 1, {
+					verdict: "PASS",
+					confidence: "high",
+					readOnly: true,
+				}),
+				provenance: {
+					...laneSummary("re_audit", 1, {
+						verdict: "PASS",
+						confidence: "high",
+						readOnly: true,
+					}).provenance,
+					finished_at: "2026-04-18T18:05:00.000Z",
+				},
+			});
+
+			const committed = await commitIteration(repo, "demo", 1, {
+				iteration_commit_succeeded: true,
+				no_unreconciled_lane_errors: true,
+				focused_checks_green: true,
+			});
+
+			assert.equal(committed.mission.status, "running");
+			assert.match(committed.judgement.reason, /hardening_gate_runner_invalid/i);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects required hardening when the gate report explicitly failed", async () => {
+		const repo = await initRepo();
+		try {
+			await createMission({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+			});
+			await setMissionPolicyProfile(repo, "demo", {
+				risk_class: "security-sensitive",
+				assurance_profile: "max-quality",
+			});
+			await startIteration(repo, "demo", "required-hardening");
+			await recordRequiredLaneSummaries(
+				repo,
+				"demo",
+				1,
+				laneSummary("re_audit", 1, {
+					verdict: "PASS",
+					confidence: "high",
+					readOnly: true,
+				}),
+				{ includeHardening: true },
+			);
+			await writeHardeningGateReport(repo, "demo", 1, {
+				status: "failed",
+				failure_reason: "review engine unavailable",
+			});
+
+			const committed = await commitIteration(repo, "demo", 1, {
+				iteration_commit_succeeded: true,
+				no_unreconciled_lane_errors: true,
+				focused_checks_green: true,
+			});
+
+			assert.equal(committed.mission.status, "running");
+			assert.match(committed.judgement.reason, /hardening_gate_failed/i);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects required hardening when post-deslop verification is missing", async () => {
+		const repo = await initRepo();
+		try {
+			await createMission({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+			});
+			await setMissionPolicyProfile(repo, "demo", {
+				risk_class: "security-sensitive",
+				assurance_profile: "max-quality",
+			});
+			await startIteration(repo, "demo", "required-hardening");
+			await recordRequiredLaneSummaries(
+				repo,
+				"demo",
+				1,
+				laneSummary("re_audit", 1, {
+					verdict: "PASS",
+					confidence: "high",
+					readOnly: true,
+				}),
+				{ includeHardening: true },
+			);
+			await writeHardeningGateReport(repo, "demo", 1, {
+				post_deslop_verification: null,
+			});
+
+			const committed = await commitIteration(repo, "demo", 1, {
+				iteration_commit_succeeded: true,
+				no_unreconciled_lane_errors: true,
+				focused_checks_green: true,
+			});
+
+			assert.equal(committed.mission.status, "running");
+			assert.match(
+				committed.judgement.reason,
+				/hardening_gate_verification_missing/i,
+			);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects required hardening when final review evidence is missing", async () => {
+		const repo = await initRepo();
+		try {
+			await createMission({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+			});
+			await setMissionPolicyProfile(repo, "demo", {
+				risk_class: "security-sensitive",
+				assurance_profile: "max-quality",
+			});
+			await startIteration(repo, "demo", "required-hardening");
+			await recordRequiredLaneSummaries(
+				repo,
+				"demo",
+				1,
+				laneSummary("re_audit", 1, {
+					verdict: "PASS",
+					confidence: "high",
+					readOnly: true,
+				}),
+				{ includeHardening: true },
+			);
+			await writeHardeningGateReport(repo, "demo", 1, {
+				final_review: null,
+			});
+
+			const committed = await commitIteration(repo, "demo", 1, {
+				iteration_commit_succeeded: true,
+				no_unreconciled_lane_errors: true,
+				focused_checks_green: true,
+			});
+
+			assert.equal(committed.mission.status, "running");
+			assert.match(
+				committed.judgement.reason,
+				/hardening_gate_incomplete:final_review/i,
+			);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("requires the final authoritative re-audit to happen after a successful hardening gate", async () => {
+		const repo = await initRepo();
+		try {
+			await createMission({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+			});
+			await setMissionPolicyProfile(repo, "demo", {
+				risk_class: "security-sensitive",
+				assurance_profile: "max-quality",
+			});
+			await startIteration(repo, "demo", "required-hardening");
+			await recordRequiredLaneSummaries(
+				repo,
+				"demo",
+				1,
+				laneSummary("re_audit", 1, {
+					verdict: "PASS",
+					confidence: "high",
+					readOnly: true,
+				}),
+				{ includeHardening: true },
+			);
+			await writeHardeningGateReport(repo, "demo", 1, {
+				completed_at: "2026-04-18T18:06:00.000Z",
+			});
+
+			const committed = await commitIteration(repo, "demo", 1, {
+				iteration_commit_succeeded: true,
+				no_unreconciled_lane_errors: true,
+				focused_checks_green: true,
+			});
+
+			assert.equal(committed.mission.status, "running");
+			assert.match(committed.judgement.reason, /hardening_gate_order_invalid/i);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects required hardening when re-audit finishes at the same instant as hardening", async () => {
+		const repo = await initRepo();
+		try {
+			await createMission({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+			});
+			await setMissionPolicyProfile(repo, "demo", {
+				risk_class: "security-sensitive",
+				assurance_profile: "max-quality",
+			});
+			await startIteration(repo, "demo", "required-hardening");
+			await recordLaneSummary(
+				repo,
+				"demo",
+				1,
+				"audit",
+				laneSummary("audit", 1, { verdict: "PASS", readOnly: true }),
+			);
+			await recordLaneSummary(
+				repo,
+				"demo",
+				1,
+				"remediation",
+				laneSummary("remediation", 1, { verdict: "PASS" }),
+			);
+			await recordLaneSummary(
+				repo,
+				"demo",
+				1,
+				"execution",
+				laneSummary("execution", 1, { verdict: "PASS" }),
+			);
+			await recordLaneSummary(repo, "demo", 1, "hardening", {
+				...laneSummary("hardening", 1, { verdict: "PASS" }),
+				provenance: {
+					...laneSummary("hardening", 1, { verdict: "PASS" }).provenance,
+					finished_at: "2026-04-18T18:04:00.000Z",
+				},
+			});
+			await writeHardeningGateReport(repo, "demo", 1, {
+				completed_at: "2026-04-18T18:04:00.000Z",
+			});
+			await recordLaneSummary(repo, "demo", 1, "re_audit", {
+				...laneSummary("re_audit", 1, {
+					verdict: "PASS",
+					confidence: "high",
+					readOnly: true,
+				}),
+				provenance: {
+					...laneSummary("re_audit", 1, {
+						verdict: "PASS",
+						confidence: "high",
+						readOnly: true,
+					}).provenance,
+					finished_at: "2026-04-18T18:04:00.000Z",
+				},
+			});
+
+			const committed = await commitIteration(repo, "demo", 1, {
+				iteration_commit_succeeded: true,
+				no_unreconciled_lane_errors: true,
+				focused_checks_green: true,
+			});
+
+			assert.equal(committed.mission.status, "running");
+			assert.match(committed.judgement.reason, /hardening_gate_order_invalid/i);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("accepts required hardening when the gate is green and the final re-audit is fresh", async () => {
+		const repo = await initRepo();
+		try {
+			await createMission({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+			});
+			await setMissionPolicyProfile(repo, "demo", {
+				risk_class: "security-sensitive",
+				assurance_profile: "max-quality",
+			});
+			await startIteration(repo, "demo", "required-hardening");
+			await recordLaneSummary(
+				repo,
+				"demo",
+				1,
+				"audit",
+				laneSummary("audit", 1, { verdict: "PASS", readOnly: true }),
+			);
+			await recordLaneSummary(
+				repo,
+				"demo",
+				1,
+				"remediation",
+				laneSummary("remediation", 1, { verdict: "PASS" }),
+			);
+			await recordLaneSummary(
+				repo,
+				"demo",
+				1,
+				"execution",
+				laneSummary("execution", 1, { verdict: "PASS" }),
+			);
+			await recordLaneSummary(repo, "demo", 1, "hardening", {
+				...laneSummary("hardening", 1, { verdict: "PASS" }),
+				provenance: {
+					...laneSummary("hardening", 1, { verdict: "PASS" }).provenance,
+					finished_at: "2026-04-18T18:04:00.000Z",
+				},
+			});
+			await writeHardeningGateReport(repo, "demo", 1, {
+				completed_at: "2026-04-18T18:04:00.000Z",
+			});
+			await recordLaneSummary(repo, "demo", 1, "re_audit", {
+				...laneSummary("re_audit", 1, {
+					verdict: "PASS",
+					confidence: "high",
+					readOnly: true,
+				}),
+				provenance: {
+					...laneSummary("re_audit", 1, {
+						verdict: "PASS",
+						confidence: "high",
+						readOnly: true,
+					}).provenance,
+					finished_at: "2026-04-18T18:05:00.000Z",
+				},
+			});
 
 			const committed = await commitIteration(repo, "demo", 1, {
 				iteration_commit_succeeded: true,

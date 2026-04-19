@@ -15,6 +15,7 @@ import {
 	MISSION_REQUIRED_LANE_TYPES,
 	MISSION_STATUSES,
 	type MissionClosurePolicy,
+	type MissionHardeningGatePolicy,
 	type MissionLaneSummary,
 	type MissionLaneSummaryInput,
 	type MissionLaneType,
@@ -25,6 +26,14 @@ import {
 	normalizeLaneSummary,
 	severityRank,
 } from "./contracts.js";
+import {
+	collectMissionHardeningArtifactRefs,
+	deriveMissionHardeningGatePolicy,
+	missionHardeningArtifactPaths,
+	missionHardeningGateIsRequired,
+	readMissionHardeningReportFromLaneRoot,
+	validateMissionHardeningReport,
+} from "./hardening.js";
 import { loadMissionLaneExecutionEnvelope } from "./isolation.js";
 
 export interface MissionState {
@@ -211,6 +220,10 @@ function missionPath(repoRoot: string, slug: string): string {
 
 function latestPath(repoRoot: string, slug: string): string {
 	return join(missionRoot(repoRoot, slug), "latest.json");
+}
+
+function executionPlanStatePathForMission(mission: MissionState): string {
+	return join(mission.mission_root, "execution-plan.json");
 }
 
 function buildMissionLatestSnapshot(
@@ -883,7 +896,25 @@ export async function recordLaneSummary(
 			reason: invalidReason,
 		};
 	}
-	const summary = normalizeLaneSummary(summaryInput);
+	let nextSummaryInput = summaryInput;
+	if (laneType === "hardening") {
+		const laneRoot = dirname(candidateSummaryFile);
+		const report = await readMissionHardeningReportFromLaneRoot(laneRoot);
+		const hardeningRefs = collectMissionHardeningArtifactRefs(
+			repoRoot,
+			laneRoot,
+			report,
+		);
+		if (hardeningRefs.length > 0) {
+			nextSummaryInput = {
+				...summaryInput,
+				evidence_refs: Array.from(
+					new Set([...(summaryInput.evidence_refs ?? []), ...hardeningRefs]),
+				),
+			};
+		}
+	}
+	const summary = normalizeLaneSummary(nextSummaryInput);
 
 	if (mission.status === "cancelling") {
 		const nextMission = removeActiveLane(mission, laneType, summary);
@@ -1217,6 +1248,101 @@ async function readRequiredIterationSummaries(
 	return summaries;
 }
 
+async function readMissionHardeningGatePolicy(
+	mission: MissionState,
+): Promise<MissionHardeningGatePolicy> {
+	const filePath = executionPlanStatePathForMission(mission);
+	if (existsSync(filePath)) {
+		const raw = await readJsonFile<{
+			hardening_gate?: MissionHardeningGatePolicy;
+		}>(filePath);
+		if (raw.hardening_gate) {
+			return raw.hardening_gate;
+		}
+	}
+	return deriveMissionHardeningGatePolicy({
+		policyProfile: mission.policy_profile,
+	});
+}
+
+async function validateHardeningGate(
+	repoRoot: string,
+	slug: string,
+	iteration: number,
+	mission: MissionState,
+	laneSummaries: MissionIterationSummaries,
+): Promise<string | null> {
+	const policy = await readMissionHardeningGatePolicy(mission);
+	if (!missionHardeningGateIsRequired(policy)) {
+		return null;
+	}
+	if (!laneSummaries.hardening) {
+		return "hardening_gate_incomplete:summary_missing";
+	}
+	const laneRoot = dirname(
+		laneSummaryPath(
+			repoRoot,
+			slug,
+			iteration,
+			"hardening",
+			mission.active_candidate_id,
+		),
+	);
+	const report = await readMissionHardeningReportFromLaneRoot(laneRoot);
+	if (!report) {
+		return "hardening_gate_incomplete:gate_result_missing";
+	}
+	if (
+		laneSummaries.hardening.provenance.runner_type !==
+			MISSION_LANE_POLICIES.hardening.runnerType
+	) {
+		return "hardening_gate_runner_invalid";
+	}
+	if (report.status !== "passed") {
+		return `hardening_gate_failed:${report.failure_reason ?? report.status}`;
+	}
+	const validationErrors = validateMissionHardeningReport(report, policy);
+	if (validationErrors.length > 0) {
+		if (
+			validationErrors.some((error) =>
+				error.startsWith("hardening_report_blocking_findings_remaining"),
+			)
+		) {
+			return "hardening_gate_blocking_findings";
+		}
+		if (
+			validationErrors.some((error) =>
+				error.startsWith("hardening_report_post_deslop_verification"),
+			)
+		) {
+			return "hardening_gate_verification_missing";
+		}
+		if (
+			validationErrors.some((error) =>
+				error.startsWith("hardening_report_final_review"),
+			)
+		) {
+			return "hardening_gate_incomplete:final_review";
+		}
+		return validationErrors[0] ?? "hardening_gate_incomplete";
+	}
+	const hardeningCompletedAt = [
+		laneSummaries.hardening.provenance.finished_at,
+		report.completed_at,
+	]
+		.filter(Boolean)
+		.sort()
+		.at(-1);
+	if (
+		hardeningCompletedAt &&
+		new Date(laneSummaries.re_audit.provenance.finished_at).getTime() <=
+			new Date(hardeningCompletedAt).getTime()
+	) {
+		return "hardening_gate_order_invalid";
+	}
+	return null;
+}
+
 function isGreenSafetyBaseline(baseline: MissionSafetyBaseline): boolean {
 	return (
 		baseline.iteration_commit_succeeded &&
@@ -1230,27 +1356,22 @@ export function judgeMissionState(
 	verifier: MissionLaneSummary,
 	delta: MissionDelta,
 	safetyBaseline: MissionSafetyBaseline,
-	verifierFreshnessError: string | null,
+	closureGateError: string | null,
 	strategyChanged = false,
 ): MissionJudgement {
+	if (closureGateError) {
+		return {
+			nextStatus: "running",
+			reason: closureGateError,
+			closureDecision: "iterate",
+		};
+	}
 	const safety = isGreenSafetyBaseline(safetyBaseline) ? "green" : "red";
 	const closure = closureMatrixDecision(
 		verifier.verdict,
 		verifier.confidence,
 		safety,
 	);
-
-	if (
-		mission.closure_policy.require_fresh_verifier &&
-		verifierFreshnessError &&
-		closure.outcome !== "iterate"
-	) {
-		return {
-			nextStatus: "running",
-			reason: verifierFreshnessError,
-			closureDecision: "iterate",
-		};
-	}
 
 	if (closure.outcome === "complete") {
 		return {
@@ -1343,13 +1464,20 @@ export async function commitIteration(
 		iteration,
 		laneSummaries,
 	);
+	const hardeningGateError = await validateHardeningGate(
+		repoRoot,
+		slug,
+		iteration,
+		mission,
+		laneSummaries,
+	);
 
 	const judgement = judgeMissionState(
 		mission,
 		verifier,
 		delta,
 		safetyBaseline,
-		verifierFreshnessError,
+		hardeningGateError ?? verifierFreshnessError,
 		strategyChanged,
 	);
 	if (!canTransitionMissionStatus(mission.status, judgement.nextStatus)) {

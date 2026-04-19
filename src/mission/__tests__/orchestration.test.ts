@@ -180,6 +180,41 @@ describe('mission orchestration artifacts', () => {
     assert.equal(blockedTransaction.approval_mode, 'needs_clarification');
   });
 
+  it('serializes hardening gate defaults from mission policy profiles', () => {
+    const sourcePack = buildMissionSourcePack({ task: 'Harden Mission execution gating' });
+    const brief = compileMissionBrief(sourcePack);
+    const contract = compileMissionAcceptanceContract(brief);
+
+    const balancedPlan = buildMissionExecutionPlan(sourcePack, brief, contract, {
+      policyProfile: {
+        risk_class: 'low-risk-local',
+        assurance_profile: 'balanced',
+      },
+    });
+    const highPlan = buildMissionExecutionPlan(sourcePack, brief, contract, {
+      policyProfile: {
+        risk_class: 'cross-cutting-refactor',
+        assurance_profile: 'high',
+      },
+    });
+    const maxPlan = buildMissionExecutionPlan(sourcePack, brief, contract, {
+      policyProfile: {
+        risk_class: 'security-sensitive',
+        assurance_profile: 'max-quality',
+      },
+    });
+
+    assert.equal(balancedPlan.hardening_gate.mode, 'optional');
+    assert.equal(highPlan.hardening_gate.mode, 'required');
+    assert.equal(maxPlan.hardening_gate.mode, 'required');
+    assert.equal(maxPlan.hardening_gate.review_engine, 'codex-parallel-review');
+    assert.equal(maxPlan.hardening_gate.max_review_fix_cycles, 2);
+    assert.match(
+      highPlan.optional_hardening_rules.join('\n'),
+      /mandatory/i,
+    );
+  });
+
   it('versions acceptance contracts and execution plans when the mission requirements change', async () => {
     const repo = await initRepo();
     try {

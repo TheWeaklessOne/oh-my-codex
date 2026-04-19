@@ -28,6 +28,7 @@ import {
 	recordMissionV3LearningShadowEval,
 	recordMissionV3ReleaseAction,
 	rebuildMissionV3DerivedStateFromDisk,
+	missionV3ArtifactPaths,
 	rescindMissionV3CandidateSelection,
 	selectMissionV3Candidate,
 	syncMissionV3AfterCommit,
@@ -759,6 +760,86 @@ describe("mission v3 surfaces", () => {
 		}
 	});
 
+	it("records required hardening gate failures as V3 adjudication risk summaries", async () => {
+		const repo = await initRepo();
+		try {
+			const runtime = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "v3-hardening-demo",
+				targetFingerprint: "repo:v3-hardening-demo",
+				task: "Require hardening before final re-audit closes.",
+				highRisk: true,
+			});
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"v3-hardening-demo",
+				"audit",
+				verifierSummary("audit", 1, "PASS", verifierToken(runtime, "audit")),
+			);
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"v3-hardening-demo",
+				"remediation",
+				workSummary("remediation", 1),
+			);
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"v3-hardening-demo",
+				"execution",
+				workSummary("execution", 1),
+			);
+			await recordMissionRuntimeLaneSummary(repo, "v3-hardening-demo", "hardening", {
+				...workSummary("hardening", 1),
+				verdict: "PASS",
+				residuals: [],
+				recommended_next_action: "handoff to fresh re-audit",
+			});
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"v3-hardening-demo",
+				"re_audit",
+				verifierSummary(
+					"re_audit",
+					1,
+					"PASS",
+					verifierToken(runtime, "re_audit"),
+				),
+			);
+			const committed = await commitMissionRuntimeIteration(
+				repo,
+				"v3-hardening-demo",
+				{
+					iteration_commit_succeeded: true,
+					no_unreconciled_lane_errors: true,
+					focused_checks_green: true,
+				},
+			);
+			assert.ok(
+				committed.mission.kernel_blockers.includes(
+					"legacy-kernel:hardening_gate_incomplete:gate_result_missing",
+				),
+			);
+
+			const adjudication = JSON.parse(
+				await readFile(
+					missionV3ArtifactPaths(
+						committed.mission.mission_root,
+						committed.mission.active_candidate_id ?? "candidate-001",
+					).adjudicationPath,
+					"utf-8",
+				),
+			) as { residual_risk_summary: string[] };
+			assert.equal(
+				adjudication.residual_risk_summary.includes(
+					"legacy-kernel:hardening_gate_incomplete:gate_result_missing",
+				),
+				true,
+			);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
 	it("fails closed on stale environment attestations even when the V2 kernel would otherwise close", async () => {
 		const repo = await initRepo();
 		try {
@@ -1362,6 +1443,88 @@ describe("mission v3 surfaces", () => {
 				"promotion-artifacts-demo",
 				"execution",
 				workSummary("execution", 1),
+			);
+			const hardeningLaneDir = runtime.lanePlans.hardening?.laneDir;
+			if (!hardeningLaneDir) {
+				throw new Error("expected hardening lane dir");
+			}
+			await writeFile(
+				join(hardeningLaneDir, "review-cycle-1.json"),
+				JSON.stringify({ cycle: 1 }, null, 2),
+				"utf-8",
+			);
+			await writeFile(
+				join(hardeningLaneDir, "deslop-report.md"),
+				"# deslop\n",
+				"utf-8",
+			);
+			await writeFile(
+				join(hardeningLaneDir, "final-review.json"),
+				JSON.stringify({ status: "pass" }, null, 2),
+				"utf-8",
+			);
+			await writeFile(
+				join(hardeningLaneDir, "gate-result.json"),
+				JSON.stringify(
+					{
+						schema_version: 1,
+						generated_at: "2026-04-18T18:00:00.000Z",
+						gate_policy: runtime.artifacts.executionPlan.hardening_gate,
+						status: "passed",
+						failure_reason: null,
+						changed_files_ref: ".omx/ralph/changed-files.txt",
+						review_cycles: [
+							{
+								cycle_number: 1,
+								review_engine: "codex-parallel-review",
+								review_report_ref: "review-cycle-1.json",
+								blocking_findings: 0,
+								verification: {
+									status: "pass",
+									command_refs: ["npm run build"],
+									evidence_refs: ["logs/build.txt"],
+									completed_at: "2026-04-11T17:02:00.000Z",
+								},
+								completed_at: "2026-04-11T17:02:00.000Z",
+							},
+						],
+						deslop_report_ref: "deslop-report.md",
+						post_deslop_verification: {
+							status: "pass",
+							command_refs: ["npm run lint"],
+							evidence_refs: ["logs/lint.txt"],
+							completed_at: "2026-04-11T17:03:00.000Z",
+						},
+						final_review: {
+							review_engine: "codex-parallel-review",
+							review_report_ref: "final-review.json",
+							blocking_findings: 0,
+							status: "pass",
+							completed_at: "2026-04-11T17:04:00.000Z",
+						},
+						blocking_findings_remaining: 0,
+						completed_at: "2026-04-11T17:04:00.000Z",
+						artifact_refs: [
+							"review-cycle-1.json",
+							"deslop-report.md",
+							"final-review.json",
+						],
+					},
+					null,
+					2,
+				),
+				"utf-8",
+			);
+			await recordMissionRuntimeLaneSummary(
+				repo,
+				"promotion-artifacts-demo",
+				"hardening",
+				{
+					...workSummary("hardening", 1),
+					verdict: "PASS",
+					residuals: [],
+					recommended_next_action: "handoff to fresh re-audit",
+				},
 			);
 			await recordMissionRuntimeLaneSummary(
 				repo,

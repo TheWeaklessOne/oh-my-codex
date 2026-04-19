@@ -100,6 +100,7 @@ describe("mission runtime", () => {
 			assert.equal(runtime.planning.mode, "direct");
 			assert.equal(runtime.lanePlans.execution?.runnerType, "team");
 			assert.equal(runtime.lanePlans.hardening?.runnerType, "ralph");
+			assert.equal(runtime.artifacts.executionPlan.hardening_gate.mode, "optional");
 			assert.equal(runtime.lanePlans.audit?.readOnly, true);
 			assert.equal(runtime.lanePlans.re_audit?.freshSession, true);
 			assert.equal(existsSync(runtime.missionFile), true);
@@ -123,6 +124,17 @@ describe("mission runtime", () => {
 			);
 			assert.match(auditBriefing, /acceptance-contract\.json/i);
 			assert.match(auditBriefing, /PASS/i);
+			const executionPlanMarkdown = await readFile(
+				runtime.artifactPaths.executionPlanPath,
+				"utf-8",
+			);
+			assert.match(executionPlanMarkdown, /## Hardening gate/i);
+			const hardeningBriefing = await readFile(
+				runtime.lanePlans.hardening?.briefingPath || "",
+				"utf-8",
+			);
+			assert.match(hardeningBriefing, /Hardening coordinator protocol/i);
+			assert.match(hardeningBriefing, /skills\/mission-hardening\/SKILL\.md/i);
 
 			const mission = await loadMission(repo, "demo");
 			assert.equal(mission.last_strategy_key, runtime.planning.strategyKey);
@@ -162,6 +174,66 @@ describe("mission runtime", () => {
 			);
 			const workflow = await loadMissionWorkflow(first.missionRoot);
 			assert.equal(workflow?.stage_history.length, 5);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("derives legacy execution-plan hardening policy from the mission profile on resume", async () => {
+		const repo = await initRepo();
+		try {
+			const runtime = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+				task: "Implement Mission V2 bootstrap artifacts",
+				highRisk: true,
+			});
+			const legacyExecutionPlan = JSON.parse(
+				await readFile(runtime.artifactPaths.executionPlanStatePath, "utf-8"),
+			) as Record<string, unknown>;
+			delete legacyExecutionPlan.hardening_gate;
+			await writeFile(
+				runtime.artifactPaths.executionPlanStatePath,
+				`${JSON.stringify(legacyExecutionPlan, null, 2)}\n`,
+				"utf-8",
+			);
+			const missionState = JSON.parse(
+				await readFile(runtime.missionFile, "utf-8"),
+			) as Record<string, unknown>;
+			await writeFile(
+				runtime.missionFile,
+				`${JSON.stringify(
+					{
+						...missionState,
+						policy_profile: {
+							risk_class: "security-sensitive",
+							assurance_profile: "max-quality",
+							autonomy_profile: "semi-auto",
+						},
+					},
+					null,
+					2,
+				)}\n`,
+				"utf-8",
+			);
+
+			const resumed = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+				task: "Resume hardening-gated mission",
+			});
+
+			assert.equal(
+				resumed.artifacts.executionPlan.hardening_gate.mode,
+				"required",
+			);
+			const hardeningBriefing = await readFile(
+				resumed.lanePlans.hardening?.briefingPath || "",
+				"utf-8",
+			);
+			assert.match(hardeningBriefing, /Mission hardening gate mode: required/i);
 		} finally {
 			await rm(repo, { recursive: true, force: true });
 		}
@@ -701,6 +773,276 @@ describe("mission runtime", () => {
 			if (!resumed.iteration) throw new Error("expected resumed iteration");
 			assert.equal(resumed.iteration.iteration, 1);
 			assert.equal(resumed.iteration.resumed, true);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("records hardening sidecar artifact refs without inflating summary structure", async () => {
+		const repo = await initRepo();
+		try {
+			const runtime = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+				task: "Record Mission hardening sidecar refs",
+				highRisk: true,
+			});
+			const laneDir = runtime.lanePlans.hardening?.laneDir;
+			if (!laneDir) throw new Error("expected hardening lane dir");
+			await writeFile(
+				join(laneDir, "review-cycle-1.json"),
+				JSON.stringify({ cycle: 1 }, null, 2),
+				"utf-8",
+			);
+			await writeFile(join(laneDir, "deslop-report.md"), "# deslop\n", "utf-8");
+			await writeFile(
+				join(laneDir, "final-review.json"),
+				JSON.stringify({ status: "pass" }, null, 2),
+				"utf-8",
+			);
+			await writeFile(
+				join(laneDir, "gate-result.json"),
+				JSON.stringify(
+					{
+						schema_version: 1,
+						generated_at: "2026-04-18T18:00:00.000Z",
+						gate_policy: runtime.artifacts.executionPlan.hardening_gate,
+						status: "passed",
+						failure_reason: null,
+						changed_files_ref: ".omx/ralph/changed-files.txt",
+						review_cycles: [
+							{
+								cycle_number: 1,
+								review_engine: "codex-parallel-review",
+								review_report_ref: "review-cycle-1.json",
+								blocking_findings: 0,
+								verification: {
+									status: "pass",
+									command_refs: ["npm run build"],
+									evidence_refs: ["logs/build.txt"],
+									completed_at: "2026-04-18T18:02:00.000Z",
+								},
+								completed_at: "2026-04-18T18:02:00.000Z",
+							},
+						],
+						deslop_report_ref: "deslop-report.md",
+						post_deslop_verification: {
+							status: "pass",
+							command_refs: ["npm run lint"],
+							evidence_refs: ["logs/lint.txt"],
+							completed_at: "2026-04-18T18:03:00.000Z",
+						},
+						final_review: {
+							review_engine: "codex-parallel-review",
+							review_report_ref: "final-review.json",
+							blocking_findings: 0,
+							status: "pass",
+							completed_at: "2026-04-18T18:04:00.000Z",
+						},
+						blocking_findings_remaining: 0,
+						completed_at: "2026-04-18T18:04:00.000Z",
+						artifact_refs: [
+							"review-cycle-1.json",
+							"deslop-report.md",
+							"final-review.json",
+						],
+					},
+					null,
+					2,
+				),
+				"utf-8",
+			);
+			await recordMissionRuntimeLaneSummary(repo, "demo", "hardening", {
+				verdict: "PASS",
+				confidence: "high",
+				residuals: [],
+				evidence_refs: ["logs/hardening.txt"],
+				recommended_next_action: "handoff to fresh re-audit",
+				provenance: {
+					lane_id: "hardening-lane-1",
+					session_id: "hardening-session-1",
+					lane_type: "hardening",
+					runner_type: "ralph",
+					adapter_version: "mission-adapter/v1",
+					started_at: "2026-04-18T18:01:00.000Z",
+					finished_at: "2026-04-18T18:04:00.000Z",
+					parent_iteration: 1,
+					trigger_reason: "required hardening gate",
+				},
+			});
+			const summary = JSON.parse(
+				await readFile(runtime.lanePlans.hardening?.summaryPath || "", "utf-8"),
+			) as { evidence_refs: string[] };
+			assert.equal(
+				summary.evidence_refs.includes(
+					".omx/missions/demo/candidates/candidate-001/iterations/001/hardening/gate-result.json",
+				),
+				true,
+			);
+			assert.equal(
+				summary.evidence_refs.includes(
+					".omx/missions/demo/candidates/candidate-001/iterations/001/hardening/final-review.json",
+				),
+				true,
+			);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("carries hardening sidecar evidence into the terminal closeout package", async () => {
+		const repo = await initRepo();
+		try {
+			const runtime = await prepareMissionRuntime({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+				task: "Close out a mission with required hardening evidence",
+				highRisk: true,
+			});
+			const laneDir = runtime.lanePlans.hardening?.laneDir;
+			if (!laneDir) throw new Error("expected hardening lane dir");
+			await writeFile(
+				join(laneDir, "review-cycle-1.json"),
+				JSON.stringify({ cycle: 1 }, null, 2),
+				"utf-8",
+			);
+			await writeFile(join(laneDir, "deslop-report.md"), "# deslop\n", "utf-8");
+			await writeFile(
+				join(laneDir, "final-review.json"),
+				JSON.stringify({ status: "pass" }, null, 2),
+				"utf-8",
+			);
+			await writeFile(
+				join(laneDir, "gate-result.json"),
+				JSON.stringify(
+					{
+						schema_version: 1,
+						generated_at: "2026-04-11T17:00:00.000Z",
+						gate_policy: runtime.artifacts.executionPlan.hardening_gate,
+						status: "passed",
+						failure_reason: null,
+						changed_files_ref: ".omx/ralph/changed-files.txt",
+						review_cycles: [
+							{
+								cycle_number: 1,
+								review_engine: "codex-parallel-review",
+								review_report_ref: "review-cycle-1.json",
+								blocking_findings: 0,
+								verification: {
+									status: "pass",
+									command_refs: ["npm run build"],
+									evidence_refs: ["logs/build.txt"],
+									completed_at: "2026-04-11T17:02:00.000Z",
+								},
+								completed_at: "2026-04-11T17:02:00.000Z",
+							},
+						],
+						deslop_report_ref: "deslop-report.md",
+						post_deslop_verification: {
+							status: "pass",
+							command_refs: ["npm run lint"],
+							evidence_refs: ["logs/lint.txt"],
+							completed_at: "2026-04-11T17:03:00.000Z",
+						},
+						final_review: {
+							review_engine: "codex-parallel-review",
+							review_report_ref: "final-review.json",
+							blocking_findings: 0,
+							status: "pass",
+							completed_at: "2026-04-11T17:04:00.000Z",
+						},
+						blocking_findings_remaining: 0,
+						completed_at: "2026-04-11T17:04:00.000Z",
+						artifact_refs: [
+							"review-cycle-1.json",
+							"deslop-report.md",
+							"final-review.json",
+						],
+					},
+					null,
+					2,
+				),
+				"utf-8",
+			);
+			await recordMissionRuntimeLaneSummary(repo, "demo", "audit", laneSummary("audit", 1, "PASS", verifierRunToken(runtime, "audit")));
+			await recordMissionRuntimeLaneSummary(repo, "demo", "remediation", {
+				verdict: "PASS",
+				confidence: "high",
+				residuals: [],
+				evidence_refs: ["logs/remediation.txt"],
+				recommended_next_action: "handoff to execution",
+				provenance: {
+					lane_id: "remediation-lane-1",
+					session_id: "remediation-session-1",
+					lane_type: "remediation",
+					runner_type: "direct",
+					adapter_version: "mission-adapter/v1",
+					started_at: "2026-04-11T17:00:00.000Z",
+					finished_at: "2026-04-11T17:01:00.000Z",
+					parent_iteration: 1,
+					trigger_reason: "remediation stage",
+				},
+			});
+			await recordMissionRuntimeLaneSummary(repo, "demo", "execution", {
+				verdict: "PASS",
+				confidence: "high",
+				residuals: [],
+				evidence_refs: ["logs/execution.txt"],
+				recommended_next_action: "handoff to hardening",
+				provenance: {
+					lane_id: "execution-lane-1",
+					session_id: "execution-session-1",
+					lane_type: "execution",
+					runner_type: "team",
+					adapter_version: "mission-adapter/v1",
+					started_at: "2026-04-11T17:01:00.000Z",
+					finished_at: "2026-04-11T17:02:00.000Z",
+					parent_iteration: 1,
+					trigger_reason: "execution stage",
+				},
+			});
+			await recordMissionRuntimeLaneSummary(repo, "demo", "hardening", {
+				verdict: "PASS",
+				confidence: "high",
+				residuals: [],
+				evidence_refs: ["logs/hardening.txt"],
+				recommended_next_action: "handoff to fresh re-audit",
+				provenance: {
+					lane_id: "hardening-lane-1",
+					session_id: "hardening-session-1",
+					lane_type: "hardening",
+					runner_type: "ralph",
+					adapter_version: "mission-adapter/v1",
+					started_at: "2026-04-11T17:02:00.000Z",
+					finished_at: "2026-04-11T17:04:00.000Z",
+					parent_iteration: 1,
+					trigger_reason: "required hardening gate",
+				},
+			});
+			await recordMissionRuntimeLaneSummary(repo, "demo", "re_audit", {
+				...laneSummary("re_audit", 1, "PASS", verifierRunToken(runtime, "re_audit")),
+				provenance: {
+					...laneSummary("re_audit", 1, "PASS", verifierRunToken(runtime, "re_audit")).provenance,
+					finished_at: "2026-04-11T17:05:00.000Z",
+				},
+			});
+
+			await commitMissionRuntimeIteration(repo, "demo", {
+				iteration_commit_succeeded: true,
+				no_unreconciled_lane_errors: true,
+				focused_checks_green: true,
+			});
+			const closeoutState = JSON.parse(
+				await readFile(runtime.artifactPaths.closeoutStatePath, "utf-8"),
+			) as { evidence_index: string[] };
+			assert.equal(
+				closeoutState.evidence_index.includes(
+					".omx/missions/demo/candidates/candidate-001/iterations/001/hardening/gate-result.json",
+				),
+				true,
+			);
 		} finally {
 			await rm(repo, { recursive: true, force: true });
 		}

@@ -37,6 +37,7 @@ Use it when the user wants OMX to keep iterating until an **independent audit/re
   - `iterations/<n>/{audit,remediation,execution,re_audit}/summary.json`
   - `iterations/<n>/*/briefing.md` lane-specific handoff context derived from the contract/plan
   - `iterations/<n>/hardening/summary.json` only when the bounded hardening fallback runs
+  - `iterations/<n>/hardening/{review-cycle-*.json,deslop-report.md,final-review.json,gate-result.json}` when the hardening coordinator runs
   - `iterations/<n>/delta.json`
   - `closeout.md` once the kernel reaches a terminal state
 
@@ -64,7 +65,7 @@ Treat the synthetic/planned lanes as informative surfaces, not as proof that a r
 - **Audit / re-audit**: fresh read-only lane by contract
 - **Remediation shaping**: direct bounded lane unless coordination is needed
 - **Execution**: `team` is the default coordinated executor
-- **Hardening / stubborn narrow follow-up**: bounded `ralph` slice when needed; if no hardening slice is needed, the iteration may commit without a hardening summary
+- **Hardening / stubborn narrow follow-up**: bounded `ralph` slice when needed, using the repo-owned `skills/mission-hardening/SKILL.md` coordinator contract; balanced profiles may skip it, but high/max-quality/security-sensitive/release-blocking profiles must complete the hardening gate before the final authoritative `re_audit`
 
 Do **not** let the outer mission loop devolve into “everything is Ralph”.
 
@@ -88,7 +89,7 @@ When the user invokes `$mission`:
 6. Otherwise run:
    - remediation shaping
    - execution
-   - optional hardening
+   - hardening only per the execution-plan `hardening_gate` policy, with the hardening coordinator owning the bounded review/fix/deslop loop and emitting compact-summary + sidecar evidence artifacts
    - fresh re-audit
    - kernel delta / plateau / closure judgment
 7. Continue until the kernel returns one of:
@@ -106,6 +107,8 @@ Every iteration should preserve only compact artifacts:
 - evidence references
 - recommended next action
 - lane provenance (`lane_id`, `session_id`, `lane_type`, runner, timing, trigger reason)
+
+When hardening runs, keep `summary.json` compact and point it at the sidecars (`review-cycle-*.json`, `deslop-report.md`, `final-review.json`, `gate-result.json`) instead of stuffing review-loop internals into the summary itself.
 
 Do **not** persist raw lane transcripts by default.
 

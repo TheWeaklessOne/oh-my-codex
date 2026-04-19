@@ -157,6 +157,7 @@ async function loadArtifactsForMission(mission: MissionState): Promise<{
 }> {
 	const existing = await loadMissionOrchestrationArtifacts(
 		mission.mission_root,
+		mission.policy_profile,
 	);
 	if (existing) {
 		return {
@@ -226,6 +227,7 @@ export async function prepareMissionRuntime(
 	).some((event) => event.event_type === "workflow_stage_entered");
 	const existingArtifacts = await loadMissionOrchestrationArtifacts(
 		currentMission.mission_root,
+		currentMission.policy_profile,
 	);
 	if (!created && !existingArtifacts && !hasBootstrapInputs(options)) {
 		throw new Error(

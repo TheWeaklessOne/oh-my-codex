@@ -5502,6 +5502,7 @@ async function loadMissionV3RuntimeContext(repoRoot: string, slug: string) {
 	const prerequisites = await loadMissionV3Prerequisites(repoRoot, slug);
 	const artifacts = await loadMissionOrchestrationArtifacts(
 		prerequisites.mission.mission_root,
+		prerequisites.mission.policy_profile,
 	);
 	if (!artifacts) {
 		throw new Error(`mission_orchestration_artifacts_missing:${slug}`);
@@ -5566,7 +5567,10 @@ export async function rebuildMissionV3DerivedStateFromDisk(
 			repairedPaths: [],
 		};
 	}
-	const artifacts = await loadMissionOrchestrationArtifacts(mission.mission_root);
+	const artifacts = await loadMissionOrchestrationArtifacts(
+		mission.mission_root,
+		mission.policy_profile,
+	);
 	if (!artifacts) {
 		throw new Error(`mission_orchestration_artifacts_missing:${slug}`);
 	}

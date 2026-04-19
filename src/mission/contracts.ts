@@ -150,6 +150,23 @@ export interface MissionLanePolicy {
   rationale: string;
 }
 
+export type MissionHardeningGateMode = "off" | "optional" | "required";
+export type MissionHardeningDeslopPolicy =
+	| "disabled"
+	| "changed-files-final-pass";
+export type MissionHardeningFinalSanityReviewMode =
+	| "disabled"
+	| "required";
+
+export interface MissionHardeningGatePolicy {
+	mode: MissionHardeningGateMode;
+	review_engine: string;
+	fallback_review_engines: string[];
+	max_review_fix_cycles: number;
+	deslop_policy: MissionHardeningDeslopPolicy;
+	final_sanity_review: MissionHardeningFinalSanityReviewMode;
+}
+
 export const MISSION_LANE_POLICIES: Record<MissionLaneType, MissionLanePolicy> = {
   audit: {
     runnerType: 'direct',

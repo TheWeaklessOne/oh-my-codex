@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { startMode, updateModeState } from '../modes/base.js';
 import { readApprovedExecutionLaunchHint, type ApprovedExecutionLaunchHint } from '../planning/artifacts.js';
@@ -8,6 +8,11 @@ import {
   buildFollowupStaffingPlan,
   resolveAvailableAgentTypes,
 } from '../team/followup-planner.js';
+import {
+  deriveMissionHardeningGatePolicy,
+  missionHardeningArtifactPaths,
+} from '../mission/hardening.js';
+import type { MissionHardeningGatePolicy } from '../mission/contracts.js';
 
 export const RALPH_HELP = `omx ralph - Launch Codex with ralph persistence mode active
 
@@ -20,7 +25,7 @@ Options:
   --help, -h           Show this help message
   --prd <task text>    PRD mode shortcut: mark the task text explicitly
   --prd=<task text>    Same as --prd "<task text>"
-  --no-deslop         Skip the final ai-slop-cleaner pass
+  --no-deslop         Skip the final ai-slop-cleaner pass unless a Mission hardening gate marks deslop as required
 
 PRD mode:
   Ralph initializes persistence artifacts in .omx/ so PRD and progress
@@ -193,6 +198,32 @@ interface RalphSessionFiles {
   changedFilesPath: string;
 }
 
+interface RalphHardeningContext {
+  gateMode: "off" | "optional" | "required";
+  reviewEngine: string;
+  maxReviewFixCycles: number;
+  changedFilesPath: string;
+  reportPaths: string[];
+  requireDeslop?: boolean;
+}
+
+interface RalphMissionLike {
+  mission_root: string;
+  status: string;
+  current_iteration: number;
+  current_stage: string;
+  updated_at?: string | null;
+  active_candidate_id?: string | null;
+  active_lanes?: Array<{ lane_type?: string | null }>;
+  policy_profile?: {
+    risk_class?: string | null;
+    assurance_profile?: string | null;
+    autonomy_profile?: string | null;
+  } | null;
+}
+
+const TERMINAL_MISSION_STATUSES = new Set(['complete', 'failed', 'plateau', 'cancelled']);
+
 export function buildRalphChangedFilesSeedContents(): string {
   return [
     '# Ralph changed files for the mandatory final ai-slop-cleaner pass',
@@ -203,8 +234,15 @@ export function buildRalphChangedFilesSeedContents(): string {
 
 export function buildRalphAppendInstructions(
   task: string,
-  options: { changedFilesPath: string; noDeslop: boolean; approvedHint?: ApprovedExecutionLaunchHint | null },
+  options: {
+    changedFilesPath: string;
+    noDeslop: boolean;
+    approvedHint?: ApprovedExecutionLaunchHint | null;
+    hardening?: RalphHardeningContext | null;
+  },
 ): string {
+  const noDeslopDisabledByHardening =
+    options.noDeslop && options.hardening?.requireDeslop === true;
   return [
     '<ralph_native_subagents>',
     'You are in OMX Ralph persistence mode.',
@@ -215,24 +253,146 @@ export function buildRalphAppendInstructions(
     '- Do not declare the task complete, and do not transition into final verification/completion, while active native subagent threads are still running.',
     '- Before closing a verification wave, confirm that active native subagent threads have drained.',
     ...buildRalphApprovedContextLines(options.approvedHint ?? null),
+    ...(options.hardening
+      ? [
+          "Mission hardening context:",
+          `- hardening gate mode: ${options.hardening.gateMode}`,
+          `- review engine: ${options.hardening.reviewEngine}`,
+          `- max review/fix cycles: ${options.hardening.maxReviewFixCycles}`,
+          `- changed-files scope seed: \`${options.hardening.changedFilesPath}\``,
+          `- report artifacts: ${options.hardening.reportPaths.join(", ")}`,
+          "- Treat this Ralph lane as the hardening coordinator: run the bounded review -> fix -> verify loop, then one ai-slop-cleaner pass, then post-deslop verification, then one final review sanity pass.",
+          "- If the required review engine is unavailable and no explicit fallback policy exists, fail fast with a hardening error instead of silently skipping review.",
+        ]
+      : []),
     'Final deslop guidance:',
-    options.noDeslop
+    noDeslopDisabledByHardening
+      ? '- `--no-deslop` was requested, but this Mission hardening gate requires the deslop pass; ignore the opt-out and run the mandatory changed-files ai-slop-cleaner pass.'
+      : options.noDeslop
       ? '- `--no-deslop` is active for this Ralph run, so skip the mandatory ai-slop-cleaner final pass and use the latest successful pre-deslop verification evidence.'
       : `- Step 7.5 must run oh-my-codex:ai-slop-cleaner in standard mode on changed files only, using the repo-relative paths listed in \`${options.changedFilesPath}\`.`,
-    options.noDeslop
+    noDeslopDisabledByHardening
+      ? '- Do not disable the hardening deslop pass; the Mission hardening gate requires it before final review completion.'
+      : options.noDeslop
       ? '- Do not run ai-slop-cleaner unless the user explicitly re-enables the deslop pass.'
       : '- Keep the cleaner scope bounded to that file list; do not widen the pass to the full codebase or unrelated files.',
-    options.noDeslop
+    noDeslopDisabledByHardening
+      ? '- Step 7.6 must rerun tests/build/lint after the mandatory hardening deslop pass; if regression fails, fix or roll back and retry before the final review sanity pass.'
+      : options.noDeslop
       ? '- Step 7.6 stays satisfied by the latest successful pre-deslop verification evidence because this run opted out of the deslop pass.'
       : '- Step 7.6 must rerun the current tests/build/lint verification after ai-slop-cleaner; if regression fails, roll back cleaner changes or fix and retry before completion.',
     '</ralph_native_subagents>',
   ].join('\n');
 }
 
+function taskSuggestsMissionHardening(
+  task: string,
+  approvedHint?: ApprovedExecutionLaunchHint | null,
+): boolean {
+  const haystack = [
+    task,
+    approvedHint?.task ?? "",
+    approvedHint?.sourcePath ?? "",
+  ]
+    .join(" ")
+    .toLowerCase();
+  return haystack.includes("hardening");
+}
+
+function missionHardeningLaneRoot(mission: RalphMissionLike): string {
+  const iterationId = String(mission.current_iteration).padStart(3, "0");
+  if (mission.active_candidate_id && mission.active_candidate_id.trim() !== "") {
+    return join(
+      mission.mission_root,
+      "candidates",
+      mission.active_candidate_id,
+      "iterations",
+      iterationId,
+      "hardening",
+    );
+  }
+  return join(mission.mission_root, "iterations", iterationId, "hardening");
+}
+
+async function resolveMissionHardeningContext(
+  cwd: string,
+  task: string,
+  changedFilesPath: string,
+  approvedHint?: ApprovedExecutionLaunchHint | null,
+): Promise<RalphHardeningContext | null> {
+  const missionsDir = join(cwd, ".omx", "missions");
+  if (!existsSync(missionsDir)) return null;
+  const hintedHardening = taskSuggestsMissionHardening(task, approvedHint);
+  const entries = await readdir(missionsDir, { withFileTypes: true }).catch(() => []);
+  const candidates: Array<{
+    mission: RalphMissionLike;
+    gate: MissionHardeningGatePolicy;
+    score: number;
+  }> = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const missionPath = join(missionsDir, entry.name, "mission.json");
+    if (!existsSync(missionPath)) continue;
+    try {
+      const mission = JSON.parse(await readFile(missionPath, "utf-8")) as RalphMissionLike;
+      if (TERMINAL_MISSION_STATUSES.has(String(mission.status ?? "").toLowerCase())) {
+        continue;
+      }
+      const gate = deriveMissionHardeningGatePolicy({
+        policyProfile: mission.policy_profile ?? null,
+      });
+      if (gate.mode === "off") continue;
+      const activeHardening =
+        mission.current_stage === "hardening" ||
+        Array.isArray(mission.active_lanes) &&
+          mission.active_lanes.some((lane) => lane?.lane_type === "hardening");
+      if (!activeHardening && !hintedHardening) continue;
+      let score = 0;
+      if (activeHardening) score += 4;
+      if (hintedHardening) score += 2;
+      if (gate.mode === "required") score += 1;
+      candidates.push({ mission, gate, score });
+    } catch {
+      continue;
+    }
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((left, right) => {
+    if (right.score !== left.score) return right.score - left.score;
+    return String(right.mission.updated_at ?? "").localeCompare(
+      String(left.mission.updated_at ?? ""),
+    );
+  });
+  const selected = candidates[0]!;
+  const laneRoot = missionHardeningLaneRoot(selected.mission);
+  const artifactPaths = missionHardeningArtifactPaths(laneRoot);
+  const reportPaths = [
+    ...Array.from({ length: selected.gate.max_review_fix_cycles }, (_, index) =>
+      artifactPaths.reviewCyclePath(index + 1),
+    ),
+    artifactPaths.deslopReportPath,
+    artifactPaths.finalReviewPath,
+    artifactPaths.gateResultPath,
+    artifactPaths.summaryPath,
+  ].map((path) => path.replace(`${cwd}/`, ""));
+  return {
+    gateMode: selected.gate.mode,
+    reviewEngine: selected.gate.review_engine,
+    maxReviewFixCycles: selected.gate.max_review_fix_cycles,
+    changedFilesPath,
+    reportPaths,
+    requireDeslop: selected.gate.deslop_policy !== "disabled",
+  };
+}
+
 async function writeRalphSessionFiles(
   cwd: string,
   task: string,
-  options: { noDeslop: boolean; approvedHint?: ApprovedExecutionLaunchHint | null },
+  options: {
+    noDeslop: boolean;
+    approvedHint?: ApprovedExecutionLaunchHint | null;
+    hardening?: RalphHardeningContext | null;
+  },
 ): Promise<RalphSessionFiles> {
   const dir = join(cwd, '.omx', 'ralph');
   await mkdir(dir, { recursive: true });
@@ -241,12 +401,24 @@ async function writeRalphSessionFiles(
   await writeFile(changedFilesPath, `${buildRalphChangedFilesSeedContents()}\n`);
   await writeFile(
     instructionsPath,
-    `${buildRalphAppendInstructions(task, { changedFilesPath: '.omx/ralph/changed-files.txt', noDeslop: options.noDeslop, approvedHint: options.approvedHint ?? null })}\n`,
+    `${buildRalphAppendInstructions(task, {
+      changedFilesPath: '.omx/ralph/changed-files.txt',
+      noDeslop: options.noDeslop,
+      approvedHint: options.approvedHint ?? null,
+      hardening: options.hardening ?? null,
+    })}\n`,
   );
   return { instructionsPath, changedFilesPath: '.omx/ralph/changed-files.txt' };
 }
 
-export async function ralphCommand(args: string[]): Promise<void> {
+interface RalphCommandDependencies {
+  launchWithHud?: (args: string[]) => Promise<void>;
+}
+
+export async function ralphCommand(
+  args: string[],
+  dependencies: RalphCommandDependencies = {},
+): Promise<void> {
   const normalizedArgs = normalizeRalphCliArgs(args);
   const cwd = process.cwd();
   if (normalizedArgs[0] === '--help' || normalizedArgs[0] === '-h') {
@@ -262,7 +434,17 @@ export async function ralphCommand(args: string[]): Promise<void> {
   const availableAgentTypes = await resolveAvailableAgentTypes(cwd);
   const staffingPlan = buildFollowupStaffingPlan('ralph', task, availableAgentTypes);
   await startMode('ralph', task, 50);
-  const sessionFiles = await writeRalphSessionFiles(cwd, task, { noDeslop, approvedHint });
+  const hardeningContext = await resolveMissionHardeningContext(
+    cwd,
+    task,
+    '.omx/ralph/changed-files.txt',
+    approvedHint,
+  );
+  const sessionFiles = await writeRalphSessionFiles(cwd, task, {
+    noDeslop,
+    approvedHint,
+    hardening: hardeningContext,
+  });
   await updateModeState('ralph', {
     current_phase: 'starting',
     canonical_progress_path: artifacts.canonicalProgressPath,
@@ -279,6 +461,10 @@ export async function ralphCommand(args: string[]): Promise<void> {
     approved_plan_path: approvedHint?.sourcePath,
     approved_test_spec_paths: approvedHint?.testSpecPaths ?? [],
     approved_deep_interview_spec_paths: approvedHint?.deepInterviewSpecPaths ?? [],
+    hardening_gate_mode: hardeningContext?.gateMode ?? null,
+    hardening_review_engine: hardeningContext?.reviewEngine ?? null,
+    hardening_report_paths: hardeningContext?.reportPaths ?? [],
+    hardening_deslop_required: hardeningContext?.requireDeslop === true,
     ...(artifacts.canonicalPrdPath ? { canonical_prd_path: artifacts.canonicalPrdPath } : {}),
   });
   if (artifacts.migratedPrd) {
@@ -290,7 +476,8 @@ export async function ralphCommand(args: string[]): Promise<void> {
   console.log('[ralph] Ralph persistence mode active. Launching Codex...');
   console.log(`[ralph] available_agent_types: ${staffingPlan.rosterSummary}`);
   console.log(`[ralph] staffing_plan: ${staffingPlan.staffingSummary}`);
-  const { launchWithHud } = await import('./index.js');
+  const launchWithHud =
+    dependencies.launchWithHud ?? (await import('./index.js')).launchWithHud;
   const codexArgsBase = filterRalphCodexArgs(normalizedArgs);
   const codexArgs = explicitTask === 'ralph-cli-launch' && approvedHint?.task
     ? [...codexArgsBase, approvedHint.task]
