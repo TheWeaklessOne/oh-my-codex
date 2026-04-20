@@ -9,6 +9,11 @@ import { dirname, join } from 'path';
 import { homedir } from 'os';
 import { asNumber, safeString } from './utils.js';
 import {
+  looksLikePermissionSeekingText,
+  looksLikePlanningOnlyText,
+  normalizeSemanticText,
+} from '../../runtime/turn-semantics.js';
+import {
   getScopedStateDirsForCurrentSession,
   getScopedStatePath,
   readJsonIfExists,
@@ -329,50 +334,11 @@ const SEMANTIC_STALL_PROMPT_PATTERNS = [
   /\bi'?ll continue from\b/g,
 ];
 
-const PLANNING_ONLY_STALL_PATTERNS = [
-  'plan',
-  'planning',
-  'approach',
-  'proposal',
-  'options',
-  'review',
-  'feedback',
-  'spec',
-  'design',
-  'next step',
-  'next steps',
-  'ready to proceed',
-];
-
-const PERMISSION_SEEKING_STALL_PATTERNS = [
-  'if you want',
-  'would you like',
-  'shall i',
-  'should i',
-  'do you want me to',
-  'do you want',
-  'want me to',
-  'let me know if',
-  'let me know',
-  'just let me know',
-  'i can also',
-  'i could also',
-  'next i can',
-  'whenever you',
-  'say go',
-  'say yes',
-  'type continue',
-  'proceed from here',
-];
-
 function normalizeStallDetectionText(text) {
-  return stripOrchestrationIntentTags(safeString(text))
-    .replace(/\r\n?/g, '\n')
+  return normalizeSemanticText(stripOrchestrationIntentTags(safeString(text)))
     .split('\n')
     .filter((line) => !line.includes(DEFAULT_MARKER))
-    .join('\n')
-    .toLowerCase()
-    .replace(/[’‘`]/g, '\'');
+    .join('\n');
 }
 
 export function normalizeAutoNudgeSignatureText(text) {
@@ -419,11 +385,11 @@ function matchesNormalizedPatterns(normalizedText, normalizedPatterns) {
 }
 
 function looksLikePlanningOnlyContinuation(normalizedText) {
-  return matchesNormalizedPatterns(normalizedText, normalizePatternList(PLANNING_ONLY_STALL_PATTERNS));
+  return looksLikePlanningOnlyText(normalizedText);
 }
 
 function looksLikePermissionSeekingContinuation(normalizedText) {
-  return matchesNormalizedPatterns(normalizedText, normalizePatternList(PERMISSION_SEEKING_STALL_PATTERNS));
+  return looksLikePermissionSeekingText(normalizedText);
 }
 
 /**

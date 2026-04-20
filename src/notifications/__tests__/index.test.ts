@@ -171,15 +171,21 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
 
     openClawCalls = 0;
     openClawResolved = false;
+    const startStarted = Date.now();
     const startResult = await notifyLifecycle('session-start', {
       sessionId: `sess-start-${Date.now()}`,
       projectPath,
     });
+    const startElapsed = Date.now() - startStarted;
 
     assert.ok(startResult);
     assert.equal(startResult.anySuccess, true);
     assert.equal(openClawCalls, 1);
     assert.equal(openClawResolved, false, 'session-start should keep fire-and-forget OpenClaw dispatch');
+    assert.ok(
+      startElapsed < askElapsed,
+      `session-start should remain faster than awaited ask-user-question dispatch (start=${startElapsed}ms ask=${askElapsed}ms)`,
+    );
 
     rmSync(projectPath, { recursive: true, force: true });
     delete process.env.OMX_OPENCLAW;
@@ -209,5 +215,33 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
     const parsed = JSON.parse(capturedBody) as { message: string };
     assert.match(parsed.message, /Recent output:/);
     assert.match(parsed.message, /waiting for live input/);
+  });
+
+  it('auto-captures tmux tail for result-ready notifications', async () => {
+    writeFakeTmux(fakeBinDir, 'PASS semantic notifications');
+
+    let capturedBody = '';
+    globalThis.fetch = async (_input, init) => {
+      capturedBody = typeof init?.body === 'string' ? init.body : '';
+      return new Response('', { status: 200 });
+    };
+    writeNotificationConfig(codexHome);
+
+    const projectPath = mkdtempSync(join(tmpdir(), 'omx-notify-index-project-result-'));
+    const { notifyLifecycle } = await import(`../index.js?result-ready-tail=${Date.now()}`);
+    const result = await notifyLifecycle('result-ready', {
+      sessionId: `sess-result-${Date.now()}`,
+      projectPath,
+      projectName: 'project',
+      contextSummary: 'All tests passed and commit created.',
+    });
+    rmSync(projectPath, { recursive: true, force: true });
+
+    assert.ok(result);
+    assert.equal(result.anySuccess, true);
+    const parsed = JSON.parse(capturedBody) as { message: string };
+    assert.match(parsed.message, /Result Ready/);
+    assert.match(parsed.message, /Recent output:/);
+    assert.match(parsed.message, /PASS semantic notifications/);
   });
 });

@@ -253,6 +253,26 @@ export function formatSessionIdle(payload: FullNotificationPayload): string {
   return lines.join("\n");
 }
 
+export function formatResultReady(payload: FullNotificationPayload): string {
+  const lines = [`# Result Ready`, ""];
+
+  if (payload.contextSummary) {
+    lines.push(`**Summary:** ${payload.contextSummary}`);
+  }
+
+  if (payload.modesUsed && payload.modesUsed.length > 0) {
+    lines.push("", `**Modes:** ${payload.modesUsed.join(", ")}`);
+  }
+
+  const tail = buildTmuxTailBlock(payload);
+  if (tail) lines.push(tail);
+
+  lines.push("");
+  lines.push(buildFooter(payload, true));
+
+  return lines.join("\n");
+}
+
 export function formatAskUserQuestion(payload: FullNotificationPayload): string {
   const lines = [`# Input Needed`, ""];
 
@@ -262,6 +282,8 @@ export function formatAskUserQuestion(payload: FullNotificationPayload): string 
   }
 
   lines.push(`Codex is waiting for your response.`);
+  const tail = buildTmuxTailBlock(payload);
+  if (tail) lines.push(tail);
   lines.push("");
   lines.push(buildFooter(payload, true));
 
@@ -278,6 +300,8 @@ export function formatNotification(payload: FullNotificationPayload): string {
       return formatSessionEnd(payload);
     case "session-idle":
       return formatSessionIdle(payload);
+    case "result-ready":
+      return formatResultReady(payload);
     case "ask-user-question":
       return formatAskUserQuestion(payload);
     default:

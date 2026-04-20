@@ -154,6 +154,14 @@ export function shouldSendIdleNotification(stateDir: string, sessionId?: string,
   return true;
 }
 
+export function shouldSendCompletedTurnNotification(
+  stateDir: string,
+  sessionId?: string,
+  fingerprint?: string,
+): boolean {
+  return shouldSendIdleNotification(stateDir, sessionId, fingerprint);
+}
+
 /**
  * Record that an idle notification was sent at the current timestamp.
  * Call this after a successful dispatch to arm the cooldown and optionally
@@ -166,6 +174,14 @@ export function recordIdleNotificationSent(stateDir: string, sessionId?: string,
     lastSentAt: new Date().toISOString(),
     fingerprint: normalizedFingerprint || undefined,
   });
+}
+
+export function recordCompletedTurnNotificationSent(
+  stateDir: string,
+  sessionId?: string,
+  fingerprint?: string,
+): void {
+  recordIdleNotificationSent(stateDir, sessionId, fingerprint);
 }
 
 /**

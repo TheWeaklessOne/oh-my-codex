@@ -165,7 +165,7 @@ describe('validateTemplate', () => {
 });
 
 describe('getDefaultTemplate', () => {
-  const EVENTS = ['session-start', 'session-stop', 'session-end', 'session-idle', 'ask-user-question'] as const;
+  const EVENTS = ['session-start', 'session-stop', 'session-end', 'session-idle', 'result-ready', 'ask-user-question'] as const;
 
   for (const event of EVENTS) {
     it(`returns non-empty template for ${event}`, () => {
@@ -189,6 +189,12 @@ describe('getDefaultTemplate', () => {
     const tmpl = getDefaultTemplate('ask-user-question');
     assert.ok(tmpl.includes('Codex'));
     assert.ok(!tmpl.includes('Claude'));
+  });
+
+  it('result-ready template includes summary and footer placeholders', () => {
+    const tmpl = getDefaultTemplate('result-ready');
+    assert.ok(tmpl.includes('{{contextSummary}}'));
+    assert.ok(tmpl.includes('{{footer}}'));
   });
 
   it('interpolating session-end template produces expected output', () => {

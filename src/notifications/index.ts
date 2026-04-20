@@ -1,9 +1,9 @@
 /**
  * Notification System - Public API
  *
- * Multi-platform lifecycle notifications for oh-my-codex.
+ * Multi-platform notifications for oh-my-codex.
  * Sends notifications to Discord, Telegram, Slack, and generic webhooks
- * on session lifecycle events.
+ * for lifecycle events and semantic turn-complete events.
  *
  * Usage:
  *   import { notifyLifecycle } from '../notifications/index.js';
@@ -43,6 +43,7 @@ export {
   formatSessionStop,
   formatSessionEnd,
   formatSessionIdle,
+  formatResultReady,
   formatAskUserQuestion,
 } from "./formatter.js";
 export {
@@ -99,6 +100,8 @@ export {
   getIdleNotificationCooldownSeconds,
   shouldSendIdleNotification,
   recordIdleNotificationSent,
+  shouldSendCompletedTurnNotification,
+  recordCompletedTurnNotificationSent,
 } from "./idle-cooldown.js";
 
 // Template engine exports
@@ -156,7 +159,7 @@ void getActiveProfileName;
 
 /**
  * Map a NotificationEvent to an OpenClawHookEvent.
- * Returns null for events that have no OpenClaw equivalent.
+ * Returns null for semantic notification events that have no OpenClaw equivalent.
  */
 function toOpenClawEvent(event: NotificationEvent): OpenClawHookEvent | null {
   switch (event) {
@@ -168,6 +171,12 @@ function toOpenClawEvent(event: NotificationEvent): OpenClawHookEvent | null {
     default: return null;
   }
 }
+
+const AUTO_CAPTURE_TMUX_TAIL_EVENTS = new Set<NotificationEvent>([
+  "session-idle",
+  "result-ready",
+  "ask-user-question",
+]);
 
 export async function shouldDispatchOpenClaw(
   event: OpenClawHookEvent,
@@ -236,15 +245,16 @@ export async function notifyLifecycle(
       incompleteTasks: data.incompleteTasks,
     };
 
-    // Auto-capture tmux tail only for live idle events. Stop/end lifecycle dispatches
-    // happen after the relevant session is stopping or has already completed, so
-    // blind capture-pane reads can replay historical pane lines into follow-up
-    // alerts. Explicitly supplied tmuxTail still passes through unchanged.
+    // Auto-capture tmux tail only for live turn-facing notifications. Stop/end
+    // lifecycle dispatches happen after the relevant session is stopping or has
+    // already completed, so blind capture-pane reads can replay historical pane
+    // lines into follow-up alerts. Explicitly supplied tmuxTail still passes
+    // through unchanged.
     const verbosity = getVerbosity(config);
     if (
       shouldIncludeTmuxTail(verbosity)
       && !data.tmuxTail
-      && event === "session-idle"
+      && AUTO_CAPTURE_TMUX_TAIL_EVENTS.has(event)
     ) {
       const { captureTmuxPaneWithLiveness } = await import("./tmux.js");
       const tmuxCapture = captureTmuxPaneWithLiveness(payload.tmuxPaneId);

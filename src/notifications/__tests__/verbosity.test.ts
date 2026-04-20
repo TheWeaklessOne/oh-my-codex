@@ -97,10 +97,16 @@ describe('isEventAllowedByVerbosity', () => {
   it('minimal rejects ask-user-question', () => {
     assert.equal(isEventAllowedByVerbosity('minimal', 'ask-user-question'), false);
   });
+  it('minimal rejects result-ready', () => {
+    assert.equal(isEventAllowedByVerbosity('minimal', 'result-ready'), false);
+  });
 
   // Session: includes idle
   it('session allows session-idle', () => {
     assert.equal(isEventAllowedByVerbosity('session', 'session-idle'), true);
+  });
+  it('session allows result-ready', () => {
+    assert.equal(isEventAllowedByVerbosity('session', 'result-ready'), true);
   });
   it('session rejects ask-user-question', () => {
     assert.equal(isEventAllowedByVerbosity('session', 'ask-user-question'), false);
@@ -120,6 +126,7 @@ describe('isEventAllowedByVerbosity', () => {
     assert.equal(isEventAllowedByVerbosity('verbose', 'session-stop'), true);
     assert.equal(isEventAllowedByVerbosity('verbose', 'session-end'), true);
     assert.equal(isEventAllowedByVerbosity('verbose', 'session-idle'), true);
+    assert.equal(isEventAllowedByVerbosity('verbose', 'result-ready'), true);
     assert.equal(isEventAllowedByVerbosity('verbose', 'ask-user-question'), true);
   });
 });
@@ -180,6 +187,28 @@ describe('isEventEnabled with verbosity', () => {
     delete process.env.OMX_NOTIFY_VERBOSITY;
     const config = makeConfig({ verbosity: 'session' });
     assert.equal(isEventEnabled(config, 'ask-user-question'), false);
+  });
+
+  it('explicit event enable overrides verbosity for ask-user-question', () => {
+    delete process.env.OMX_NOTIFY_VERBOSITY;
+    const config = makeConfig({
+      verbosity: 'session',
+      events: {
+        'ask-user-question': { enabled: true },
+      },
+    });
+    assert.equal(isEventEnabled(config, 'ask-user-question'), true);
+  });
+
+  it('explicit event enable overrides minimal verbosity for result-ready', () => {
+    delete process.env.OMX_NOTIFY_VERBOSITY;
+    const config = makeConfig({
+      verbosity: 'minimal',
+      events: {
+        'result-ready': { enabled: true },
+      },
+    });
+    assert.equal(isEventEnabled(config, 'result-ready'), true);
   });
 
   it('env var override takes precedence', () => {

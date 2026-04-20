@@ -278,10 +278,19 @@ const DEFAULT_TEMPLATES: Record<NotificationEvent, string> = {
     "{{tmuxTailBlock}}" +
     "\n\n{{footer}}",
 
+  "result-ready":
+    "# Result Ready\n\n" +
+    "{{#if contextSummary}}**Summary:** {{contextSummary}}{{/if}}" +
+    "{{#if modesDisplay}}\n\n**Modes:** {{modesDisplay}}{{/if}}" +
+    "{{tmuxTailBlock}}" +
+    "\n\n{{footer}}",
+
   "ask-user-question":
     "# Input Needed\n" +
     "{{#if question}}\n**Question:** {{question}}\n{{/if}}" +
-    "\nCodex is waiting for your response.\n\n{{footer}}",
+    "\nCodex is waiting for your response." +
+    "{{tmuxTailBlock}}" +
+    "\n\n{{footer}}",
 };
 
 /**

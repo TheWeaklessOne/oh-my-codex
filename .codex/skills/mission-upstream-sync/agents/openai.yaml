@@ -1,4 +1,0 @@
-interface:
-  display_name: "Mission Upstream Sync"
-  short_description: "Check upstream OMX, rebase a mission branch, relink the local CLI"
-  default_prompt: "Use $mission-upstream-sync to check the latest upstream OMX release, probe/rebase the freshest mission branch onto upstream main, and rebuild/relink the local CLI from this repo checkout. If rebase conflicts appear, resolve them manually as the invoking agent instead of using scripted auto-resolution."

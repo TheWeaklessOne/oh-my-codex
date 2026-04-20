@@ -215,6 +215,34 @@ For non-team sessions, native Codex hooks are now the canonical lifecycle surfac
 
 See [Codex native hook mapping](./docs/codex-native-hooks.md) for the current native / fallback matrix.
 
+### Meaningful Telegram notifications
+
+If you want Telegram to receive only meaningful turn results and real input requests, keep a session-level verbosity profile and explicitly enable only the semantic events you care about:
+
+```json
+{
+  "notifications": {
+    "enabled": true,
+    "verbosity": "session",
+    "telegram": {
+      "enabled": true,
+      "botToken": "env-or-config-token",
+      "chatId": "env-or-config-chat"
+    },
+    "events": {
+      "session-start": { "enabled": false },
+      "session-stop": { "enabled": false },
+      "session-idle": { "enabled": false },
+      "result-ready": { "enabled": true },
+      "ask-user-question": { "enabled": true },
+      "session-end": { "enabled": true }
+    }
+  }
+}
+```
+
+`omx --telegram` now narrows the active transport for that run while preserving the configured notification policy/profile.
+
 
 ### Troubleshooting false-green readiness
 

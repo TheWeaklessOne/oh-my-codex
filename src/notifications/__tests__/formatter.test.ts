@@ -5,6 +5,7 @@ import {
   formatSessionStart,
   formatSessionEnd,
   formatSessionStop,
+  formatResultReady,
   formatAskUserQuestion,
   formatNotification,
   parseTmuxTail,
@@ -112,6 +113,40 @@ describe('formatAskUserQuestion', () => {
     assert.ok(result.includes('Which approach should I use?'));
     assert.ok(result.includes('Codex is waiting for your response.'));
   });
+
+  it('includes recent output when tmux tail is present', () => {
+    const result = formatAskUserQuestion({
+      ...basePayload,
+      event: 'ask-user-question',
+      question: 'Which approach should I use?',
+      tmuxTail: 'Would you like me to continue?',
+    });
+    assert.ok(result.includes('Recent output:'));
+    assert.ok(result.includes('Would you like me to continue?'));
+  });
+});
+
+describe('formatResultReady', () => {
+  it('renders the result-ready heading and summary', () => {
+    const result = formatResultReady({
+      ...basePayload,
+      event: 'result-ready',
+      contextSummary: 'Created commit abc123 and all tests passed.',
+    });
+    assert.ok(result.includes('# Result Ready'));
+    assert.ok(result.includes('Created commit abc123 and all tests passed.'));
+  });
+
+  it('includes recent output when tmux tail is present', () => {
+    const result = formatResultReady({
+      ...basePayload,
+      event: 'result-ready',
+      contextSummary: 'Tests passed and summary ready.',
+      tmuxTail: 'npm test\nPASS meaningful notifications',
+    });
+    assert.ok(result.includes('Recent output:'));
+    assert.ok(result.includes('PASS meaningful notifications'));
+  });
 });
 
 describe('formatNotification routing', () => {
@@ -120,6 +155,7 @@ describe('formatNotification routing', () => {
     assert.ok(formatNotification({ ...basePayload, event: 'session-start' }).includes('# Session Started'));
     assert.ok(formatNotification({ ...basePayload, event: 'session-end' }).includes('# Session Ended'));
     assert.ok(formatNotification({ ...basePayload, event: 'session-stop' }).includes('# Session Continuing'));
+    assert.ok(formatNotification({ ...basePayload, event: 'result-ready' }).includes('# Result Ready'));
     assert.ok(formatNotification({ ...basePayload, event: 'ask-user-question' }).includes('# Input Needed'));
   });
 });

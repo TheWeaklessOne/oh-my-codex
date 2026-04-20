@@ -27,6 +27,20 @@ import {
   readNotifyTempContractFromEnv,
 } from "./temp-contract.js";
 
+const TEMP_SELECTOR_PLATFORM_MAP = {
+  discord: ["discord", "discord-bot"],
+  telegram: ["telegram"],
+  slack: ["slack"],
+} as const satisfies Record<string, NotificationPlatform[]>;
+
+const TEMP_FILTERABLE_PLATFORMS = [
+  "discord",
+  "discord-bot",
+  "telegram",
+  "slack",
+  "webhook",
+] as const satisfies readonly NotificationPlatform[];
+
 const CONFIG_FILE = join(codexHome(), ".omx-config.json");
 
 function readRawConfig(): Record<string, unknown> | null {
@@ -330,52 +344,51 @@ function normalizeCustomTransportGate(config: FullNotificationConfig): FullNotif
   };
 }
 
-function buildTempModeConfigFromContract(): FullNotificationConfig | null {
-  const contract = readNotifyTempContractFromEnv(process.env);
-  const envActive = isNotifyTempEnvActive(process.env);
-  if (!contract?.active && !envActive) return null;
-
-  const selectors = getTempBuiltinSelectors(contract);
-  const envConfig = buildConfigFromEnv();
-  const config: FullNotificationConfig = { enabled: false };
-
-  if (selectors.has("discord")) {
-    if (envConfig?.discord) config.discord = envConfig.discord;
-    if (envConfig?.["discord-bot"]) config["discord-bot"] = envConfig["discord-bot"];
-  }
-  if (selectors.has("telegram") && envConfig?.telegram) {
-    config.telegram = envConfig.telegram;
-  }
-  if (selectors.has("slack") && envConfig?.slack) {
-    config.slack = envConfig.slack;
-  }
-  if (isOpenClawSelectedInTempContract(contract)) {
-    config.openclaw = { enabled: true };
-  }
-
-  config.enabled = Boolean(
-    config.discord?.enabled
-    || config["discord-bot"]?.enabled
-    || config.telegram?.enabled
-    || config.slack?.enabled
-    || config.openclaw?.enabled,
-  );
-
-  return config;
+function isPlatformSelectedInTempMode(
+  selectors: Set<string>,
+  platform: NotificationPlatform,
+): boolean {
+  return Object.entries(TEMP_SELECTOR_PLATFORM_MAP).some(([selector, platforms]) => {
+    const allowedPlatforms = platforms as readonly NotificationPlatform[];
+    return selectors.has(selector) && allowedPlatforms.includes(platform);
+  });
 }
 
-export function getNotificationConfig(
+function filterEventPlatformsForTempSelection(
+  eventConfig: EventNotificationConfig | undefined,
+  selectors: Set<string>,
+): EventNotificationConfig | undefined {
+  if (!eventConfig) return eventConfig;
+  const filtered = { ...eventConfig };
+  for (const platform of TEMP_FILTERABLE_PLATFORMS) {
+    if (!isPlatformSelectedInTempMode(selectors, platform)) {
+      delete filtered[platform];
+    }
+  }
+  return filtered;
+}
+
+function filterTopLevelPlatformsForTempSelection(
+  config: FullNotificationConfig,
+  selectors: Set<string>,
+): FullNotificationConfig {
+  const filtered = { ...config };
+  for (const platform of TEMP_FILTERABLE_PLATFORMS) {
+    if (!isPlatformSelectedInTempMode(selectors, platform)) {
+      delete filtered[platform];
+    }
+  }
+  return filtered;
+}
+
+function resolvePersistentNotificationConfig(
   profileName?: string,
 ): FullNotificationConfig | null {
-  const tempModeConfig = buildTempModeConfigFromContract();
-  if (tempModeConfig) return tempModeConfig;
-
   const raw = readRawConfig();
 
   if (raw) {
     const notifications = raw.notifications as NotificationsBlock | undefined;
     if (notifications) {
-      // Try profile resolution first
       const profileConfig = resolveProfileConfig(notifications, profileName);
       if (profileConfig) {
         if (typeof profileConfig.enabled !== "boolean") {
@@ -388,7 +401,6 @@ export function getNotificationConfig(
         return applyHookConfigIfPresent(normalizeCustomTransportGate(merged));
       }
 
-      // Fall back to flat config (backward compatible)
       if (typeof notifications.enabled !== "boolean") {
         return null;
       }
@@ -425,6 +437,63 @@ export function getNotificationConfig(
   return null;
 }
 
+function selectTempModeTransports(
+  config: FullNotificationConfig,
+  selectors: Set<string>,
+  openClawSelected: boolean,
+): FullNotificationConfig {
+  const nextEvents = config.events
+    ? Object.fromEntries(
+        Object.entries(config.events).map(([eventName, eventConfig]) => {
+          return [eventName, filterEventPlatformsForTempSelection(eventConfig, selectors)];
+        }),
+      ) as FullNotificationConfig["events"]
+    : undefined;
+
+  const selected: FullNotificationConfig = {
+    ...filterTopLevelPlatformsForTempSelection(config, selectors),
+    events: nextEvents,
+    openclaw: openClawSelected ? (config.openclaw ?? { enabled: true }) : undefined,
+    custom_cli_command: openClawSelected ? config.custom_cli_command : undefined,
+    custom_webhook_command: openClawSelected ? config.custom_webhook_command : undefined,
+  };
+
+  selected.enabled = Boolean(
+    selected.discord?.enabled
+    || selected["discord-bot"]?.enabled
+    || selected.telegram?.enabled
+    || selected.slack?.enabled
+    || selected.openclaw?.enabled
+    || hasCustomTransportAlias(selected),
+  );
+  return selected;
+}
+
+function buildTempModeConfigFromContract(
+  baseConfig: FullNotificationConfig | null,
+): FullNotificationConfig | null {
+  const contract = readNotifyTempContractFromEnv(process.env);
+  const envActive = isNotifyTempEnvActive(process.env);
+  if (!contract?.active && !envActive) return null;
+
+  const selectors = getTempBuiltinSelectors(contract);
+  const seedConfig = baseConfig ?? buildConfigFromEnv() ?? { enabled: false };
+  return selectTempModeTransports(
+    seedConfig,
+    selectors,
+    isOpenClawSelectedInTempContract(contract),
+  );
+}
+
+export function getNotificationConfig(
+  profileName?: string,
+): FullNotificationConfig | null {
+  const persistentConfig = resolvePersistentNotificationConfig(profileName);
+  const tempModeConfig = buildTempModeConfigFromContract(persistentConfig);
+  if (tempModeConfig) return tempModeConfig;
+  return persistentConfig;
+}
+
 const VALID_VERBOSITY_LEVELS: VerbosityLevel[] = ["verbose", "agent", "session", "minimal"];
 const DEFAULT_VERBOSITY: VerbosityLevel = "session";
 
@@ -446,6 +515,7 @@ const EVENT_MIN_VERBOSITY: Record<NotificationEvent, VerbosityLevel> = {
   "session-stop": "minimal",
   "session-end": "minimal",
   "session-idle": "session",
+  "result-ready": "session",
   "ask-user-question": "agent",
 };
 
@@ -487,14 +557,12 @@ export function isEventEnabled(
   event: NotificationEvent,
 ): boolean {
   if (!config.enabled) return false;
-
-  // Verbosity gate: reject events below the configured verbosity level
-  const verbosity = getVerbosity(config);
-  if (!isEventAllowedByVerbosity(verbosity, event)) return false;
-
   const eventConfig = config.events?.[event];
+  if (eventConfig?.enabled === false) return false;
 
-  if (eventConfig && eventConfig.enabled === false) return false;
+  // Verbosity gate: explicit per-event enables override the coarse verbosity floor.
+  const verbosity = getVerbosity(config);
+  if (eventConfig?.enabled !== true && !isEventAllowedByVerbosity(verbosity, event)) return false;
 
   if (!eventConfig) {
     return !!(
@@ -577,6 +645,7 @@ export function getEnabledPlatforms(
 const REPLY_PLATFORM_EVENTS: NotificationEvent[] = [
   "session-start",
   "ask-user-question",
+  "result-ready",
   "session-stop",
   "session-idle",
   "session-end",

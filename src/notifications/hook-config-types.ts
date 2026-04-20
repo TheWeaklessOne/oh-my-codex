@@ -5,7 +5,7 @@
  * message templates with per-event, per-platform overrides.
  */
 
-import type { NotificationPlatform } from "./types.js";
+import type { NotificationEvent, NotificationPlatform } from "./types.js";
 
 /** Template variables available for interpolation in message templates. */
 export type TemplateVariable =
@@ -52,13 +52,7 @@ export interface HookNotificationConfig {
   /** Global enable/disable */
   enabled: boolean;
   /** Default templates per event (used when no platform override exists) */
-  events?: {
-    "session-start"?: HookEventConfig;
-    "session-stop"?: HookEventConfig;
-    "session-end"?: HookEventConfig;
-    "session-idle"?: HookEventConfig;
-    "ask-user-question"?: HookEventConfig;
-  };
+  events?: Partial<Record<NotificationEvent, HookEventConfig>>;
   /** Global default template (fallback when event has no template) */
   defaultTemplate?: string;
 }

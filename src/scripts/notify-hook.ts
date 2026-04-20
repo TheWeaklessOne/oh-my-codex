@@ -58,6 +58,10 @@ import {
   resolveOperationalSessionName,
 } from './notify-hook/operational-events.js';
 import {
+  buildCompletedTurnFingerprint,
+  classifyCompletedTurn,
+} from '../runtime/turn-semantics.js';
+import {
   parseTeamWorkerEnv,
   resolveTeamStateDirForWorker,
   updateWorkerHeartbeat,
@@ -80,77 +84,9 @@ const RALPH_ACTIVE_PROGRESS_PHASES = new Set([
   'fixing',
 ]);
 
-const IDLE_NOTIFICATION_SUMMARY_MAX_LENGTH = 240;
-
-function summarizeIdleNotificationMessage(message: unknown): string {
-  const source = safeString(message)
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const preferred = source.at(-1) || '';
-  const normalized = preferred.replace(/\s+/g, ' ').trim();
-  if (!normalized) return '';
-  return normalized.length > IDLE_NOTIFICATION_SUMMARY_MAX_LENGTH
-    ? `${normalized.slice(0, IDLE_NOTIFICATION_SUMMARY_MAX_LENGTH - 1)}…`
-    : normalized;
-}
-
-function classifyIdleNotificationPhase(message: unknown): 'idle' | 'progress' | 'finished' | 'failed' {
-  const lower = safeString(message).toLowerCase();
-  if (!lower) return 'idle';
-
-  if (/(error|failed|exception|invalid|timed out|timeout)/i.test(lower)) {
-    return 'failed';
-  }
-
-  if ([
-    'all tests pass',
-    'build succeeded',
-    'completed',
-    'complete',
-    'done',
-    'final summary',
-    'summary',
-  ].some((pattern) => lower.includes(pattern))) {
-    return 'finished';
-  }
-
-  if ([
-    'verify',
-    'verified',
-    'verification',
-    'review',
-    'reviewed',
-    'diagnostic',
-    'typecheck',
-    'test',
-    'implement',
-    'implemented',
-    'apply patch',
-    'change',
-    'fix',
-    'update',
-    'refactor',
-    'resume',
-    'resumed',
-    'progress',
-    'continue',
-    'continued',
-  ].some((pattern) => lower.includes(pattern))) {
-    return 'progress';
-  }
-
-  return 'idle';
-}
-
 function buildIdleNotificationFingerprint(payload: Record<string, unknown>): string {
   const lastAssistantMessage = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '');
-  const summary = summarizeIdleNotificationMessage(lastAssistantMessage);
-  const phase = classifyIdleNotificationPhase(lastAssistantMessage);
-  return JSON.stringify({
-    phase,
-    ...(summary ? { summary } : {}),
-  });
+  return buildCompletedTurnFingerprint(classifyCompletedTurn(lastAssistantMessage));
 }
 
 function isTurnCompletePayload(payload: Record<string, unknown>): boolean {
@@ -594,32 +530,43 @@ async function main() {
     // Non-fatal: extensibility modules may not be built yet
   }
 
-  // 8. Dispatch session-idle lifecycle notification (lead session only, best effort)
+  // 8. Dispatch semantic human-facing notifications while preserving the
+  //    coarse internal session-idle hook path (lead session only, best effort).
   if (!isTeamWorker) {
     try {
       const { notifyLifecycle } = await import('../notifications/index.js');
       const {
-        shouldSendIdleNotification,
-        recordIdleNotificationSent,
+        shouldSendCompletedTurnNotification,
+        recordCompletedTurnNotificationSent,
         shouldSendSessionIdleHookEvent,
         recordSessionIdleHookEventSent,
       } = await import('../notifications/idle-cooldown.js');
       const idleFingerprint = buildIdleNotificationFingerprint(payload);
       const notifySessionId = getEffectiveSessionId();
+      const lastAssistantMessage = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '');
+      const semanticOutcome = classifyCompletedTurn(lastAssistantMessage);
+      const semanticEvent = semanticOutcome.notificationEvent;
+      const humanFacingFingerprint = buildCompletedTurnFingerprint(semanticOutcome);
 
       const shouldNotifyLifecycle = notifySessionId
-        && shouldSendIdleNotification(stateDir, notifySessionId, idleFingerprint);
+        && semanticEvent
+        && shouldSendCompletedTurnNotification(stateDir, notifySessionId, humanFacingFingerprint);
       const shouldDispatchSessionIdleHookEvent = notifySessionId
         && shouldSendSessionIdleHookEvent(stateDir, notifySessionId, idleFingerprint);
 
       if (shouldNotifyLifecycle || shouldDispatchSessionIdleHookEvent) {
         if (shouldNotifyLifecycle) {
-          const idleResult = await notifyLifecycle('session-idle', {
+          const idleResult = await notifyLifecycle(semanticEvent!, {
             sessionId: notifySessionId,
             projectPath: cwd,
+            contextSummary: semanticOutcome.summary || undefined,
+            question:
+              semanticOutcome.kind === 'input-needed'
+                ? (semanticOutcome.question || semanticOutcome.summary || 'Input is needed to continue.')
+                : undefined,
           });
           if (idleResult && idleResult.anySuccess) {
-            recordIdleNotificationSent(stateDir, notifySessionId, idleFingerprint);
+            recordCompletedTurnNotificationSent(stateDir, notifySessionId, humanFacingFingerprint);
           }
         }
 
@@ -636,6 +583,10 @@ async function main() {
                 extra: {
                   project_path: cwd,
                   reason: 'post_turn_idle_notification',
+                  semantic_phase: semanticOutcome.kind,
+                  semantic_summary: semanticOutcome.summary || null,
+                  semantic_question: semanticOutcome.question || null,
+                  semantic_notification_event: semanticEvent || null,
                 },
               }),
             }, {

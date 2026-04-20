@@ -214,6 +214,7 @@ Options:
   --discord      Select Discord provider for temporary notification mode
   --slack        Select Slack provider for temporary notification mode
   --telegram     Select Telegram provider for temporary notification mode
+                (transport only; keeps configured event policy/profile)
   --custom <name>
                 Select custom/OpenClaw gateway name for temporary notification mode
   -w, --worktree[=<name>]
@@ -1993,7 +1994,7 @@ export function buildNotifyTempStartupMessages(
       ? contract.canonicalSelectors.join(",")
       : "none";
   const infoLines = [
-    `notify temp: active | providers=${providers} | persistent-routing=bypassed`,
+    `notify temp: active | providers=${providers} | transport-scope=selected-only | persistent-policy=preserved`,
   ];
   const warningLines = [...contract.warnings];
   if (!hasValidProviders) {

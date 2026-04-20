@@ -1,9 +1,9 @@
 /**
  * Notification System Types
  *
- * Defines types for the multi-platform lifecycle notification system.
+ * Defines types for the multi-platform notification system.
  * Supports Discord, Telegram, Slack, and generic webhooks across
- * session lifecycle events (start, stop, end, ask-user-question).
+ * lifecycle events plus semantic turn-complete events.
  */
 
 /** Events that can trigger notifications */
@@ -12,14 +12,15 @@ export type NotificationEvent =
   | "session-stop"
   | "session-end"
   | "session-idle"
-  | "ask-user-question";
+  | "ask-user-question"
+  | "result-ready";
 
 /**
  * Verbosity levels for notification filtering.
  *
  * - verbose: all text/tool call output
  * - agent:   per-agent-call events (includes ask-user-question)
- * - session: start/idle/stop/end + tmux tail snippet [DEFAULT]
+ * - session: session lifecycle + meaningful turn-complete notifications [DEFAULT]
  * - minimal: start/stop/end only, no idle, no tmux tail
  */
 export type VerbosityLevel = "verbose" | "agent" | "session" | "minimal";
@@ -150,13 +151,7 @@ export interface FullNotificationConfig {
   custom_cli_command?: CustomCliCommandConfig;
 
   /** Per-event configuration */
-  events?: {
-    "session-start"?: EventNotificationConfig;
-    "session-stop"?: EventNotificationConfig;
-    "session-end"?: EventNotificationConfig;
-    "session-idle"?: EventNotificationConfig;
-    "ask-user-question"?: EventNotificationConfig;
-  };
+  events?: Partial<Record<NotificationEvent, EventNotificationConfig>>;
 }
 
 /** Payload sent with each notification */
