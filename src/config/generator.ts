@@ -44,6 +44,10 @@ const OMX_TOP_LEVEL_KEYS = [
 const DEFAULT_SETUP_MODEL = DEFAULT_FRONTIER_MODEL;
 const DEFAULT_SETUP_MODEL_CONTEXT_WINDOW = 1000000;
 const DEFAULT_SETUP_MODEL_AUTO_COMPACT_TOKEN_LIMIT = 900000;
+const OMX_SEEDED_BEHAVIORAL_DEFAULTS_START_MARKER =
+  "# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)";
+const OMX_SEEDED_BEHAVIORAL_DEFAULTS_END_MARKER =
+  "# End oh-my-codex seeded behavioral defaults";
 const SHARED_MCP_REGISTRY_MARKER = "oh-my-codex (OMX) Shared MCP Registry Sync";
 const SHARED_MCP_REGISTRY_END_MARKER =
   "# End oh-my-codex shared MCP registry sync";
@@ -112,13 +116,77 @@ function getOmxTopLevelLines(
     !existingContextWindow &&
     !existingAutoCompact
   ) {
+    lines.push(OMX_SEEDED_BEHAVIORAL_DEFAULTS_START_MARKER);
     lines.push(`model_context_window = ${DEFAULT_SETUP_MODEL_CONTEXT_WINDOW}`);
     lines.push(
       `model_auto_compact_token_limit = ${DEFAULT_SETUP_MODEL_AUTO_COMPACT_TOKEN_LIMIT}`,
     );
+    lines.push(OMX_SEEDED_BEHAVIORAL_DEFAULTS_END_MARKER);
   }
 
   return lines;
+}
+
+function isUnchangedOmxSeededBehavioralDefaultsBlock(lines: string[]): boolean {
+  const relevant = lines.filter((line) => {
+    const trimmed = line.trim();
+    return trimmed.length > 0 && !trimmed.startsWith("#");
+  });
+  if (relevant.length !== 2) return false;
+
+  const parsed = parseRootKeyValues(relevant.join("\n"));
+  return (
+    parsed.size === 2 &&
+    parsed.get("model_context_window") ===
+      String(DEFAULT_SETUP_MODEL_CONTEXT_WINDOW) &&
+    parsed.get("model_auto_compact_token_limit") ===
+      String(DEFAULT_SETUP_MODEL_AUTO_COMPACT_TOKEN_LIMIT)
+  );
+}
+
+export function stripOmxSeededBehavioralDefaults(config: string): string {
+  const lines = config.split(/\r?\n/);
+  const firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
+  const boundary = firstTable >= 0 ? firstTable : lines.length;
+  const result: string[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const trimmed = lines[index].trim();
+
+    if (
+      index < boundary &&
+      trimmed === OMX_SEEDED_BEHAVIORAL_DEFAULTS_START_MARKER
+    ) {
+      const endIndex = lines.findIndex(
+        (line, candidateIndex) =>
+          candidateIndex > index &&
+          candidateIndex < boundary &&
+          line.trim() === OMX_SEEDED_BEHAVIORAL_DEFAULTS_END_MARKER,
+      );
+
+      if (endIndex < 0) {
+        continue;
+      }
+
+      const blockLines = lines.slice(index + 1, endIndex);
+      if (!isUnchangedOmxSeededBehavioralDefaultsBlock(blockLines)) {
+        result.push(...blockLines);
+      }
+      index = endIndex;
+      continue;
+    }
+
+    if (
+      index < boundary &&
+      trimmed === OMX_SEEDED_BEHAVIORAL_DEFAULTS_END_MARKER
+    ) {
+      continue;
+    }
+
+    result.push(lines[index]);
+  }
+
+  return result.join("\n");
 }
 
 function stripRootLevelKeys(config: string, keys: readonly string[]): string {

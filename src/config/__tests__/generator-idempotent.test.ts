@@ -22,7 +22,7 @@ function assertSingleOmxBlock(toml: string): void {
     "OMX marker should appear once",
   );
   assert.equal(
-    count(toml, /# End oh-my-codex/g),
+    count(toml, /^# End oh-my-codex$/gm),
     1,
     "End marker should appear once",
   );
@@ -451,8 +451,13 @@ describe("config generator idempotency (#384)", () => {
       const toml = await readFile(configPath, "utf-8");
 
       assert.match(toml, /^model = "gpt-5.4"$/m);
+      assert.match(
+        toml,
+        /^# oh-my-codex seeded behavioral defaults \(uninstall removes unchanged defaults\)$/m,
+      );
       assert.match(toml, /^model_context_window = 1000000$/m);
       assert.match(toml, /^model_auto_compact_token_limit = 900000$/m);
+      assert.match(toml, /^# End oh-my-codex seeded behavioral defaults$/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -467,8 +472,13 @@ describe("config generator idempotency (#384)", () => {
 
       assert.match(toml, /^model = "gpt-5\.4"$/m);
       assert.doesNotMatch(toml, /^model = "gpt-5\.3-codex"$/m);
+      assert.match(
+        toml,
+        /^# oh-my-codex seeded behavioral defaults \(uninstall removes unchanged defaults\)$/m,
+      );
       assert.match(toml, /^model_context_window = 1000000$/m);
       assert.match(toml, /^model_auto_compact_token_limit = 900000$/m);
+      assert.match(toml, /^# End oh-my-codex seeded behavioral defaults$/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -533,6 +543,19 @@ describe("config generator idempotency (#384)", () => {
         1,
         "seeded auto compact limit should appear once",
       );
+      assert.equal(
+        count(
+          toml,
+          /^# oh-my-codex seeded behavioral defaults \(uninstall removes unchanged defaults\)$/gm,
+        ),
+        1,
+        "seeded defaults start marker should appear once",
+      );
+      assert.equal(
+        count(toml, /^# End oh-my-codex seeded behavioral defaults$/gm),
+        1,
+        "seeded defaults end marker should appear once",
+      );
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -595,7 +618,7 @@ describe("config generator idempotency (#384)", () => {
       const toml = buildMergedConfig(broken, wd);
       assert.equal(count(toml, /^\[tui\]$/gm), 1, "[tui] should appear once");
       assert.equal(
-        count(toml, /# End oh-my-codex/g),
+        count(toml, /^# End oh-my-codex$/gm),
         1,
         "End marker should appear once",
       );
