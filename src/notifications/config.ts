@@ -796,8 +796,9 @@ function normalizeInteger(
   return value;
 }
 
-export function getReplyConfig(): import("./types.js").ReplyConfig | null {
-  const notifConfig = getNotificationConfig();
+export function getReplyConfig(
+  notifConfig: FullNotificationConfig | null = getNotificationConfig(),
+): import("./types.js").ReplyConfig | null {
   if (!notifConfig?.enabled) return null;
 
   const hasDiscordBot = !!getEnabledReplyPlatformConfig<DiscordBotNotificationConfig>(

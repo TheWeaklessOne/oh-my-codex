@@ -207,6 +207,38 @@ export function normalizeReplyListenerConfig(config: ReplyListenerDaemonConfig):
   };
 }
 
+function getTelegramSourceIdentity(config: ReplyListenerDaemonConfig): string | null {
+  if (!config.telegramEnabled || !config.telegramBotToken || !config.telegramChatId) {
+    return null;
+  }
+  return `${config.telegramBotToken}:${config.telegramChatId}`;
+}
+
+function getDiscordSourceIdentity(config: ReplyListenerDaemonConfig): string | null {
+  if (!config.discordEnabled || !config.discordBotToken || !config.discordChannelId) {
+    return null;
+  }
+  return `${config.discordBotToken}:${config.discordChannelId}`;
+}
+
+function reconcileReplyListenerStateWithConfigChange(
+  previousConfig: ReplyListenerDaemonConfig,
+  nextConfig: ReplyListenerDaemonConfig,
+  currentState: ReplyListenerState,
+): ReplyListenerState {
+  const nextState = { ...currentState };
+
+  if (getTelegramSourceIdentity(previousConfig) !== getTelegramSourceIdentity(nextConfig)) {
+    nextState.telegramLastUpdateId = null;
+  }
+
+  if (getDiscordSourceIdentity(previousConfig) !== getDiscordSourceIdentity(nextConfig)) {
+    nextState.discordLastMessageId = null;
+  }
+
+  return nextState;
+}
+
 function readDaemonState(): ReplyListenerState | null {
   try {
     if (!existsSync(STATE_FILE_PATH)) return null;
@@ -416,6 +448,10 @@ export interface ReplyListenerPollDeps {
   logImpl?: typeof log;
 }
 
+interface ReplyListenerRuntimeRefreshDeps {
+  readDaemonConfigImpl?: typeof readDaemonConfig;
+}
+
 const SENSITIVE_KEY_PATTERN = /(["']?(?:api[_-]?key|token|secret|password|credentials?|authorization)["']?\s*[=:]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\n]+)/gi;
 const SENSITIVE_TOKEN_PATTERNS: RegExp[] = [
   /(?:sk-(?:proj-|live-|test-)?|ghp_|gho_|ghs_|ghu_|github_pat_|xox[bpsar]-|glpat-|AKIA[A-Z0-9])\S+/g,
@@ -461,6 +497,43 @@ export function formatReplyAcknowledgement(summary: string | null): string {
   }
 
   return `${REPLY_ACK_PREFIX}\n\nRecent output:\n${summary}`;
+}
+
+export function refreshReplyListenerRuntimeConfig(
+  currentConfig: ReplyListenerDaemonConfig,
+  currentRateLimiter: ReplyListenerRateLimiter,
+  deps: ReplyListenerRuntimeRefreshDeps = {},
+): {
+  config: ReplyListenerDaemonConfig;
+  rateLimiter: ReplyListenerRateLimiter;
+  shouldStopDaemon: boolean;
+} {
+  const readDaemonConfigImpl = deps.readDaemonConfigImpl ?? readDaemonConfig;
+  const nextConfig = readDaemonConfigImpl();
+  if (!nextConfig) {
+    return {
+      config: currentConfig,
+      rateLimiter: currentRateLimiter,
+      shouldStopDaemon: false,
+    };
+  }
+
+  const normalizedConfig = normalizeReplyListenerConfig(nextConfig);
+  const shouldStopDaemon =
+    !normalizedConfig.discordEnabled && !normalizedConfig.telegramEnabled;
+  if (normalizedConfig.rateLimitPerMinute === currentConfig.rateLimitPerMinute) {
+    return {
+      config: normalizedConfig,
+      rateLimiter: currentRateLimiter,
+      shouldStopDaemon,
+    };
+  }
+
+  return {
+    config: normalizedConfig,
+    rateLimiter: new RateLimiter(normalizedConfig.rateLimitPerMinute),
+    shouldStopDaemon,
+  };
 }
 
 function injectReply(
@@ -872,11 +945,12 @@ const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 async function pollLoop(): Promise<void> {
   log('Reply listener daemon starting poll loop');
 
-  const config = readDaemonConfig();
-  if (!config) {
+  const initialConfig = readDaemonConfig();
+  if (!initialConfig) {
     log('ERROR: No daemon config found, exiting');
     process.exit(1);
   }
+  let config = normalizeReplyListenerConfig(initialConfig);
 
   const state = readDaemonState() || {
     isRunning: true,
@@ -892,7 +966,7 @@ async function pollLoop(): Promise<void> {
   state.isRunning = true;
   state.pid = process.pid;
 
-  const rateLimiter = new RateLimiter(config.rateLimitPerMinute);
+  let rateLimiter: ReplyListenerRateLimiter = new RateLimiter(config.rateLimitPerMinute);
   let lastPruneAt = Date.now();
 
   const shutdown = () => {
@@ -915,6 +989,24 @@ async function pollLoop(): Promise<void> {
 
   while (state.isRunning) {
     try {
+      const previousConfig = config;
+      const refreshedRuntime = refreshReplyListenerRuntimeConfig(config, rateLimiter);
+      config = refreshedRuntime.config;
+      rateLimiter = refreshedRuntime.rateLimiter;
+      const reconciledState = reconcileReplyListenerStateWithConfigChange(
+        previousConfig,
+        config,
+        state,
+      );
+      state.telegramLastUpdateId = reconciledState.telegramLastUpdateId;
+      state.discordLastMessageId = reconciledState.discordLastMessageId;
+      if (refreshedRuntime.shouldStopDaemon) {
+        log('Reply listener config disabled all reply platforms; shutting down daemon');
+        state.isRunning = false;
+        writeDaemonState(state);
+        removePidFile();
+        break;
+      }
       state.lastPollAt = new Date().toISOString();
 
       await pollDiscord(config, state, rateLimiter);
@@ -948,22 +1040,33 @@ async function pollLoop(): Promise<void> {
 // Daemon Control
 // ============================================================================
 
-export function startReplyListener(config: ReplyListenerDaemonConfig): DaemonResponse {
-  if (isDaemonRunning()) {
-    const state = readDaemonState();
-    return {
-      success: true,
-      message: 'Reply listener daemon is already running',
-      state: state ?? undefined,
-    };
-  }
+interface StartReplyListenerDeps {
+  ensureStateDirImpl?: typeof ensureStateDir;
+  isDaemonRunningImpl?: typeof isDaemonRunning;
+  isTmuxAvailableImpl?: typeof isTmuxAvailable;
+  readDaemonConfigImpl?: typeof readDaemonConfig;
+  readDaemonStateImpl?: typeof readDaemonState;
+  spawnImpl?: typeof spawn;
+  writeDaemonConfigImpl?: typeof writeDaemonConfig;
+  writeDaemonStateImpl?: typeof writeDaemonState;
+  writePidFileImpl?: typeof writePidFile;
+  logImpl?: typeof log;
+}
 
-  if (!isTmuxAvailable()) {
-    return {
-      success: false,
-      message: 'tmux not available - reply injection requires tmux',
-    };
-  }
+export function startReplyListener(
+  config: ReplyListenerDaemonConfig,
+  deps: StartReplyListenerDeps = {},
+): DaemonResponse {
+  const ensureStateDirImpl = deps.ensureStateDirImpl ?? ensureStateDir;
+  const isDaemonRunningImpl = deps.isDaemonRunningImpl ?? isDaemonRunning;
+  const isTmuxAvailableImpl = deps.isTmuxAvailableImpl ?? isTmuxAvailable;
+  const readDaemonConfigImpl = deps.readDaemonConfigImpl ?? readDaemonConfig;
+  const readDaemonStateImpl = deps.readDaemonStateImpl ?? readDaemonState;
+  const spawnImpl = deps.spawnImpl ?? spawn;
+  const writeDaemonConfigImpl = deps.writeDaemonConfigImpl ?? writeDaemonConfig;
+  const writeDaemonStateImpl = deps.writeDaemonStateImpl ?? writeDaemonState;
+  const writePidFileImpl = deps.writePidFileImpl ?? writePidFile;
+  const logImpl = deps.logImpl ?? log;
 
   const normalizedConfig = normalizeReplyListenerConfig(config);
   if (!normalizedConfig.discordEnabled && !normalizedConfig.telegramEnabled) {
@@ -973,8 +1076,39 @@ export function startReplyListener(config: ReplyListenerDaemonConfig): DaemonRes
     };
   }
 
-  writeDaemonConfig(normalizedConfig);
-  ensureStateDir();
+  if (isDaemonRunningImpl()) {
+    const previousConfig = normalizeReplyListenerConfig(
+      readDaemonConfigImpl() ?? normalizedConfig,
+    );
+    const state = readDaemonStateImpl();
+    const refreshedState = state
+      ? reconcileReplyListenerStateWithConfigChange(
+          previousConfig,
+          normalizedConfig,
+          state,
+        )
+      : null;
+    ensureStateDirImpl();
+    writeDaemonConfigImpl(normalizedConfig);
+    if (refreshedState) {
+      writeDaemonStateImpl(refreshedState);
+    }
+    return {
+      success: true,
+      message: 'Reply listener daemon is already running (config refreshed)',
+      state: refreshedState ?? state ?? undefined,
+    };
+  }
+
+  if (!isTmuxAvailableImpl()) {
+    return {
+      success: false,
+      message: 'tmux not available - reply injection requires tmux',
+    };
+  }
+
+  writeDaemonConfigImpl(normalizedConfig);
+  ensureStateDirImpl();
 
   const modulePath = __filename.replace(/\.ts$/, '.js');
   const daemonScript = `
@@ -984,7 +1118,7 @@ export function startReplyListener(config: ReplyListenerDaemonConfig): DaemonRes
   `;
 
   try {
-    const child = spawn('node', ['-e', daemonScript], {
+    const child = spawnImpl('node', ['-e', daemonScript], {
       detached: true,
       stdio: 'ignore',
       windowsHide: true,
@@ -996,7 +1130,7 @@ export function startReplyListener(config: ReplyListenerDaemonConfig): DaemonRes
 
     const pid = child.pid;
     if (pid) {
-      writePidFile(pid);
+      writePidFileImpl(pid);
 
       const state: ReplyListenerState = {
         isRunning: true,
@@ -1008,8 +1142,8 @@ export function startReplyListener(config: ReplyListenerDaemonConfig): DaemonRes
         messagesInjected: 0,
         errors: 0,
       };
-      writeDaemonState(state);
-      log(`Reply listener daemon started with PID ${pid}`);
+      writeDaemonStateImpl(state);
+      logImpl(`Reply listener daemon started with PID ${pid}`);
 
       return {
         success: true,

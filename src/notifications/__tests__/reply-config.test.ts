@@ -85,4 +85,30 @@ describe('getReplyConfig validation', () => {
     assert.equal(config.rateLimitPerMinute, 1);
     assert.equal(config.maxMessageLength, 4000);
   });
+
+  it('honors an explicit notification config so reply enablement can follow the active profile', async () => {
+    const configFile = join(codexHomeDir, '.omx-config.json');
+    await writeFile(configFile, JSON.stringify({
+      notifications: {
+        enabled: true,
+        reply: {
+          enabled: true,
+        },
+      },
+    }, null, 2));
+
+    const { getReplyConfig } = await importConfigFresh();
+    const config = getReplyConfig({
+      enabled: true,
+      telegram: {
+        enabled: true,
+        botToken: 'profile-token',
+        chatId: 'profile-chat',
+      },
+    });
+
+    assert.ok(config);
+    assert.equal(config.pollIntervalMs, 3000);
+    assert.equal(config.rateLimitPerMinute, 10);
+  });
 });

@@ -245,3 +245,132 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
     assert.match(parsed.message, /PASS semantic notifications/);
   });
 });
+
+describe('ensureReplyListenerForConfig', () => {
+  it('starts the reply listener when reply mode and Telegram notifications are both enabled', async () => {
+    const { ensureReplyListenerForConfig } = await import(`../index.js?reply-listener-start=${Date.now()}`);
+    const startCalls: unknown[] = [];
+
+    ensureReplyListenerForConfig(
+      {
+        enabled: true,
+        telegram: {
+          enabled: true,
+          botToken: 'tg-token',
+          chatId: 'tg-chat',
+        },
+      },
+      {
+        getReplyConfigImpl: () => ({
+          enabled: true,
+          pollIntervalMs: 3000,
+          maxMessageLength: 500,
+          rateLimitPerMinute: 10,
+          includePrefix: true,
+          authorizedDiscordUserIds: [],
+        }),
+        getReplyListenerPlatformConfigImpl: () => ({
+          telegramEnabled: true,
+          telegramBotToken: 'tg-token',
+          telegramChatId: 'tg-chat',
+          discordEnabled: false,
+        }),
+        startReplyListenerImpl: (config: Record<string, unknown>) => {
+          startCalls.push(config);
+          return { success: true, message: 'started' };
+        },
+      },
+    );
+
+    assert.equal(startCalls.length, 1);
+    assert.deepEqual(startCalls[0], {
+      enabled: true,
+      pollIntervalMs: 3000,
+      maxMessageLength: 500,
+      rateLimitPerMinute: 10,
+      includePrefix: true,
+      authorizedDiscordUserIds: [],
+      telegramEnabled: true,
+      telegramBotToken: 'tg-token',
+      telegramChatId: 'tg-chat',
+      discordEnabled: false,
+    });
+  });
+
+  it('stops a running reply listener when reply handling is disabled', async () => {
+    const { ensureReplyListenerForConfig } = await import(`../index.js?reply-listener-disabled=${Date.now()}`);
+    let startCalled = false;
+    let stopCalled = false;
+
+    ensureReplyListenerForConfig(
+      {
+        enabled: true,
+        telegram: {
+          enabled: true,
+          botToken: 'tg-token',
+          chatId: 'tg-chat',
+        },
+      },
+      {
+        getReplyConfigImpl: () => null,
+        startReplyListenerImpl: () => {
+          startCalled = true;
+          return { success: true, message: 'started' };
+        },
+        stopReplyListenerImpl: () => {
+          stopCalled = true;
+          return { success: true, message: 'stopped' };
+        },
+      },
+    );
+
+    assert.equal(startCalled, false);
+    assert.equal(stopCalled, true);
+  });
+});
+
+describe('notifyLifecycle reply listener sync', () => {
+  it('syncs reply-listener config through notifyLifecycle before dispatch', async () => {
+    const projectPath = mkdtempSync(join(tmpdir(), 'omx-notify-index-reply-sync-'));
+    const { notifyLifecycle } = await import(`../index.js?reply-listener-notify=${Date.now()}`);
+    const config = {
+      enabled: true,
+      telegram: {
+        enabled: true,
+        botToken: 'tg-token',
+        chatId: 'tg-chat',
+      },
+    } as const;
+    const syncedConfigs: unknown[] = [];
+
+    const result = await notifyLifecycle(
+      'session-start',
+      {
+        sessionId: `sess-reply-sync-${Date.now()}`,
+        projectPath,
+        tmuxPaneId: '%42',
+        tmuxSession: 'omx',
+        message: 'hello',
+      },
+      undefined,
+      {
+        getNotificationConfigImpl: () => config,
+        isEventEnabledImpl: () => true,
+        ensureReplyListenerForConfigImpl: (replyConfig: unknown) => {
+          syncedConfigs.push(replyConfig);
+        },
+        dispatchNotificationsImpl: async () => ({
+          event: 'session-start',
+          anySuccess: true,
+          results: [],
+        }),
+      },
+    );
+
+    rmSync(projectPath, { recursive: true, force: true });
+
+    assert.deepEqual(syncedConfigs, [config]);
+    assert.ok(result);
+    assert.equal(result.anySuccess, true);
+  });
+});

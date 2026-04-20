@@ -13,7 +13,9 @@ import {
   normalizeReplyListenerConfig,
   pollDiscordOnce,
   pollTelegramOnce,
+  refreshReplyListenerRuntimeConfig,
   resetReplyListenerTransientState,
+  startReplyListener,
 } from '../reply-listener.js';
 import type { ReplyListenerDaemonConfig, ReplyListenerState } from '../reply-listener.js';
 import type { SessionMapping } from '../session-registry.js';
@@ -323,6 +325,120 @@ describe('normalizeReplyListenerConfig', () => {
 
     assert.equal(normalized.telegramEnabled, true);
     assert.equal(normalized.discordEnabled, false);
+  });
+});
+
+describe('refreshReplyListenerRuntimeConfig', () => {
+  it('reloads persisted runtime config without resetting the limiter when the rate is unchanged', () => {
+    const currentConfig = createBaseConfig({ pollIntervalMs: 3000, rateLimitPerMinute: 10 });
+    const currentRateLimiter = { canProceed: () => true, reset: () => {} };
+
+    const refreshed = refreshReplyListenerRuntimeConfig(
+      currentConfig,
+      currentRateLimiter,
+      {
+        readDaemonConfigImpl: () => ({
+          ...currentConfig,
+          pollIntervalMs: 5000,
+        }),
+      },
+    );
+
+    assert.equal(refreshed.config.pollIntervalMs, 5000);
+    assert.equal(refreshed.config.rateLimitPerMinute, 10);
+    assert.equal(refreshed.rateLimiter, currentRateLimiter);
+  });
+
+  it('rebuilds the limiter when the persisted rate limit changes', () => {
+    const currentConfig = createBaseConfig({ rateLimitPerMinute: 10 });
+    const currentRateLimiter = { canProceed: () => true, reset: () => {} };
+
+    const refreshed = refreshReplyListenerRuntimeConfig(
+      currentConfig,
+      currentRateLimiter,
+      {
+        readDaemonConfigImpl: () => ({
+          ...currentConfig,
+          rateLimitPerMinute: 2,
+        }),
+      },
+    );
+
+    assert.equal(refreshed.config.rateLimitPerMinute, 2);
+    assert.notEqual(refreshed.rateLimiter, currentRateLimiter);
+  });
+
+  it('requests daemon shutdown when refreshed config disables every reply platform', () => {
+    const currentConfig = createBaseConfig();
+    const currentRateLimiter = { canProceed: () => true, reset: () => {} };
+
+    const refreshed = refreshReplyListenerRuntimeConfig(
+      currentConfig,
+      currentRateLimiter,
+      {
+        readDaemonConfigImpl: () => ({
+          ...currentConfig,
+          telegramEnabled: false,
+          telegramBotToken: undefined,
+          telegramChatId: undefined,
+          discordEnabled: false,
+          discordBotToken: undefined,
+          discordChannelId: undefined,
+        }),
+      },
+    );
+
+    assert.equal(refreshed.shouldStopDaemon, true);
+  });
+});
+
+describe('startReplyListener', () => {
+  it('refreshes a running daemon config and clears stale platform cursors when sources change', () => {
+    const previousConfig = createBaseConfig({
+      telegramBotToken: '123456:old-telegram-token',
+      telegramChatId: 'old-chat',
+      discordBotToken: 'old-discord-token',
+      discordChannelId: 'old-discord-channel',
+    });
+    const nextConfig = createBaseConfig({
+      telegramBotToken: '123456:new-telegram-token',
+      telegramChatId: 'new-chat',
+      discordBotToken: 'new-discord-token',
+      discordChannelId: 'new-discord-channel',
+    });
+    const state: ReplyListenerState = {
+      ...createBaseState(),
+      telegramLastUpdateId: 44,
+      discordLastMessageId: 'discord-message-44',
+    };
+
+    let writtenConfig: ReplyListenerDaemonConfig | null = null;
+    let writtenState: ReplyListenerState | null = null;
+
+    const response = startReplyListener(nextConfig, {
+      ensureStateDirImpl: () => {},
+      isDaemonRunningImpl: () => true,
+      readDaemonConfigImpl: () => previousConfig,
+      readDaemonStateImpl: () => state,
+      writeDaemonConfigImpl: (config) => {
+        writtenConfig = config;
+      },
+      writeDaemonStateImpl: (nextState) => {
+        writtenState = nextState;
+      },
+    });
+
+    assert.equal(response.success, true);
+    assert.match(response.message, /config refreshed/);
+    assert.ok(writtenConfig);
+    assert.ok(writtenState);
+    const persistedConfig = writtenConfig as ReplyListenerDaemonConfig;
+    const persistedState = writtenState as ReplyListenerState;
+    assert.equal(persistedConfig.telegramChatId, 'new-chat');
+    assert.equal(persistedState.telegramLastUpdateId, null);
+    assert.equal(persistedState.discordLastMessageId, null);
+    assert.equal(response.state?.telegramLastUpdateId, null);
+    assert.equal(response.state?.discordLastMessageId, null);
   });
 });
 

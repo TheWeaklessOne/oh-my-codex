@@ -128,10 +128,19 @@ export type {
 
 import type {
   NotificationEvent,
+  FullNotificationConfig,
   FullNotificationPayload,
   DispatchResult,
 } from "./types.js";
-import { getNotificationConfig, isEventEnabled, getVerbosity, shouldIncludeTmuxTail, getActiveProfileName } from "./config.js";
+import {
+  getNotificationConfig,
+  getReplyConfig,
+  getReplyListenerPlatformConfig,
+  isEventEnabled,
+  getVerbosity,
+  shouldIncludeTmuxTail,
+  getActiveProfileName,
+} from "./config.js";
 import {
   getSelectedOpenClawGatewayNames,
   isOpenClawSelectedInTempContract,
@@ -141,6 +150,7 @@ import {
 import { formatNotification } from "./formatter.js";
 import { dispatchNotifications } from "./dispatcher.js";
 import { getCurrentTmuxSession, sanitizeTmuxAlertText } from "./tmux.js";
+import { startReplyListener, stopReplyListener } from "./reply-listener.js";
 import { basename } from "path";
 import { omxStateDir } from "../utils/paths.js";
 import {
@@ -178,6 +188,53 @@ const AUTO_CAPTURE_TMUX_TAIL_EVENTS = new Set<NotificationEvent>([
   "ask-user-question",
 ]);
 
+interface EnsureReplyListenerDeps {
+  getReplyConfigImpl?: typeof getReplyConfig;
+  getReplyListenerPlatformConfigImpl?: typeof getReplyListenerPlatformConfig;
+  startReplyListenerImpl?: typeof startReplyListener;
+  stopReplyListenerImpl?: typeof stopReplyListener;
+}
+
+export function ensureReplyListenerForConfig(
+  config: FullNotificationConfig | null,
+  deps: EnsureReplyListenerDeps = {},
+): void {
+  const getReplyConfigImpl = deps.getReplyConfigImpl ?? getReplyConfig;
+  const getReplyListenerPlatformConfigImpl =
+    deps.getReplyListenerPlatformConfigImpl ?? getReplyListenerPlatformConfig;
+  const startReplyListenerImpl = deps.startReplyListenerImpl ?? startReplyListener;
+  const stopReplyListenerImpl = deps.stopReplyListenerImpl ?? stopReplyListener;
+
+  if (!config?.enabled) {
+    stopReplyListenerImpl();
+    return;
+  }
+
+  const replyConfig = getReplyConfigImpl(config);
+  if (!replyConfig?.enabled) {
+    stopReplyListenerImpl();
+    return;
+  }
+
+  const platformConfig = getReplyListenerPlatformConfigImpl(config);
+  if (!platformConfig.discordEnabled && !platformConfig.telegramEnabled) {
+    stopReplyListenerImpl();
+    return;
+  }
+
+  startReplyListenerImpl({
+    ...replyConfig,
+    ...platformConfig,
+  });
+}
+
+interface NotifyLifecycleDeps {
+  getNotificationConfigImpl?: typeof getNotificationConfig;
+  isEventEnabledImpl?: typeof isEventEnabled;
+  ensureReplyListenerForConfigImpl?: typeof ensureReplyListenerForConfig;
+  dispatchNotificationsImpl?: typeof dispatchNotifications;
+}
+
 export async function shouldDispatchOpenClaw(
   event: OpenClawHookEvent,
   tempContract: NotifyTempContract | null,
@@ -212,10 +269,21 @@ export async function notifyLifecycle(
   event: NotificationEvent,
   data: Partial<FullNotificationPayload> & { sessionId: string },
   profileName?: string,
+  deps: NotifyLifecycleDeps = {},
 ): Promise<DispatchResult | null> {
   try {
-    const config = getNotificationConfig(profileName);
-    if (!config || !isEventEnabled(config, event)) {
+    const getNotificationConfigImpl =
+      deps.getNotificationConfigImpl ?? getNotificationConfig;
+    const isEventEnabledImpl = deps.isEventEnabledImpl ?? isEventEnabled;
+    const ensureReplyListenerForConfigImpl =
+      deps.ensureReplyListenerForConfigImpl ?? ensureReplyListenerForConfig;
+    const dispatchNotificationsImpl =
+      deps.dispatchNotificationsImpl ?? dispatchNotifications;
+
+    const config = getNotificationConfigImpl(profileName);
+    ensureReplyListenerForConfigImpl(config);
+
+    if (!config || !isEventEnabledImpl(config, event)) {
       return null;
     }
 
@@ -244,7 +312,6 @@ export async function notifyLifecycle(
       question: data.question,
       incompleteTasks: data.incompleteTasks,
     };
-
     // Auto-capture tmux tail only for live turn-facing notifications. Stop/end
     // lifecycle dispatches happen after the relevant session is stopping or has
     // already completed, so blind capture-pane reads can replay historical pane
@@ -334,7 +401,7 @@ export async function notifyLifecycle(
       void dispatchOpenClawLater();
     }
 
-    const result = await dispatchNotifications(config, event, payload);
+    const result = await dispatchNotificationsImpl(config, event, payload);
     if (result.anySuccess) {
       recordLifecycleNotificationSent(lifecycleStateDir, payload);
       if (event === "session-idle" && sessionIdleTmuxTailAllowed) {
