@@ -22,6 +22,7 @@ import {
   packageRoot,
   OMX_ENTRY_PATH_ENV,
   OMX_STARTUP_CWD_ENV,
+  preferLogicalPath,
   rememberOmxLaunchContext,
   resolveOmxCliEntryPath,
   resolveOmxEntryPath,
@@ -407,6 +408,33 @@ describe("packageRoot", () => {
   });
 });
 
+describe("preferLogicalPath", () => {
+  it("returns the absolute path unchanged outside the /private/var alias case", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-prefer-logical-"));
+    try {
+      assert.equal(preferLogicalPath(wd), wd);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers the logical /var path over /private/var aliases on darwin when both exist", async () => {
+    if (process.platform !== "darwin") return;
+
+    const logicalPath = await mkdtemp(join(tmpdir(), "omx-prefer-logical-"));
+    try {
+      if (!logicalPath.startsWith("/var/")) return;
+
+      const privatePath = `/private${logicalPath}`;
+      if (!existsSync(privatePath)) return;
+
+      assert.equal(preferLogicalPath(privatePath), logicalPath);
+    } finally {
+      await rm(logicalPath, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("OMX launcher path resolution", () => {
   const originalEntryPath = process.env[OMX_ENTRY_PATH_ENV];
   const originalStartupCwd = process.env[OMX_STARTUP_CWD_ENV];
@@ -446,6 +474,34 @@ describe("OMX launcher path resolution", () => {
     } finally {
       await rm(startupCwd, { recursive: true, force: true });
       await rm(laterCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers an explicit argv1 over a previously remembered launcher env path", async () => {
+    const startupCwd = await mkdtemp(join(tmpdir(), "omx-launcher-explicit-start-"));
+    try {
+      const envLauncherDir = join(startupCwd, "env-dist", "cli");
+      const envLauncherPath = join(envLauncherDir, "omx.js");
+      const explicitLauncherDir = join(startupCwd, "explicit-dist", "cli");
+      const explicitLauncherPath = join(explicitLauncherDir, "omx.js");
+      await mkdir(envLauncherDir, { recursive: true });
+      await mkdir(explicitLauncherDir, { recursive: true });
+      await writeFile(envLauncherPath, "#!/usr/bin/env node\n", "utf-8");
+      await writeFile(explicitLauncherPath, "#!/usr/bin/env node\n", "utf-8");
+
+      const resolved = resolveOmxEntryPath({
+        argv1: "explicit-dist/cli/omx.js",
+        cwd: startupCwd,
+        env: {
+          ...process.env,
+          [OMX_ENTRY_PATH_ENV]: envLauncherPath,
+          [OMX_STARTUP_CWD_ENV]: startupCwd,
+        },
+      });
+
+      assert.equal(resolved, explicitLauncherPath);
+    } finally {
+      await rm(startupCwd, { recursive: true, force: true });
     }
   });
 

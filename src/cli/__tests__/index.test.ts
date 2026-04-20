@@ -70,12 +70,18 @@ import type { ProcessEntry } from "../cleanup.js";
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(testDir, "..", "..", "..");
+const originalOmxTmuxBinary = process.env.OMX_TMUX_BINARY;
 
 function expectedLowComplexityModel(codexHomeOverride?: string): string {
   return getTeamLowComplexityModel(codexHomeOverride);
 }
 
 afterEach(() => {
+  if (typeof originalOmxTmuxBinary === "string") {
+    process.env.OMX_TMUX_BINARY = originalOmxTmuxBinary;
+  } else {
+    delete process.env.OMX_TMUX_BINARY;
+  }
   mock.restoreAll();
 });
 
@@ -1253,6 +1259,17 @@ describe("resolveCodexLaunchPolicy", () => {
     );
   });
 
+  it("falls back to direct launch when already inside tmux but tmux is unavailable", () => {
+    assert.equal(
+      resolveCodexLaunchPolicy(
+        { TMUX: "/tmp/tmux-1000/default,123,0" },
+        "darwin",
+        false,
+      ),
+      "direct",
+    );
+  });
+
   it("uses tmux-aware launch path when already inside tmux on native Windows", () => {
     assert.equal(
       resolveCodexLaunchPolicy(
@@ -1611,6 +1628,7 @@ describe("detached tmux new-session sequencing", () => {
   });
 
   it("buildDetachedSessionBootstrapSteps kills detached tmux session on normal shell exit", () => {
+    process.env.OMX_TMUX_BINARY = "tmux";
     const steps = buildDetachedSessionBootstrapSteps(
       "omx-demo",
       "/tmp/project",
@@ -1632,8 +1650,8 @@ describe("detached tmux new-session sequencing", () => {
     assert.match(leaderCmd!, /kill -TERM "\$omx_codex_pid"/);
     assert.match(leaderCmd!, /releaseTmuxExtendedKeysLease/);
     assert.match(leaderCmd!, /if \[ "\$status" -lt 128 \]; then/);
-    assert.match(leaderCmd!, /tmux kill-session -t/);
-    assert.match(leaderCmd!, /"omx-demo"/);
+    assert.match(leaderCmd!, /kill-session/);
+    assert.match(leaderCmd!, /omx-demo/);
     assert.match(leaderCmd!, /exit \$status/);
   });
 
@@ -1676,6 +1694,7 @@ exit 0
 `,
       );
       await chmod(join(fakeBin, "tmux"), 0o755);
+      process.env.OMX_TMUX_BINARY = join(fakeBin, "tmux");
 
       const steps = buildDetachedSessionBootstrapSteps(
         "omx-demo",
@@ -1745,6 +1764,7 @@ exit 0
 `,
       );
       await chmod(join(fakeBin, "tmux"), 0o755);
+      process.env.OMX_TMUX_BINARY = join(fakeBin, "tmux");
 
       const steps = buildDetachedSessionBootstrapSteps(
         "omx-demo",
@@ -1823,6 +1843,7 @@ exit 0
 `,
       );
       await chmod(join(fakeBin, "tmux"), 0o755);
+      process.env.OMX_TMUX_BINARY = join(fakeBin, "tmux");
 
       const steps = buildDetachedSessionBootstrapSteps(
         "omx-demo",
@@ -2382,6 +2403,13 @@ describe("buildTmuxPaneCommand", () => {
       "should fall back to /bin/sh",
     );
     assert.ok(!result.includes(" -lc "), "should not use a login shell");
+  });
+
+  it("prefixes an explicit cwd before sourcing shell rc files", () => {
+    const result = buildTmuxPaneCommand("codex", [], "/bin/bash", "/tmp/omx-cwd");
+    assert.match(result, /cd "\/tmp\/omx-cwd" \|\| exit 1;/);
+    assert.match(result, /PWD="\/tmp\/omx-cwd"; export PWD;/);
+    assert.match(result, /source ~\/\.bashrc/);
   });
 });
 

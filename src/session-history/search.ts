@@ -1,8 +1,8 @@
 import { createReadStream, existsSync } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
-import { join, relative } from 'node:path';
+import { isAbsolute, join, relative } from 'node:path';
 import { createInterface } from 'node:readline';
-import { codexHome } from '../utils/paths.js';
+import { codexHome, sameFilePath } from '../utils/paths.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -254,6 +254,15 @@ function matchesFilter(value: string | null, filter: string | undefined, caseSen
   return value.toLowerCase().includes(filter.toLowerCase());
 }
 
+function matchesProjectFilter(value: string | null, filter: string | undefined, caseSensitive: boolean): boolean {
+  if (!filter) return true;
+  if (!value) return false;
+  if (isAbsolute(value) && isAbsolute(filter) && sameFilePath(value, filter)) {
+    return true;
+  }
+  return matchesFilter(value, filter, caseSensitive);
+}
+
 async function searchRolloutFile(
   filePath: string,
   options: Required<Pick<SessionSearchOptions, 'query' | 'context' | 'caseSensitive'>> & {
@@ -291,7 +300,7 @@ async function searchRolloutFile(
           skipFile = true;
           break;
         }
-        if (!matchesFilter(meta.cwd, options.projectFilter, options.caseSensitive)) {
+        if (!matchesProjectFilter(meta.cwd, options.projectFilter, options.caseSensitive)) {
           skipFile = true;
           break;
         }

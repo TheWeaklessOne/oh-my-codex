@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseSinceSpec, searchSessionHistory } from '../search.js';
@@ -155,6 +155,57 @@ describe('searchSessionHistory', () => {
       assert.deepEqual(report.results, []);
       assert.equal(report.matched_sessions, 0);
       assert.equal(report.searched_files, 1);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('matches absolute project filters that resolve to the same directory', async () => {
+    if (process.platform === 'win32') return;
+
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-search-'));
+    const codexHomeDir = join(cwd, '.codex-home');
+    const realProjectDir = join(cwd, 'project-real');
+    const aliasProjectDir = join(cwd, 'project-alias');
+    try {
+      await mkdir(realProjectDir, { recursive: true });
+      try {
+        await symlink(realProjectDir, aliasProjectDir);
+      } catch (error) {
+        const code = typeof error === 'object' && error !== null && 'code' in error
+          ? String((error as { code?: unknown }).code ?? '')
+          : '';
+        if (code === 'EPERM' || code === 'EACCES') return;
+        throw error;
+      }
+
+      await writeRollout(codexHomeDir, '2026-03-10T12:00:00.000Z', 'rollout-2026-03-10T12-00-00-session-link.jsonl', [
+        {
+          type: 'session_meta',
+          payload: {
+            id: 'session-link',
+            timestamp: '2026-03-10T12:00:00.000Z',
+            cwd: aliasProjectDir,
+          },
+        },
+        {
+          type: 'event_msg',
+          payload: {
+            type: 'user_message',
+            message: 'Inspect detached tmux socket path handling.',
+          },
+        },
+      ]);
+
+      const report = await searchSessionHistory({
+        query: 'socket path',
+        project: realProjectDir,
+        codexHomeDir,
+        cwd,
+      });
+
+      assert.equal(report.results.length, 1);
+      assert.equal(report.results[0].session_id, 'session-link');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

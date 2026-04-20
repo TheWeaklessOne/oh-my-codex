@@ -19,15 +19,7 @@ export const OMX_ENTRY_PATH_ENV = "OMX_ENTRY_PATH";
 export const OMX_STARTUP_CWD_ENV = "OMX_STARTUP_CWD";
 
 function resolveLauncherPath(rawPath: string, baseCwd: string): string {
-  const absolutePath = isAbsolute(rawPath) ? rawPath : resolve(baseCwd, rawPath);
-  if (!existsSync(absolutePath)) return absolutePath;
-  try {
-    return typeof realpathSync.native === "function"
-      ? realpathSync.native(absolutePath)
-      : realpathSync(absolutePath);
-  } catch {
-    return absolutePath;
-  }
+  return isAbsolute(rawPath) ? rawPath : resolve(baseCwd, rawPath);
 }
 
 export function canonicalizeComparablePath(rawPath: string): string {
@@ -46,6 +38,17 @@ export function sameFilePath(leftPath: string, rightPath: string): boolean {
   return canonicalizeComparablePath(leftPath) === canonicalizeComparablePath(rightPath);
 }
 
+export function preferLogicalPath(rawPath: string): string {
+  const absolutePath = resolve(rawPath);
+  if (process.platform !== "darwin" || !absolutePath.startsWith("/private/var/")) {
+    return absolutePath;
+  }
+
+  const logicalVarPath = absolutePath.slice("/private".length);
+  if (!existsSync(logicalVarPath)) return absolutePath;
+  return sameFilePath(absolutePath, logicalVarPath) ? logicalVarPath : absolutePath;
+}
+
 export function resolveOmxEntryPath(
   options: {
     argv1?: string | null;
@@ -61,11 +64,9 @@ export function resolveOmxEntryPath(
     const startupCwd = String(env[OMX_STARTUP_CWD_ENV] ?? "").trim() || cwd;
     return resolveLauncherPath(rawPath, startupCwd);
   }
-
   const fromEnv = String(env[OMX_ENTRY_PATH_ENV] ?? "").trim();
-  if (fromEnv !== "") return fromEnv;
-
-  if (rawPath === "") return null;
+  if (!hasExplicitArgv1 && fromEnv !== "") return fromEnv;
+  if (rawPath === "") return fromEnv || null;
 
   const startupCwd = String(env[OMX_STARTUP_CWD_ENV] ?? "").trim() || cwd;
   return resolveLauncherPath(rawPath, startupCwd);

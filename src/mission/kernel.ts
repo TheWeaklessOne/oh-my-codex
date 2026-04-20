@@ -29,7 +29,6 @@ import {
 import {
 	collectMissionHardeningArtifactRefs,
 	deriveMissionHardeningGatePolicy,
-	missionHardeningArtifactPaths,
 	missionHardeningGateIsRequired,
 	readMissionHardeningReportFromLaneRoot,
 	validateMissionHardeningReport,

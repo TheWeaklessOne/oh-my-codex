@@ -94,7 +94,7 @@ import {
   mitigateCopyModeUnderlineArtifacts,
 } from "../team/tmux-session.js";
 import { getPackageRoot } from "../utils/package.js";
-import { codexConfigPath, rememberOmxLaunchContext, resolveOmxEntryPath } from "../utils/paths.js";
+import { codexConfigPath, preferLogicalPath, rememberOmxLaunchContext, resolveOmxEntryPath } from "../utils/paths.js";
 import { repairConfigIfNeeded } from "../config/generator.js";
 import { HUD_TMUX_HEIGHT_LINES } from "../hud/constants.js";
 import {
@@ -442,7 +442,7 @@ export function resolveCodexLaunchPolicy(
   stdoutIsTTY: boolean = Boolean(process.stdout.isTTY),
   explicitPolicy?: CodexLaunchPolicy,
 ): CodexLaunchPolicy {
-  if (env.TMUX) return "inside-tmux";
+  if (env.TMUX) return tmuxAvailable ? "inside-tmux" : "direct";
   if (explicitPolicy === "detached-tmux") return tmuxAvailable ? "detached-tmux" : "direct";
   if (explicitPolicy === "direct") return "direct";
   if (_platform === "win32") return "direct";
@@ -457,6 +457,8 @@ type ExecFileSyncFailure = NodeJS.ErrnoException & {
 };
 
 function resolveTmuxExecutableForLaunch(): string {
+  const override = process.env.OMX_TMUX_BINARY?.trim();
+  if (override) return override;
   return resolveTmuxBinaryForPlatform() || "tmux";
 }
 
@@ -891,7 +893,7 @@ export async function launchWithHud(args: string[]): Promise<void> {
     }
   }
 
-  const launchCwd = process.cwd();
+  const launchCwd = preferLogicalPath(process.cwd());
   const parsedWorktree = parseWorktreeMode(args);
   const notifyTempResult = resolveNotifyTempContract(
     parsedWorktree.remainingArgs,
@@ -1618,7 +1620,11 @@ function buildDetachedSessionLeaderCommand(
   sessionName: string,
   codexCmd: string,
 ): string {
+  const escapedCwd = escapeShellDoubleQuotedValue(cwd);
+  const tmuxKillSessionCmd = buildTmuxShellCommandLiteral(["kill-session", "-t", sessionName]);
   const wrapped = [
+    `cd "${escapedCwd}" || exit 1;`,
+    `PWD="${escapedCwd}"; export PWD;`,
     buildTmuxExtendedKeysAcquireShellSnippet(cwd),
     'exec 3<&0;',
     'omx_codex_pid="";',
@@ -1632,7 +1638,7 @@ function buildDetachedSessionLeaderCommand(
     'exec 3<&- 2>/dev/null || true;',
     buildTmuxExtendedKeysReleaseShellSnippet(cwd),
     'if [ "$status" -lt 128 ]; then',
-    `tmux kill-session -t "${escapeShellDoubleQuotedValue(sessionName)}" >/dev/null 2>&1 || true;`,
+    `${tmuxKillSessionCmd} >/dev/null 2>&1 || true;`,
     "fi;",
     "exit $status;",
     "};",
@@ -1745,19 +1751,48 @@ function buildTmuxExtendedKeysHelperCommand(
 ): string {
   const cwdLiteral = JSON.stringify(cwd);
   const moduleUrlLiteral = JSON.stringify(import.meta.url);
+  const tmuxBinaryLiteral = quoteShellArg(resolveTmuxExecutableForLaunch());
   const script =
     operation === "acquire"
       ? `const mod = await import(${moduleUrlLiteral}); const lease = mod.acquireTmuxExtendedKeysLease(${cwdLiteral}); if (lease) process.stdout.write(lease);`
       : `const mod = await import(${moduleUrlLiteral}); mod.releaseTmuxExtendedKeysLease(${cwdLiteral}, process.argv[1] ?? "");`;
-  return `${quoteShellArg(process.execPath)} --input-type=module -e ${quoteShellArg(script)}`;
+  return `OMX_TMUX_BINARY=${tmuxBinaryLiteral} ${quoteShellArg(process.execPath)} --input-type=module -e ${quoteShellArg(script)}`;
+}
+
+function buildTmuxShellCommandLiteral(args: string[]): string {
+  return [resolveTmuxExecutableForLaunch(), ...args]
+    .map((arg) => quoteShellArg(arg))
+    .join(" ");
 }
 
 function buildTmuxExtendedKeysAcquireShellSnippet(cwd: string): string {
-  return `OMX_TMUX_EXTENDED_KEYS_LEASE=$(${buildTmuxExtendedKeysHelperCommand(cwd, "acquire")} 2>/dev/null || true);`;
+  const displaySocketCmd = buildTmuxShellCommandLiteral(["display-message", "-p", "#{socket_path}"]);
+  const showOptionsCmd = buildTmuxShellCommandLiteral(["show-options", "-sv", "extended-keys"]);
+  const setAlwaysCmd = buildTmuxShellCommandLiteral(["set-option", "-sq", "extended-keys", TMUX_EXTENDED_KEYS_MODE]);
+  return [
+    `OMX_TMUX_EXTENDED_KEYS_LEASE=$(${buildTmuxExtendedKeysHelperCommand(cwd, "acquire")} 2>/dev/null || true);`,
+    'if [ -z "${OMX_TMUX_EXTENDED_KEYS_LEASE:-}" ]; then',
+    `${displaySocketCmd} >/dev/null 2>&1 || true;`,
+    `OMX_TMUX_EXTENDED_KEYS_ORIGINAL=$(${showOptionsCmd} 2>/dev/null || printf ${quoteShellArg(TMUX_EXTENDED_KEYS_FALLBACK_MODE)});`,
+    `${setAlwaysCmd} >/dev/null 2>&1 || true;`,
+    'OMX_TMUX_EXTENDED_KEYS_LEASE="fallback:${OMX_TMUX_EXTENDED_KEYS_ORIGINAL}";',
+    'fi;',
+  ].join(" ");
 }
 
 function buildTmuxExtendedKeysReleaseShellSnippet(cwd: string): string {
-  return `if [ -n "\${OMX_TMUX_EXTENDED_KEYS_LEASE:-}" ]; then ${buildTmuxExtendedKeysHelperCommand(cwd, "release")} "\${OMX_TMUX_EXTENDED_KEYS_LEASE}" >/dev/null 2>&1 || true; fi;`;
+  const tmuxBinary = quoteShellArg(resolveTmuxExecutableForLaunch());
+  return [
+    'if [ -n "${OMX_TMUX_EXTENDED_KEYS_LEASE:-}" ]; then',
+    'case "${OMX_TMUX_EXTENDED_KEYS_LEASE}" in',
+    'fallback:*)',
+    'OMX_TMUX_EXTENDED_KEYS_ORIGINAL=${OMX_TMUX_EXTENDED_KEYS_LEASE#fallback:};',
+    `${tmuxBinary} 'set-option' '-sq' 'extended-keys' "\${OMX_TMUX_EXTENDED_KEYS_ORIGINAL:-off}" >/dev/null 2>&1 || true;`,
+    ';;',
+    `*) ${buildTmuxExtendedKeysHelperCommand(cwd, "release")} "\${OMX_TMUX_EXTENDED_KEYS_LEASE}" >/dev/null 2>&1 || true ;;`,
+    'esac;',
+    'fi;',
+  ].join(" ");
 }
 
 export function withTmuxExtendedKeys<T>(
@@ -2498,7 +2533,7 @@ function runCodex(
     runCodexBlocking(cwd, launchArgs, codexEnvWithNotify);
   } else {
     // Not in tmux: create a new tmux session with codex + HUD pane
-    const codexCmd = buildTmuxPaneCommand("codex", launchArgs);
+    const codexCmd = buildTmuxPaneCommand("codex", launchArgs, undefined, cwd);
     const detachedWindowsCodexCmd = nativeWindows
       ? buildWindowsPromptCommand("codex", launchArgs)
       : null;
@@ -2689,6 +2724,7 @@ export function buildTmuxPaneCommand(
   command: string,
   args: string[],
   shellPath: string | undefined = process.env.SHELL,
+  cwd?: string,
 ): string {
   const bareCmd = buildTmuxShellCommand(command, args);
   let rcSource = "";
@@ -2700,7 +2736,10 @@ export function buildTmuxPaneCommand(
   const rawShell =
     shellPath && shellPath.trim() !== "" ? shellPath.trim() : "/bin/sh";
   const shellBin = ALLOWED_SHELLS.has(rawShell) ? rawShell : "/bin/sh";
-  const inner = `${rcSource}exec ${bareCmd}`;
+  const cwdPrefix = cwd
+    ? `cd "${escapeShellDoubleQuotedValue(cwd)}" || exit 1; PWD="${escapeShellDoubleQuotedValue(cwd)}"; export PWD; `
+    : "";
+  const inner = `${cwdPrefix}${rcSource}exec ${bareCmd}`;
   return `${quoteShellArg(shellBin)} -c ${quoteShellArg(inner)}`;
 }
 
