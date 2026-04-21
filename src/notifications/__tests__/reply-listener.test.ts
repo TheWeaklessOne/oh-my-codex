@@ -1333,6 +1333,95 @@ describe('pollTelegramOnce', () => {
     assert.match(parsedBody.text, /not authorized/i);
   });
 
+  it('does not send usage replies for unauthorized non-reply Telegram messages in the configured chat', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    let sendMessageAttempted = false;
+
+    await pollTelegramOnce(
+      config,
+      createBaseState(),
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 46,
+                  message: {
+                    message_id: 336,
+                    chat: { id: 777, type: 'private' },
+                    from: { id: 'intruder' },
+                    text: 'hello',
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: () => {
+            sendMessageAttempted = true;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 452 } } };
+          },
+        }),
+      },
+    );
+
+    assert.equal(sendMessageAttempted, false);
+  });
+
+  it('refuses reply injection from non-private Telegram chats when no sender allowlist is configured', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig({ authorizedTelegramUserIds: [] });
+    const state = createBaseState();
+    let sendMessageBody = '';
+    let injectCalled = false;
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 47,
+                  message: {
+                    message_id: 337,
+                    chat: { id: 777, type: 'supergroup' },
+                    from: { id: 'telegram-user-2' },
+                    text: 'resume',
+                    reply_to_message: { message_id: 222 },
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 453 } } };
+          },
+        }),
+        lookupByMessageIdImpl: () => createMapping('telegram'),
+        injectReplyImpl: () => {
+          injectCalled = true;
+          return true;
+        },
+      },
+    );
+
+    assert.equal(injectCalled, false);
+    const parsedBody = JSON.parse(sendMessageBody) as { text: string };
+    assert.match(parsedBody.text, /not authorized/i);
+    assert.equal(state.messagesInjected, 0);
+  });
+
   it('responds to Telegram status probes without injecting command text', async () => {
     resetReplyListenerTransientState();
     const config = createBaseConfig();

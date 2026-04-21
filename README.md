@@ -270,7 +270,7 @@ If you enable inbound notification replies, OMX now keeps Telegram on polling-on
 }
 ```
 
-- `authorizedTelegramUserIds` hardens Telegram replies beyond chat-level matching. If omitted, OMX keeps a compatibility fallback to chat-level authorization only.
+- `authorizedTelegramUserIds` hardens Telegram replies beyond chat-level matching. If omitted, OMX only accepts Telegram replies from private chats; group chats require an explicit sender allowlist.
 - `ackMode` defaults to `minimal`; use `summary` only when you explicitly want a redacted recent-pane tail in the acknowledgement, or `off` to suppress follow-up replies entirely.
 - `telegramStartupBacklogPolicy` supports `resume`, `drop_pending`, and `replay_once`.
   - `resume` enters normal long polling immediately using the persisted cursor state.

@@ -245,6 +245,26 @@ export function injectQuestionAnswerToPane(
   return true;
 }
 
+export function isQuestionRendererAlive(
+  renderer: QuestionRendererState,
+  execTmux: ExecTmuxSync = defaultExecTmux,
+): boolean {
+  try {
+    if (renderer.target === 'test-noop-renderer') {
+      return true;
+    }
+    if (renderer.renderer === 'tmux-pane') {
+      const rawPane = execTmux(['display-message', '-p', '-t', renderer.target, '#{pane_id}']);
+      return parsePaneIdFromTmuxOutput(rawPane) === renderer.target;
+    }
+
+    execTmux(['has-session', '-t', renderer.target]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function launchQuestionRenderer(
   options: LaunchQuestionRendererOptions,
   deps: {

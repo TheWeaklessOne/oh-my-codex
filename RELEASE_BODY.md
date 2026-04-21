@@ -6,9 +6,11 @@
 
 ## Added
 
-- **Canonical supervisor runtime events** — runtime command-event contracts now include canonical event types for supervisor control and downstream dispatch/readiness decisions.
-- **Deep-interview summary gates** — oversized interview flows now require compact summaries before continuing, reducing context blow-up during long clarification paths.
-- **Docker-host tmux question bridge** — question rendering can bridge docker-host tmux detection so operator-visible prompts survive container/host pane splits.
+- **Korean `ulw` keyboard drift handling** — prompts typed as `ㅕㅣㅈ` normalize to the existing `ulw` ultrawork shorthand before workflow activation.
+- **Background-question guidance for deep-interview** — skill, template, and native-hook guidance now tell agents to wait for background `omx question` terminals to finish and read the JSON answer before scoring ambiguity or handing off.
+- **`omx question` structured interactive entrypoint** — OMX now has a first-party blocking-question command for agent-invoked user questions, with JSON input, tmux renderer selection, persistent question records, and structured answer output.
+- **Question-obligation tracking for deep-interview** — deep-interview can now mark a question as pending/required, satisfy it, and clear it explicitly so interactive progress is durable instead of inferred from free-form prompt text.
+- **Advisory triage classifier** — non-keyword prompts now get PASS/LIGHT/HEAVY advisory routing backed by persisted triage state and follow-up suppression.
 
 ## Changed
 

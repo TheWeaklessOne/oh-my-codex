@@ -160,7 +160,7 @@ type TelegramUpdate = {
   update_id?: number;
   message?: {
     message_id?: number;
-    chat?: { id?: number | string };
+    chat?: { id?: number | string; type?: string };
     from?: { id?: number | string };
     text?: string;
     reply_to_message?: { message_id?: number | string };
@@ -595,6 +595,19 @@ function logSourceEvent(
     platform: source.platform,
     ...details,
   }));
+}
+
+function isTelegramMessageFromAuthorizedSender(
+  config: ReplyListenerDaemonConfig,
+  msg: TelegramUpdate["message"],
+): boolean {
+  if (!msg) return false;
+  if (config.authorizedTelegramUserIds.length > 0) {
+    const senderId = msg.from?.id !== undefined ? String(msg.from.id) : null;
+    return !!senderId && config.authorizedTelegramUserIds.includes(senderId);
+  }
+
+  return msg.chat?.type === 'private';
 }
 
 function buildTelegramGetUpdatesPath(
@@ -1554,8 +1567,9 @@ export async function pollTelegramOnce(
         continue;
       }
 
+      const isSenderAuthorized = isTelegramMessageFromAuthorizedSender(config, msg);
       if (!msg.reply_to_message?.message_id) {
-        if (text) {
+        if (text && isSenderAuthorized) {
           await trySendTelegramTextReply(
             config,
             httpsRequestImpl,
@@ -1569,11 +1583,7 @@ export async function pollTelegramOnce(
         continue;
       }
 
-      const senderId = msg.from?.id !== undefined ? String(msg.from.id) : null;
-      if (
-        config.authorizedTelegramUserIds.length > 0
-        && (!senderId || !config.authorizedTelegramUserIds.includes(senderId))
-      ) {
+      if (!isSenderAuthorized) {
         await trySendTelegramTextReply(
           config,
           httpsRequestImpl,

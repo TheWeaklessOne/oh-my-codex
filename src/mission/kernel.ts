@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rm } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { writeAtomic } from "../team/state/io.js";
+import { sleep } from "../utils/sleep.js";
 import {
 	canTransitionMissionStatus,
 	closureMatrixDecision,
@@ -205,12 +206,79 @@ export interface CommitIterationResult {
 	judgement: MissionJudgement;
 }
 
+const MISSION_SLUG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const MISSION_LOCK_RETRY_MS = 25;
+const MISSION_LOCK_TIMEOUT_MS = 5_000;
+
+let missionLockHookForTests: (() => Promise<void>) | null = null;
+
 function nowIso(): string {
 	return new Date().toISOString();
 }
 
+function validateMissionSlug(slug: string): string {
+	const normalized = String(slug).trim();
+	if (
+		!normalized ||
+		normalized === "." ||
+		normalized === ".." ||
+		!MISSION_SLUG_PATTERN.test(normalized)
+	) {
+		throw new Error(`mission_invalid_slug:${slug}`);
+	}
+	return normalized;
+}
+
+function missionLocksRoot(repoRoot: string): string {
+	return join(repoRoot, ".omx", "missions", ".locks");
+}
+
+function missionLockPath(repoRoot: string, slug: string): string {
+	return join(missionLocksRoot(repoRoot), `${validateMissionSlug(slug)}.lock`);
+}
+
+async function withMissionLock<T>(
+	repoRoot: string,
+	slug: string,
+	callback: () => Promise<T>,
+): Promise<T> {
+	const lockRoot = missionLocksRoot(repoRoot);
+	await mkdir(lockRoot, { recursive: true });
+	const lockPath = missionLockPath(repoRoot, slug);
+	const startedAt = Date.now();
+
+	while (true) {
+		try {
+			await mkdir(lockPath);
+			break;
+		} catch (error) {
+			const err = error as NodeJS.ErrnoException;
+			if (err.code !== "EEXIST") throw error;
+			if (Date.now() - startedAt > MISSION_LOCK_TIMEOUT_MS) {
+				throw new Error(`mission_lock_timeout:${slug}`);
+			}
+			await sleep(MISSION_LOCK_RETRY_MS);
+		}
+	}
+
+	try {
+		if (missionLockHookForTests) {
+			await missionLockHookForTests();
+		}
+		return await callback();
+	} finally {
+		await rm(lockPath, { recursive: true, force: true });
+	}
+}
+
+export function setMissionLockHookForTests(
+	hook: (() => Promise<void>) | null,
+): void {
+	missionLockHookForTests = hook;
+}
+
 function missionRoot(repoRoot: string, slug: string): string {
-	return join(repoRoot, ".omx", "missions", slug);
+	return join(repoRoot, ".omx", "missions", validateMissionSlug(slug));
 }
 
 function missionPath(repoRoot: string, slug: string): string {
@@ -604,9 +672,10 @@ function isTerminalStatus(status: MissionStatus): boolean {
 export async function createMission(
 	options: MissionCreateOptions,
 ): Promise<MissionState> {
-	const target = resolveTargetFingerprint(options);
+	const normalizedSlug = validateMissionSlug(options.slug);
+	const target = resolveTargetFingerprint({ ...options, slug: normalizedSlug });
 	const startedAt = options.startedAt ?? nowIso();
-	const root = missionRoot(options.repoRoot, options.slug);
+	const root = missionRoot(options.repoRoot, normalizedSlug);
 
 	for (const filePath of await listMissionJsonFiles(options.repoRoot)) {
 		const existing = await readJsonFile<MissionState>(filePath);
@@ -619,15 +688,15 @@ export async function createMission(
 		}
 	}
 
-	await mkdir(iterationsRoot(options.repoRoot, options.slug), {
+	await mkdir(iterationsRoot(options.repoRoot, normalizedSlug), {
 		recursive: true,
 	});
-	const missionId = `${options.slug}-${startedAt.replace(/[^0-9]/g, "").slice(0, 14)}-${hashValue(target)}`;
+	const missionId = `${normalizedSlug}-${startedAt.replace(/[^0-9]/g, "").slice(0, 14)}-${hashValue(target)}`;
 	const state: MissionState = {
 		schema_version: 1,
 		mission_version: 3,
 		mission_id: missionId,
-		slug: options.slug,
+		slug: normalizedSlug,
 		repo_root: options.repoRoot,
 		mission_root: root,
 		target_fingerprint: target,
@@ -692,7 +761,7 @@ export async function createMission(
 		latest_authoritative_iteration_ref: null,
 		latest_authoritative_adjudication_ref: null,
 	};
-	await writeJsonFile(missionPath(options.repoRoot, options.slug), state);
+	await writeJsonFile(missionPath(options.repoRoot, normalizedSlug), state);
 	return state;
 }
 
@@ -879,69 +948,71 @@ export async function recordLaneSummary(
 	laneType: MissionLaneType,
 	summaryInput: MissionLaneSummaryInput,
 ): Promise<MissionRecordLaneResult> {
-	const mission = await loadMission(repoRoot, slug);
-	const invalidReason = validateLaneIteration(mission, iteration);
-	const candidateSummaryFile = laneSummaryPath(
-		repoRoot,
-		slug,
-		iteration,
-		laneType,
-		mission.active_candidate_id,
-	);
-	if (invalidReason) {
-		return {
-			status: "ignored",
-			summaryPath: candidateSummaryFile,
-			reason: invalidReason,
-		};
-	}
-	let nextSummaryInput = summaryInput;
-	if (laneType === "hardening") {
-		const laneRoot = dirname(candidateSummaryFile);
-		const report = await readMissionHardeningReportFromLaneRoot(laneRoot);
-		const hardeningRefs = collectMissionHardeningArtifactRefs(
+	return withMissionLock(repoRoot, slug, async () => {
+		const mission = await loadMission(repoRoot, slug);
+		const invalidReason = validateLaneIteration(mission, iteration);
+		const candidateSummaryFile = laneSummaryPath(
 			repoRoot,
-			laneRoot,
-			report,
+			slug,
+			iteration,
+			laneType,
+			mission.active_candidate_id,
 		);
-		if (hardeningRefs.length > 0) {
-			nextSummaryInput = {
-				...summaryInput,
-				evidence_refs: Array.from(
-					new Set([...(summaryInput.evidence_refs ?? []), ...hardeningRefs]),
-				),
+		if (invalidReason) {
+			return {
+				status: "ignored",
+				summaryPath: candidateSummaryFile,
+				reason: invalidReason,
 			};
 		}
-	}
-	const summary = normalizeLaneSummary(nextSummaryInput);
+		let nextSummaryInput = summaryInput;
+		if (laneType === "hardening") {
+			const laneRoot = dirname(candidateSummaryFile);
+			const report = await readMissionHardeningReportFromLaneRoot(laneRoot);
+			const hardeningRefs = collectMissionHardeningArtifactRefs(
+				repoRoot,
+				laneRoot,
+				report,
+			);
+			if (hardeningRefs.length > 0) {
+				nextSummaryInput = {
+					...summaryInput,
+					evidence_refs: Array.from(
+						new Set([...(summaryInput.evidence_refs ?? []), ...hardeningRefs]),
+					),
+				};
+			}
+		}
+		const summary = normalizeLaneSummary(nextSummaryInput);
 
-	if (mission.status === "cancelling") {
+		if (mission.status === "cancelling") {
+			const nextMission = removeActiveLane(mission, laneType, summary);
+			await writeJsonFile(missionPath(repoRoot, slug), nextMission);
+			return {
+				status: "ignored",
+				summaryPath: candidateSummaryFile,
+				reason: "cancelled",
+				summary,
+			};
+		}
+
+		if (existsSync(candidateSummaryFile)) {
+			return {
+				status: "duplicate",
+				summaryPath: candidateSummaryFile,
+				reason: "duplicate",
+				summary: await readJsonFile<MissionLaneSummary>(candidateSummaryFile),
+			};
+		}
+
+		await mkdir(dirname(candidateSummaryFile), {
+			recursive: true,
+		});
+		await writeJsonFile(candidateSummaryFile, summary);
 		const nextMission = removeActiveLane(mission, laneType, summary);
 		await writeJsonFile(missionPath(repoRoot, slug), nextMission);
-		return {
-			status: "ignored",
-			summaryPath: candidateSummaryFile,
-			reason: "cancelled",
-			summary,
-		};
-	}
-
-	if (existsSync(candidateSummaryFile)) {
-		return {
-			status: "duplicate",
-			summaryPath: candidateSummaryFile,
-			reason: "duplicate",
-			summary: await readJsonFile<MissionLaneSummary>(candidateSummaryFile),
-		};
-	}
-
-	await mkdir(dirname(candidateSummaryFile), {
-		recursive: true,
+		return { status: "written", summaryPath: candidateSummaryFile, summary };
 	});
-	await writeJsonFile(candidateSummaryFile, summary);
-	const nextMission = removeActiveLane(mission, laneType, summary);
-	await writeJsonFile(missionPath(repoRoot, slug), nextMission);
-	return { status: "written", summaryPath: candidateSummaryFile, summary };
 }
 
 function loadResidualHistory(deltaHistory: MissionDelta[]): Set<string> {

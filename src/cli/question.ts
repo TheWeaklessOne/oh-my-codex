@@ -1,11 +1,11 @@
 import { evaluateQuestionPolicy } from '../question/policy.js';
 import {
-  createQuestionRecord,
-  markQuestionTerminalError,
-  markQuestionPrompting,
-  waitForQuestionTerminalState,
+	createQuestionRecord,
+	markQuestionTerminalError,
+	markQuestionPrompting,
+	waitForQuestionTerminalState,
 } from '../question/state.js';
-import { launchQuestionRenderer } from '../question/renderer.js';
+import { isQuestionRendererAlive, launchQuestionRenderer } from '../question/renderer.js';
 import { normalizeQuestionInput } from '../question/types.js';
 import { runQuestionUi } from '../question/ui.js';
 
@@ -105,7 +105,20 @@ function extractErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export async function questionCommand(args: string[]): Promise<void> {
+interface QuestionCommandDeps {
+  evaluateQuestionPolicyImpl?: typeof evaluateQuestionPolicy;
+  createQuestionRecordImpl?: typeof createQuestionRecord;
+  markQuestionTerminalErrorImpl?: typeof markQuestionTerminalError;
+  markQuestionPromptingImpl?: typeof markQuestionPrompting;
+  waitForQuestionTerminalStateImpl?: typeof waitForQuestionTerminalState;
+  launchQuestionRendererImpl?: typeof launchQuestionRenderer;
+  isQuestionRendererAliveImpl?: typeof isQuestionRendererAlive;
+}
+
+export async function questionCommand(
+  args: string[],
+  deps: QuestionCommandDeps = {},
+): Promise<void> {
   const parsed = parseQuestionArgs(args);
   if (parsed.help || args.length === 0) {
     console.log(QUESTION_HELP);
@@ -129,7 +142,19 @@ export async function questionCommand(args: string[]): Promise<void> {
 
   const input = normalizeQuestionInput(rawInput);
   const cwd = process.cwd();
-  const policy = await evaluateQuestionPolicy({ cwd, explicitSessionId: input.session_id });
+  const evaluateQuestionPolicyImpl = deps.evaluateQuestionPolicyImpl ?? evaluateQuestionPolicy;
+  const createQuestionRecordImpl = deps.createQuestionRecordImpl ?? createQuestionRecord;
+  const markQuestionTerminalErrorImpl =
+    deps.markQuestionTerminalErrorImpl ?? markQuestionTerminalError;
+  const markQuestionPromptingImpl = deps.markQuestionPromptingImpl ?? markQuestionPrompting;
+  const waitForQuestionTerminalStateImpl =
+    deps.waitForQuestionTerminalStateImpl ?? waitForQuestionTerminalState;
+  const launchQuestionRendererImpl =
+    deps.launchQuestionRendererImpl ?? launchQuestionRenderer;
+  const isQuestionRendererAliveImpl =
+    deps.isQuestionRendererAliveImpl ?? isQuestionRendererAlive;
+
+  const policy = await evaluateQuestionPolicyImpl({ cwd, explicitSessionId: input.session_id });
   if (!policy.allowed) {
     printJson({
       ok: false,
@@ -142,20 +167,26 @@ export async function questionCommand(args: string[]): Promise<void> {
     return;
   }
 
-  const { record, recordPath } = await createQuestionRecord(cwd, input, policy.sessionId);
+  const { record, recordPath } = await createQuestionRecordImpl(cwd, input, policy.sessionId);
 
   let finalRecord;
   try {
-    const renderer = launchQuestionRenderer({
+    const renderer = launchQuestionRendererImpl({
       cwd,
       recordPath,
       sessionId: policy.sessionId,
     });
-    await markQuestionPrompting(recordPath, renderer);
-    finalRecord = await waitForQuestionTerminalState(recordPath);
+    await markQuestionPromptingImpl(recordPath, renderer);
+    finalRecord = await waitForQuestionTerminalStateImpl(recordPath, {
+      onPending: async (pendingRecord) => {
+        if (pendingRecord.renderer && !isQuestionRendererAliveImpl(pendingRecord.renderer)) {
+          throw new Error('Question renderer exited before writing a terminal state.');
+        }
+      },
+    });
   } catch (error) {
     const message = extractErrorMessage(error);
-    await markQuestionTerminalError(
+    await markQuestionTerminalErrorImpl(
       recordPath,
       'error',
       'question_runtime_failed',

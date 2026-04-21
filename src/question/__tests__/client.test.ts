@@ -83,4 +83,88 @@ describe('runOmxQuestion', () => {
       },
     );
   });
+
+  it('throws when omx question emits no stdout', async () => {
+    await assert.rejects(
+      runOmxQuestion(
+        {
+          question: 'What next?',
+          options: [{ label: 'Launch', value: 'launch' }],
+          allow_other: false,
+        },
+        {
+          cwd: '/repo',
+          argv1: '/repo/dist/cli/omx.js',
+          runner: makeRunner('', 1, 'stderr'),
+        },
+      ),
+      (error) => {
+        assert.ok(error instanceof OmxQuestionError);
+        assert.equal(error.code, 'question_no_stdout');
+        return true;
+      },
+    );
+  });
+
+  it('throws when omx question emits invalid stdout JSON', async () => {
+    await assert.rejects(
+      runOmxQuestion(
+        {
+          question: 'What next?',
+          options: [{ label: 'Launch', value: 'launch' }],
+          allow_other: false,
+        },
+        {
+          cwd: '/repo',
+          argv1: '/repo/dist/cli/omx.js',
+          runner: makeRunner('not-json', 1, 'stderr'),
+        },
+      ),
+      (error) => {
+        assert.ok(error instanceof OmxQuestionError);
+        assert.equal(error.code, 'question_invalid_stdout');
+        return true;
+      },
+    );
+  });
+
+  it('throws when omx question returns a success payload but exits non-zero', async () => {
+    await assert.rejects(
+      runOmxQuestion(
+        {
+          question: 'What next?',
+          options: [{ label: 'Launch', value: 'launch' }],
+          allow_other: false,
+        },
+        {
+          cwd: '/repo',
+          argv1: '/repo/dist/cli/omx.js',
+          runner: makeRunner({
+            ok: true,
+            question_id: 'q-2',
+            session_id: 'sess-2',
+            prompt: {
+              question: 'What next?',
+              options: [{ label: 'Launch', value: 'launch' }],
+              allow_other: false,
+              other_label: 'Other',
+              type: 'single-answerable',
+              multi_select: false,
+            },
+            answer: {
+              kind: 'option',
+              value: 'launch',
+              selected_labels: ['Launch'],
+              selected_values: ['launch'],
+            },
+          }, 3),
+        },
+      ),
+      (error) => {
+        assert.ok(error instanceof OmxQuestionError);
+        assert.equal(error.code, 'question_nonzero_exit');
+        return true;
+      },
+    );
+  });
 });

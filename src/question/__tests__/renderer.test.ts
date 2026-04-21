@@ -6,6 +6,7 @@ import { describe, it } from 'node:test';
 import {
   formatQuestionAnswerForInjection,
   injectQuestionAnswerToPane,
+  isQuestionRendererAlive,
   launchQuestionRenderer,
   resolveQuestionRendererStrategy,
 } from '../renderer.js';
@@ -612,5 +613,56 @@ describe('question answer injection', () => {
     assert.deepEqual(calls, buildSendPaneArgvs('%11', '[omx question answered] proceed', true));
     assert.deepEqual(sleeps, [120, 100]);
     assert.equal(calls.some((argv) => argv.includes('Enter')), false);
+  });
+});
+
+describe('isQuestionRendererAlive', () => {
+  it('confirms a live tmux pane by matching the reported pane id', () => {
+    assert.equal(
+      isQuestionRendererAlive(
+        {
+          renderer: 'tmux-pane',
+          target: '%42',
+          launched_at: '2026-04-21T00:00:00.000Z',
+        },
+        () => '%42\n',
+      ),
+      true,
+    );
+  });
+
+  it('detects dead tmux panes when the pane id lookup fails', () => {
+    assert.equal(
+      isQuestionRendererAlive(
+        {
+          renderer: 'tmux-pane',
+          target: '%42',
+          launched_at: '2026-04-21T00:00:00.000Z',
+        },
+        () => {
+          throw new Error('pane missing');
+        },
+      ),
+      false,
+    );
+  });
+
+  it('confirms a live detached tmux session with has-session', () => {
+    const calls: string[][] = [];
+    assert.equal(
+      isQuestionRendererAlive(
+        {
+          renderer: 'tmux-session',
+          target: 'omx-question-q1',
+          launched_at: '2026-04-21T00:00:00.000Z',
+        },
+        (args) => {
+          calls.push(args);
+          return '';
+        },
+      ),
+      true,
+    );
+    assert.deepEqual(calls, [['has-session', '-t', 'omx-question-q1']]);
   });
 });

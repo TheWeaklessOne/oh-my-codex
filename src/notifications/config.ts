@@ -925,8 +925,8 @@ export function getReplyConfig(
   }
   if (hasTelegram && authorizedTelegramUserIds.length === 0) {
     console.warn(
-      "[notifications] Telegram reply listening is using chat-level authorization only because authorizedTelegramUserIds is empty. " +
-      "Set OMX_REPLY_TELEGRAM_USER_IDS or add to .omx-config.json notifications.reply.authorizedTelegramUserIds for sender-level hardening."
+      "[notifications] Telegram reply listening allows replies only from private chats because authorizedTelegramUserIds is empty. " +
+      "Set OMX_REPLY_TELEGRAM_USER_IDS or add to .omx-config.json notifications.reply.authorizedTelegramUserIds to enable sender-level authorization in group chats."
     );
   }
 

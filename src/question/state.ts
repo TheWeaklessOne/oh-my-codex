@@ -131,6 +131,7 @@ export async function waitForQuestionTerminalState(
   options: {
     pollIntervalMs?: number;
     timeoutMs?: number;
+    onPending?: (record: QuestionRecord) => Promise<void> | void;
   } = {},
 ): Promise<QuestionRecord> {
   const pollIntervalMs = Math.max(10, options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
@@ -141,6 +142,9 @@ export async function waitForQuestionTerminalState(
     const record = await readQuestionRecord(recordPath);
     if (!record) throw new Error(`Question record not found while waiting: ${recordPath}`);
     if (isTerminalQuestionStatus(record.status)) return record;
+    if (options.onPending) {
+      await options.onPending(record);
+    }
     if (typeof timeoutMs === 'number' && timeoutMs >= 0 && Date.now() - startedAt > timeoutMs) {
       throw new Error(`Timed out waiting for question answer after ${timeoutMs}ms`);
     }

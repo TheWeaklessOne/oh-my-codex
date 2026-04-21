@@ -21,6 +21,7 @@ import {
 	createMission,
 	loadMission,
 	recordLaneSummary,
+	setMissionLockHookForTests,
 	startIteration,
 } from "../kernel.js";
 
@@ -246,6 +247,24 @@ async function writeHardeningGateReport(
 }
 
 describe("mission kernel", () => {
+	it("rejects unsafe mission slugs before touching the filesystem", async () => {
+		const repo = await initRepo();
+		try {
+			await assert.rejects(
+				() =>
+					createMission({
+						repoRoot: repo,
+						slug: "../../../tmp/pwn",
+						targetFingerprint: "repo:unsafe",
+					}),
+				/mission_invalid_slug/i,
+			);
+			await assert.rejects(() => loadMission(repo, ".."), /mission_invalid_slug/i);
+		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
 	it("normalizes legacy Mission V2 state on load", async () => {
 		const repo = await initRepo();
 		try {
@@ -435,6 +454,77 @@ describe("mission kernel", () => {
 			const reconciled = await loadMission(repo, "demo");
 			assert.equal(reconciled.status, "cancelled");
 		} finally {
+			await rm(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("serializes concurrent lane summary writes so active_lanes cannot clobber sibling completions", async () => {
+		const repo = await initRepo();
+		try {
+			await createMission({
+				repoRoot: repo,
+				slug: "demo",
+				targetFingerprint: "repo:demo",
+			});
+			await startIteration(repo, "demo", "initial");
+
+			let releaseFirstLock: (() => void) | null = null;
+			const firstLockHeld = new Promise<void>((resolve) => {
+				releaseFirstLock = resolve;
+			});
+			let acquisitions = 0;
+			let secondResolved = false;
+
+			setMissionLockHookForTests(async () => {
+				acquisitions += 1;
+				if (acquisitions === 1) {
+					await firstLockHeld;
+				}
+			});
+
+			const first = recordLaneSummary(
+				repo,
+				"demo",
+				1,
+				"audit",
+				laneSummary("audit", 1, { verdict: "PASS", readOnly: true }),
+			);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			const second = recordLaneSummary(
+				repo,
+				"demo",
+				1,
+				"remediation",
+				laneSummary("remediation", 1, { verdict: "PASS" }),
+			).then((value) => {
+				secondResolved = true;
+				return value;
+			});
+
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			assert.equal(secondResolved, false);
+
+			const unlockFirstLock: () => void =
+				releaseFirstLock ??
+				(() => {
+					throw new Error("expected the first mission lock hook to be armed");
+				});
+			unlockFirstLock();
+			const [firstResult, secondResult] = await Promise.all([first, second]);
+			assert.equal(firstResult.status, "written");
+			assert.equal(secondResult.status, "written");
+
+			const mission = await loadMission(repo, "demo");
+			assert.equal(
+				mission.active_lanes.some((lane) => lane.lane_type === "audit"),
+				false,
+			);
+			assert.equal(
+				mission.active_lanes.some((lane) => lane.lane_type === "remediation"),
+				false,
+			);
+		} finally {
+			setMissionLockHookForTests(null);
 			await rm(repo, { recursive: true, force: true });
 		}
 	});
