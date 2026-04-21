@@ -335,3 +335,167 @@ describe('lookupBySourceMessage', () => {
     }
   });
 });
+
+describe('source-aware registry mutations', () => {
+  it('removeSession prunes legacy and source-aware rows for only the targeted session', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'omx-session-registry-remove-session-'));
+    const stateDir = join(homeDir, '.omx', 'state');
+    const registryPath = join(stateDir, 'reply-session-registry.jsonl');
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+
+    try {
+      await mkdir(stateDir, { recursive: true });
+      process.env.HOME = homeDir;
+      process.env.USERPROFILE = homeDir;
+
+      const targetLegacy = createMockMapping({
+        sessionId: 'session-target',
+        messageId: 'legacy-target',
+      });
+      delete targetLegacy.source;
+
+      const targetSourceAware = createMockMapping({
+        sessionId: 'session-target',
+        messageId: 'source-target',
+        platform: 'telegram',
+        source: buildTelegramReplySource('123456:telegram-token', '777'),
+      });
+
+      const keep = createMockMapping({
+        sessionId: 'session-keep',
+        messageId: 'keep-message',
+      });
+
+      await writeFile(
+        registryPath,
+        [targetLegacy, targetSourceAware, keep].map((entry) => JSON.stringify(entry)).join('\n') + '\n',
+        'utf-8',
+      );
+
+      const registry = await importSessionRegistryFresh();
+      registry.removeSession('session-target');
+
+      const persisted = readFileSync(registryPath, 'utf-8')
+        .split('\n')
+        .filter((line) => line.trim() !== '')
+        .map((line) => JSON.parse(line) as SessionMapping);
+
+      assert.deepEqual(persisted.map((entry) => entry.sessionId), ['session-keep']);
+      assert.equal(persisted[0].messageId, 'keep-message');
+    } finally {
+      if (typeof originalHome === 'string') process.env.HOME = originalHome;
+      else delete process.env.HOME;
+      if (typeof originalUserProfile === 'string') process.env.USERPROFILE = originalUserProfile;
+      else delete process.env.USERPROFILE;
+      await rm(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it('removeMessagesByPane removes only the targeted pane across mixed legacy/source-aware rows', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'omx-session-registry-remove-pane-'));
+    const stateDir = join(homeDir, '.omx', 'state');
+    const registryPath = join(stateDir, 'reply-session-registry.jsonl');
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+
+    try {
+      await mkdir(stateDir, { recursive: true });
+      process.env.HOME = homeDir;
+      process.env.USERPROFILE = homeDir;
+
+      const targetLegacy = createMockMapping({
+        tmuxPaneId: '%9',
+        messageId: 'legacy-pane-target',
+      });
+      delete targetLegacy.source;
+
+      const targetSourceAware = createMockMapping({
+        tmuxPaneId: '%9',
+        messageId: 'source-pane-target',
+        platform: 'telegram',
+        source: buildTelegramReplySource('123456:telegram-token', '777'),
+      });
+
+      const keep = createMockMapping({
+        tmuxPaneId: '%10',
+        messageId: 'keep-pane-message',
+      });
+
+      await writeFile(
+        registryPath,
+        [targetLegacy, targetSourceAware, keep].map((entry) => JSON.stringify(entry)).join('\n') + '\n',
+        'utf-8',
+      );
+
+      const registry = await importSessionRegistryFresh();
+      registry.removeMessagesByPane('%9');
+
+      const persisted = readFileSync(registryPath, 'utf-8')
+        .split('\n')
+        .filter((line) => line.trim() !== '')
+        .map((line) => JSON.parse(line) as SessionMapping);
+
+      assert.deepEqual(persisted.map((entry) => entry.tmuxPaneId), ['%10']);
+      assert.equal(persisted[0].messageId, 'keep-pane-message');
+    } finally {
+      if (typeof originalHome === 'string') process.env.HOME = originalHome;
+      else delete process.env.HOME;
+      if (typeof originalUserProfile === 'string') process.env.USERPROFILE = originalUserProfile;
+      else delete process.env.USERPROFILE;
+      await rm(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it('pruneStale keeps fresh source-aware rows while removing stale legacy rows', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'omx-session-registry-prune-'));
+    const stateDir = join(homeDir, '.omx', 'state');
+    const registryPath = join(stateDir, 'reply-session-registry.jsonl');
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+
+    try {
+      await mkdir(stateDir, { recursive: true });
+      process.env.HOME = homeDir;
+      process.env.USERPROFILE = homeDir;
+
+      const now = Date.now();
+      const staleLegacy = createMockMapping({
+        messageId: 'stale-legacy',
+        createdAt: new Date(now - (25 * 60 * 60 * 1000)).toISOString(),
+      });
+      delete staleLegacy.source;
+
+      const freshSourceAware = createMockMapping({
+        messageId: 'fresh-source-aware',
+        platform: 'telegram',
+        source: buildTelegramReplySource('123456:telegram-token', '777'),
+        createdAt: new Date(now - 60_000).toISOString(),
+      });
+
+      await writeFile(
+        registryPath,
+        [staleLegacy, freshSourceAware].map((entry) => JSON.stringify(entry)).join('\n') + '\n',
+        'utf-8',
+      );
+
+      const registry = await importSessionRegistryFresh();
+      registry.pruneStale();
+
+      const persisted = readFileSync(registryPath, 'utf-8')
+        .split('\n')
+        .filter((line) => line.trim() !== '')
+        .map((line) => JSON.parse(line) as SessionMapping);
+
+      assert.equal(persisted.length, 1);
+      assert.equal(persisted[0].messageId, 'fresh-source-aware');
+      assert.equal(persisted[0].source?.platform, 'telegram');
+    } finally {
+      if (typeof originalHome === 'string') process.env.HOME = originalHome;
+      else delete process.env.HOME;
+      if (typeof originalUserProfile === 'string') process.env.USERPROFILE = originalUserProfile;
+      else delete process.env.USERPROFILE;
+      await rm(homeDir, { recursive: true, force: true });
+    }
+  });
+});

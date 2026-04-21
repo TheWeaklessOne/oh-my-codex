@@ -328,6 +328,78 @@ describe('ensureReplyListenerForConfig', () => {
     });
   });
 
+  it('passes mixed Telegram and Discord reply sources through the public integration seam', async () => {
+    const { ensureReplyListenerForConfig } = await import(`../index.js?reply-listener-mixed=${Date.now()}`);
+    const startCalls: unknown[] = [];
+
+    ensureReplyListenerForConfig(
+      {
+        enabled: true,
+        telegram: {
+          enabled: true,
+          botToken: 'tg-token',
+          chatId: 'tg-chat',
+        },
+        'discord-bot': {
+          enabled: true,
+          botToken: 'discord-token',
+          channelId: 'discord-channel',
+          mention: '<@123456789012345678>',
+        },
+      },
+      {
+        getReplyConfigImpl: () => ({
+          enabled: true,
+          pollIntervalMs: 3000,
+          maxMessageLength: 500,
+          rateLimitPerMinute: 10,
+          includePrefix: true,
+          ackMode: 'minimal',
+          authorizedDiscordUserIds: ['123456789012345678'],
+          authorizedTelegramUserIds: ['telegram-user-1'],
+          telegramPollTimeoutSeconds: 30,
+          telegramAllowedUpdates: ['message'],
+          telegramStartupBacklogPolicy: 'resume',
+        }),
+        getReplyListenerPlatformConfigImpl: () => ({
+          telegramEnabled: true,
+          telegramBotToken: 'tg-token',
+          telegramChatId: 'tg-chat',
+          discordEnabled: true,
+          discordBotToken: 'discord-token',
+          discordChannelId: 'discord-channel',
+          discordMention: '<@123456789012345678>',
+        }),
+        startReplyListenerImpl: (config: Record<string, unknown>) => {
+          startCalls.push(config);
+          return { success: true, message: 'started' };
+        },
+      },
+    );
+
+    assert.equal(startCalls.length, 1);
+    assert.deepEqual(startCalls[0], {
+      enabled: true,
+      pollIntervalMs: 3000,
+      maxMessageLength: 500,
+      rateLimitPerMinute: 10,
+      includePrefix: true,
+      ackMode: 'minimal',
+      authorizedDiscordUserIds: ['123456789012345678'],
+      authorizedTelegramUserIds: ['telegram-user-1'],
+      telegramPollTimeoutSeconds: 30,
+      telegramAllowedUpdates: ['message'],
+      telegramStartupBacklogPolicy: 'resume',
+      telegramEnabled: true,
+      telegramBotToken: 'tg-token',
+      telegramChatId: 'tg-chat',
+      discordEnabled: true,
+      discordBotToken: 'discord-token',
+      discordChannelId: 'discord-channel',
+      discordMention: '<@123456789012345678>',
+    });
+  });
+
   it('stops a running reply listener when reply handling is disabled', async () => {
     const { ensureReplyListenerForConfig } = await import(`../index.js?reply-listener-disabled=${Date.now()}`);
     let startCalled = false;
@@ -357,6 +429,13 @@ describe('ensureReplyListenerForConfig', () => {
 
     assert.equal(startCalled, false);
     assert.equal(stopCalled, true);
+  });
+});
+
+describe('notifications public exports', () => {
+  it('re-exports the source-aware reply correlation lookup', async () => {
+    const mod = await import(`../index.js?reply-listener-export=${Date.now()}`);
+    assert.equal(typeof mod.lookupBySourceMessage, 'function');
   });
 });
 

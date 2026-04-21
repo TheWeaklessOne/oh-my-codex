@@ -71,6 +71,7 @@ export {
   registerMessage,
   loadAllMappings,
   lookupByMessageId,
+  lookupBySourceMessage,
   removeSession,
   removeMessagesByPane,
   pruneStale,
