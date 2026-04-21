@@ -631,6 +631,37 @@ describe('startReplyListener', () => {
     assert.equal(persisted.sourceStates[discordSource.key]?.discordLastMessageId, 'discord-message-91');
   });
 
+  it('forwards OMX_NOTIFY_PROFILE into the detached daemon environment for canonical config re-derivation', () => {
+    const originalNotifyProfile = process.env.OMX_NOTIFY_PROFILE;
+    let spawnedEnv: NodeJS.ProcessEnv | undefined;
+
+    try {
+      process.env.OMX_NOTIFY_PROFILE = 'ops';
+
+      const response = startReplyListener(createBaseConfig(), {
+        ensureStateDirImpl: () => {},
+        isDaemonRunningImpl: () => false,
+        isTmuxAvailableImpl: () => true,
+        spawnImpl: ((command: string, args: string[], options?: import('node:child_process').SpawnOptions) => {
+          assert.equal(command, 'node');
+          assert.ok(Array.isArray(args));
+          spawnedEnv = options?.env;
+          return { pid: 54321, unref() {} } as unknown as ReturnType<typeof import('node:child_process').spawn>;
+        }) as typeof import('node:child_process').spawn,
+        writeDaemonConfigImpl: () => {},
+        writeDaemonStateImpl: () => {},
+        writePidFileImpl: () => {},
+        logImpl: () => {},
+      });
+
+      assert.equal(response.success, true);
+      assert.equal(spawnedEnv?.OMX_NOTIFY_PROFILE, 'ops');
+    } finally {
+      if (typeof originalNotifyProfile === 'string') process.env.OMX_NOTIFY_PROFILE = originalNotifyProfile;
+      else delete process.env.OMX_NOTIFY_PROFILE;
+    }
+  });
+
   it('narrows active source mirrors without discarding historical source state on refresh', () => {
     const previousConfig = createBaseConfig();
     const nextConfig = createBaseConfig({

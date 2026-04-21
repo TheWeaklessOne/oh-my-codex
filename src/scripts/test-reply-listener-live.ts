@@ -2,6 +2,10 @@ import {
   getReplyListenerStatus,
   type ReplyListenerStatusDiagnostics,
 } from '../notifications/reply-listener.js';
+import {
+  buildDiscordReplySource,
+  buildTelegramReplySource,
+} from '../notifications/reply-source.js';
 
 interface ReplyListenerLiveConfig {
   discordBotToken: string;
@@ -130,16 +134,24 @@ export function resolveReplyListenerLiveEnv(env: NodeJS.ProcessEnv = process.env
 }
 
 export function inspectReplyListenerStatusForLiveSmoke(
-  expectations: NonNullable<ReplyListenerLiveConfig['expectations']>,
+  config: ReplyListenerLiveConfig,
   deps: {
     readReplyListenerStatusImpl?: typeof getReplyListenerStatus;
   } = {},
 ): ReplyListenerLiveStatusSummary {
   const readReplyListenerStatusImpl = deps.readReplyListenerStatusImpl ?? getReplyListenerStatus;
   const status = readReplyListenerStatusImpl();
+  const expectations = config.expectations;
+  if (!expectations) {
+    throw new Error('Reply listener live smoke requires expectations to validate daemon status.');
+  }
   const diagnostics = status.diagnostics as ReplyListenerStatusDiagnostics | undefined;
   if (!diagnostics) {
     throw new Error('Reply listener status diagnostics are unavailable; start the daemon before running live smoke.');
+  }
+  const isRunning = status.state?.isRunning === true || /reply listener daemon is running/i.test(status.message);
+  if (!isRunning) {
+    throw new Error(`Reply listener is not running: ${status.message}`);
   }
 
   if (diagnostics.ackMode !== expectations.ackMode) {
@@ -168,6 +180,18 @@ export function inspectReplyListenerStatusForLiveSmoke(
       `Reply listener telegramAllowedUpdates mismatch: expected ${expectedAllowedUpdates.join(',')}, got ${normalizedAllowedUpdates.join(',')}`,
     );
   }
+  const activeSourceKeys = diagnostics.activeSources.map((source) => source.key);
+  const expectedSourceKeys = [
+    buildDiscordReplySource(config.discordBotToken, config.discordChannelId).key,
+    buildTelegramReplySource(config.telegramBotToken, config.telegramChatId).key,
+  ];
+  for (const expectedSourceKey of expectedSourceKeys) {
+    if (!activeSourceKeys.includes(expectedSourceKey)) {
+      throw new Error(
+        `Reply listener missing expected active source: ${expectedSourceKey} (active: ${activeSourceKeys.join(',') || 'none'})`,
+      );
+    }
+  }
 
   return {
     ackMode: diagnostics.ackMode,
@@ -175,7 +199,7 @@ export function inspectReplyListenerStatusForLiveSmoke(
     telegramAllowedUpdates: [...diagnostics.telegramAllowedUpdates],
     telegramStartupBacklogPolicy: diagnostics.telegramStartupBacklogPolicy ?? expectations.telegramStartupBacklogPolicy,
     authorizedTelegramUserIdsConfigured: diagnostics.authorizedTelegramUserIdsConfigured,
-    activeSourceKeys: diagnostics.activeSources.map((source) => source.key),
+    activeSourceKeys,
     secretStorage: diagnostics.secretStorage,
   };
 }
@@ -189,7 +213,7 @@ export async function runReplyListenerLiveSmoke(
   const readReplyListenerStatusImpl = deps.readReplyListenerStatusImpl ?? getReplyListenerStatus;
   const stamp = new Date().toISOString();
   const replyListenerStatus = config.expectations
-    ? inspectReplyListenerStatusForLiveSmoke(config.expectations, { readReplyListenerStatusImpl })
+    ? inspectReplyListenerStatusForLiveSmoke(config, { readReplyListenerStatusImpl })
     : null;
 
   if (config.expectations) {

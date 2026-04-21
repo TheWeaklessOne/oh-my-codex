@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { buildDiscordReplySource, buildTelegramReplySource } from '../../notifications/reply-source.js';
 import {
   inspectReplyListenerStatusForLiveSmoke,
   resolveReplyListenerLiveEnv,
@@ -72,6 +73,8 @@ test('resolveReplyListenerLiveEnv exposes reply-listener expectation defaults an
 test('runReplyListenerLiveSmoke exercises Discord and Telegram send + cleanup requests', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const logs: string[] = [];
+  const discordSource = buildDiscordReplySource('discord-token', 'channel-1');
+  const telegramSource = buildTelegramReplySource('123456:telegram-token', 'chat-1');
 
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = String(input);
@@ -88,13 +91,13 @@ test('runReplyListenerLiveSmoke exercises Discord and Telegram send + cleanup re
       return new Response(null, { status: 204 });
     }
 
-    if (url === 'https://api.telegram.org/bottelegram-token/sendMessage') {
+    if (url === 'https://api.telegram.org/bot123456:telegram-token/sendMessage') {
       assert.equal(init?.method, 'POST');
       assert.match(String(init?.body), /Telegram connectivity probe/);
       return jsonResponse({ ok: true, result: { message_id: 42 } });
     }
 
-    if (url === 'https://api.telegram.org/bottelegram-token/deleteMessage') {
+    if (url === 'https://api.telegram.org/bot123456:telegram-token/deleteMessage') {
       assert.equal(init?.method, 'POST');
       const payload = JSON.parse(String(init?.body)) as { chat_id: string; message_id: number };
       assert.deepEqual(payload, { chat_id: 'chat-1', message_id: 42 });
@@ -108,7 +111,7 @@ test('runReplyListenerLiveSmoke exercises Discord and Telegram send + cleanup re
     {
       discordBotToken: 'discord-token',
       discordChannelId: 'channel-1',
-      telegramBotToken: 'telegram-token',
+      telegramBotToken: '123456:telegram-token',
       telegramChatId: 'chat-1',
       expectations: {
         ackMode: 'minimal',
@@ -136,7 +139,7 @@ test('runReplyListenerLiveSmoke exercises Discord and Telegram send + cleanup re
           secretStorage: 'not-persisted',
           activeSources: [
             {
-              key: 'discord-bot:discord-channel:fingerprint',
+              key: discordSource.key,
               platform: 'discord-bot',
               label: 'discord-bot:discord-channel',
               cursor: 'discord-message-77',
@@ -148,9 +151,9 @@ test('runReplyListenerLiveSmoke exercises Discord and Telegram send + cleanup re
               failureCounts: {},
             },
             {
-              key: 'telegram:123456:777',
+              key: telegramSource.key,
               platform: 'telegram',
-              label: 'telegram:777',
+              label: telegramSource.label,
               cursor: 77,
               lastPollAt: '2026-03-20T00:06:00.000Z',
               lastIngestAt: '2026-03-20T00:06:01.000Z',
@@ -175,7 +178,7 @@ test('runReplyListenerLiveSmoke exercises Discord and Telegram send + cleanup re
       telegramAllowedUpdates: ['message'],
       telegramStartupBacklogPolicy: 'resume',
       authorizedTelegramUserIdsConfigured: false,
-      activeSourceKeys: ['discord-bot:discord-channel:fingerprint', 'telegram:123456:777'],
+      activeSourceKeys: [discordSource.key, telegramSource.key],
       secretStorage: 'not-persisted',
     },
   });
@@ -183,17 +186,25 @@ test('runReplyListenerLiveSmoke exercises Discord and Telegram send + cleanup re
   assert.ok(logs.some((entry) => entry.includes('Reply listener expectations: ack=minimal')));
   assert.ok(logs.some((entry) => entry.includes('Discord probe message sent: discord-message-1')));
   assert.ok(logs.some((entry) => entry.includes('Telegram probe message sent: 42')));
-  assert.ok(logs.some((entry) => entry.includes('Reply listener status verified: sources=discord-bot:discord-channel:fingerprint,telegram:123456:777')));
+  assert.ok(logs.some((entry) => entry.includes(`Reply listener status verified: sources=${discordSource.key},${telegramSource.key}`)));
 });
 
 test('inspectReplyListenerStatusForLiveSmoke validates live reply-listener expectations against source-aware diagnostics', () => {
+  const discordSource = buildDiscordReplySource('discord-token', 'channel-1');
+  const telegramSource = buildTelegramReplySource('123456:telegram-token', 'chat-1');
   const result = inspectReplyListenerStatusForLiveSmoke(
     {
-      ackMode: 'summary',
-      telegramPollTimeoutSeconds: 45,
-      telegramAllowedUpdates: ['message', 'edited_message'],
-      telegramStartupBacklogPolicy: 'drop_pending',
-      authorizedTelegramUserIdsConfigured: true,
+      discordBotToken: 'discord-token',
+      discordChannelId: 'channel-1',
+      telegramBotToken: '123456:telegram-token',
+      telegramChatId: 'chat-1',
+      expectations: {
+        ackMode: 'summary',
+        telegramPollTimeoutSeconds: 45,
+        telegramAllowedUpdates: ['message', 'edited_message'],
+        telegramStartupBacklogPolicy: 'drop_pending',
+        authorizedTelegramUserIdsConfigured: true,
+      },
     },
     {
       readReplyListenerStatusImpl: () => ({
@@ -212,7 +223,7 @@ test('inspectReplyListenerStatusForLiveSmoke validates live reply-listener expec
           secretStorage: 'fallback-secret-file',
           activeSources: [
             {
-              key: 'discord-bot:discord-channel:fingerprint',
+              key: discordSource.key,
               platform: 'discord-bot',
               label: 'discord-bot:discord-channel',
               cursor: 'discord-message-91',
@@ -224,9 +235,9 @@ test('inspectReplyListenerStatusForLiveSmoke validates live reply-listener expec
               failureCounts: {},
             },
             {
-              key: 'telegram:123456:777',
+              key: telegramSource.key,
               platform: 'telegram',
-              label: 'telegram:777',
+              label: telegramSource.label,
               cursor: 91,
               lastPollAt: null,
               lastIngestAt: null,
@@ -247,20 +258,119 @@ test('inspectReplyListenerStatusForLiveSmoke validates live reply-listener expec
     telegramAllowedUpdates: ['message', 'edited_message'],
     telegramStartupBacklogPolicy: 'drop_pending',
     authorizedTelegramUserIdsConfigured: true,
-    activeSourceKeys: ['discord-bot:discord-channel:fingerprint', 'telegram:123456:777'],
+    activeSourceKeys: [discordSource.key, telegramSource.key],
     secretStorage: 'fallback-secret-file',
   });
+});
+
+test('inspectReplyListenerStatusForLiveSmoke fails when the daemon is not actually running', () => {
+  assert.throws(
+    () => inspectReplyListenerStatusForLiveSmoke(
+      {
+        discordBotToken: 'discord-token',
+        discordChannelId: 'channel-1',
+        telegramBotToken: '123456:telegram-token',
+        telegramChatId: 'chat-1',
+        expectations: {
+          ackMode: 'minimal',
+          telegramPollTimeoutSeconds: 30,
+          telegramAllowedUpdates: ['message'],
+          telegramStartupBacklogPolicy: 'resume',
+          authorizedTelegramUserIdsConfigured: false,
+        },
+      },
+      {
+        readReplyListenerStatusImpl: () => ({
+          success: true,
+          message: 'Reply listener daemon is not running',
+          diagnostics: {
+            ackMode: 'minimal',
+            pollIntervalMs: 3000,
+            rateLimitPerMinute: 10,
+            includePrefix: true,
+            telegramPollTimeoutSeconds: 30,
+            telegramAllowedUpdates: ['message'],
+            telegramStartupBacklogPolicy: 'resume',
+            authorizedDiscordUsersConfigured: true,
+            authorizedTelegramUserIdsConfigured: false,
+            secretStorage: 'not-persisted',
+            activeSources: [],
+          },
+        }),
+      },
+    ),
+    /reply listener is not running/i,
+  );
+});
+
+test('inspectReplyListenerStatusForLiveSmoke fails when an expected source is not active', () => {
+  assert.throws(
+    () => inspectReplyListenerStatusForLiveSmoke(
+      {
+        discordBotToken: 'discord-token',
+        discordChannelId: 'channel-1',
+        telegramBotToken: '123456:telegram-token',
+        telegramChatId: 'chat-1',
+        expectations: {
+          ackMode: 'summary',
+          telegramPollTimeoutSeconds: 45,
+          telegramAllowedUpdates: ['message', 'edited_message'],
+          telegramStartupBacklogPolicy: 'drop_pending',
+          authorizedTelegramUserIdsConfigured: true,
+        },
+      },
+      {
+        readReplyListenerStatusImpl: () => ({
+          success: true,
+          message: 'Reply listener daemon is running (1 active source)',
+          diagnostics: {
+            ackMode: 'summary',
+            pollIntervalMs: 3000,
+            rateLimitPerMinute: 10,
+            includePrefix: true,
+            telegramPollTimeoutSeconds: 45,
+            telegramAllowedUpdates: ['message', 'edited_message'],
+            telegramStartupBacklogPolicy: 'drop_pending',
+            authorizedDiscordUsersConfigured: true,
+            authorizedTelegramUserIdsConfigured: true,
+            secretStorage: 'fallback-secret-file',
+            activeSources: [
+              {
+                key: buildDiscordReplySource('discord-token', 'channel-1').key,
+                platform: 'discord-bot',
+                label: 'discord-bot:discord-channel',
+                cursor: 'discord-message-91',
+                lastPollAt: null,
+                lastIngestAt: null,
+                lastFailureAt: null,
+                lastFailureCategory: null,
+                lastFailureMessage: null,
+                failureCounts: {},
+              },
+            ],
+          },
+        }),
+      },
+    ),
+    /missing expected active source/i,
+  );
 });
 
 test('inspectReplyListenerStatusForLiveSmoke fails when the running daemon diverges from the expected long-poll config', () => {
   assert.throws(
     () => inspectReplyListenerStatusForLiveSmoke(
       {
-        ackMode: 'minimal',
-        telegramPollTimeoutSeconds: 30,
-        telegramAllowedUpdates: ['message'],
-        telegramStartupBacklogPolicy: 'resume',
-        authorizedTelegramUserIdsConfigured: false,
+        discordBotToken: 'discord-token',
+        discordChannelId: 'channel-1',
+        telegramBotToken: '123456:telegram-token',
+        telegramChatId: 'chat-1',
+        expectations: {
+          ackMode: 'minimal',
+          telegramPollTimeoutSeconds: 30,
+          telegramAllowedUpdates: ['message'],
+          telegramStartupBacklogPolicy: 'resume',
+          authorizedTelegramUserIdsConfigured: false,
+        },
       },
       {
         readReplyListenerStatusImpl: () => ({
