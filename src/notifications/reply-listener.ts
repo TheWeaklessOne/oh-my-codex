@@ -8,7 +8,7 @@
  * - State/PID/log files use restrictive permissions (0600)
  * - Bot tokens stored in state file, NOT in environment variables
  * - Two-layer input sanitization (sanitizeReplyInput + newline stripping in buildSendPaneArgvs)
- * - Pane verification via analyzePaneContent before every injection
+ * - Pane verification uses tmux metadata plus content heuristics before every injection
  * - Authorization: only configured user IDs (Discord) / sender IDs plus chat boundary (Telegram) can inject
  * - Rate limiting to prevent spam/abuse
  */
@@ -21,9 +21,9 @@ import { spawn, spawnSync } from 'child_process';
 import { request as httpsRequest } from 'https';
 import {
   capturePaneContent,
-  analyzePaneContent,
   sendToPane,
   isTmuxAvailable,
+  verifyPaneTarget,
 } from './tmux-detector.js';
 import {
   lookupBySourceMessage,
@@ -71,6 +71,8 @@ const DEFAULT_STATE_DIR = join(homedir(), '.omx', 'state');
 const PID_FILE_PATH = join(DEFAULT_STATE_DIR, 'reply-listener.pid');
 const STATE_FILE_PATH = join(DEFAULT_STATE_DIR, 'reply-listener-state.json');
 const LOG_FILE_PATH = join(DEFAULT_STATE_DIR, 'reply-listener.log');
+const CONFIG_FILE_PATH = join(DEFAULT_STATE_DIR, 'reply-listener-config.json');
+const SECRET_FILE_PATH = join(DEFAULT_STATE_DIR, 'reply-listener-secrets.json');
 const MIN_REPLY_POLL_INTERVAL_MS = 500;
 const MAX_REPLY_POLL_INTERVAL_MS = 60_000;
 const DEFAULT_REPLY_POLL_INTERVAL_MS = 3_000;
@@ -89,6 +91,8 @@ const REPLY_ACK_CAPTURE_LINES = 200;
 const REPLY_ACK_SUMMARY_MAX_CHARS = 700;
 const REPLY_ACK_PREFIX = 'Injected into Codex CLI session.';
 const REPLY_ACK_FALLBACK = 'Recent output summary unavailable.';
+const TELEGRAM_UNAUTHORIZED_REPLY_MESSAGE = 'This Telegram sender is not authorized to control OMX replies for this source.';
+const TELEGRAM_REPLY_USAGE_MESSAGE = 'Reply to a tracked OMX notification message, or reply "status" to inspect the tracked OMX session.';
 
 export interface ReplyListenerState {
   isRunning: boolean;
@@ -113,6 +117,10 @@ export interface ReplyListenerSourceState {
   telegramStartupPolicyApplied?: boolean;
   lastPollAt?: string | null;
   lastIngestAt?: string | null;
+  lastFailureAt?: string | null;
+  lastFailureCategory?: string | null;
+  lastFailureMessage?: string | null;
+  failureCounts?: Record<string, number>;
 }
 
 export interface ReplyListenerDaemonConfig extends ReplyConfig {
@@ -302,6 +310,21 @@ function normalizeReplyListenerState(state: Partial<ReplyListenerState>): ReplyL
           lastIngestAt: typeof normalizedSourceState.lastIngestAt === 'string'
             ? normalizedSourceState.lastIngestAt
             : null,
+          lastFailureAt: typeof normalizedSourceState.lastFailureAt === 'string'
+            ? normalizedSourceState.lastFailureAt
+            : null,
+          lastFailureCategory: typeof normalizedSourceState.lastFailureCategory === 'string'
+            ? normalizedSourceState.lastFailureCategory
+            : null,
+          lastFailureMessage: typeof normalizedSourceState.lastFailureMessage === 'string'
+            ? normalizedSourceState.lastFailureMessage
+            : null,
+          failureCounts:
+            normalizedSourceState.failureCounts && typeof normalizedSourceState.failureCounts === 'object'
+              ? Object.fromEntries(
+                  Object.entries(normalizedSourceState.failureCounts).filter(([, count]) => typeof count === 'number'),
+                )
+              : {},
         } satisfies ReplyListenerSourceState,
       ];
     }),
@@ -365,6 +388,10 @@ function ensureSourceState(
       : false,
     lastPollAt: null,
     lastIngestAt: null,
+    lastFailureAt: null,
+    lastFailureCategory: null,
+    lastFailureMessage: null,
+    failureCounts: {},
   };
   state.sourceStates[source.key] = created;
   return created;
@@ -520,6 +547,37 @@ function commitTelegramCursor(
   writeDaemonStateImpl(state);
 }
 
+function recordSourceFailure(
+  state: ReplyListenerState,
+  source: ReplySourceDescriptor,
+  category: string,
+  message: string | null,
+): void {
+  const sourceState = ensureSourceState(state, source);
+  sourceState.lastFailureAt = new Date().toISOString();
+  sourceState.lastFailureCategory = category;
+  sourceState.lastFailureMessage = message;
+  sourceState.failureCounts = {
+    ...(sourceState.failureCounts ?? {}),
+    [category]: (sourceState.failureCounts?.[category] ?? 0) + 1,
+  };
+}
+
+function logSourceEvent(
+  logImpl: typeof log,
+  source: ReplySourceDescriptor,
+  event: string,
+  details: Record<string, unknown> = {},
+): void {
+  logImpl(JSON.stringify({
+    scope: 'reply-listener',
+    event,
+    sourceKey: source.key,
+    platform: source.platform,
+    ...details,
+  }));
+}
+
 function buildTelegramGetUpdatesPath(
   config: ReplyListenerDaemonConfig,
   sourceState: ReplyListenerSourceState,
@@ -545,18 +603,45 @@ function getTelegramRequestTimeoutMs(timeoutSeconds: number): number {
 
 function readDaemonConfig(): ReplyListenerDaemonConfig | null {
   try {
-    const configPath = join(DEFAULT_STATE_DIR, 'reply-listener-config.json');
-    if (!existsSync(configPath)) return null;
-    const content = readFileSync(configPath, 'utf-8');
-    return JSON.parse(content) as ReplyListenerDaemonConfig;
+    if (!existsSync(CONFIG_FILE_PATH)) return null;
+    const content = readFileSync(CONFIG_FILE_PATH, 'utf-8');
+    const parsed = JSON.parse(content) as ReplyListenerDaemonConfig;
+
+    if ('telegramBotToken' in parsed || 'discordBotToken' in parsed) {
+      return parsed;
+    }
+
+    const secrets = existsSync(SECRET_FILE_PATH)
+      ? JSON.parse(readFileSync(SECRET_FILE_PATH, 'utf-8')) as Partial<ReplyListenerDaemonConfig>
+      : {};
+
+    return {
+      ...parsed,
+      ...(typeof secrets.telegramBotToken === 'string' ? { telegramBotToken: secrets.telegramBotToken } : {}),
+      ...(typeof secrets.discordBotToken === 'string' ? { discordBotToken: secrets.discordBotToken } : {}),
+    };
   } catch {
     return null;
   }
 }
 
 function writeDaemonConfig(config: ReplyListenerDaemonConfig): void {
-  const configPath = join(DEFAULT_STATE_DIR, 'reply-listener-config.json');
-  writeSecureFile(configPath, JSON.stringify(config, null, 2));
+  const publicConfig: ReplyListenerDaemonConfig = {
+    ...config,
+    telegramBotToken: undefined,
+    discordBotToken: undefined,
+  };
+  const secretConfig = {
+    ...(config.telegramBotToken ? { telegramBotToken: config.telegramBotToken } : {}),
+    ...(config.discordBotToken ? { discordBotToken: config.discordBotToken } : {}),
+  };
+
+  writeSecureFile(CONFIG_FILE_PATH, JSON.stringify(publicConfig, null, 2));
+  if (Object.keys(secretConfig).length > 0) {
+    writeSecureFile(SECRET_FILE_PATH, JSON.stringify(secretConfig, null, 2));
+  } else if (existsSync(SECRET_FILE_PATH)) {
+    unlinkSync(SECRET_FILE_PATH);
+  }
 }
 
 function readPidFile(): number | null {
@@ -718,6 +803,7 @@ export interface ReplyListenerDiscordPollDeps {
     text: string,
     platform: string,
     config: ReplyListenerDaemonConfig,
+    options?: { expectedSessionName?: string },
   ) => InjectReplyLikeResult;
   captureReplyAcknowledgementSummaryImpl?: typeof captureReplyAcknowledgementSummary;
   formatReplyAcknowledgementImpl?: typeof formatReplyAcknowledgement;
@@ -737,6 +823,7 @@ export interface ReplyListenerTelegramPollDeps {
     text: string,
     platform: string,
     config: ReplyListenerDaemonConfig,
+    options?: { expectedSessionName?: string },
   ) => InjectReplyLikeResult;
   captureReplyAcknowledgementSummaryImpl?: typeof captureReplyAcknowledgementSummary;
   formatReplyAcknowledgementImpl?: typeof formatReplyAcknowledgement;
@@ -752,6 +839,7 @@ export interface ReplyListenerPollDeps {
     text: string,
     platform: string,
     config: ReplyListenerDaemonConfig,
+    options?: { expectedSessionName?: string },
   ) => InjectReplyLikeResult;
   buildSessionStatusReplyImpl?: typeof buildDiscordSessionStatusReply;
   captureReplyAcknowledgementSummaryImpl?: typeof captureReplyAcknowledgementSummary;
@@ -901,16 +989,25 @@ function injectReply(
   text: string,
   platform: string,
   config: ReplyListenerDaemonConfig,
+  options: {
+    expectedSessionName?: string;
+  } = {},
 ): ReplyInjectionResult {
-  const content = capturePaneContent(paneId, 15);
-  const analysis = analyzePaneContent(content);
+  const verification = verifyPaneTarget(paneId, {
+    ...(options.expectedSessionName ? { expectedSessionName: options.expectedSessionName } : {}),
+  });
 
-  if (analysis.confidence < 0.4) {
-    log(`WARN: Pane ${paneId} does not appear to be running Codex CLI (confidence: ${analysis.confidence}). Skipping injection, removing stale mapping.`);
+  if (!verification.accepted) {
+    log(
+      `WARN: Pane ${paneId} failed reply verification (${verification.reason}; confidence: ${verification.analysis.confidence}). ` +
+      `Skipping injection and removing stale mapping.`
+    );
     removeMessagesByPane(paneId);
     return {
       outcome: 'terminal-ignore',
-      reason: `pane verification failed (${analysis.confidence.toFixed(2)})`,
+      reason: verification.reason === 'session-mismatch'
+        ? 'Target pane is no longer an OMX session'
+        : `pane verification failed (${verification.analysis.confidence.toFixed(2)})`,
     };
   }
 
@@ -1067,6 +1164,11 @@ export async function pollDiscordOnce(
       if (!rateLimiter.canProceed()) {
         logImpl(`WARN: Rate limit exceeded, deferring Discord message ${msg.id}`);
         state.errors++;
+        recordSourceFailure(state, source, 'rate-limit', `Deferred Discord message ${msg.id}`);
+        logSourceEvent(logImpl, source, 'intake-deferred', {
+          category: 'rate-limit',
+          messageId: msg.id,
+        });
         break;
       }
 
@@ -1081,7 +1183,9 @@ export async function pollDiscordOnce(
       }
 
       const injectionResult = normalizeInjectReplyResult(
-        injectReplyImpl(mapping.tmuxPaneId, msg.content, 'discord', config),
+        injectReplyImpl(mapping.tmuxPaneId, msg.content, 'discord', config, {
+          expectedSessionName: mapping.tmuxSessionName,
+        }),
       );
       if (injectionResult.outcome === 'success') {
         state.messagesInjected++;
@@ -1137,6 +1241,12 @@ export async function pollDiscordOnce(
         commitDiscordCursor(state, config, source, msg.id, writeDaemonStateImpl);
       } else {
         state.errors++;
+        recordSourceFailure(state, source, 'retryable-injection', injectionResult.reason ?? null);
+        logSourceEvent(logImpl, source, 'intake-deferred', {
+          category: 'retryable-injection',
+          messageId: msg.id,
+          reason: injectionResult.reason ?? null,
+        });
         logImpl(`WARN: Deferring Discord message ${msg.id} after retryable intake failure${injectionResult.reason ? `: ${injectionResult.reason}` : ''}`);
         break;
       }
@@ -1144,6 +1254,10 @@ export async function pollDiscordOnce(
   } catch (error) {
     state.errors++;
     state.lastError = error instanceof Error ? error.message : String(error);
+    recordSourceFailure(state, source, 'poll-error', state.lastError);
+    logSourceEvent(logImpl, source, 'poll-error', {
+      error: state.lastError,
+    });
     logImpl(`Discord polling error: ${state.lastError}`);
   }
 }
@@ -1304,6 +1418,7 @@ export async function pollTelegramOnce(
 
   const httpsRequestImpl = deps.httpsRequestImpl ?? httpsRequest;
   const injectReplyImpl = deps.injectReplyImpl ?? injectReply;
+  const buildSessionStatusReplyImpl = deps.buildSessionStatusReplyImpl ?? buildDiscordSessionStatusReply;
   const captureReplyAcknowledgementSummaryImpl = deps.captureReplyAcknowledgementSummaryImpl ?? captureReplyAcknowledgementSummary;
   const formatReplyAcknowledgementImpl = deps.formatReplyAcknowledgementImpl ?? formatReplyAcknowledgement;
   const lookupByMessageIdImpl = deps.lookupByMessageIdImpl ?? lookupBySourceMessage;
@@ -1331,12 +1446,21 @@ export async function pollTelegramOnce(
         continue;
       }
       const msg = update.message;
+      const text = msg?.text || '';
+      const isStatusCommand = isDiscordStatusCommand(text);
       if (!msg) {
         commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
         continue;
       }
 
       if (!msg.reply_to_message?.message_id) {
+        if (text) {
+          await sendTelegramReplyMessage(config, httpsRequestImpl, {
+            chat_id: config.telegramChatId,
+            text: TELEGRAM_REPLY_USAGE_MESSAGE,
+            reply_to_message_id: msg.message_id,
+          });
+        }
         commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
         continue;
       }
@@ -1351,18 +1475,43 @@ export async function pollTelegramOnce(
         config.authorizedTelegramUserIds.length > 0
         && (!senderId || !config.authorizedTelegramUserIds.includes(senderId))
       ) {
+        await sendTelegramReplyMessage(config, httpsRequestImpl, {
+          chat_id: config.telegramChatId,
+          text: TELEGRAM_UNAUTHORIZED_REPLY_MESSAGE,
+          reply_to_message_id: msg.message_id,
+        });
         commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
         continue;
       }
 
       const mapping = lookupByMessageIdImpl('telegram', String(msg.reply_to_message.message_id), source.key);
       if (!mapping) {
+        await sendTelegramReplyMessage(config, httpsRequestImpl, {
+          chat_id: config.telegramChatId,
+          text: NO_TRACKED_SESSION_MESSAGE,
+          reply_to_message_id: msg.message_id,
+        });
         commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
         continue;
       }
 
-      const text = msg.text || '';
       if (!text) {
+        await sendTelegramReplyMessage(config, httpsRequestImpl, {
+          chat_id: config.telegramChatId,
+          text: TELEGRAM_REPLY_USAGE_MESSAGE,
+          reply_to_message_id: msg.message_id,
+        });
+        commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
+        continue;
+      }
+
+      if (isStatusCommand) {
+        const statusMessage = await buildSessionStatusReplyImpl(mapping);
+        await sendTelegramReplyMessage(config, httpsRequestImpl, {
+          chat_id: config.telegramChatId,
+          text: statusMessage,
+          reply_to_message_id: msg.message_id,
+        });
         commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
         continue;
       }
@@ -1370,11 +1519,18 @@ export async function pollTelegramOnce(
       if (!rateLimiter.canProceed()) {
         logImpl(`WARN: Rate limit exceeded, deferring Telegram message ${msg.message_id}`);
         state.errors++;
+        recordSourceFailure(state, source, 'rate-limit', `Deferred Telegram message ${msg.message_id}`);
+        logSourceEvent(logImpl, source, 'intake-deferred', {
+          category: 'rate-limit',
+          messageId: msg.message_id,
+        });
         break;
       }
 
       const injectionResult = normalizeInjectReplyResult(
-        injectReplyImpl(mapping.tmuxPaneId, text, 'telegram', config),
+        injectReplyImpl(mapping.tmuxPaneId, text, 'telegram', config, {
+          expectedSessionName: mapping.tmuxSessionName,
+        }),
       );
       if (injectionResult.outcome === 'success') {
         state.messagesInjected++;
@@ -1398,9 +1554,20 @@ export async function pollTelegramOnce(
           }
         }
       } else if (injectionResult.outcome === 'terminal-ignore') {
+        await sendTelegramReplyMessage(config, httpsRequestImpl, {
+          chat_id: config.telegramChatId,
+          text: injectionResult.reason || 'The target OMX pane is no longer available for replies.',
+          reply_to_message_id: msg.message_id,
+        });
         commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
       } else {
         state.errors++;
+        recordSourceFailure(state, source, 'retryable-injection', injectionResult.reason ?? null);
+        logSourceEvent(logImpl, source, 'intake-deferred', {
+          category: 'retryable-injection',
+          updateId,
+          reason: injectionResult.reason ?? null,
+        });
         logImpl(`WARN: Deferring Telegram update ${updateId} after retryable intake failure${injectionResult.reason ? `: ${injectionResult.reason}` : ''}`);
         break;
       }
@@ -1408,6 +1575,10 @@ export async function pollTelegramOnce(
   } catch (error) {
     state.errors++;
     state.lastError = error instanceof Error ? error.message : String(error);
+    recordSourceFailure(state, source, 'poll-error', state.lastError);
+    logSourceEvent(logImpl, source, 'poll-error', {
+      error: state.lastError,
+    });
     logImpl(`Telegram polling error: ${state.lastError}`);
   }
 }
@@ -1703,8 +1874,13 @@ export function stopReplyListener(): DaemonResponse {
 }
 
 export function getReplyListenerStatus(): DaemonResponse {
+  const config = readDaemonConfig();
   const state = readDaemonState();
   const running = isDaemonRunning();
+  if (state && config) {
+    syncLegacyStateMirrors(state, config);
+  }
+  const activeSourceCount = config ? listActiveReplySources(config).length : 0;
 
   if (!running && !state) {
     return {
@@ -1723,7 +1899,9 @@ export function getReplyListenerStatus(): DaemonResponse {
 
   return {
     success: true,
-    message: 'Reply listener daemon is running',
+    message: activeSourceCount > 0
+      ? `Reply listener daemon is running (${activeSourceCount} active source${activeSourceCount === 1 ? '' : 's'})`
+      : 'Reply listener daemon is running',
     state: state ?? undefined,
   };
 }

@@ -43,6 +43,20 @@ export interface PaneAnalysis {
   confidence: number;
 }
 
+export interface PaneMetadata {
+  paneId: string;
+  currentCommand: string | null;
+  sessionName: string | null;
+  tty: string | null;
+}
+
+export interface PaneVerificationResult {
+  accepted: boolean;
+  reason: 'metadata-match' | 'content-fallback' | 'session-mismatch' | 'verification-failed';
+  analysis: PaneAnalysis;
+  metadata: PaneMetadata | null;
+}
+
 export function analyzePaneContent(content: string): PaneAnalysis {
   const lower = content.toLowerCase();
 
@@ -69,6 +83,85 @@ export function analyzePaneContent(content: string): PaneAnalysis {
   if (content.trim().length > 0) confidence += 0.1;
 
   return { hasCodex, hasRateLimitMessage, isBlocked, confidence: Math.min(confidence, 1) };
+}
+
+export function inspectPaneMetadata(paneId: string): PaneMetadata | null {
+  try {
+    const raw = execFileSync(
+      resolveTmuxBinaryForPlatform() || 'tmux',
+      ['display-message', '-p', '-t', paneId, '#{pane_current_command}\t#{session_name}\t#{pane_tty}'],
+      {
+        encoding: 'utf-8',
+        timeout: 3000,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: process.platform === 'win32',
+      },
+    ).trim();
+
+    const [currentCommandRaw, sessionNameRaw, ttyRaw] = raw.split('\t');
+    return {
+      paneId,
+      currentCommand: currentCommandRaw?.trim() || null,
+      sessionName: sessionNameRaw?.trim() || null,
+      tty: ttyRaw?.trim() || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function verifyPaneTarget(
+  paneId: string,
+  options: {
+    expectedSessionName?: string;
+    capturePaneContentImpl?: typeof capturePaneContent;
+    inspectPaneMetadataImpl?: typeof inspectPaneMetadata;
+  } = {},
+): PaneVerificationResult {
+  const capturePaneContentImpl = options.capturePaneContentImpl ?? capturePaneContent;
+  const inspectPaneMetadataImpl = options.inspectPaneMetadataImpl ?? inspectPaneMetadata;
+  const metadata = inspectPaneMetadataImpl(paneId);
+  const analysis = analyzePaneContent(capturePaneContentImpl(paneId, 15));
+
+  const normalizedCommand = metadata?.currentCommand?.toLowerCase() ?? '';
+  const commandLooksInteractive = /(codex|omx|node|claude|python|bash|zsh|fish|sh)/.test(normalizedCommand);
+  const sessionMatches = options.expectedSessionName
+    ? metadata?.sessionName === options.expectedSessionName
+    : true;
+
+  if (metadata && !sessionMatches) {
+    return {
+      accepted: false,
+      reason: 'session-mismatch',
+      analysis,
+      metadata,
+    };
+  }
+
+  if (metadata && sessionMatches && commandLooksInteractive) {
+    return {
+      accepted: true,
+      reason: 'metadata-match',
+      analysis,
+      metadata,
+    };
+  }
+
+  if (analysis.confidence >= 0.4) {
+    return {
+      accepted: true,
+      reason: 'content-fallback',
+      analysis,
+      metadata,
+    };
+  }
+
+  return {
+    accepted: false,
+    reason: 'verification-failed',
+    analysis,
+    metadata,
+  };
 }
 
 /**

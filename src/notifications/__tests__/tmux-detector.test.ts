@@ -1,6 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { analyzePaneContent, buildSendPaneArgvs, buildCapturePaneArgv, sendToPane } from '../tmux-detector.js';
+import {
+  analyzePaneContent,
+  buildSendPaneArgvs,
+  buildCapturePaneArgv,
+  sendToPane,
+  verifyPaneTarget,
+} from '../tmux-detector.js';
 import type { PaneAnalysis } from '../tmux-detector.js';
 
 describe('analyzePaneContent', () => {
@@ -89,6 +95,50 @@ describe('analyzePaneContent', () => {
     const result = analyzePaneContent('some random text here');
     assert.equal(result.hasCodex, false);
     assert.ok(result.confidence > 0);
+  });
+});
+
+describe('verifyPaneTarget', () => {
+  it('accepts panes when tmux metadata matches the expected session even if content is sparse', () => {
+    const result = verifyPaneTarget('%9', {
+      expectedSessionName: 'omx-session',
+      capturePaneContentImpl: () => '',
+      inspectPaneMetadataImpl: () => ({
+        paneId: '%9',
+        currentCommand: 'codex',
+        sessionName: 'omx-session',
+        tty: '/dev/ttys001',
+      }),
+    });
+
+    assert.equal(result.accepted, true);
+    assert.equal(result.reason, 'metadata-match');
+  });
+
+  it('rejects panes when tmux metadata shows a different session despite codex-like content', () => {
+    const result = verifyPaneTarget('%9', {
+      expectedSessionName: 'omx-session',
+      capturePaneContentImpl: () => 'Codex > running task',
+      inspectPaneMetadataImpl: () => ({
+        paneId: '%9',
+        currentCommand: 'codex',
+        sessionName: 'different-session',
+        tty: '/dev/ttys002',
+      }),
+    });
+
+    assert.equal(result.accepted, false);
+    assert.equal(result.reason, 'session-mismatch');
+  });
+
+  it('falls back to content heuristics when metadata cannot be collected', () => {
+    const result = verifyPaneTarget('%9', {
+      capturePaneContentImpl: () => 'Codex > running task',
+      inspectPaneMetadataImpl: () => null,
+    });
+
+    assert.equal(result.accepted, true);
+    assert.equal(result.reason, 'content-fallback');
   });
 });
 

@@ -1142,6 +1142,7 @@ describe('pollTelegramOnce', () => {
     resetReplyListenerTransientState();
     const config = createBaseConfig();
     const state = createBaseState();
+    let sendMessageBody = '';
 
     await pollTelegramOnce(
       config,
@@ -1167,6 +1168,10 @@ describe('pollTelegramOnce', () => {
               ],
             },
           }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 447 } } };
+          },
         }),
         lookupByMessageIdImpl: () => {
           throw new Error('lookup should not run for unauthorized Telegram senders');
@@ -1180,6 +1185,154 @@ describe('pollTelegramOnce', () => {
     assert.equal(state.telegramLastUpdateId, 46);
     assert.equal(state.messagesInjected, 0);
     assert.equal(state.errors, 0);
+    const parsedBody = JSON.parse(sendMessageBody) as { text: string; reply_to_message_id: number };
+    assert.equal(parsedBody.reply_to_message_id, 335);
+    assert.match(parsedBody.text, /not authorized/i);
+  });
+
+  it('responds to Telegram status probes without injecting command text', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    let sendMessageBody = '';
+    let injectCalled = false;
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 47,
+                  message: {
+                    message_id: 336,
+                    chat: { id: 777 },
+                    from: { id: 'telegram-user-1' },
+                    text: ' status ',
+                    reply_to_message: { message_id: 222 },
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 448 } } };
+          },
+        }),
+        lookupByMessageIdImpl: () => createMapping('telegram'),
+        buildSessionStatusReplyImpl: async (mapping) => {
+          assert.equal(mapping.sessionId, 'session-1');
+          return 'Tracked OMX session status';
+        },
+        injectReplyImpl: () => {
+          injectCalled = true;
+          return true;
+        },
+      },
+    );
+
+    assert.equal(injectCalled, false);
+    const parsedBody = JSON.parse(sendMessageBody) as { text: string; reply_to_message_id: number };
+    assert.equal(parsedBody.reply_to_message_id, 336);
+    assert.equal(parsedBody.text, 'Tracked OMX session status');
+  });
+
+  it('sends an explicit Telegram error reply when the original notification is no longer tracked', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    let sendMessageBody = '';
+
+    await pollTelegramOnce(
+      config,
+      createBaseState(),
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 48,
+                  message: {
+                    message_id: 337,
+                    chat: { id: 777 },
+                    from: { id: 'telegram-user-1' },
+                    text: 'resume',
+                    reply_to_message: { message_id: 999 },
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 449 } } };
+          },
+        }),
+        lookupByMessageIdImpl: () => null,
+        injectReplyImpl: () => {
+          throw new Error('injectReply should not run for untracked Telegram replies');
+        },
+      },
+    );
+
+    const parsedBody = JSON.parse(sendMessageBody) as { text: string };
+    assert.match(parsedBody.text, /no tracked omx session/i);
+  });
+
+  it('sends an explicit Telegram error reply when pane verification fails terminally', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    let sendMessageBody = '';
+
+    await pollTelegramOnce(
+      config,
+      createBaseState(),
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 49,
+                  message: {
+                    message_id: 338,
+                    chat: { id: 777 },
+                    from: { id: 'telegram-user-1' },
+                    text: 'resume',
+                    reply_to_message: { message_id: 222 },
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 450 } } };
+          },
+        }),
+        lookupByMessageIdImpl: () => createMapping('telegram'),
+        injectReplyImpl: () => ({
+          outcome: 'terminal-ignore',
+          reason: 'Target pane is no longer an OMX session',
+        }),
+      },
+    );
+
+    const parsedBody = JSON.parse(sendMessageBody) as { text: string };
+    assert.match(parsedBody.text, /target pane is no longer an omx session/i);
   });
 
   it('records an error when Telegram injection fails and does not send an acknowledgement', async () => {
@@ -1226,6 +1379,9 @@ describe('pollTelegramOnce', () => {
     assert.equal(state.messagesInjected, 0);
     assert.equal(state.errors, 1);
     assert.equal(state.telegramLastUpdateId, null);
+    const sourceKey = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!).key;
+    assert.equal(state.sourceStates[sourceKey]?.lastFailureCategory, 'retryable-injection');
+    assert.equal(state.sourceStates[sourceKey]?.failureCounts?.['retryable-injection'], 1);
   });
 
   it('drops pending Telegram backlog deterministically when configured', async () => {
