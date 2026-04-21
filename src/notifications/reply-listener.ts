@@ -6,7 +6,8 @@
  *
  * Security considerations:
  * - State/PID/log files use restrictive permissions (0600)
- * - Bot tokens stored in state file, NOT in environment variables
+ * - Public daemon state/config avoid inline bot tokens; fallback secret storage is only used
+ *   when OMX cannot re-derive the active transport tokens from canonical config/environment
  * - Two-layer input sanitization (sanitizeReplyInput + newline stripping in buildSendPaneArgvs)
  * - Pane verification uses tmux metadata plus content heuristics before every injection
  * - Authorization: only configured user IDs (Discord) / sender IDs plus chat boundary (Telegram) can inject
@@ -40,7 +41,11 @@ import {
   buildDiscordSessionStatusReply,
   isDiscordStatusCommand,
 } from './session-status.js';
-import { parseMentionAllowedMentions } from './config.js';
+import {
+  getNotificationConfig,
+  getReplyListenerPlatformConfig,
+  parseMentionAllowedMentions,
+} from './config.js';
 import { parseTmuxTail } from './formatter.js';
 import { spawnPlatformCommandSync } from '../utils/platform-command.js';
 import type {
@@ -63,6 +68,9 @@ const DAEMON_ENV_ALLOWLIST = [
   'XDG_RUNTIME_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME',
   'SHELL',
   'NODE_ENV',
+  'OMX_DISCORD_NOTIFIER_BOT_TOKEN', 'OMX_DISCORD_NOTIFIER_CHANNEL', 'OMX_DISCORD_MENTION',
+  'OMX_TELEGRAM_BOT_TOKEN', 'OMX_TELEGRAM_NOTIFIER_BOT_TOKEN',
+  'OMX_TELEGRAM_CHAT_ID', 'OMX_TELEGRAM_NOTIFIER_CHAT_ID', 'OMX_TELEGRAM_NOTIFIER_UID',
   'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY', 'no_proxy',
   'SystemRoot', 'SYSTEMROOT', 'windir', 'COMSPEC',
 ] as const;
@@ -137,7 +145,40 @@ export interface DaemonResponse {
   success: boolean;
   message: string;
   state?: ReplyListenerState;
+  diagnostics?: ReplyListenerStatusDiagnostics;
   error?: string;
+}
+
+export type ReplyListenerSecretStorageMode =
+  | 'not-persisted'
+  | 'fallback-secret-file'
+  | 'inline-config-legacy';
+
+export interface ReplyListenerSourceDiagnostics {
+  key: string;
+  platform: 'telegram' | 'discord-bot';
+  label: string;
+  cursor: number | string | null;
+  lastPollAt: string | null;
+  lastIngestAt: string | null;
+  lastFailureAt: string | null;
+  lastFailureCategory: string | null;
+  lastFailureMessage: string | null;
+  failureCounts: Record<string, number>;
+}
+
+export interface ReplyListenerStatusDiagnostics {
+  ackMode: ReplyAcknowledgementMode;
+  pollIntervalMs: number;
+  rateLimitPerMinute: number;
+  includePrefix: boolean;
+  telegramPollTimeoutSeconds: number | null;
+  telegramAllowedUpdates: string[];
+  telegramStartupBacklogPolicy: TelegramStartupBacklogPolicy | null;
+  authorizedDiscordUsersConfigured: boolean;
+  authorizedTelegramUserIdsConfigured: boolean;
+  secretStorage: ReplyListenerSecretStorageMode;
+  activeSources: ReplyListenerSourceDiagnostics[];
 }
 
 type ReplyProcessingDisposition = 'success' | 'terminal-ignore' | 'retryable-failure';
@@ -241,16 +282,26 @@ function rotateLogIfNeeded(logPath: string): void {
   }
 }
 
-function log(message: string): void {
+function writeStructuredLogLine(entry: Record<string, unknown>): void {
   try {
     ensureStateDir();
     rotateLogIfNeeded(LOG_FILE_PATH);
-    const timestamp = new Date().toISOString();
-    const logLine = `[${timestamp}] ${message}\n`;
-    appendFileSync(LOG_FILE_PATH, logLine, { mode: SECURE_FILE_MODE });
+    const payload = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      scope: 'reply-listener',
+      ...entry,
+    });
+    appendFileSync(LOG_FILE_PATH, `${payload}\n`, { mode: SECURE_FILE_MODE });
   } catch {
     // Ignore log write errors
   }
+}
+
+function log(message: string): void {
+  writeStructuredLogLine({
+    level: 'INFO',
+    message,
+  });
 }
 
 function normalizeInteger(
@@ -588,6 +639,17 @@ function logSourceEvent(
   event: string,
   details: Record<string, unknown> = {},
 ): void {
+  if (logImpl === log) {
+    writeStructuredLogLine({
+      level: 'INFO',
+      event,
+      sourceKey: source.key,
+      platform: source.platform,
+      ...details,
+    });
+    return;
+  }
+
   logImpl(JSON.stringify({
     scope: 'reply-listener',
     event,
@@ -637,10 +699,29 @@ function readDaemonConfig(): ReplyListenerDaemonConfig | null {
   try {
     if (!existsSync(CONFIG_FILE_PATH)) return null;
     const content = readFileSync(CONFIG_FILE_PATH, 'utf-8');
-    const parsed = JSON.parse(content) as ReplyListenerDaemonConfig;
+    const parsed = JSON.parse(content) as Partial<ReplyListenerDaemonConfig>;
+    const canonicalPlatformConfig = getReplyListenerPlatformConfig(getNotificationConfig());
+    const fromCanonicalConfig: Partial<ReplyListenerDaemonConfig> = {
+      ...(typeof canonicalPlatformConfig.telegramBotToken === 'string'
+        && canonicalPlatformConfig.telegramChatId === parsed.telegramChatId
+        ? { telegramBotToken: canonicalPlatformConfig.telegramBotToken }
+        : {}),
+      ...(typeof canonicalPlatformConfig.discordBotToken === 'string'
+        && canonicalPlatformConfig.discordChannelId === parsed.discordChannelId
+        ? {
+            discordBotToken: canonicalPlatformConfig.discordBotToken,
+            ...(typeof canonicalPlatformConfig.discordMention === 'string'
+              ? { discordMention: canonicalPlatformConfig.discordMention }
+              : {}),
+          }
+        : {}),
+    };
 
     if ('telegramBotToken' in parsed || 'discordBotToken' in parsed) {
-      return parsed;
+      return {
+        ...parsed,
+        ...fromCanonicalConfig,
+      } as ReplyListenerDaemonConfig;
     }
 
     const secrets = existsSync(SECRET_FILE_PATH)
@@ -649,9 +730,10 @@ function readDaemonConfig(): ReplyListenerDaemonConfig | null {
 
     return {
       ...parsed,
+      ...fromCanonicalConfig,
       ...(typeof secrets.telegramBotToken === 'string' ? { telegramBotToken: secrets.telegramBotToken } : {}),
       ...(typeof secrets.discordBotToken === 'string' ? { discordBotToken: secrets.discordBotToken } : {}),
-    };
+    } as ReplyListenerDaemonConfig;
   } catch {
     return null;
   }
@@ -663,9 +745,22 @@ function writeDaemonConfig(config: ReplyListenerDaemonConfig): void {
     telegramBotToken: undefined,
     discordBotToken: undefined,
   };
+  const canonicalPlatformConfig = getReplyListenerPlatformConfig(getNotificationConfig());
   const secretConfig = {
-    ...(config.telegramBotToken ? { telegramBotToken: config.telegramBotToken } : {}),
-    ...(config.discordBotToken ? { discordBotToken: config.discordBotToken } : {}),
+    ...(config.telegramBotToken
+      && !(
+        canonicalPlatformConfig.telegramBotToken === config.telegramBotToken
+        && canonicalPlatformConfig.telegramChatId === config.telegramChatId
+      )
+      ? { telegramBotToken: config.telegramBotToken }
+      : {}),
+    ...(config.discordBotToken
+      && !(
+        canonicalPlatformConfig.discordBotToken === config.discordBotToken
+        && canonicalPlatformConfig.discordChannelId === config.discordChannelId
+      )
+      ? { discordBotToken: config.discordBotToken }
+      : {}),
   };
 
   writeSecureFile(CONFIG_FILE_PATH, JSON.stringify(publicConfig, null, 2));
@@ -2010,7 +2105,63 @@ export function stopReplyListener(): DaemonResponse {
   }
 }
 
+function detectReplyListenerSecretStorageMode(
+  rawConfig: Partial<ReplyListenerDaemonConfig> | null,
+): ReplyListenerSecretStorageMode {
+  if (rawConfig && (typeof rawConfig.telegramBotToken === 'string' || typeof rawConfig.discordBotToken === 'string')) {
+    return 'inline-config-legacy';
+  }
+  return existsSync(SECRET_FILE_PATH) ? 'fallback-secret-file' : 'not-persisted';
+}
+
+function buildReplyListenerStatusDiagnostics(
+  config: ReplyListenerDaemonConfig,
+  state: ReplyListenerState | null,
+  secretStorage: ReplyListenerSecretStorageMode,
+): ReplyListenerStatusDiagnostics {
+  const diagnosticState = state ? normalizeReplyListenerState(state) : normalizeReplyListenerState({});
+  const activeSources = listActiveReplySources(config).map((source) => {
+    const sourceState = ensureSourceState(diagnosticState, source);
+    return {
+      key: source.key,
+      platform: source.platform,
+      label: source.label,
+      cursor: source.platform === 'telegram'
+        ? sourceState.telegramLastUpdateId ?? null
+        : sourceState.discordLastMessageId ?? null,
+      lastPollAt: sourceState.lastPollAt ?? null,
+      lastIngestAt: sourceState.lastIngestAt ?? null,
+      lastFailureAt: sourceState.lastFailureAt ?? null,
+      lastFailureCategory: sourceState.lastFailureCategory ?? null,
+      lastFailureMessage: sourceState.lastFailureMessage ?? null,
+      failureCounts: { ...(sourceState.failureCounts ?? {}) },
+    };
+  });
+
+  return {
+    ackMode: config.ackMode,
+    pollIntervalMs: config.pollIntervalMs,
+    rateLimitPerMinute: config.rateLimitPerMinute,
+    includePrefix: config.includePrefix,
+    telegramPollTimeoutSeconds: config.telegramEnabled ? config.telegramPollTimeoutSeconds : null,
+    telegramAllowedUpdates: config.telegramEnabled ? [...config.telegramAllowedUpdates] : [],
+    telegramStartupBacklogPolicy: config.telegramEnabled ? config.telegramStartupBacklogPolicy : null,
+    authorizedDiscordUsersConfigured: config.authorizedDiscordUserIds.length > 0,
+    authorizedTelegramUserIdsConfigured: config.authorizedTelegramUserIds.length > 0,
+    secretStorage,
+    activeSources,
+  };
+}
+
 export function getReplyListenerStatus(): DaemonResponse {
+  let rawConfig: Partial<ReplyListenerDaemonConfig> | null = null;
+  try {
+    rawConfig = existsSync(CONFIG_FILE_PATH)
+      ? JSON.parse(readFileSync(CONFIG_FILE_PATH, 'utf-8')) as Partial<ReplyListenerDaemonConfig>
+      : null;
+  } catch {
+    rawConfig = null;
+  }
   const config = readDaemonConfig();
   const state = readDaemonState();
   const running = isDaemonRunning();
@@ -2018,19 +2169,28 @@ export function getReplyListenerStatus(): DaemonResponse {
     syncLegacyStateMirrors(state, config);
   }
   const activeSourceCount = config ? listActiveReplySources(config).length : 0;
+  const diagnostics = config
+    ? buildReplyListenerStatusDiagnostics(
+        config,
+        state ?? null,
+        detectReplyListenerSecretStorageMode(rawConfig),
+      )
+    : undefined;
 
-  if (!running && !state) {
+  if (!running && !state && !config) {
     return {
       success: true,
       message: 'Reply listener daemon has never been started',
+      ...(diagnostics ? { diagnostics } : {}),
     };
   }
 
-  if (!running && state) {
+  if (!running && (state || config)) {
     return {
       success: true,
       message: 'Reply listener daemon is not running',
-      state: { ...state, isRunning: false, pid: null },
+      state: state ? { ...state, isRunning: false, pid: null } : undefined,
+      ...(diagnostics ? { diagnostics } : {}),
     };
   }
 
@@ -2040,6 +2200,7 @@ export function getReplyListenerStatus(): DaemonResponse {
       ? `Reply listener daemon is running (${activeSourceCount} active source${activeSourceCount === 1 ? '' : 's'})`
       : 'Reply listener daemon is running',
     state: state ?? undefined,
+    ...(diagnostics ? { diagnostics } : {}),
   };
 }
 

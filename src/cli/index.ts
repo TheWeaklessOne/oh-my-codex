@@ -794,13 +794,10 @@ export async function main(args: string[]): Promise<void> {
 async function showStatus(): Promise<void> {
   const { readFile } = await import("fs/promises");
   const cwd = process.cwd();
+  let printedAny = false;
   try {
     const refs = await listModeStateFilesWithScopePreference(cwd);
     const states = refs.map((ref) => ref.path);
-    if (states.length === 0) {
-      console.log("No active modes.");
-      return;
-    }
     for (const path of states) {
       const content = await readFile(path, "utf-8");
       let state: Record<string, unknown>;
@@ -815,9 +812,40 @@ async function showStatus(): Promise<void> {
       console.log(
         `${mode}: ${state.active === true ? "ACTIVE" : "inactive"} (phase: ${String(state.current_phase || "n/a")})`,
       );
+      printedAny = true;
     }
   } catch (err) {
     process.stderr.write(`[cli/index] operation failed: ${err}\n`);
+  }
+
+  try {
+    const { getReplyListenerStatus } = await import("../notifications/reply-listener.js");
+    const replyStatus = getReplyListenerStatus();
+    if (
+      replyStatus.message !== "Reply listener daemon has never been started"
+      || replyStatus.state
+      || replyStatus.diagnostics
+    ) {
+      const running = replyStatus.state?.isRunning === true || /is running/i.test(replyStatus.message);
+      const diagnostics = replyStatus.diagnostics;
+      const activeSourceCount = diagnostics?.activeSources.length ?? 0;
+      const summary = diagnostics
+        ? `${activeSourceCount} active source${activeSourceCount === 1 ? "" : "s"}, ack=${diagnostics.ackMode}, secrets=${diagnostics.secretStorage}`
+        : replyStatus.message;
+      console.log(`reply-listener: ${running ? "RUNNING" : "inactive"} (${summary})`);
+      for (const source of diagnostics?.activeSources ?? []) {
+        console.log(
+          `  - ${source.label} cursor=${source.cursor ?? "none"} last_ingest=${source.lastIngestAt ?? "n/a"}`
+          + `${source.lastFailureCategory ? ` last_failure=${source.lastFailureCategory}` : ""}`,
+        );
+      }
+      printedAny = true;
+    }
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
+  }
+
+  if (!printedAny) {
     console.log("No active modes.");
   }
 }

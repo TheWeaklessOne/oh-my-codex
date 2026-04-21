@@ -1,3 +1,8 @@
+import {
+  getReplyListenerStatus,
+  type ReplyListenerStatusDiagnostics,
+} from '../notifications/reply-listener.js';
+
 interface ReplyListenerLiveConfig {
   discordBotToken: string;
   discordChannelId: string;
@@ -21,11 +26,23 @@ interface ReplyListenerLiveEnvResolution {
 interface ReplyListenerLiveSmokeResult {
   discordMessageId: string;
   telegramMessageId: string;
+  replyListenerStatus: ReplyListenerLiveStatusSummary | null;
 }
 
 interface ReplyListenerLiveSmokeDeps {
   fetchImpl?: typeof fetch;
   log?: (message: string) => void;
+  readReplyListenerStatusImpl?: typeof getReplyListenerStatus;
+}
+
+export interface ReplyListenerLiveStatusSummary {
+  ackMode: 'off' | 'minimal' | 'summary';
+  telegramPollTimeoutSeconds: number;
+  telegramAllowedUpdates: string[];
+  telegramStartupBacklogPolicy: 'resume' | 'drop_pending' | 'replay_once';
+  authorizedTelegramUserIdsConfigured: boolean;
+  activeSourceKeys: string[];
+  secretStorage: string;
 }
 
 const LIVE_ENABLE_ENV = 'OMX_REPLY_LISTENER_LIVE';
@@ -112,13 +129,68 @@ export function resolveReplyListenerLiveEnv(env: NodeJS.ProcessEnv = process.env
   };
 }
 
+export function inspectReplyListenerStatusForLiveSmoke(
+  expectations: NonNullable<ReplyListenerLiveConfig['expectations']>,
+  deps: {
+    readReplyListenerStatusImpl?: typeof getReplyListenerStatus;
+  } = {},
+): ReplyListenerLiveStatusSummary {
+  const readReplyListenerStatusImpl = deps.readReplyListenerStatusImpl ?? getReplyListenerStatus;
+  const status = readReplyListenerStatusImpl();
+  const diagnostics = status.diagnostics as ReplyListenerStatusDiagnostics | undefined;
+  if (!diagnostics) {
+    throw new Error('Reply listener status diagnostics are unavailable; start the daemon before running live smoke.');
+  }
+
+  if (diagnostics.ackMode !== expectations.ackMode) {
+    throw new Error(`Reply listener ackMode mismatch: expected ${expectations.ackMode}, got ${diagnostics.ackMode}`);
+  }
+  if (diagnostics.telegramPollTimeoutSeconds !== expectations.telegramPollTimeoutSeconds) {
+    throw new Error(
+      `Reply listener telegramPollTimeoutSeconds mismatch: expected ${expectations.telegramPollTimeoutSeconds}, got ${diagnostics.telegramPollTimeoutSeconds}`,
+    );
+  }
+  if (diagnostics.telegramStartupBacklogPolicy !== expectations.telegramStartupBacklogPolicy) {
+    throw new Error(
+      `Reply listener telegramStartupBacklogPolicy mismatch: expected ${expectations.telegramStartupBacklogPolicy}, got ${diagnostics.telegramStartupBacklogPolicy}`,
+    );
+  }
+  if (diagnostics.authorizedTelegramUserIdsConfigured !== expectations.authorizedTelegramUserIdsConfigured) {
+    throw new Error(
+      `Reply listener authorizedTelegramUserIdsConfigured mismatch: expected ${expectations.authorizedTelegramUserIdsConfigured}, got ${diagnostics.authorizedTelegramUserIdsConfigured}`,
+    );
+  }
+
+  const normalizedAllowedUpdates = [...diagnostics.telegramAllowedUpdates].sort();
+  const expectedAllowedUpdates = [...expectations.telegramAllowedUpdates].sort();
+  if (normalizedAllowedUpdates.join('\u0000') !== expectedAllowedUpdates.join('\u0000')) {
+    throw new Error(
+      `Reply listener telegramAllowedUpdates mismatch: expected ${expectedAllowedUpdates.join(',')}, got ${normalizedAllowedUpdates.join(',')}`,
+    );
+  }
+
+  return {
+    ackMode: diagnostics.ackMode,
+    telegramPollTimeoutSeconds: diagnostics.telegramPollTimeoutSeconds ?? expectations.telegramPollTimeoutSeconds,
+    telegramAllowedUpdates: [...diagnostics.telegramAllowedUpdates],
+    telegramStartupBacklogPolicy: diagnostics.telegramStartupBacklogPolicy ?? expectations.telegramStartupBacklogPolicy,
+    authorizedTelegramUserIdsConfigured: diagnostics.authorizedTelegramUserIdsConfigured,
+    activeSourceKeys: diagnostics.activeSources.map((source) => source.key),
+    secretStorage: diagnostics.secretStorage,
+  };
+}
+
 export async function runReplyListenerLiveSmoke(
   config: ReplyListenerLiveConfig,
   deps: ReplyListenerLiveSmokeDeps = {},
 ): Promise<ReplyListenerLiveSmokeResult> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const log = deps.log ?? console.log;
+  const readReplyListenerStatusImpl = deps.readReplyListenerStatusImpl ?? getReplyListenerStatus;
   const stamp = new Date().toISOString();
+  const replyListenerStatus = config.expectations
+    ? inspectReplyListenerStatusForLiveSmoke(config.expectations, { readReplyListenerStatusImpl })
+    : null;
 
   if (config.expectations) {
     log(
@@ -127,6 +199,10 @@ export async function runReplyListenerLiveSmoke(
       `allowed_updates=${config.expectations.telegramAllowedUpdates.join('|')}, ` +
       `backlog=${config.expectations.telegramStartupBacklogPolicy}, ` +
       `telegram_sender_allowlist=${config.expectations.authorizedTelegramUserIdsConfigured ? 'configured' : 'chat-only-fallback'}`
+    );
+    log(
+      `Reply listener status verified: sources=${replyListenerStatus?.activeSourceKeys.join(',') || 'none'}, ` +
+      `secrets=${replyListenerStatus?.secretStorage || 'unknown'}`,
     );
   }
 
@@ -211,7 +287,7 @@ export async function runReplyListenerLiveSmoke(
     log(`Telegram probe cleanup skipped for ${telegramMessageId}`);
   }
 
-  return { discordMessageId, telegramMessageId };
+  return { discordMessageId, telegramMessageId, replyListenerStatus };
 }
 
 export async function main(): Promise<void> {
@@ -229,6 +305,10 @@ export async function main(): Promise<void> {
   console.log('reply-listener live smoke: PASS');
   console.log(`discord_message_id=${result.discordMessageId}`);
   console.log(`telegram_message_id=${result.telegramMessageId}`);
+  if (result.replyListenerStatus) {
+    console.log(`reply_listener_sources=${result.replyListenerStatus.activeSourceKeys.join(',')}`);
+    console.log(`reply_listener_secrets=${result.replyListenerStatus.secretStorage}`);
+  }
 }
 
 const isMain = process.argv[1]

@@ -3,6 +3,10 @@ import assert from 'node:assert/strict';
 import { spawn, type spawnSync } from 'node:child_process';
 import type { ClientRequestArgs, IncomingMessage } from 'node:http';
 import { PassThrough } from 'node:stream';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import {
   RateLimiter,
   captureReplyAcknowledgementSummary,
@@ -64,6 +68,12 @@ function createBaseState(): ReplyListenerState {
 
 function cloneState(state: ReplyListenerState): ReplyListenerState {
   return JSON.parse(JSON.stringify(state)) as ReplyListenerState;
+}
+
+async function importReplyListenerFresh() {
+  const moduleUrl = new URL('../reply-listener.js', import.meta.url);
+  moduleUrl.searchParams.set('t', `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  return import(moduleUrl.href);
 }
 
 function createMapping(platform: SessionMapping['platform']): SessionMapping {
@@ -619,6 +629,350 @@ describe('startReplyListener', () => {
     assert.equal(persisted.discordLastMessageId, 'discord-message-91');
     assert.equal(persisted.sourceStates[telegramSource.key]?.telegramLastUpdateId, 91);
     assert.equal(persisted.sourceStates[discordSource.key]?.discordLastMessageId, 'discord-message-91');
+  });
+
+  it('narrows active source mirrors without discarding historical source state on refresh', () => {
+    const previousConfig = createBaseConfig();
+    const nextConfig = createBaseConfig({
+      telegramEnabled: false,
+      telegramBotToken: undefined,
+      telegramChatId: undefined,
+    });
+    const telegramSource = buildTelegramReplySource(
+      previousConfig.telegramBotToken!,
+      previousConfig.telegramChatId!,
+    );
+    const discordSource = buildDiscordReplySource(
+      previousConfig.discordBotToken!,
+      previousConfig.discordChannelId!,
+    );
+    const state: ReplyListenerState = {
+      ...createBaseState(),
+      telegramLastUpdateId: 55,
+      discordLastMessageId: 'discord-message-55',
+      sourceStates: {
+        [telegramSource.key]: {
+          sourceKey: telegramSource.key,
+          platform: 'telegram',
+          label: telegramSource.label,
+          telegramLastUpdateId: 55,
+          telegramStartupPolicyApplied: true,
+          lastPollAt: null,
+          lastIngestAt: null,
+          lastFailureAt: null,
+          lastFailureCategory: null,
+          lastFailureMessage: null,
+          failureCounts: {},
+        },
+        [discordSource.key]: {
+          sourceKey: discordSource.key,
+          platform: 'discord-bot',
+          label: discordSource.label,
+          discordLastMessageId: 'discord-message-55',
+          telegramStartupPolicyApplied: false,
+          lastPollAt: null,
+          lastIngestAt: null,
+          lastFailureAt: null,
+          lastFailureCategory: null,
+          lastFailureMessage: null,
+          failureCounts: {},
+        },
+      },
+    };
+
+    let writtenState: ReplyListenerState | null = null;
+    const response = startReplyListener(nextConfig, {
+      ensureStateDirImpl: () => {},
+      isDaemonRunningImpl: () => true,
+      readDaemonConfigImpl: () => previousConfig,
+      readDaemonStateImpl: () => state,
+      writeDaemonConfigImpl: () => {},
+      writeDaemonStateImpl: (nextState) => {
+        writtenState = cloneState(nextState);
+      },
+    });
+
+    assert.equal(response.success, true);
+    assert.ok(writtenState);
+    const persisted = writtenState as ReplyListenerState;
+    assert.equal(persisted.telegramLastUpdateId, null);
+    assert.equal(persisted.discordLastMessageId, 'discord-message-55');
+    assert.deepEqual(Object.keys(persisted.sourceStates).sort(), [discordSource.key, telegramSource.key].sort());
+    assert.equal(persisted.sourceStates[discordSource.key]?.discordLastMessageId, 'discord-message-55');
+    assert.equal(persisted.sourceStates[telegramSource.key]?.telegramLastUpdateId, 55);
+  });
+});
+
+describe('filesystem-backed daemon config persistence', () => {
+  it('avoids persisting fallback reply-listener secrets when canonical env config can re-derive them', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'omx-reply-listener-config-env-'));
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const originalDiscordToken = process.env.OMX_DISCORD_NOTIFIER_BOT_TOKEN;
+    const originalDiscordChannel = process.env.OMX_DISCORD_NOTIFIER_CHANNEL;
+    const originalTelegramToken = process.env.OMX_TELEGRAM_BOT_TOKEN;
+    const originalTelegramChatId = process.env.OMX_TELEGRAM_CHAT_ID;
+    const originalReplyEnabled = process.env.OMX_REPLY_ENABLED;
+
+    try {
+      process.env.HOME = homeDir;
+      process.env.USERPROFILE = homeDir;
+      process.env.OMX_DISCORD_NOTIFIER_BOT_TOKEN = 'discord-token';
+      process.env.OMX_DISCORD_NOTIFIER_CHANNEL = 'discord-channel';
+      process.env.OMX_TELEGRAM_BOT_TOKEN = '123456:telegram-token';
+      process.env.OMX_TELEGRAM_CHAT_ID = '777';
+      process.env.OMX_REPLY_ENABLED = 'true';
+
+      const mod = await importReplyListenerFresh();
+      const response = mod.startReplyListener(createBaseConfig(), {
+        ensureStateDirImpl: () => {},
+        isDaemonRunningImpl: () => false,
+        isTmuxAvailableImpl: () => true,
+        spawnImpl: (() => ({ pid: 43210, unref() {} })) as unknown as typeof import('node:child_process').spawn,
+        writePidFileImpl: () => {},
+        logImpl: () => {},
+      });
+
+      assert.equal(response.success, true);
+
+      const stateDir = join(homeDir, '.omx', 'state');
+      const publicConfig = JSON.parse(
+        await readFile(join(stateDir, 'reply-listener-config.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(publicConfig.telegramBotToken, undefined);
+      assert.equal(publicConfig.discordBotToken, undefined);
+      assert.equal(existsSync(join(stateDir, 'reply-listener-secrets.json')), false);
+    } finally {
+      if (typeof originalHome === 'string') process.env.HOME = originalHome;
+      else delete process.env.HOME;
+      if (typeof originalUserProfile === 'string') process.env.USERPROFILE = originalUserProfile;
+      else delete process.env.USERPROFILE;
+      if (typeof originalDiscordToken === 'string') process.env.OMX_DISCORD_NOTIFIER_BOT_TOKEN = originalDiscordToken;
+      else delete process.env.OMX_DISCORD_NOTIFIER_BOT_TOKEN;
+      if (typeof originalDiscordChannel === 'string') process.env.OMX_DISCORD_NOTIFIER_CHANNEL = originalDiscordChannel;
+      else delete process.env.OMX_DISCORD_NOTIFIER_CHANNEL;
+      if (typeof originalTelegramToken === 'string') process.env.OMX_TELEGRAM_BOT_TOKEN = originalTelegramToken;
+      else delete process.env.OMX_TELEGRAM_BOT_TOKEN;
+      if (typeof originalTelegramChatId === 'string') process.env.OMX_TELEGRAM_CHAT_ID = originalTelegramChatId;
+      else delete process.env.OMX_TELEGRAM_CHAT_ID;
+      if (typeof originalReplyEnabled === 'string') process.env.OMX_REPLY_ENABLED = originalReplyEnabled;
+      else delete process.env.OMX_REPLY_ENABLED;
+      await rm(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a fallback secret file when canonical config cannot re-derive the active bot tokens', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'omx-reply-listener-config-secret-'));
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const originalDiscordToken = process.env.OMX_DISCORD_NOTIFIER_BOT_TOKEN;
+    const originalDiscordChannel = process.env.OMX_DISCORD_NOTIFIER_CHANNEL;
+    const originalTelegramToken = process.env.OMX_TELEGRAM_BOT_TOKEN;
+    const originalTelegramChatId = process.env.OMX_TELEGRAM_CHAT_ID;
+    const originalReplyEnabled = process.env.OMX_REPLY_ENABLED;
+
+    try {
+      process.env.HOME = homeDir;
+      process.env.USERPROFILE = homeDir;
+      delete process.env.OMX_DISCORD_NOTIFIER_BOT_TOKEN;
+      delete process.env.OMX_DISCORD_NOTIFIER_CHANNEL;
+      delete process.env.OMX_TELEGRAM_BOT_TOKEN;
+      delete process.env.OMX_TELEGRAM_CHAT_ID;
+      process.env.OMX_REPLY_ENABLED = 'true';
+
+      const mod = await importReplyListenerFresh();
+      const response = mod.startReplyListener(createBaseConfig(), {
+        ensureStateDirImpl: () => {},
+        isDaemonRunningImpl: () => false,
+        isTmuxAvailableImpl: () => true,
+        spawnImpl: (() => ({ pid: 54321, unref() {} })) as unknown as typeof import('node:child_process').spawn,
+        writePidFileImpl: () => {},
+        logImpl: () => {},
+      });
+
+      assert.equal(response.success, true);
+
+      const stateDir = join(homeDir, '.omx', 'state');
+      const secretConfig = JSON.parse(
+        await readFile(join(stateDir, 'reply-listener-secrets.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(secretConfig.telegramBotToken, '123456:telegram-token');
+      assert.equal(secretConfig.discordBotToken, 'discord-token');
+    } finally {
+      if (typeof originalHome === 'string') process.env.HOME = originalHome;
+      else delete process.env.HOME;
+      if (typeof originalUserProfile === 'string') process.env.USERPROFILE = originalUserProfile;
+      else delete process.env.USERPROFILE;
+      if (typeof originalDiscordToken === 'string') process.env.OMX_DISCORD_NOTIFIER_BOT_TOKEN = originalDiscordToken;
+      else delete process.env.OMX_DISCORD_NOTIFIER_BOT_TOKEN;
+      if (typeof originalDiscordChannel === 'string') process.env.OMX_DISCORD_NOTIFIER_CHANNEL = originalDiscordChannel;
+      else delete process.env.OMX_DISCORD_NOTIFIER_CHANNEL;
+      if (typeof originalTelegramToken === 'string') process.env.OMX_TELEGRAM_BOT_TOKEN = originalTelegramToken;
+      else delete process.env.OMX_TELEGRAM_BOT_TOKEN;
+      if (typeof originalTelegramChatId === 'string') process.env.OMX_TELEGRAM_CHAT_ID = originalTelegramChatId;
+      else delete process.env.OMX_TELEGRAM_CHAT_ID;
+      if (typeof originalReplyEnabled === 'string') process.env.OMX_REPLY_ENABLED = originalReplyEnabled;
+      else delete process.env.OMX_REPLY_ENABLED;
+      await rm(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports source-aware diagnostics and secret storage mode in reply-listener status', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'omx-reply-listener-status-'));
+    const stateDir = join(homeDir, '.omx', 'state');
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const originalDiscordToken = process.env.OMX_DISCORD_NOTIFIER_BOT_TOKEN;
+    const originalDiscordChannel = process.env.OMX_DISCORD_NOTIFIER_CHANNEL;
+    const originalTelegramToken = process.env.OMX_TELEGRAM_BOT_TOKEN;
+    const originalTelegramChatId = process.env.OMX_TELEGRAM_CHAT_ID;
+    const originalReplyEnabled = process.env.OMX_REPLY_ENABLED;
+
+    try {
+      await mkdir(stateDir, { recursive: true });
+      process.env.HOME = homeDir;
+      process.env.USERPROFILE = homeDir;
+      process.env.OMX_DISCORD_NOTIFIER_BOT_TOKEN = 'discord-token';
+      process.env.OMX_DISCORD_NOTIFIER_CHANNEL = 'discord-channel';
+      process.env.OMX_TELEGRAM_BOT_TOKEN = '123456:telegram-token';
+      process.env.OMX_TELEGRAM_CHAT_ID = '777';
+      process.env.OMX_REPLY_ENABLED = 'true';
+
+      const telegramSource = buildTelegramReplySource('123456:telegram-token', '777');
+      const discordSource = buildDiscordReplySource('discord-token', 'discord-channel');
+      await writeFile(join(stateDir, 'reply-listener-config.json'), JSON.stringify({
+        ...createBaseConfig(),
+        telegramBotToken: undefined,
+        discordBotToken: undefined,
+      }, null, 2));
+      await writeFile(join(stateDir, 'reply-listener-state.json'), JSON.stringify({
+        ...createBaseState(),
+        isRunning: true,
+        pid: 98765,
+        telegramLastUpdateId: 77,
+        discordLastMessageId: 'discord-message-77',
+        sourceStates: {
+          [telegramSource.key]: {
+            sourceKey: telegramSource.key,
+            platform: 'telegram',
+            label: telegramSource.label,
+            telegramLastUpdateId: 77,
+            telegramStartupPolicyApplied: true,
+            lastPollAt: '2026-03-20T00:05:00.000Z',
+            lastIngestAt: '2026-03-20T00:05:05.000Z',
+            lastFailureAt: null,
+            lastFailureCategory: null,
+            lastFailureMessage: null,
+            failureCounts: {},
+          },
+          [discordSource.key]: {
+            sourceKey: discordSource.key,
+            platform: 'discord-bot',
+            label: discordSource.label,
+            discordLastMessageId: 'discord-message-77',
+            telegramStartupPolicyApplied: false,
+            lastPollAt: '2026-03-20T00:06:00.000Z',
+            lastIngestAt: '2026-03-20T00:06:05.000Z',
+            lastFailureAt: '2026-03-20T00:06:06.000Z',
+            lastFailureCategory: 'rate-limit',
+            lastFailureMessage: 'Deferred Discord message 77',
+            failureCounts: { 'rate-limit': 1 },
+          },
+        },
+      }, null, 2));
+
+      const mod = await importReplyListenerFresh();
+      const status = mod.getReplyListenerStatus();
+
+      assert.equal(status.success, true);
+      assert.equal(status.diagnostics?.ackMode, 'minimal');
+      assert.equal(status.diagnostics?.telegramPollTimeoutSeconds, 30);
+      assert.deepEqual(
+        status.diagnostics?.activeSources.map((source: { key: string }) => source.key).sort(),
+        [discordSource.key, telegramSource.key].sort(),
+      );
+      const telegramDiagnostics = status.diagnostics?.activeSources.find((source: { key: string }) => source.key === telegramSource.key);
+      const discordDiagnostics = status.diagnostics?.activeSources.find((source: { key: string }) => source.key === discordSource.key);
+      assert.equal(telegramDiagnostics?.cursor, 77);
+      assert.equal(discordDiagnostics?.cursor, 'discord-message-77');
+      assert.equal(discordDiagnostics?.lastFailureCategory, 'rate-limit');
+      assert.equal(status.diagnostics?.secretStorage, 'not-persisted');
+    } finally {
+      if (typeof originalHome === 'string') process.env.HOME = originalHome;
+      else delete process.env.HOME;
+      if (typeof originalUserProfile === 'string') process.env.USERPROFILE = originalUserProfile;
+      else delete process.env.USERPROFILE;
+      if (typeof originalDiscordToken === 'string') process.env.OMX_DISCORD_NOTIFIER_BOT_TOKEN = originalDiscordToken;
+      else delete process.env.OMX_DISCORD_NOTIFIER_BOT_TOKEN;
+      if (typeof originalDiscordChannel === 'string') process.env.OMX_DISCORD_NOTIFIER_CHANNEL = originalDiscordChannel;
+      else delete process.env.OMX_DISCORD_NOTIFIER_CHANNEL;
+      if (typeof originalTelegramToken === 'string') process.env.OMX_TELEGRAM_BOT_TOKEN = originalTelegramToken;
+      else delete process.env.OMX_TELEGRAM_BOT_TOKEN;
+      if (typeof originalTelegramChatId === 'string') process.env.OMX_TELEGRAM_CHAT_ID = originalTelegramChatId;
+      else delete process.env.OMX_TELEGRAM_CHAT_ID;
+      if (typeof originalReplyEnabled === 'string') process.env.OMX_REPLY_ENABLED = originalReplyEnabled;
+      else delete process.env.OMX_REPLY_ENABLED;
+      await rm(homeDir, { recursive: true, force: true });
+    }
+  });
+
+  it('writes machine-parseable JSON log lines for reply-listener lifecycle events', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'omx-reply-listener-log-json-'));
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const originalDiscordToken = process.env.OMX_DISCORD_NOTIFIER_BOT_TOKEN;
+    const originalDiscordChannel = process.env.OMX_DISCORD_NOTIFIER_CHANNEL;
+    const originalTelegramToken = process.env.OMX_TELEGRAM_BOT_TOKEN;
+    const originalTelegramChatId = process.env.OMX_TELEGRAM_CHAT_ID;
+    const originalReplyEnabled = process.env.OMX_REPLY_ENABLED;
+
+    try {
+      process.env.HOME = homeDir;
+      process.env.USERPROFILE = homeDir;
+      process.env.OMX_DISCORD_NOTIFIER_BOT_TOKEN = 'discord-token';
+      process.env.OMX_DISCORD_NOTIFIER_CHANNEL = 'discord-channel';
+      process.env.OMX_TELEGRAM_BOT_TOKEN = '123456:telegram-token';
+      process.env.OMX_TELEGRAM_CHAT_ID = '777';
+      process.env.OMX_REPLY_ENABLED = 'true';
+
+      const mod = await importReplyListenerFresh();
+      const response = mod.startReplyListener(createBaseConfig(), {
+        ensureStateDirImpl: () => {},
+        isDaemonRunningImpl: () => false,
+        isTmuxAvailableImpl: () => true,
+        spawnImpl: (() => ({ pid: 65432, unref() {} })) as unknown as typeof import('node:child_process').spawn,
+        writePidFileImpl: () => {},
+      });
+
+      assert.equal(response.success, true);
+      const logLines = (await readFile(join(homeDir, '.omx', 'state', 'reply-listener.log'), 'utf-8'))
+        .trim()
+        .split('\n')
+        .filter((line) => line.length > 0);
+      assert.ok(logLines.length >= 1);
+
+      const first = JSON.parse(logLines[0]) as Record<string, unknown>;
+      assert.equal(first.scope, 'reply-listener');
+      assert.equal(first.level, 'INFO');
+      assert.equal(typeof first.timestamp, 'string');
+      assert.match(String(first.message), /Reply listener daemon started/i);
+    } finally {
+      if (typeof originalHome === 'string') process.env.HOME = originalHome;
+      else delete process.env.HOME;
+      if (typeof originalUserProfile === 'string') process.env.USERPROFILE = originalUserProfile;
+      else delete process.env.USERPROFILE;
+      if (typeof originalDiscordToken === 'string') process.env.OMX_DISCORD_NOTIFIER_BOT_TOKEN = originalDiscordToken;
+      else delete process.env.OMX_DISCORD_NOTIFIER_BOT_TOKEN;
+      if (typeof originalDiscordChannel === 'string') process.env.OMX_DISCORD_NOTIFIER_CHANNEL = originalDiscordChannel;
+      else delete process.env.OMX_DISCORD_NOTIFIER_CHANNEL;
+      if (typeof originalTelegramToken === 'string') process.env.OMX_TELEGRAM_BOT_TOKEN = originalTelegramToken;
+      else delete process.env.OMX_TELEGRAM_BOT_TOKEN;
+      if (typeof originalTelegramChatId === 'string') process.env.OMX_TELEGRAM_CHAT_ID = originalTelegramChatId;
+      else delete process.env.OMX_TELEGRAM_CHAT_ID;
+      if (typeof originalReplyEnabled === 'string') process.env.OMX_REPLY_ENABLED = originalReplyEnabled;
+      else delete process.env.OMX_REPLY_ENABLED;
+      await rm(homeDir, { recursive: true, force: true });
+    }
   });
 });
 

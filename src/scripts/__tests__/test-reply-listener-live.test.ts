@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  inspectReplyListenerStatusForLiveSmoke,
   resolveReplyListenerLiveEnv,
   runReplyListenerLiveSmoke,
 } from '../test-reply-listener-live.js';
@@ -119,6 +120,48 @@ test('runReplyListenerLiveSmoke exercises Discord and Telegram send + cleanup re
     },
     {
       fetchImpl,
+      readReplyListenerStatusImpl: () => ({
+        success: true,
+        message: 'Reply listener daemon is running (2 active sources)',
+        diagnostics: {
+          ackMode: 'minimal',
+          pollIntervalMs: 3000,
+          rateLimitPerMinute: 10,
+          includePrefix: true,
+          telegramPollTimeoutSeconds: 30,
+          telegramAllowedUpdates: ['message'],
+          telegramStartupBacklogPolicy: 'resume',
+          authorizedDiscordUsersConfigured: true,
+          authorizedTelegramUserIdsConfigured: false,
+          secretStorage: 'not-persisted',
+          activeSources: [
+            {
+              key: 'discord-bot:discord-channel:fingerprint',
+              platform: 'discord-bot',
+              label: 'discord-bot:discord-channel',
+              cursor: 'discord-message-77',
+              lastPollAt: '2026-03-20T00:05:00.000Z',
+              lastIngestAt: '2026-03-20T00:05:01.000Z',
+              lastFailureAt: null,
+              lastFailureCategory: null,
+              lastFailureMessage: null,
+              failureCounts: {},
+            },
+            {
+              key: 'telegram:123456:777',
+              platform: 'telegram',
+              label: 'telegram:777',
+              cursor: 77,
+              lastPollAt: '2026-03-20T00:06:00.000Z',
+              lastIngestAt: '2026-03-20T00:06:01.000Z',
+              lastFailureAt: null,
+              lastFailureCategory: null,
+              lastFailureMessage: null,
+              failureCounts: {},
+            },
+          ],
+        },
+      }),
       log: (message) => logs.push(message),
     },
   );
@@ -126,9 +169,119 @@ test('runReplyListenerLiveSmoke exercises Discord and Telegram send + cleanup re
   assert.deepEqual(result, {
     discordMessageId: 'discord-message-1',
     telegramMessageId: '42',
+    replyListenerStatus: {
+      ackMode: 'minimal',
+      telegramPollTimeoutSeconds: 30,
+      telegramAllowedUpdates: ['message'],
+      telegramStartupBacklogPolicy: 'resume',
+      authorizedTelegramUserIdsConfigured: false,
+      activeSourceKeys: ['discord-bot:discord-channel:fingerprint', 'telegram:123456:777'],
+      secretStorage: 'not-persisted',
+    },
   });
   assert.equal(calls.length, 4);
   assert.ok(logs.some((entry) => entry.includes('Reply listener expectations: ack=minimal')));
   assert.ok(logs.some((entry) => entry.includes('Discord probe message sent: discord-message-1')));
   assert.ok(logs.some((entry) => entry.includes('Telegram probe message sent: 42')));
+  assert.ok(logs.some((entry) => entry.includes('Reply listener status verified: sources=discord-bot:discord-channel:fingerprint,telegram:123456:777')));
+});
+
+test('inspectReplyListenerStatusForLiveSmoke validates live reply-listener expectations against source-aware diagnostics', () => {
+  const result = inspectReplyListenerStatusForLiveSmoke(
+    {
+      ackMode: 'summary',
+      telegramPollTimeoutSeconds: 45,
+      telegramAllowedUpdates: ['message', 'edited_message'],
+      telegramStartupBacklogPolicy: 'drop_pending',
+      authorizedTelegramUserIdsConfigured: true,
+    },
+    {
+      readReplyListenerStatusImpl: () => ({
+        success: true,
+        message: 'Reply listener daemon is running (2 active sources)',
+        diagnostics: {
+          ackMode: 'summary',
+          pollIntervalMs: 3000,
+          rateLimitPerMinute: 10,
+          includePrefix: true,
+          telegramPollTimeoutSeconds: 45,
+          telegramAllowedUpdates: ['message', 'edited_message'],
+          telegramStartupBacklogPolicy: 'drop_pending',
+          authorizedDiscordUsersConfigured: true,
+          authorizedTelegramUserIdsConfigured: true,
+          secretStorage: 'fallback-secret-file',
+          activeSources: [
+            {
+              key: 'discord-bot:discord-channel:fingerprint',
+              platform: 'discord-bot',
+              label: 'discord-bot:discord-channel',
+              cursor: 'discord-message-91',
+              lastPollAt: null,
+              lastIngestAt: null,
+              lastFailureAt: null,
+              lastFailureCategory: null,
+              lastFailureMessage: null,
+              failureCounts: {},
+            },
+            {
+              key: 'telegram:123456:777',
+              platform: 'telegram',
+              label: 'telegram:777',
+              cursor: 91,
+              lastPollAt: null,
+              lastIngestAt: null,
+              lastFailureAt: null,
+              lastFailureCategory: null,
+              lastFailureMessage: null,
+              failureCounts: {},
+            },
+          ],
+        },
+      }),
+    },
+  );
+
+  assert.deepEqual(result, {
+    ackMode: 'summary',
+    telegramPollTimeoutSeconds: 45,
+    telegramAllowedUpdates: ['message', 'edited_message'],
+    telegramStartupBacklogPolicy: 'drop_pending',
+    authorizedTelegramUserIdsConfigured: true,
+    activeSourceKeys: ['discord-bot:discord-channel:fingerprint', 'telegram:123456:777'],
+    secretStorage: 'fallback-secret-file',
+  });
+});
+
+test('inspectReplyListenerStatusForLiveSmoke fails when the running daemon diverges from the expected long-poll config', () => {
+  assert.throws(
+    () => inspectReplyListenerStatusForLiveSmoke(
+      {
+        ackMode: 'minimal',
+        telegramPollTimeoutSeconds: 30,
+        telegramAllowedUpdates: ['message'],
+        telegramStartupBacklogPolicy: 'resume',
+        authorizedTelegramUserIdsConfigured: false,
+      },
+      {
+        readReplyListenerStatusImpl: () => ({
+          success: true,
+          message: 'Reply listener daemon is running',
+          diagnostics: {
+            ackMode: 'summary',
+            pollIntervalMs: 3000,
+            rateLimitPerMinute: 10,
+            includePrefix: true,
+            telegramPollTimeoutSeconds: 45,
+            telegramAllowedUpdates: ['message', 'edited_message'],
+            telegramStartupBacklogPolicy: 'drop_pending',
+            authorizedDiscordUsersConfigured: true,
+            authorizedTelegramUserIdsConfigured: true,
+            secretStorage: 'fallback-secret-file',
+            activeSources: [],
+          },
+        }),
+      },
+    ),
+    /reply listener ackMode mismatch/i,
+  );
 });

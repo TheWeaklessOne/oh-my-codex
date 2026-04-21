@@ -277,6 +277,9 @@ If you enable inbound notification replies, OMX now keeps Telegram on polling-on
   - `drop_pending` performs a retry-safe startup sweep that discards the current pending backlog once the discard fetch succeeds.
   - `replay_once` performs one non-blocking startup sweep of the current backlog, replays those pending updates once, then switches back to normal long polling.
 - `telegramPollTimeoutSeconds` controls Bot API long polling. Webhooks are intentionally out of scope for the local OMX reply listener.
+- `omx status` now includes reply-listener source diagnostics when the daemon has been started, including active source keys, last-ingest cursors, and the latest failure category per source.
+- Reply-listener source diagnostics are filtered to the currently active sources, while historical source state remains available internally for compatibility-safe resume/reconciliation.
+- Reply-listener secrets are only duplicated into the fallback secret file when OMX cannot re-derive the active transport tokens from the canonical notification config or environment.
 
 
 ### Troubleshooting false-green readiness
