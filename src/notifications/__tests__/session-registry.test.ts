@@ -79,6 +79,19 @@ describe('SessionMapping shape', () => {
     assert.equal(mapping.source?.platform, 'telegram');
     assert.ok(mapping.source?.key.includes('telegram:123456:777'));
   });
+
+  it('supports optional projectKey and messageThreadId metadata for topic-aware correlation', () => {
+    const mapping = createMockMapping({
+      platform: 'telegram',
+      projectKey: 'project-key-1',
+      messageThreadId: '9001',
+      topicName: 'project-a',
+    });
+
+    assert.equal(mapping.projectKey, 'project-key-1');
+    assert.equal(mapping.messageThreadId, '9001');
+    assert.equal(mapping.topicName, 'project-a');
+  });
 });
 
 describe('JSONL format', () => {

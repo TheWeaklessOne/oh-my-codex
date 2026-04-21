@@ -20,6 +20,8 @@ export type {
   DiscordNotificationConfig,
   DiscordBotNotificationConfig,
   TelegramNotificationConfig,
+  TelegramProjectTopicsConfig,
+  TelegramProjectTopicNaming,
   SlackNotificationConfig,
   WebhookNotificationConfig,
   EventNotificationConfig,
@@ -37,6 +39,27 @@ export {
   sendSlack,
   sendWebhook,
 } from "./dispatcher.js";
+export {
+  buildProjectTopicName,
+  coerceTelegramMessageThreadId,
+  createForumTopic,
+  ensureProjectTopic,
+  normalizeTelegramProjectIdentity,
+  performTelegramBotApiRequest,
+  resolveTelegramDestination,
+  TelegramBotApiError,
+} from "./telegram-topics.js";
+export {
+  buildTelegramTopicRegistryKey,
+  getTelegramTopicRegistryPath,
+  getTelegramTopicRegistryRecord,
+  listTelegramTopicRegistryRecords,
+  touchTelegramTopicRegistryRecord,
+  updateTelegramTopicRegistryRecord,
+  upsertTelegramTopicRegistryRecord,
+  withTelegramTopicProjectLock,
+} from "./telegram-topic-registry.js";
+export type { TelegramTopicRegistryRecord } from "./telegram-topic-registry.js";
 export {
   formatNotification,
   formatSessionStart,
@@ -444,6 +467,9 @@ export async function notifyLifecycle(
               event: payload.event,
               createdAt: new Date().toISOString(),
               projectPath: payload.projectPath,
+              projectKey: r.projectKey,
+              messageThreadId: r.messageThreadId,
+              topicName: r.topicName,
             });
           }
         }

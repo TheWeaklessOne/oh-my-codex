@@ -56,6 +56,22 @@ export interface DiscordBotNotificationConfig {
 }
 
 /** Telegram platform configuration */
+export type TelegramProjectTopicNaming = "projectName" | "projectNameWithHash";
+
+export interface TelegramProjectTopicsConfig {
+  enabled: boolean;
+  /** Automatically create missing forum topics on first send (default: true) */
+  autoCreate?: boolean;
+  /** Fall back to the root/general chat when topic routing is unavailable (default: true) */
+  fallbackToGeneral?: boolean;
+  /** Visible topic naming policy (default: projectName) */
+  naming?: TelegramProjectTopicNaming;
+  /** Optional Bot API forum topic icon color */
+  iconColor?: number;
+  /** Cooldown before retrying a failed topic creation (default: 300000 / 5 min) */
+  createFailureCooldownMs?: number;
+}
+
 export interface TelegramNotificationConfig {
   enabled: boolean;
   /** Telegram bot token */
@@ -64,6 +80,8 @@ export interface TelegramNotificationConfig {
   chatId: string;
   /** Parse mode: Markdown or HTML (default: Markdown) */
   parseMode?: "Markdown" | "HTML";
+  /** Optional per-project Telegram topic routing policy */
+  projectTopics?: TelegramProjectTopicsConfig;
 }
 
 /** Slack platform configuration */
@@ -210,6 +228,9 @@ export interface NotificationResult {
   success: boolean;
   error?: string;
   messageId?: string;
+  messageThreadId?: string;
+  projectKey?: string;
+  topicName?: string;
 }
 
 /** Result of dispatching notifications for an event */

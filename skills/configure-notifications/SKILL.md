@@ -83,6 +83,37 @@ Collect and validate platform-specific values, then write directly under native 
 
 Do not write these as generic command/webhook aliases.
 
+### Telegram forum topics per project
+
+If the user wants Telegram notifications separated by project inside one chat, configure the nested Telegram forum-topic block instead of inventing a custom routing layer:
+
+```json
+{
+  "notifications": {
+    "telegram": {
+      "enabled": true,
+      "botToken": "env-or-config-token",
+      "chatId": "-1001234567890",
+      "projectTopics": {
+        "enabled": true,
+        "autoCreate": true,
+        "fallbackToGeneral": true,
+        "naming": "projectName",
+        "iconColor": 7322096,
+        "createFailureCooldownMs": 300000
+      }
+    }
+  }
+}
+```
+
+Operator notes:
+
+- This requires a **forum-enabled supergroup**.
+- The bot must have permission to post, and lazy auto-create also requires Telegram admin rights with **`can_manage_topics`**.
+- Keep this mode opt-in. When `projectTopics.enabled` is absent/false, Telegram must keep the legacy single-chat behavior.
+- `fallbackToGeneral=true` means OMX should keep sending to the root/general chat if topic creation fails; topic creation is lazy and happens on first send from a new project.
+
 ## Step 4: Configure Generic Extensibility
 
 ### 4a) `custom_webhook_command`

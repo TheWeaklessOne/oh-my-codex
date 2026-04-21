@@ -192,6 +192,7 @@ describe('buildConfigFromEnv', () => {
       botToken: '123:abc',
       chatId: '999',
     });
+    assert.equal(config.telegram?.projectTopics, undefined);
   });
 
   it('builds slack config from env var', () => {
@@ -303,6 +304,11 @@ describe('getReplyListenerPlatformConfig', () => {
         enabled: true,
         botToken: 'tg-token',
         chatId: 'tg-chat',
+        projectTopics: {
+          enabled: true,
+          autoCreate: true,
+          fallbackToGeneral: true,
+        },
       },
       'discord-bot': {
         enabled: false,

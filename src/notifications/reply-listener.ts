@@ -31,6 +31,7 @@ import {
   removeMessagesByPane,
   pruneStale,
 } from './session-registry.js';
+import { coerceTelegramMessageThreadId } from './telegram-topics.js';
 import {
   buildDiscordReplySource,
   buildTelegramReplySource,
@@ -202,10 +203,14 @@ type TelegramUpdate = {
   update_id?: number;
   message?: {
     message_id?: number;
+    message_thread_id?: number | string;
     chat?: { id?: number | string; type?: string };
     from?: { id?: number | string };
     text?: string;
-    reply_to_message?: { message_id?: number | string };
+    reply_to_message?: {
+      message_id?: number | string;
+      message_thread_id?: number | string;
+    };
   };
 };
 
@@ -1522,26 +1527,35 @@ async function sendTelegramReplyMessage(
 async function sendTelegramTextReply(
   config: ReplyListenerDaemonConfig,
   httpsRequestImpl: typeof httpsRequest,
-  replyToMessageId: number | string | undefined,
+  target: {
+    replyToMessageId?: number | string;
+    messageThreadId?: number | string;
+  },
   text: string,
 ): Promise<void> {
   await sendTelegramReplyMessage(config, httpsRequestImpl, {
     chat_id: config.telegramChatId,
     text,
-    reply_to_message_id: replyToMessageId,
+    reply_to_message_id: target.replyToMessageId,
+    ...(target.messageThreadId !== undefined
+      ? { message_thread_id: coerceTelegramMessageThreadId(target.messageThreadId) }
+      : {}),
   });
 }
 
 async function trySendTelegramTextReply(
   config: ReplyListenerDaemonConfig,
   httpsRequestImpl: typeof httpsRequest,
-  replyToMessageId: number | string | undefined,
+  target: {
+    replyToMessageId?: number | string;
+    messageThreadId?: number | string;
+  },
   text: string,
   logImpl: typeof log,
   context: string,
 ): Promise<boolean> {
   try {
-    await sendTelegramTextReply(config, httpsRequestImpl, replyToMessageId, text);
+    await sendTelegramTextReply(config, httpsRequestImpl, target, text);
     return true;
   } catch (error) {
     logImpl(`WARN: Failed to send Telegram reply (${context}): ${error}`);
@@ -1651,6 +1665,7 @@ export async function pollTelegramOnce(
         continue;
       }
       const msg = update.message;
+      const inboundThreadId = msg?.message_thread_id;
       const text = msg?.text || '';
       const isStatusCommand = isDiscordStatusCommand(text);
       if (!msg) {
@@ -1669,7 +1684,10 @@ export async function pollTelegramOnce(
           await trySendTelegramTextReply(
             config,
             httpsRequestImpl,
-            msg.message_id,
+            {
+              replyToMessageId: msg.message_id,
+              messageThreadId: inboundThreadId,
+            },
             TELEGRAM_REPLY_USAGE_MESSAGE,
             logImpl,
             'usage',
@@ -1683,7 +1701,10 @@ export async function pollTelegramOnce(
         await trySendTelegramTextReply(
           config,
           httpsRequestImpl,
-          msg.message_id,
+          {
+            replyToMessageId: msg.message_id,
+            messageThreadId: inboundThreadId,
+          },
           TELEGRAM_UNAUTHORIZED_REPLY_MESSAGE,
           logImpl,
           'unauthorized',
@@ -1697,7 +1718,10 @@ export async function pollTelegramOnce(
         await trySendTelegramTextReply(
           config,
           httpsRequestImpl,
-          msg.message_id,
+          {
+            replyToMessageId: msg.message_id,
+            messageThreadId: inboundThreadId,
+          },
           NO_TRACKED_SESSION_MESSAGE,
           logImpl,
           'untracked',
@@ -1710,7 +1734,10 @@ export async function pollTelegramOnce(
         await trySendTelegramTextReply(
           config,
           httpsRequestImpl,
-          msg.message_id,
+          {
+            replyToMessageId: msg.message_id,
+            messageThreadId: inboundThreadId ?? mapping.messageThreadId,
+          },
           TELEGRAM_REPLY_USAGE_MESSAGE,
           logImpl,
           'missing-text',
@@ -1724,7 +1751,10 @@ export async function pollTelegramOnce(
         await trySendTelegramTextReply(
           config,
           httpsRequestImpl,
-          msg.message_id,
+          {
+            replyToMessageId: msg.message_id,
+            messageThreadId: inboundThreadId ?? mapping.messageThreadId,
+          },
           statusMessage,
           logImpl,
           'status',
@@ -1763,7 +1793,10 @@ export async function pollTelegramOnce(
           await trySendTelegramTextReply(
             config,
             httpsRequestImpl,
-            msg.message_id,
+            {
+              replyToMessageId: msg.message_id,
+              messageThreadId: inboundThreadId ?? mapping.messageThreadId,
+            },
             acknowledgement,
             logImpl,
             'acknowledgement',
@@ -1773,7 +1806,10 @@ export async function pollTelegramOnce(
         await trySendTelegramTextReply(
           config,
           httpsRequestImpl,
-          msg.message_id,
+          {
+            replyToMessageId: msg.message_id,
+            messageThreadId: inboundThreadId ?? mapping.messageThreadId,
+          },
           injectionResult.reason || 'The target OMX pane is no longer available for replies.',
           logImpl,
           'terminal-ignore',

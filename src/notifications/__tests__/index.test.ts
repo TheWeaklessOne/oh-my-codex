@@ -437,6 +437,14 @@ describe('notifications public exports', () => {
     const mod = await import(`../index.js?reply-listener-export=${Date.now()}`);
     assert.equal(typeof mod.lookupBySourceMessage, 'function');
   });
+
+  it('re-exports Telegram topic routing helpers', async () => {
+    const mod = await import(`../index.js?telegram-topic-export=${Date.now()}`);
+    assert.equal(typeof mod.resolveTelegramDestination, 'function');
+    assert.equal(typeof mod.ensureProjectTopic, 'function');
+    assert.equal(typeof mod.buildProjectTopicName, 'function');
+    assert.equal(typeof mod.getTelegramTopicRegistryRecord, 'function');
+  });
 });
 
 describe('notifyLifecycle reply listener sync', () => {

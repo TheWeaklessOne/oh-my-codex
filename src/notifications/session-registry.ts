@@ -56,6 +56,9 @@ export interface SessionMapping {
   event: string;
   createdAt: string;
   projectPath?: string;
+  projectKey?: string;
+  messageThreadId?: string;
+  topicName?: string;
 }
 
 function ensureRegistryDir(): void {

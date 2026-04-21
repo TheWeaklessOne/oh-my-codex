@@ -243,6 +243,47 @@ If you want Telegram to receive only meaningful turn results and real input requ
 
 `omx --telegram` now narrows the active transport for that run while preserving the configured notification policy/profile.
 
+### Telegram project-per-topic routing
+
+OMX can optionally route different projects into different Telegram forum topics inside the same supergroup chat. This mode is **strictly opt-in** and preserves the old single-chat behavior unless you enable `notifications.telegram.projectTopics.enabled`.
+
+Prerequisites:
+
+- the target Telegram chat must be a **forum-enabled supergroup**
+- the bot must be able to post messages in that chat
+- for lazy topic creation, the bot must be an admin with **`can_manage_topics`**
+
+```json
+{
+  "notifications": {
+    "enabled": true,
+    "telegram": {
+      "enabled": true,
+      "botToken": "env-or-config-token",
+      "chatId": "-1001234567890",
+      "projectTopics": {
+        "enabled": true,
+        "autoCreate": true,
+        "fallbackToGeneral": true,
+        "naming": "projectName",
+        "iconColor": 7322096,
+        "createFailureCooldownMs": 300000
+      }
+    }
+  }
+}
+```
+
+Behavior summary:
+
+- OMX computes stable project identity from the **canonical project path**, not only from the basename/project name.
+- On the first notification from a project, OMX lazily creates a forum topic with `createForumTopic`, stores the resulting `message_thread_id`, and immediately sends the notification into that topic in the same dispatch flow.
+- Later notifications from the same project reuse the stored `message_thread_id`.
+- Projects with the same visible name do not collide: OMX keeps the routing key path-based and adds a short hash suffix to topic names when needed.
+- If topic creation fails and `fallbackToGeneral` is enabled, OMX logs a warning and sends the message to the root/general chat instead of failing the notify pipeline.
+- Deterministic forum/permissions failures are cooled down before OMX retries topic creation again.
+- Telegram reply listener polling stays **chat-scoped**, but OMX sends usage / unauthorized / status / acknowledgement replies back into the same topic when thread metadata is available.
+
 ### Reply listener hardening knobs
 
 If you enable inbound notification replies, OMX now keeps Telegram on polling-only local delivery and hardens the intake path with long polling, sender allowlists, privacy-safe acknowledgements, and deterministic backlog handling.

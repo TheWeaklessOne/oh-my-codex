@@ -1,5 +1,7 @@
 import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
+import type { ClientRequestArgs, IncomingMessage } from 'node:http';
+import { PassThrough } from 'node:stream';
 import type {
   DiscordNotificationConfig,
   DiscordBotNotificationConfig,
@@ -12,7 +14,9 @@ import type {
 import {
   sendDiscord,
   sendDiscordBot,
+  getEffectivePlatformConfig,
   sendSlack,
+  sendTelegram,
   sendWebhook,
   dispatchNotifications,
 } from '../dispatcher.js';
@@ -25,6 +29,66 @@ const basePayload: FullNotificationPayload = {
   projectPath: '/home/user/project',
   projectName: 'project',
 };
+
+type HttpsRouteHandler = (body: string, options: ClientRequestArgs) => {
+  statusCode: number;
+  body?: unknown;
+};
+
+function createHttpsRequestMock(
+  routes: Record<string, HttpsRouteHandler>,
+): typeof import('node:https').request {
+  return ((options: ClientRequestArgs, callback?: (res: IncomingMessage) => void) => {
+    const listeners = new Map<string, Array<(value?: unknown) => void>>();
+    let requestBody = '';
+
+    const emit = (event: string, value?: unknown) => {
+      for (const handler of listeners.get(event) ?? []) {
+        handler(value);
+      }
+    };
+
+    const request = {
+      on(event: string, handler: (value?: unknown) => void) {
+        listeners.set(event, [...(listeners.get(event) ?? []), handler]);
+        return request;
+      },
+      write(chunk: string | Buffer) {
+        requestBody += Buffer.isBuffer(chunk) ? chunk.toString('utf-8') : chunk;
+        return true;
+      },
+      end() {
+        queueMicrotask(() => {
+          try {
+            const key = `${options.method ?? 'GET'} ${options.path ?? ''}`;
+            const route = routes[key];
+            assert.ok(route, `Unexpected https request: ${key}`);
+            const result = route(requestBody, options);
+            const response = new PassThrough() as PassThrough & IncomingMessage;
+            (response as { statusCode?: number }).statusCode = result.statusCode;
+            callback?.(response);
+            if (result.body !== undefined) {
+              response.write(
+                typeof result.body === 'string'
+                  ? result.body
+                  : JSON.stringify(result.body),
+              );
+            }
+            response.end();
+          } catch (error) {
+            emit('error', error);
+          }
+        });
+        return request;
+      },
+      destroy() {
+        return request;
+      },
+    };
+
+    return request;
+  }) as typeof import('node:https').request;
+}
 
 // ---------------------------------------------------------------------------
 // sendDiscord
@@ -107,6 +171,161 @@ describe('sendDiscordBot', () => {
     const result = await sendDiscordBot(config, basePayload);
     assert.equal(result.success, false);
     assert.ok(result.error?.includes('Missing botToken or channelId'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sendTelegram
+// ---------------------------------------------------------------------------
+
+describe('sendTelegram', () => {
+  it('passes message_thread_id and returns topic metadata when the resolver selects a project topic', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true },
+    };
+    let requestBody = '';
+
+    const result = await sendTelegram(
+      config,
+      basePayload,
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+          messageThreadId: '9001',
+          projectKey: 'project-key-1',
+          topicName: 'project-a',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+            requestBody = body;
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: 321,
+                  message_thread_id: 9001,
+                },
+              },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(result.messageId, '321');
+    assert.equal(result.messageThreadId, '9001');
+    assert.equal(result.projectKey, 'project-key-1');
+    assert.equal(result.topicName, 'project-a');
+
+    const parsedBody = JSON.parse(requestBody) as {
+      chat_id: string;
+      text: string;
+      parse_mode: string;
+      message_thread_id: number;
+    };
+    assert.equal(parsedBody.chat_id, '777');
+    assert.equal(parsedBody.text, basePayload.message);
+    assert.equal(parsedBody.parse_mode, 'Markdown');
+    assert.equal(parsedBody.message_thread_id, 9001);
+  });
+
+  it('sends to the root chat without a thread id when topic routing falls back', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true },
+    };
+    let requestBody = '';
+
+    const result = await sendTelegram(
+      config,
+      basePayload,
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+          projectKey: 'project-key-1',
+          usedFallback: true,
+          warningCode: 'forum-unavailable',
+          warningMessage: 'Forum topics are unavailable.',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+            requestBody = body;
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: 654,
+                },
+              },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(result.messageId, '654');
+    assert.equal(result.messageThreadId, undefined);
+
+    const parsedBody = JSON.parse(requestBody) as {
+      chat_id: string;
+      message_thread_id?: number;
+    };
+    assert.equal(parsedBody.chat_id, '777');
+    assert.equal(parsedBody.message_thread_id, undefined);
+  });
+
+  it('returns a bounded failure when topic routing cannot fall back', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true, fallbackToGeneral: false },
+    };
+    let httpsCalled = false;
+
+    const result = await sendTelegram(
+      config,
+      basePayload,
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+          projectKey: 'project-key-1',
+          skipSend: true,
+          warningCode: 'topic-create-cooldown',
+          warningMessage: 'Topic creation is cooling down.',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: () => {
+            httpsCalled = true;
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: 1,
+                },
+              },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(result.error, 'Topic creation is cooling down.');
+    assert.equal(httpsCalled, false);
   });
 });
 
@@ -237,5 +456,96 @@ describe('dispatchNotifications', () => {
     const result = await dispatchNotifications(config, 'session-start', basePayload);
     assert.ok(result.results.length > 0);
     assert.equal(result.results[0].platform, 'discord');
+  });
+});
+
+describe('getEffectivePlatformConfig', () => {
+  it('merges event-level Telegram overrides with top-level projectTopics config', () => {
+    const merged = getEffectivePlatformConfig<TelegramNotificationConfig>(
+      'telegram',
+      {
+        enabled: true,
+        telegram: {
+          enabled: true,
+          botToken: 'top-token',
+          chatId: 'top-chat',
+          parseMode: 'Markdown',
+          projectTopics: {
+            enabled: true,
+            autoCreate: true,
+            fallbackToGeneral: false,
+          },
+        },
+        events: {
+          'session-end': {
+            enabled: true,
+            telegram: {
+              enabled: true,
+              botToken: 'event-token',
+              chatId: 'event-chat',
+            },
+          },
+        },
+      },
+      'session-end',
+    );
+
+    assert.ok(merged);
+    assert.equal(merged?.botToken, 'event-token');
+    assert.equal(merged?.chatId, 'event-chat');
+    assert.equal(merged?.parseMode, 'Markdown');
+    assert.deepEqual(merged?.projectTopics, {
+      enabled: true,
+      autoCreate: true,
+      fallbackToGeneral: false,
+    });
+  });
+
+  it('deep-merges nested event-level Telegram projectTopics overrides', () => {
+    const merged = getEffectivePlatformConfig<TelegramNotificationConfig>(
+      'telegram',
+      {
+        enabled: true,
+        telegram: {
+          enabled: true,
+          botToken: 'top-token',
+          chatId: 'top-chat',
+          projectTopics: {
+            enabled: true,
+            autoCreate: true,
+            fallbackToGeneral: true,
+            naming: 'projectName',
+            createFailureCooldownMs: 60_000,
+          },
+        },
+        events: {
+          'session-end': {
+            enabled: true,
+            telegram: {
+              enabled: true,
+              botToken: 'event-token',
+              chatId: 'event-chat',
+              projectTopics: {
+                enabled: true,
+                fallbackToGeneral: false,
+                naming: 'projectNameWithHash',
+              },
+            },
+          },
+        },
+      },
+      'session-end',
+    );
+
+    assert.ok(merged);
+    assert.equal(merged?.botToken, 'event-token');
+    assert.equal(merged?.chatId, 'event-chat');
+    assert.deepEqual(merged?.projectTopics, {
+      enabled: true,
+      autoCreate: true,
+      fallbackToGeneral: false,
+      naming: 'projectNameWithHash',
+      createFailureCooldownMs: 60_000,
+    });
   });
 });

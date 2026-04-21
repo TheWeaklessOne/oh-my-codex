@@ -89,6 +89,9 @@ function createMapping(platform: SessionMapping['platform']): SessionMapping {
     event: 'session-idle',
     createdAt: '2026-03-20T00:00:00.000Z',
     projectPath: '/tmp/project',
+    projectKey: platform === 'telegram' ? 'project-key-1' : undefined,
+    messageThreadId: platform === 'telegram' ? '9001' : undefined,
+    topicName: platform === 'telegram' ? 'project-a' : undefined,
   };
 }
 
@@ -1537,6 +1540,7 @@ describe('pollTelegramOnce', () => {
                   update_id: 44,
                   message: {
                     message_id: 333,
+                    message_thread_id: 9001,
                     chat: { id: 777 },
                     from: { id: 'telegram-user-1' },
                     text: 'continue',
@@ -1574,9 +1578,11 @@ describe('pollTelegramOnce', () => {
       chat_id: string;
       text: string;
       reply_to_message_id: number;
+      message_thread_id: number;
     };
     assert.equal(parsedBody.chat_id, config.telegramChatId);
     assert.equal(parsedBody.reply_to_message_id, 333);
+    assert.equal(parsedBody.message_thread_id, 9001);
     assert.equal(
       parsedBody.text,
       'Injected into Codex CLI session.',
@@ -1687,6 +1693,7 @@ describe('pollTelegramOnce', () => {
                   update_id: 46,
                   message: {
                     message_id: 335,
+                    message_thread_id: 9001,
                     chat: { id: 777 },
                     from: { id: 'intruder' },
                     text: 'wrong sender',
@@ -1713,8 +1720,13 @@ describe('pollTelegramOnce', () => {
     assert.equal(state.telegramLastUpdateId, 46);
     assert.equal(state.messagesInjected, 0);
     assert.equal(state.errors, 0);
-    const parsedBody = JSON.parse(sendMessageBody) as { text: string; reply_to_message_id: number };
+    const parsedBody = JSON.parse(sendMessageBody) as {
+      text: string;
+      reply_to_message_id: number;
+      message_thread_id: number;
+    };
     assert.equal(parsedBody.reply_to_message_id, 335);
+    assert.equal(parsedBody.message_thread_id, 9001);
     assert.match(parsedBody.text, /not authorized/i);
   });
 
@@ -1856,9 +1868,67 @@ describe('pollTelegramOnce', () => {
     );
 
     assert.equal(injectCalled, false);
-    const parsedBody = JSON.parse(sendMessageBody) as { text: string; reply_to_message_id: number };
+    const parsedBody = JSON.parse(sendMessageBody) as {
+      text: string;
+      reply_to_message_id: number;
+      message_thread_id: number;
+    };
     assert.equal(parsedBody.reply_to_message_id, 336);
+    assert.equal(parsedBody.message_thread_id, 9001);
     assert.equal(parsedBody.text, 'Tracked OMX session status');
+  });
+
+  it('reuses the tracked mapping thread id when an inbound Telegram reply omits message_thread_id', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    let sendMessageBody = '';
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 47,
+                  message: {
+                    message_id: 336,
+                    chat: { id: 777 },
+                    from: { id: 'telegram-user-1' },
+                    text: 'continue',
+                    reply_to_message: { message_id: 222 },
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return {
+              statusCode: 200,
+              body: { ok: true, result: { message_id: 448 } },
+            };
+          },
+        }),
+        lookupByMessageIdImpl: () => createMapping('telegram'),
+        injectReplyImpl: () => true,
+      },
+    );
+
+    const parsedBody = JSON.parse(sendMessageBody) as {
+      text: string;
+      reply_to_message_id: number;
+      message_thread_id: number;
+    };
+    assert.equal(parsedBody.reply_to_message_id, 336);
+    assert.equal(parsedBody.message_thread_id, 9001);
+    assert.equal(parsedBody.text, 'Injected into Codex CLI session.');
   });
 
   it('sends an explicit Telegram error reply when the original notification is no longer tracked', async () => {
@@ -1881,6 +1951,7 @@ describe('pollTelegramOnce', () => {
                   update_id: 48,
                   message: {
                     message_id: 337,
+                    message_thread_id: 9001,
                     chat: { id: 777 },
                     from: { id: 'telegram-user-1' },
                     text: 'resume',
@@ -1902,7 +1973,11 @@ describe('pollTelegramOnce', () => {
       },
     );
 
-    const parsedBody = JSON.parse(sendMessageBody) as { text: string };
+    const parsedBody = JSON.parse(sendMessageBody) as {
+      text: string;
+      message_thread_id: number;
+    };
+    assert.equal(parsedBody.message_thread_id, 9001);
     assert.match(parsedBody.text, /no tracked omx session/i);
   });
 

@@ -206,6 +206,34 @@ describe("resolveProfileConfig", () => {
     assert.deepEqual(result!.events, profile.events);
   });
 
+  it("preserves nested telegram project topic routing config inside profiles", () => {
+    const profile = {
+      enabled: true,
+      telegram: {
+        enabled: true,
+        botToken: "t",
+        chatId: "c",
+        projectTopics: {
+          enabled: true,
+          autoCreate: true,
+          fallbackToGeneral: false,
+          naming: "projectNameWithHash" as const,
+          createFailureCooldownMs: 120000,
+        },
+      },
+    };
+
+    const result = resolveProfileConfig(
+      {
+        enabled: true,
+        profiles: { topics: profile },
+      },
+      "topics",
+    );
+
+    assert.deepEqual(result?.telegram?.projectTopics, profile.telegram.projectTopics);
+  });
+
   it("priority order: explicit > env > defaultProfile", () => {
     process.env[PROFILE_ENV_KEY] = "env-profile";
     const config = {

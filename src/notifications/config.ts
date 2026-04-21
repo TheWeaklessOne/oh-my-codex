@@ -232,6 +232,15 @@ function mergeEnvIntoFileConfig(
 
   if (!merged.telegram && envConfig.telegram) {
     merged.telegram = envConfig.telegram;
+  } else if (merged.telegram && envConfig.telegram) {
+    merged.telegram = {
+      ...merged.telegram,
+      botToken: merged.telegram.botToken || envConfig.telegram.botToken,
+      chatId: merged.telegram.chatId || envConfig.telegram.chatId,
+      parseMode: merged.telegram.parseMode || envConfig.telegram.parseMode,
+      projectTopics:
+        merged.telegram.projectTopics ?? envConfig.telegram.projectTopics,
+    };
   }
 
   if (!merged.slack && envConfig.slack) {

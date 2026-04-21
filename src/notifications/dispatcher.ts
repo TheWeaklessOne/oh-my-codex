@@ -22,6 +22,15 @@ import type {
 } from "./types.js";
 
 import { parseMentionAllowedMentions } from "./config.js";
+import {
+  coerceTelegramMessageThreadId,
+  normalizeTelegramProjectIdentity,
+  performTelegramBotApiRequest,
+  resolveTelegramDestination,
+  type TelegramResolvedDestination,
+  type TelegramTopicResolutionDeps,
+} from "./telegram-topics.js";
+import { updateTelegramTopicRegistryRecord } from "./telegram-topic-registry.js";
 
 const SEND_TIMEOUT_MS = 10_000;
 const DISPATCH_TIMEOUT_MS = 15_000;
@@ -101,6 +110,32 @@ function validateWebhookUrl(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function mergeTelegramPlatformOverrides(
+  topLevelPlatform: Record<string, unknown>,
+  eventPlatform: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = {
+    ...topLevelPlatform,
+    ...eventPlatform,
+  };
+
+  if (
+    isPlainRecord(topLevelPlatform.projectTopics)
+    && isPlainRecord(eventPlatform.projectTopics)
+  ) {
+    merged.projectTopics = {
+      ...topLevelPlatform.projectTopics,
+      ...eventPlatform.projectTopics,
+    };
+  }
+
+  return merged;
 }
 
 export async function sendDiscord(
@@ -218,6 +253,9 @@ export async function sendDiscordBot(
 export async function sendTelegram(
   config: TelegramNotificationConfig,
   payload: FullNotificationPayload,
+  deps: (TelegramTopicResolutionDeps & {
+    resolveTelegramDestinationImpl?: typeof resolveTelegramDestination;
+  }) = {},
 ): Promise<NotificationResult> {
   if (!config.enabled || !config.botToken || !config.chatId) {
     return { platform: "telegram", success: false, error: "Not configured" };
@@ -231,70 +269,78 @@ export async function sendTelegram(
     };
   }
 
+  let destination: TelegramResolvedDestination | null = null;
+
   try {
-    const body = JSON.stringify({
-      chat_id: config.chatId,
-      text: payload.message,
-      parse_mode: config.parseMode || "Markdown",
-    });
+    const resolveTelegramDestinationImpl =
+      deps.resolveTelegramDestinationImpl ?? resolveTelegramDestination;
+    destination = await resolveTelegramDestinationImpl(config, payload, deps);
+    if (destination.skipSend) {
+      return {
+        platform: "telegram",
+        success: false,
+        error:
+          destination.warningMessage
+          || "Telegram topic routing is unavailable and fallbackToGeneral is disabled",
+        projectKey: destination.projectKey,
+        topicName: destination.topicName,
+      };
+    }
 
-    const result = await new Promise<NotificationResult>((resolve) => {
-      const req = httpsRequest(
-        {
-          hostname: "api.telegram.org",
-          path: `/bot${config.botToken}/sendMessage`,
-          method: "POST",
-          family: 4,
-          headers: {
-            "Content-Type": "application/json",
-            "Content-Length": Buffer.byteLength(body),
-          },
-          timeout: SEND_TIMEOUT_MS,
-        },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on("data", (chunk: Buffer) => chunks.push(chunk));
-          res.on("end", () => {
-            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-              let messageId: string | undefined;
-              try {
-                const body = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
-                if (body?.result?.message_id !== undefined) {
-                  messageId = String(body.result.message_id);
-                }
-              } catch {
-                // Non-fatal
+    const result = await performTelegramBotApiRequest<{
+      message_id?: number | string;
+      message_thread_id?: number | string;
+    }>(
+      config.botToken,
+      "sendMessage",
+      {
+        chat_id: destination.chatId,
+        text: payload.message,
+        parse_mode: config.parseMode || "Markdown",
+        ...(destination.messageThreadId
+            ? {
+                message_thread_id: coerceTelegramMessageThreadId(
+                  destination.messageThreadId,
+                ),
               }
-              resolve({ platform: "telegram", success: true, messageId });
-            } else {
-              resolve({
-                platform: "telegram",
-                success: false,
-                error: `HTTP ${res.statusCode}`,
-              });
-            }
-          });
-        },
-      );
+            : {}),
+      },
+      {
+        httpsRequestImpl: deps.httpsRequestImpl ?? httpsRequest,
+        timeoutMs: deps.timeoutMs ?? SEND_TIMEOUT_MS,
+      },
+    );
 
-      req.on("error", (e) => {
-        resolve({ platform: "telegram", success: false, error: e.message });
-      });
-      req.on("timeout", () => {
-        req.destroy();
-        resolve({
-          platform: "telegram",
-          success: false,
-          error: "Request timeout",
-        });
-      });
+    const messageId =
+      result?.message_id !== undefined ? String(result.message_id) : undefined;
+    const messageThreadId =
+      destination.messageThreadId
+      ?? (result?.message_thread_id !== undefined
+        ? String(result.message_thread_id)
+        : undefined);
 
-      req.write(body);
-      req.end();
-    });
+    await persistTelegramDestinationMappingBestEffort(
+      config,
+      payload,
+      destination,
+      messageThreadId,
+    );
 
-    return result;
+    return {
+      platform: "telegram",
+      success: true,
+      messageId,
+      messageThreadId,
+      projectKey: destination.projectKey,
+      topicName: destination.topicName,
+    };
   } catch (error) {
+    await persistTelegramDestinationMappingBestEffort(
+      config,
+      payload,
+      destination,
+      destination?.messageThreadId,
+    );
     return {
       platform: "telegram",
       success: false,
@@ -409,23 +455,95 @@ export async function sendWebhook(
   }
 }
 
-function getEffectivePlatformConfig<T>(
+async function persistTelegramDestinationMappingBestEffort(
+  config: TelegramNotificationConfig,
+  payload: FullNotificationPayload,
+  destination: TelegramResolvedDestination | null,
+  messageThreadId: string | undefined,
+): Promise<void> {
+  if (config.projectTopics?.enabled !== true) {
+    return;
+  }
+
+  if (!destination?.sourceChatKey || !destination.projectKey || !messageThreadId) {
+    return;
+  }
+
+  const identity = normalizeTelegramProjectIdentity(payload);
+  if (!identity || identity.projectKey !== destination.projectKey) {
+    return;
+  }
+
+  const nowIso = new Date().toISOString();
+
+  try {
+    await updateTelegramTopicRegistryRecord(
+      destination.sourceChatKey,
+      destination.projectKey,
+      (record) => ({
+        ...record,
+        sourceChatKey: destination.sourceChatKey,
+        projectKey: destination.projectKey!,
+        canonicalProjectPath: identity.canonicalProjectPath,
+        displayName: identity.displayName,
+        topicName: destination.topicName || record?.topicName || identity.displayName,
+        messageThreadId,
+        createdAt: record?.createdAt || nowIso,
+        lastUsedAt: nowIso,
+        lastCreateAttemptAt: record?.lastCreateAttemptAt || nowIso,
+        lastCreateFailureAt: undefined,
+        lastCreateFailureCode: undefined,
+        lastCreateFailureMessage: undefined,
+        createFailureCooldownUntil: undefined,
+      }),
+    );
+  } catch (error) {
+    console.warn("[notifications] telegram topic registry persistence warning", {
+      warningCode: "topic-registry-persist-after-send-failed",
+      sourceChatKey: destination.sourceChatKey,
+      projectKey: destination.projectKey,
+      canonicalProjectPath: identity.canonicalProjectPath,
+      messageThreadId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+export function getEffectivePlatformConfig<T>(
   platform: NotificationPlatform,
   config: FullNotificationConfig,
   event: NotificationEvent,
 ): T | undefined {
   const eventConfig = config.events?.[event];
   const eventPlatform = eventConfig?.[platform as keyof typeof eventConfig];
+  const topLevelPlatform = config[platform as keyof FullNotificationConfig];
 
   if (
     eventPlatform &&
     typeof eventPlatform === "object" &&
     "enabled" in eventPlatform
   ) {
+    if (
+      topLevelPlatform &&
+      typeof topLevelPlatform === "object" &&
+      "enabled" in topLevelPlatform
+    ) {
+      const topLevelRecord = topLevelPlatform as unknown as Record<string, unknown>;
+      const eventRecord = eventPlatform as unknown as Record<string, unknown>;
+      return (
+        platform === "telegram"
+          ? mergeTelegramPlatformOverrides(topLevelRecord, eventRecord)
+          : {
+              ...topLevelRecord,
+              ...eventRecord,
+            }
+      ) as T;
+    }
+
     return eventPlatform as T;
   }
 
-  return config[platform as keyof FullNotificationConfig] as T | undefined;
+  return topLevelPlatform as T | undefined;
 }
 
 export async function dispatchNotifications(
