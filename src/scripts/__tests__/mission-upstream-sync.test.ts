@@ -43,8 +43,11 @@ function runSync(
 async function createSyncFixture(
 	branchName: string,
 	conflictMode: 'delete-agents' | 'clean',
+	options: {
+		releaseTrailingMainCommit?: boolean;
+	} = {},
 ): Promise<{ repo: string; cleanupRoot: string }> {
-	const rawRoot = await mkdtemp(join(tmpdir(), 'omx-mission-sync-fixture-'));
+	const rawRoot = await mkdtemp(join(tmpdir(), 'omx-upstream-sync-fixture-'));
 	const cleanupRoot = realpathSync(rawRoot);
 	const repo = join(cleanupRoot, 'repo');
 	const remote = join(cleanupRoot, 'origin.git');
@@ -67,28 +70,36 @@ async function createSyncFixture(
 	execFileSync('git', ['push', 'origin', 'v0.1.0'], { cwd: repo, stdio: 'ignore' });
 
 	execFileSync('git', ['checkout', '-b', branchName], { cwd: repo, stdio: 'ignore' });
-	await writeFile(join(repo, 'AGENTS.md'), `mission branch file for ${branchName}\n`, 'utf-8');
+	await writeFile(join(repo, 'AGENTS.md'), `work branch file for ${branchName}\n`, 'utf-8');
 	execFileSync('git', ['add', 'AGENTS.md'], { cwd: repo, stdio: 'ignore' });
-	execFileSync('git', ['commit', '-m', 'mission branch change'], { cwd: repo, stdio: 'ignore' });
+	execFileSync('git', ['commit', '-m', 'work branch change'], { cwd: repo, stdio: 'ignore' });
 
 	execFileSync('git', ['checkout', 'main'], { cwd: repo, stdio: 'ignore' });
 	if (conflictMode === 'delete-agents') {
 		await rm(join(repo, 'AGENTS.md'));
 		execFileSync('git', ['add', '-A', 'AGENTS.md'], { cwd: repo, stdio: 'ignore' });
 	} else {
-		await writeFile(join(repo, 'README.md'), 'upstream main update\n', 'utf-8');
+		await writeFile(join(repo, 'README.md'), 'upstream release update\n', 'utf-8');
 		execFileSync('git', ['add', 'README.md'], { cwd: repo, stdio: 'ignore' });
 	}
 	execFileSync('git', ['commit', '-m', 'upstream update'], { cwd: repo, stdio: 'ignore' });
 	execFileSync('git', ['tag', 'v0.1.1'], { cwd: repo, stdio: 'ignore' });
 	execFileSync('git', ['push', 'origin', 'main', '--tags'], { cwd: repo, stdio: 'ignore' });
+
+	if (options.releaseTrailingMainCommit) {
+		await writeFile(join(repo, 'README.md'), 'post-release main tip\n', 'utf-8');
+		execFileSync('git', ['add', 'README.md'], { cwd: repo, stdio: 'ignore' });
+		execFileSync('git', ['commit', '-m', 'post-release main update'], { cwd: repo, stdio: 'ignore' });
+		execFileSync('git', ['push', 'origin', 'main'], { cwd: repo, stdio: 'ignore' });
+	}
+
 	execFileSync('git', ['checkout', branchName], { cwd: repo, stdio: 'ignore' });
 
 	return { repo, cleanupRoot };
 }
 
 async function installFakeCliTools(): Promise<{ env: Record<string, string>; logPath: string; globalRoot: string; cleanupRoot: string }> {
-	const rawRoot = await mkdtemp(join(tmpdir(), 'omx-mission-sync-bin-'));
+	const rawRoot = await mkdtemp(join(tmpdir(), 'omx-upstream-sync-bin-'));
 	const cleanupRoot = realpathSync(rawRoot);
 	const fakeBin = join(cleanupRoot, 'bin');
 	const logPath = join(cleanupRoot, 'npm.log');
@@ -103,11 +114,11 @@ async function installFakeCliTools(): Promise<{ env: Record<string, string>; log
 		[
 			'#!/bin/sh',
 			'set -eu',
-			'log="$MISSION_SYNC_NPM_LOG"',
+			'log="$UPSTREAM_SYNC_NPM_LOG"',
 			'case "$1" in',
 			'  root)',
 			'    if [ "${2:-}" = "-g" ]; then',
-			'      printf \'%s\\n\' "$MISSION_SYNC_GLOBAL_ROOT"',
+			'      printf \'%s\\n\' "$UPSTREAM_SYNC_GLOBAL_ROOT"',
 			'      exit 0',
 			'    fi',
 			'    ;;',
@@ -117,9 +128,9 @@ async function installFakeCliTools(): Promise<{ env: Record<string, string>; log
 			'    ;;',
 			'  link)',
 			'    printf \'npm link\\n\' >> "$log"',
-			'    mkdir -p "$MISSION_SYNC_GLOBAL_ROOT"',
-			'    rm -rf "$MISSION_SYNC_GLOBAL_ROOT/oh-my-codex"',
-			'    ln -s "$PWD" "$MISSION_SYNC_GLOBAL_ROOT/oh-my-codex"',
+			'    mkdir -p "$UPSTREAM_SYNC_GLOBAL_ROOT"',
+			'    rm -rf "$UPSTREAM_SYNC_GLOBAL_ROOT/oh-my-codex"',
+			'    ln -s "$PWD" "$UPSTREAM_SYNC_GLOBAL_ROOT/oh-my-codex"',
 			'    exit 0',
 			'    ;;',
 			'esac',
@@ -145,8 +156,8 @@ async function installFakeCliTools(): Promise<{ env: Record<string, string>; log
 	return {
 		env: {
 			PATH: `${fakeBin}:${process.env.PATH || ''}`,
-			MISSION_SYNC_NPM_LOG: logPath,
-			MISSION_SYNC_GLOBAL_ROOT: globalRoot,
+			UPSTREAM_SYNC_NPM_LOG: logPath,
+			UPSTREAM_SYNC_GLOBAL_ROOT: globalRoot,
 		},
 		logPath,
 		globalRoot,
@@ -155,8 +166,23 @@ async function installFakeCliTools(): Promise<{ env: Record<string, string>; log
 }
 
 describe('mission-upstream-sync skill script', () => {
+	it('defaults to the current non-main branch when no --branch is provided', async () => {
+		const branchName = 'feat/current-work';
+		const fixture = await createSyncFixture(branchName, 'clean');
+
+		try {
+			const result = runSync(fixture.repo, ['--remote', 'origin', '--check-only', '--no-cli-update']);
+			assert.equal(result.status, 0, result.stderr || result.stdout);
+			assert.match(result.stdout, /==> Working branch status/);
+			assert.match(result.stdout, new RegExp(`Target branch:\\s+${branchName}`));
+			assert.doesNotMatch(result.stdout, /Mission branch status/);
+		} finally {
+			await rm(fixture.cleanupRoot, { recursive: true, force: true });
+		}
+	});
+
 	it('stops on probe conflicts and leaves resolution to the invoking agent', async () => {
-		const branchName = 'feat/mission-sync';
+		const branchName = 'feat/conflict-sync';
 		const fixture = await createSyncFixture(branchName, 'delete-agents');
 
 		try {
@@ -176,14 +202,35 @@ describe('mission-upstream-sync skill script', () => {
 			assert.equal(behind, '1');
 
 			const agents = await readFile(join(fixture.repo, 'AGENTS.md'), 'utf-8');
-			assert.match(agents, /mission branch file for feat\/mission-sync/);
+			assert.match(agents, /work branch file for feat\/conflict-sync/);
+		} finally {
+			await rm(fixture.cleanupRoot, { recursive: true, force: true });
+		}
+	});
+
+	it('rebases onto the latest release tag instead of unreleased remote main commits', async () => {
+		const branchName = 'feat/release-target';
+		const fixture = await createSyncFixture(branchName, 'clean', { releaseTrailingMainCommit: true });
+
+		try {
+			const result = runSync(fixture.repo, ['--branch', branchName, '--remote', 'origin', '--no-cli-update']);
+			assert.equal(result.status, 0, result.stderr || result.stdout);
+			assert.match(result.stdout, /Sync target:\s+release v0\.1\.1/);
+
+			const counts = git(fixture.repo, ['rev-list', '--left-right', '--count', `${branchName}...refs/remotes/origin/main`]);
+			const [ahead, behind] = counts.split(/\s+/);
+			assert.equal(ahead, '1');
+			assert.equal(behind, '1');
+
+			const readme = await readFile(join(fixture.repo, 'README.md'), 'utf-8');
+			assert.equal(readme, 'upstream release update\n');
 		} finally {
 			await rm(fixture.cleanupRoot, { recursive: true, force: true });
 		}
 	});
 
 	it('rebuilds and relinks the local repo-backed CLI instead of installing the published npm package', async () => {
-		const branchName = 'feat/mission-link';
+		const branchName = 'feat/link-sync';
 		const fixture = await createSyncFixture(branchName, 'clean');
 		const fakeCli = await installFakeCliTools();
 
