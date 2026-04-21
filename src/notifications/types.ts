@@ -242,6 +242,9 @@ export interface NotificationsBlock extends FullNotificationConfig {
 }
 
 /** Reply injection configuration */
+export type ReplyAcknowledgementMode = "off" | "minimal" | "summary";
+export type TelegramStartupBacklogPolicy = "resume" | "drop_pending" | "replay_once";
+
 export interface ReplyConfig {
   enabled: boolean;
   /** Polling interval in milliseconds (default: 3000) */
@@ -252,6 +255,16 @@ export interface ReplyConfig {
   rateLimitPerMinute: number;
   /** Include visual prefix like [reply:discord] (default: true) */
   includePrefix: boolean;
+  /** Reply acknowledgement verbosity (default: minimal) */
+  ackMode: ReplyAcknowledgementMode;
   /** Authorized Discord user IDs (REQUIRED for Discord, empty = Discord disabled) */
   authorizedDiscordUserIds: string[];
+  /** Authorized Telegram sender IDs (empty = fallback to chat-level auth only) */
+  authorizedTelegramUserIds: string[];
+  /** Telegram long-poll timeout in seconds (default: 30) */
+  telegramPollTimeoutSeconds: number;
+  /** Allowed Telegram update types for reply intake (default: ['message']) */
+  telegramAllowedUpdates: string[];
+  /** Startup backlog handling policy for Telegram intake (default: resume) */
+  telegramStartupBacklogPolicy: TelegramStartupBacklogPolicy;
 }

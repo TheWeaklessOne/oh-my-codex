@@ -3,6 +3,13 @@ interface ReplyListenerLiveConfig {
   discordChannelId: string;
   telegramBotToken: string;
   telegramChatId: string;
+  expectations?: {
+    ackMode: 'off' | 'minimal' | 'summary';
+    telegramPollTimeoutSeconds: number;
+    telegramAllowedUpdates: string[];
+    telegramStartupBacklogPolicy: 'resume' | 'drop_pending' | 'replay_once';
+    authorizedTelegramUserIdsConfigured: boolean;
+  };
 }
 
 interface ReplyListenerLiveEnvResolution {
@@ -28,6 +35,37 @@ const REQUIRED_ENV_KEYS = [
   'OMX_TELEGRAM_BOT_TOKEN',
   'OMX_TELEGRAM_CHAT_ID',
 ] as const;
+const DEFAULT_EXPECTATIONS = {
+  ackMode: 'minimal' as const,
+  telegramPollTimeoutSeconds: 30,
+  telegramAllowedUpdates: ['message'],
+  telegramStartupBacklogPolicy: 'resume' as const,
+};
+
+function parseAckMode(value: string | undefined): 'off' | 'minimal' | 'summary' {
+  return value === 'off' || value === 'summary' || value === 'minimal'
+    ? value
+    : DEFAULT_EXPECTATIONS.ackMode;
+}
+
+function parseTelegramStartupBacklogPolicy(
+  value: string | undefined,
+): 'resume' | 'drop_pending' | 'replay_once' {
+  return value === 'drop_pending' || value === 'replay_once' || value === 'resume'
+    ? value
+    : DEFAULT_EXPECTATIONS.telegramStartupBacklogPolicy;
+}
+
+function parseAllowedUpdates(value: string | undefined): string[] {
+  if (!value) {
+    return [...DEFAULT_EXPECTATIONS.telegramAllowedUpdates];
+  }
+  const updates = value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  return updates.length > 0 ? updates : [...DEFAULT_EXPECTATIONS.telegramAllowedUpdates];
+}
 
 function requireJsonObject(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -63,6 +101,13 @@ export function resolveReplyListenerLiveEnv(env: NodeJS.ProcessEnv = process.env
       discordChannelId: env.OMX_DISCORD_NOTIFIER_CHANNEL!.trim(),
       telegramBotToken: env.OMX_TELEGRAM_BOT_TOKEN!.trim(),
       telegramChatId: env.OMX_TELEGRAM_CHAT_ID!.trim(),
+      expectations: {
+        ackMode: parseAckMode(env.OMX_REPLY_ACK_MODE),
+        telegramPollTimeoutSeconds: Number.parseInt(env.OMX_REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS || '', 10) || DEFAULT_EXPECTATIONS.telegramPollTimeoutSeconds,
+        telegramAllowedUpdates: parseAllowedUpdates(env.OMX_REPLY_TELEGRAM_ALLOWED_UPDATES),
+        telegramStartupBacklogPolicy: parseTelegramStartupBacklogPolicy(env.OMX_REPLY_TELEGRAM_STARTUP_BACKLOG),
+        authorizedTelegramUserIdsConfigured: Boolean(env.OMX_REPLY_TELEGRAM_USER_IDS?.trim()),
+      },
     },
   };
 }
@@ -74,6 +119,16 @@ export async function runReplyListenerLiveSmoke(
   const fetchImpl = deps.fetchImpl ?? fetch;
   const log = deps.log ?? console.log;
   const stamp = new Date().toISOString();
+
+  if (config.expectations) {
+    log(
+      `Reply listener expectations: ack=${config.expectations.ackMode}, ` +
+      `telegram_timeout=${config.expectations.telegramPollTimeoutSeconds}s, ` +
+      `allowed_updates=${config.expectations.telegramAllowedUpdates.join('|')}, ` +
+      `backlog=${config.expectations.telegramStartupBacklogPolicy}, ` +
+      `telegram_sender_allowlist=${config.expectations.authorizedTelegramUserIdsConfigured ? 'configured' : 'chat-only-fallback'}`
+    );
+  }
 
   const discordSendResponse = await fetchImpl(
     `https://discord.com/api/v10/channels/${config.discordChannelId}/messages`,

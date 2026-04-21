@@ -43,6 +43,31 @@ test('resolveReplyListenerLiveEnv reports missing credentials when opted in', ()
   assert.equal(result.config, null);
 });
 
+test('resolveReplyListenerLiveEnv exposes reply-listener expectation defaults and env overrides', () => {
+  const result = resolveReplyListenerLiveEnv({
+    OMX_REPLY_LISTENER_LIVE: '1',
+    OMX_DISCORD_NOTIFIER_BOT_TOKEN: 'discord-token',
+    OMX_DISCORD_NOTIFIER_CHANNEL: 'channel-1',
+    OMX_TELEGRAM_BOT_TOKEN: 'telegram-token',
+    OMX_TELEGRAM_CHAT_ID: 'chat-1',
+    OMX_REPLY_ACK_MODE: 'summary',
+    OMX_REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS: '45',
+    OMX_REPLY_TELEGRAM_ALLOWED_UPDATES: 'message,edited_message',
+    OMX_REPLY_TELEGRAM_STARTUP_BACKLOG: 'drop_pending',
+    OMX_REPLY_TELEGRAM_USER_IDS: '1001,1002',
+  });
+
+  assert.equal(result.enabled, true);
+  assert.deepEqual(result.missing, []);
+  assert.deepEqual(result.config?.expectations, {
+    ackMode: 'summary',
+    telegramPollTimeoutSeconds: 45,
+    telegramAllowedUpdates: ['message', 'edited_message'],
+    telegramStartupBacklogPolicy: 'drop_pending',
+    authorizedTelegramUserIdsConfigured: true,
+  });
+});
+
 test('runReplyListenerLiveSmoke exercises Discord and Telegram send + cleanup requests', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const logs: string[] = [];
@@ -84,6 +109,13 @@ test('runReplyListenerLiveSmoke exercises Discord and Telegram send + cleanup re
       discordChannelId: 'channel-1',
       telegramBotToken: 'telegram-token',
       telegramChatId: 'chat-1',
+      expectations: {
+        ackMode: 'minimal',
+        telegramPollTimeoutSeconds: 30,
+        telegramAllowedUpdates: ['message'],
+        telegramStartupBacklogPolicy: 'resume',
+        authorizedTelegramUserIdsConfigured: false,
+      },
     },
     {
       fetchImpl,
@@ -96,6 +128,7 @@ test('runReplyListenerLiveSmoke exercises Discord and Telegram send + cleanup re
     telegramMessageId: '42',
   });
   assert.equal(calls.length, 4);
+  assert.ok(logs.some((entry) => entry.includes('Reply listener expectations: ack=minimal')));
   assert.ok(logs.some((entry) => entry.includes('Discord probe message sent: discord-message-1')));
   assert.ok(logs.some((entry) => entry.includes('Telegram probe message sent: 42')));
 });

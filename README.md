@@ -243,6 +243,38 @@ If you want Telegram to receive only meaningful turn results and real input requ
 
 `omx --telegram` now narrows the active transport for that run while preserving the configured notification policy/profile.
 
+### Reply listener hardening knobs
+
+If you enable inbound notification replies, OMX now keeps Telegram on polling-only local delivery and hardens the intake path with long polling, sender allowlists, privacy-safe acknowledgements, and deterministic backlog handling.
+
+```json
+{
+  "notifications": {
+    "enabled": true,
+    "telegram": {
+      "enabled": true,
+      "botToken": "env-or-config-token",
+      "chatId": "env-or-config-chat"
+    },
+    "reply": {
+      "enabled": true,
+      "authorizedDiscordUserIds": ["123456789012345678"],
+      "authorizedTelegramUserIds": ["4001", "4002"],
+      "pollIntervalMs": 3000,
+      "telegramPollTimeoutSeconds": 30,
+      "telegramAllowedUpdates": ["message"],
+      "telegramStartupBacklogPolicy": "resume",
+      "ackMode": "minimal"
+    }
+  }
+}
+```
+
+- `authorizedTelegramUserIds` hardens Telegram replies beyond chat-level matching. If omitted, OMX keeps a compatibility fallback to chat-level authorization only.
+- `ackMode` defaults to `minimal`; use `summary` only when you explicitly want a redacted recent-pane tail in the acknowledgement, or `off` to suppress follow-up replies entirely.
+- `telegramStartupBacklogPolicy` supports `resume`, `drop_pending`, and `replay_once`.
+- `telegramPollTimeoutSeconds` controls Bot API long polling. Webhooks are intentionally out of scope for the local OMX reply listener.
+
 
 ### Troubleshooting false-green readiness
 

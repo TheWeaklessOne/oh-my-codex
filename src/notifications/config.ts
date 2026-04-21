@@ -742,6 +742,29 @@ function parseDiscordUserIds(
   return [];
 }
 
+function parseTelegramUserIds(
+  envValue: string | undefined,
+  configValue: unknown,
+): string[] {
+  if (envValue) {
+    const ids = envValue
+      .split(",")
+      .map((id) => id.trim())
+      .filter((id) => /^\d{1,20}$/.test(id));
+    if (ids.length > 0) return ids;
+  }
+
+  if (Array.isArray(configValue)) {
+    const ids = configValue
+      .filter((id): id is string => typeof id === "string")
+      .map((id) => id.trim())
+      .filter((id) => /^\d{1,20}$/.test(id));
+    if (ids.length > 0) return ids;
+  }
+
+  return [];
+}
+
 const REPLY_POLL_INTERVAL_MIN_MS = 500;
 const REPLY_POLL_INTERVAL_MAX_MS = 60_000;
 const REPLY_POLL_INTERVAL_DEFAULT_MS = 3_000;
@@ -750,14 +773,31 @@ const REPLY_RATE_LIMIT_DEFAULT_PER_MINUTE = 10;
 const REPLY_MAX_MESSAGE_LENGTH_MIN = 1;
 const REPLY_MAX_MESSAGE_LENGTH_MAX = 4_000;
 const REPLY_MAX_MESSAGE_LENGTH_DEFAULT = 500;
+const REPLY_ACK_MODE_DEFAULT = "minimal";
+const REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS_MIN = 1;
+const REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS_MAX = 60;
+const REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS_DEFAULT = 30;
+const REPLY_TELEGRAM_ALLOWED_UPDATES_DEFAULT = ["message"];
+const REPLY_TELEGRAM_STARTUP_BACKLOG_DEFAULT = "resume";
+const REPLY_ACK_MODES = new Set(["off", "minimal", "summary"]);
+const REPLY_TELEGRAM_STARTUP_BACKLOG_POLICIES = new Set([
+  "resume",
+  "drop_pending",
+  "replay_once",
+]);
 
 interface ReplySettingsRaw {
   enabled?: unknown;
   authorizedDiscordUserIds?: unknown;
+  authorizedTelegramUserIds?: unknown;
   pollIntervalMs?: unknown;
   rateLimitPerMinute?: unknown;
   maxMessageLength?: unknown;
   includePrefix?: unknown;
+  ackMode?: unknown;
+  telegramPollTimeoutSeconds?: unknown;
+  telegramAllowedUpdates?: unknown;
+  telegramStartupBacklogPolicy?: unknown;
 }
 
 interface NotificationsConfigRaw {
@@ -782,6 +822,57 @@ function parseIntegerInput(value: unknown): number | undefined {
     if (Number.isFinite(parsed)) return parsed;
   }
   return undefined;
+}
+
+function parseStringList(
+  envValue: string | undefined,
+  configValue: unknown,
+): string[] {
+  if (envValue) {
+    const values = envValue
+      .split(",")
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0);
+    if (values.length > 0) return values;
+  }
+
+  if (Array.isArray(configValue)) {
+    const values = configValue
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0);
+    if (values.length > 0) return values;
+  }
+
+  return [];
+}
+
+function parseReplyAckMode(
+  envValue: string | undefined,
+  configValue: unknown,
+): "off" | "minimal" | "summary" {
+  const candidate = typeof envValue === "string" && envValue.trim()
+    ? envValue.trim().toLowerCase()
+    : typeof configValue === "string" && configValue.trim()
+      ? configValue.trim().toLowerCase()
+      : REPLY_ACK_MODE_DEFAULT;
+  return REPLY_ACK_MODES.has(candidate)
+    ? candidate as "off" | "minimal" | "summary"
+    : REPLY_ACK_MODE_DEFAULT;
+}
+
+function parseTelegramStartupBacklogPolicy(
+  envValue: string | undefined,
+  configValue: unknown,
+): "resume" | "drop_pending" | "replay_once" {
+  const candidate = typeof envValue === "string" && envValue.trim()
+    ? envValue.trim().toLowerCase()
+    : typeof configValue === "string" && configValue.trim()
+      ? configValue.trim().toLowerCase()
+      : REPLY_TELEGRAM_STARTUP_BACKLOG_DEFAULT;
+  return REPLY_TELEGRAM_STARTUP_BACKLOG_POLICIES.has(candidate)
+    ? candidate as "resume" | "drop_pending" | "replay_once"
+    : REPLY_TELEGRAM_STARTUP_BACKLOG_DEFAULT;
 }
 
 function normalizeInteger(
@@ -821,11 +912,21 @@ export function getReplyConfig(
     process.env.OMX_REPLY_DISCORD_USER_IDS,
     replyRaw?.authorizedDiscordUserIds,
   );
+  const authorizedTelegramUserIds = parseTelegramUserIds(
+    process.env.OMX_REPLY_TELEGRAM_USER_IDS,
+    replyRaw?.authorizedTelegramUserIds,
+  );
 
   if (hasDiscordBot && authorizedDiscordUserIds.length === 0) {
     console.warn(
       "[notifications] Discord reply listening disabled: authorizedDiscordUserIds is empty. " +
       "Set OMX_REPLY_DISCORD_USER_IDS or add to .omx-config.json notifications.reply.authorizedDiscordUserIds"
+    );
+  }
+  if (hasTelegram && authorizedTelegramUserIds.length === 0) {
+    console.warn(
+      "[notifications] Telegram reply listening is using chat-level authorization only because authorizedTelegramUserIds is empty. " +
+      "Set OMX_REPLY_TELEGRAM_USER_IDS or add to .omx-config.json notifications.reply.authorizedTelegramUserIds for sender-level hardening."
     );
   }
 
@@ -848,6 +949,17 @@ export function getReplyConfig(
     REPLY_MAX_MESSAGE_LENGTH_MIN,
     REPLY_MAX_MESSAGE_LENGTH_MAX,
   );
+  const telegramPollTimeoutSeconds = normalizeInteger(
+    parseIntegerInput(process.env.OMX_REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS)
+      ?? parseIntegerInput(replyRaw?.telegramPollTimeoutSeconds),
+    REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS_DEFAULT,
+    REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS_MIN,
+    REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS_MAX,
+  );
+  const telegramAllowedUpdates = parseStringList(
+    process.env.OMX_REPLY_TELEGRAM_ALLOWED_UPDATES,
+    replyRaw?.telegramAllowedUpdates,
+  );
 
   return {
     enabled: true,
@@ -855,6 +967,17 @@ export function getReplyConfig(
     maxMessageLength,
     rateLimitPerMinute,
     includePrefix: process.env.OMX_REPLY_INCLUDE_PREFIX !== "false" && (replyRaw?.includePrefix !== false),
+    ackMode: parseReplyAckMode(process.env.OMX_REPLY_ACK_MODE, replyRaw?.ackMode),
     authorizedDiscordUserIds,
+    authorizedTelegramUserIds,
+    telegramPollTimeoutSeconds,
+    telegramAllowedUpdates:
+      telegramAllowedUpdates.length > 0
+        ? telegramAllowedUpdates
+        : [...REPLY_TELEGRAM_ALLOWED_UPDATES_DEFAULT],
+    telegramStartupBacklogPolicy: parseTelegramStartupBacklogPolicy(
+      process.env.OMX_REPLY_TELEGRAM_STARTUP_BACKLOG,
+      replyRaw?.telegramStartupBacklogPolicy,
+    ),
   };
 }

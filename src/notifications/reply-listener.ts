@@ -9,7 +9,7 @@
  * - Bot tokens stored in state file, NOT in environment variables
  * - Two-layer input sanitization (sanitizeReplyInput + newline stripping in buildSendPaneArgvs)
  * - Pane verification via analyzePaneContent before every injection
- * - Authorization: only configured user IDs (Discord) / chat ID (Telegram) can inject
+ * - Authorization: only configured user IDs (Discord) / sender IDs plus chat boundary (Telegram) can inject
  * - Rate limiting to prevent spam/abuse
  */
 
@@ -38,7 +38,11 @@ import {
 import { parseMentionAllowedMentions } from './config.js';
 import { parseTmuxTail } from './formatter.js';
 import { spawnPlatformCommandSync } from '../utils/platform-command.js';
-import type { ReplyConfig } from './types.js';
+import type {
+  ReplyAcknowledgementMode,
+  ReplyConfig,
+  TelegramStartupBacklogPolicy,
+} from './types.js';
 
 const __filename = fileURLToPath(import.meta.url);
 
@@ -70,6 +74,12 @@ const DEFAULT_REPLY_RATE_LIMIT_PER_MINUTE = 10;
 const MIN_REPLY_MAX_MESSAGE_LENGTH = 1;
 const MAX_REPLY_MAX_MESSAGE_LENGTH = 4_000;
 const DEFAULT_REPLY_MAX_MESSAGE_LENGTH = 500;
+const MIN_TELEGRAM_POLL_TIMEOUT_SECONDS = 1;
+const MAX_TELEGRAM_POLL_TIMEOUT_SECONDS = 60;
+const DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS = 30;
+const DEFAULT_TELEGRAM_ALLOWED_UPDATES = ['message'];
+const DEFAULT_REPLY_ACK_MODE: ReplyAcknowledgementMode = 'minimal';
+const DEFAULT_TELEGRAM_STARTUP_BACKLOG_POLICY: TelegramStartupBacklogPolicy = 'resume';
 const REPLY_ACK_CAPTURE_LINES = 200;
 const REPLY_ACK_SUMMARY_MAX_CHARS = 700;
 const REPLY_ACK_PREFIX = 'Injected into Codex CLI session.';
@@ -82,6 +92,7 @@ export interface ReplyListenerState {
   lastPollAt: string | null;
   telegramLastUpdateId: number | null;
   discordLastMessageId: string | null;
+  telegramStartupPolicyApplied: boolean;
   messagesInjected: number;
   errors: number;
   lastError?: string;
@@ -103,6 +114,45 @@ export interface DaemonResponse {
   state?: ReplyListenerState;
   error?: string;
 }
+
+type ReplyProcessingDisposition = 'success' | 'terminal-ignore' | 'retryable-failure';
+
+export interface ReplyInjectionResult {
+  outcome: ReplyProcessingDisposition;
+  reason?: string;
+}
+
+type InjectReplyLikeResult = ReplyInjectionResult | boolean;
+
+type DiscordMessage = {
+  id: string;
+  author: { id: string };
+  content: string;
+  message_reference?: { message_id: string };
+};
+
+type TelegramUpdate = {
+  update_id?: number;
+  message?: {
+    message_id?: number;
+    chat?: { id?: number | string };
+    from?: { id?: number | string };
+    text?: string;
+    reply_to_message?: { message_id?: number | string };
+  };
+};
+
+const DEFAULT_REPLY_LISTENER_STATE: ReplyListenerState = {
+  isRunning: false,
+  pid: null,
+  startedAt: null,
+  lastPollAt: null,
+  telegramLastUpdateId: null,
+  discordLastMessageId: null,
+  telegramStartupPolicyApplied: false,
+  messagesInjected: 0,
+  errors: 0,
+};
 
 function createMinimalDaemonEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
@@ -175,6 +225,39 @@ function normalizeInteger(
   return numeric;
 }
 
+function normalizeStringList(value: unknown, fallback: string[]): string[] {
+  if (!Array.isArray(value)) {
+    return [...fallback];
+  }
+
+  const normalized = value
+    .filter((entry): entry is string => typeof entry === 'string')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+
+  return normalized.length > 0 ? normalized : [...fallback];
+}
+
+function normalizeAckMode(value: unknown): ReplyAcknowledgementMode {
+  return value === 'off' || value === 'summary' || value === 'minimal'
+    ? value
+    : DEFAULT_REPLY_ACK_MODE;
+}
+
+function normalizeTelegramStartupBacklogPolicy(value: unknown): TelegramStartupBacklogPolicy {
+  return value === 'drop_pending' || value === 'replay_once' || value === 'resume'
+    ? value
+    : DEFAULT_TELEGRAM_STARTUP_BACKLOG_POLICY;
+}
+
+function normalizeReplyListenerState(state: Partial<ReplyListenerState>): ReplyListenerState {
+  return {
+    ...DEFAULT_REPLY_LISTENER_STATE,
+    ...state,
+    telegramStartupPolicyApplied: state.telegramStartupPolicyApplied === true,
+  };
+}
+
 export function normalizeReplyListenerConfig(config: ReplyListenerDaemonConfig): ReplyListenerDaemonConfig {
   const discordEnabled = config.discordEnabled ?? !!(config.discordBotToken && config.discordChannelId);
   const telegramEnabled = config.telegramEnabled ?? !!(config.telegramBotToken && config.telegramChatId);
@@ -201,9 +284,26 @@ export function normalizeReplyListenerConfig(config: ReplyListenerDaemonConfig):
       MAX_REPLY_MAX_MESSAGE_LENGTH,
     ),
     includePrefix: config.includePrefix !== false,
+    ackMode: normalizeAckMode(config.ackMode),
     authorizedDiscordUserIds: Array.isArray(config.authorizedDiscordUserIds)
       ? config.authorizedDiscordUserIds.filter((id): id is string => typeof id === 'string' && id.trim() !== '')
       : [],
+    authorizedTelegramUserIds: Array.isArray(config.authorizedTelegramUserIds)
+      ? config.authorizedTelegramUserIds.filter((id): id is string => typeof id === 'string' && id.trim() !== '')
+      : [],
+    telegramPollTimeoutSeconds: normalizeInteger(
+      config.telegramPollTimeoutSeconds,
+      DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS,
+      MIN_TELEGRAM_POLL_TIMEOUT_SECONDS,
+      MAX_TELEGRAM_POLL_TIMEOUT_SECONDS,
+    ),
+    telegramAllowedUpdates: normalizeStringList(
+      config.telegramAllowedUpdates,
+      DEFAULT_TELEGRAM_ALLOWED_UPDATES,
+    ),
+    telegramStartupBacklogPolicy: normalizeTelegramStartupBacklogPolicy(
+      config.telegramStartupBacklogPolicy,
+    ),
   };
 }
 
@@ -230,6 +330,7 @@ function reconcileReplyListenerStateWithConfigChange(
 
   if (getTelegramSourceIdentity(previousConfig) !== getTelegramSourceIdentity(nextConfig)) {
     nextState.telegramLastUpdateId = null;
+    nextState.telegramStartupPolicyApplied = false;
   }
 
   if (getDiscordSourceIdentity(previousConfig) !== getDiscordSourceIdentity(nextConfig)) {
@@ -243,14 +344,65 @@ function readDaemonState(): ReplyListenerState | null {
   try {
     if (!existsSync(STATE_FILE_PATH)) return null;
     const content = readFileSync(STATE_FILE_PATH, 'utf-8');
-    return JSON.parse(content) as ReplyListenerState;
+    return normalizeReplyListenerState(JSON.parse(content) as Partial<ReplyListenerState>);
   } catch {
     return null;
   }
 }
 
 function writeDaemonState(state: ReplyListenerState): void {
-  writeSecureFile(STATE_FILE_PATH, JSON.stringify(state, null, 2));
+  writeSecureFile(
+    STATE_FILE_PATH,
+    JSON.stringify(normalizeReplyListenerState(state), null, 2),
+  );
+}
+
+function normalizeInjectReplyResult(result: InjectReplyLikeResult): ReplyInjectionResult {
+  if (typeof result === 'boolean') {
+    return result
+      ? { outcome: 'success' }
+      : { outcome: 'retryable-failure', reason: 'injection failed' };
+  }
+  return result;
+}
+
+function commitDiscordCursor(
+  state: ReplyListenerState,
+  messageId: string,
+  writeDaemonStateImpl: typeof writeDaemonState,
+): void {
+  state.discordLastMessageId = messageId;
+  writeDaemonStateImpl(state);
+}
+
+function commitTelegramCursor(
+  state: ReplyListenerState,
+  updateId: number,
+  writeDaemonStateImpl: typeof writeDaemonState,
+): void {
+  state.telegramLastUpdateId = updateId;
+  writeDaemonStateImpl(state);
+}
+
+function buildTelegramGetUpdatesPath(
+  config: ReplyListenerDaemonConfig,
+  state: ReplyListenerState,
+  options: {
+    timeoutSeconds?: number;
+    offset?: number;
+  } = {},
+): string {
+  const offset = options.offset ?? (state.telegramLastUpdateId !== null ? state.telegramLastUpdateId + 1 : 0);
+  const timeoutSeconds = options.timeoutSeconds ?? config.telegramPollTimeoutSeconds;
+  const params = new URLSearchParams();
+  params.set('offset', String(offset));
+  params.set('timeout', String(timeoutSeconds));
+  params.set('allowed_updates', JSON.stringify(config.telegramAllowedUpdates));
+  return `/bot${config.telegramBotToken}/getUpdates?${params.toString()}`;
+}
+
+function getTelegramRequestTimeoutMs(timeoutSeconds: number): number {
+  return Math.max(5_000, (timeoutSeconds + 5) * 1_000);
 }
 
 function readDaemonConfig(): ReplyListenerDaemonConfig | null {
@@ -419,7 +571,12 @@ interface ReplyAcknowledgementDeps {
 export interface ReplyListenerDiscordPollDeps {
   fetchImpl?: typeof fetch;
   lookupByMessageIdImpl?: typeof lookupByMessageId;
-  injectReplyImpl?: typeof injectReply;
+  injectReplyImpl?: (
+    paneId: string,
+    text: string,
+    platform: string,
+    config: ReplyListenerDaemonConfig,
+  ) => InjectReplyLikeResult;
   captureReplyAcknowledgementSummaryImpl?: typeof captureReplyAcknowledgementSummary;
   formatReplyAcknowledgementImpl?: typeof formatReplyAcknowledgement;
   writeDaemonStateImpl?: typeof writeDaemonState;
@@ -429,7 +586,12 @@ export interface ReplyListenerDiscordPollDeps {
 export interface ReplyListenerTelegramPollDeps {
   httpsRequestImpl?: typeof httpsRequest;
   lookupByMessageIdImpl?: typeof lookupByMessageId;
-  injectReplyImpl?: typeof injectReply;
+  injectReplyImpl?: (
+    paneId: string,
+    text: string,
+    platform: string,
+    config: ReplyListenerDaemonConfig,
+  ) => InjectReplyLikeResult;
   captureReplyAcknowledgementSummaryImpl?: typeof captureReplyAcknowledgementSummary;
   formatReplyAcknowledgementImpl?: typeof formatReplyAcknowledgement;
   writeDaemonStateImpl?: typeof writeDaemonState;
@@ -439,9 +601,15 @@ export interface ReplyListenerTelegramPollDeps {
 export interface ReplyListenerPollDeps {
   fetchImpl?: typeof fetch;
   httpsRequestImpl?: typeof httpsRequest;
-  injectReplyImpl?: typeof injectReply;
+  injectReplyImpl?: (
+    paneId: string,
+    text: string,
+    platform: string,
+    config: ReplyListenerDaemonConfig,
+  ) => InjectReplyLikeResult;
   buildSessionStatusReplyImpl?: typeof buildDiscordSessionStatusReply;
   captureReplyAcknowledgementSummaryImpl?: typeof captureReplyAcknowledgementSummary;
+  formatReplyAcknowledgementImpl?: typeof formatReplyAcknowledgement;
   lookupByMessageIdImpl?: typeof lookupByMessageId;
   writeDaemonStateImpl?: typeof writeDaemonState;
   parseMentionAllowedMentionsImpl?: typeof parseMentionAllowedMentions;
@@ -491,12 +659,33 @@ export function captureReplyAcknowledgementSummary(
   return `${summary.slice(0, REPLY_ACK_SUMMARY_MAX_CHARS - 1).trimEnd()}…`;
 }
 
-export function formatReplyAcknowledgement(summary: string | null): string {
+export function formatReplyAcknowledgement(
+  summary: string | null,
+  mode: ReplyAcknowledgementMode = DEFAULT_REPLY_ACK_MODE,
+): string | null {
+  if (mode === 'off') {
+    return null;
+  }
+  if (mode === 'minimal') {
+    return REPLY_ACK_PREFIX;
+  }
   if (!summary) {
     return `${REPLY_ACK_PREFIX}\n\n${REPLY_ACK_FALLBACK}`;
   }
 
   return `${REPLY_ACK_PREFIX}\n\nRecent output:\n${summary}`;
+}
+
+function buildReplyAcknowledgement(
+  paneId: string,
+  config: ReplyListenerDaemonConfig,
+  captureReplyAcknowledgementSummaryImpl: typeof captureReplyAcknowledgementSummary,
+  formatReplyAcknowledgementImpl: typeof formatReplyAcknowledgement,
+): string | null {
+  const summary = config.ackMode === 'summary'
+    ? captureReplyAcknowledgementSummaryImpl(paneId)
+    : null;
+  return formatReplyAcknowledgementImpl(summary, config.ackMode);
 }
 
 export function refreshReplyListenerRuntimeConfig(
@@ -541,14 +730,17 @@ function injectReply(
   text: string,
   platform: string,
   config: ReplyListenerDaemonConfig,
-): boolean {
+): ReplyInjectionResult {
   const content = capturePaneContent(paneId, 15);
   const analysis = analyzePaneContent(content);
 
   if (analysis.confidence < 0.4) {
     log(`WARN: Pane ${paneId} does not appear to be running Codex CLI (confidence: ${analysis.confidence}). Skipping injection, removing stale mapping.`);
     removeMessagesByPane(paneId);
-    return false;
+    return {
+      outcome: 'terminal-ignore',
+      reason: `pane verification failed (${analysis.confidence.toFixed(2)})`,
+    };
   }
 
   const prefix = config.includePrefix ? `[reply:${platform}] ` : '';
@@ -562,7 +754,9 @@ function injectReply(
     log(`ERROR: Failed to inject reply into pane ${paneId}`);
   }
 
-  return success;
+  return success
+    ? { outcome: 'success' }
+    : { outcome: 'retryable-failure', reason: 'tmux send failed' };
 }
 
 async function postDiscordReplyMessage(
@@ -633,6 +827,7 @@ export async function pollDiscordOnce(
   const injectReplyImpl = deps.injectReplyImpl ?? injectReply;
   const buildSessionStatusReplyImpl = deps.buildSessionStatusReplyImpl ?? buildDiscordSessionStatusReply;
   const captureReplyAcknowledgementSummaryImpl = deps.captureReplyAcknowledgementSummaryImpl ?? captureReplyAcknowledgementSummary;
+  const formatReplyAcknowledgementImpl = deps.formatReplyAcknowledgementImpl ?? formatReplyAcknowledgement;
   const lookupByMessageIdImpl = deps.lookupByMessageIdImpl ?? lookupByMessageId;
   const writeDaemonStateImpl = deps.writeDaemonStateImpl ?? writeDaemonState;
   const parseMentionAllowedMentionsImpl = deps.parseMentionAllowedMentionsImpl ?? parseMentionAllowedMentions;
@@ -662,12 +857,7 @@ export async function pollDiscordOnce(
       return;
     }
 
-    const messages = await response.json() as Array<{
-      id: string;
-      author: { id: string };
-      content: string;
-      message_reference?: { message_id: string };
-    }>;
+    const messages = await response.json() as DiscordMessage[];
 
     if (!Array.isArray(messages) || messages.length === 0) return;
 
@@ -677,21 +867,16 @@ export async function pollDiscordOnce(
       const isStatusCommand = isDiscordStatusCommand(msg.content ?? '');
 
       if (!msg.message_reference?.message_id) {
-        state.discordLastMessageId = msg.id;
-        writeDaemonStateImpl(state);
+        commitDiscordCursor(state, msg.id, writeDaemonStateImpl);
         continue;
       }
 
       if (!config.authorizedDiscordUserIds.includes(msg.author.id)) {
-        state.discordLastMessageId = msg.id;
-        writeDaemonStateImpl(state);
+        commitDiscordCursor(state, msg.id, writeDaemonStateImpl);
         continue;
       }
 
       const mapping = lookupByMessageIdImpl('discord-bot', msg.message_reference.message_id);
-      state.discordLastMessageId = msg.id;
-      writeDaemonStateImpl(state);
-
       if (!mapping) {
         if (isStatusCommand) {
           await postDiscordReplyMessage(config, msg.id, NO_TRACKED_SESSION_MESSAGE, {
@@ -699,13 +884,14 @@ export async function pollDiscordOnce(
             logImpl,
           });
         }
+        commitDiscordCursor(state, msg.id, writeDaemonStateImpl);
         continue;
       }
 
       if (!rateLimiter.canProceed()) {
-        logImpl(`WARN: Rate limit exceeded, dropping Discord message ${msg.id}`);
+        logImpl(`WARN: Rate limit exceeded, deferring Discord message ${msg.id}`);
         state.errors++;
-        continue;
+        break;
       }
 
       if (isStatusCommand) {
@@ -714,53 +900,69 @@ export async function pollDiscordOnce(
           fetchImpl,
           logImpl,
         });
+        commitDiscordCursor(state, msg.id, writeDaemonStateImpl);
         continue;
       }
 
-      const success = injectReplyImpl(mapping.tmuxPaneId, msg.content, 'discord', config);
-      if (success) {
+      const injectionResult = normalizeInjectReplyResult(
+        injectReplyImpl(mapping.tmuxPaneId, msg.content, 'discord', config),
+      );
+      if (injectionResult.outcome === 'success') {
         state.messagesInjected++;
-        const acknowledgement = formatReplyAcknowledgement(captureReplyAcknowledgementSummaryImpl(mapping.tmuxPaneId));
-        // Add ✅ reaction to the user's reply
-        try {
-          await fetchImpl(
-            `https://discord.com/api/v10/channels/${config.discordChannelId}/messages/${msg.id}/reactions/%E2%9C%85/@me`,
-            {
-              method: 'PUT',
-              headers: { 'Authorization': `Bot ${config.discordBotToken}` },
-              signal: AbortSignal.timeout(5000),
-            }
-          );
-        } catch (e) {
-          logImpl(`WARN: Failed to add confirmation reaction: ${e}`);
-        }
+        commitDiscordCursor(state, msg.id, writeDaemonStateImpl);
 
-        // Send injection notification as a reply to the user's message (non-critical)
-        try {
-          const feedbackAllowedMentions = config.discordMention
-            ? parseMentionAllowedMentionsImpl(config.discordMention)
-            : { parse: [] as string[] };
-          await fetchImpl(
-            `https://discord.com/api/v10/channels/${config.discordChannelId}/messages`,
-            {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bot ${config.discordBotToken}`,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                content: acknowledgement,
-                message_reference: { message_id: msg.id },
-                allowed_mentions: feedbackAllowedMentions,
-              }),
-              signal: AbortSignal.timeout(5000),
-            }
-          );
-        } catch (e) {
-          logImpl(`WARN: Failed to send injection channel notification: ${e}`);
+        const acknowledgement = buildReplyAcknowledgement(
+          mapping.tmuxPaneId,
+          config,
+          captureReplyAcknowledgementSummaryImpl,
+          formatReplyAcknowledgementImpl,
+        );
+        if (acknowledgement !== null) {
+          // Add ✅ reaction to the user's reply
+          try {
+            await fetchImpl(
+              `https://discord.com/api/v10/channels/${config.discordChannelId}/messages/${msg.id}/reactions/%E2%9C%85/@me`,
+              {
+                method: 'PUT',
+                headers: { 'Authorization': `Bot ${config.discordBotToken}` },
+                signal: AbortSignal.timeout(5000),
+              }
+            );
+          } catch (e) {
+            logImpl(`WARN: Failed to add confirmation reaction: ${e}`);
+          }
+
+          // Send injection notification as a reply to the user's message (non-critical)
+          try {
+            const feedbackAllowedMentions = config.discordMention
+              ? parseMentionAllowedMentionsImpl(config.discordMention)
+              : { parse: [] as string[] };
+            await fetchImpl(
+              `https://discord.com/api/v10/channels/${config.discordChannelId}/messages`,
+              {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bot ${config.discordBotToken}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  content: acknowledgement,
+                  message_reference: { message_id: msg.id },
+                  allowed_mentions: feedbackAllowedMentions,
+                }),
+                signal: AbortSignal.timeout(5000),
+              }
+            );
+          } catch (e) {
+            logImpl(`WARN: Failed to send injection channel notification: ${e}`);
+          }
         }
+      } else if (injectionResult.outcome === 'terminal-ignore') {
+        commitDiscordCursor(state, msg.id, writeDaemonStateImpl);
       } else {
         state.errors++;
+        logImpl(`WARN: Deferring Discord message ${msg.id} after retryable intake failure${injectionResult.reason ? `: ${injectionResult.reason}` : ''}`);
+        break;
       }
     }
   } catch (error) {
@@ -773,6 +975,130 @@ export async function pollDiscordOnce(
 // ============================================================================
 // Telegram Polling
 // ============================================================================
+
+async function requestTelegramUpdates(
+  config: ReplyListenerDaemonConfig,
+  state: ReplyListenerState,
+  httpsRequestImpl: typeof httpsRequest,
+  options: {
+    timeoutSeconds?: number;
+    offset?: number;
+  } = {},
+): Promise<TelegramUpdate[]> {
+  const timeoutSeconds = options.timeoutSeconds ?? config.telegramPollTimeoutSeconds;
+  const path = buildTelegramGetUpdatesPath(config, state, {
+    timeoutSeconds,
+    ...(options.offset !== undefined ? { offset: options.offset } : {}),
+  });
+
+  return await new Promise<TelegramUpdate[]>((resolve, reject) => {
+    const req = httpsRequestImpl(
+      {
+        hostname: 'api.telegram.org',
+        path,
+        method: 'GET',
+        family: 4,
+        timeout: getTelegramRequestTimeoutMs(timeoutSeconds),
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => {
+          try {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf-8')) as {
+              result?: TelegramUpdate[];
+            };
+            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+              resolve(Array.isArray(body.result) ? body.result : []);
+            } else {
+              reject(new Error(`HTTP ${res.statusCode}`));
+            }
+          } catch (error) {
+            reject(error);
+          }
+        });
+      }
+    );
+
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Request timeout'));
+    });
+
+    req.end();
+  });
+}
+
+async function sendTelegramReplyMessage(
+  config: ReplyListenerDaemonConfig,
+  httpsRequestImpl: typeof httpsRequest,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const replyBody = JSON.stringify(body);
+
+  await new Promise<void>((resolve) => {
+    const replyReq = httpsRequestImpl(
+      {
+        hostname: 'api.telegram.org',
+        path: `/bot${config.telegramBotToken}/sendMessage`,
+        method: 'POST',
+        family: 4,
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(replyBody),
+        },
+        timeout: 5000,
+      },
+      (res) => {
+        res.resume();
+        resolve();
+      }
+    );
+
+    replyReq.on('error', () => resolve());
+    replyReq.on('timeout', () => {
+      replyReq.destroy();
+      resolve();
+    });
+
+    replyReq.write(replyBody);
+    replyReq.end();
+  });
+}
+
+async function applyTelegramStartupBacklogPolicy(
+  config: ReplyListenerDaemonConfig,
+  state: ReplyListenerState,
+  httpsRequestImpl: typeof httpsRequest,
+  writeDaemonStateImpl: typeof writeDaemonState,
+  logImpl: typeof log,
+): Promise<boolean> {
+  if (state.telegramStartupPolicyApplied) {
+    return false;
+  }
+
+  state.telegramStartupPolicyApplied = true;
+
+  if (config.telegramStartupBacklogPolicy !== 'drop_pending') {
+    writeDaemonStateImpl(state);
+    return false;
+  }
+
+  const updates = await requestTelegramUpdates(config, state, httpsRequestImpl, { timeoutSeconds: 0 });
+  const lastUpdateId = updates
+    .map((update) => update.update_id)
+    .filter((updateId): updateId is number => typeof updateId === 'number')
+    .at(-1);
+
+  if (lastUpdateId !== undefined) {
+    state.telegramLastUpdateId = lastUpdateId;
+    logImpl(`INFO: Dropped ${updates.length} pending Telegram update(s) on startup`);
+  }
+
+  writeDaemonStateImpl(state);
+  return true;
+}
 
 async function pollTelegram(
   config: ReplyListenerDaemonConfig,
@@ -794,139 +1120,102 @@ export async function pollTelegramOnce(
   const httpsRequestImpl = deps.httpsRequestImpl ?? httpsRequest;
   const injectReplyImpl = deps.injectReplyImpl ?? injectReply;
   const captureReplyAcknowledgementSummaryImpl = deps.captureReplyAcknowledgementSummaryImpl ?? captureReplyAcknowledgementSummary;
+  const formatReplyAcknowledgementImpl = deps.formatReplyAcknowledgementImpl ?? formatReplyAcknowledgement;
   const lookupByMessageIdImpl = deps.lookupByMessageIdImpl ?? lookupByMessageId;
   const writeDaemonStateImpl = deps.writeDaemonStateImpl ?? writeDaemonState;
   const logImpl = deps.logImpl ?? log;
 
   try {
-    const offset = state.telegramLastUpdateId ? state.telegramLastUpdateId + 1 : 0;
-    const path = `/bot${config.telegramBotToken}/getUpdates?offset=${offset}&timeout=0`;
+    if (await applyTelegramStartupBacklogPolicy(
+      config,
+      state,
+      httpsRequestImpl,
+      writeDaemonStateImpl,
+      logImpl,
+    )) {
+      return;
+    }
 
-    const updates = await new Promise<any[]>((resolve, reject) => {
-      const req = httpsRequestImpl(
-        {
-          hostname: 'api.telegram.org',
-          path,
-          method: 'GET',
-          family: 4,
-          timeout: 10000,
-        },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on('data', (chunk: Buffer) => chunks.push(chunk));
-          res.on('end', () => {
-            try {
-              const body = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-              if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-                resolve(body.result || []);
-              } else {
-                reject(new Error(`HTTP ${res.statusCode}`));
-              }
-            } catch (e) {
-              reject(e);
-            }
-          });
-        }
-      );
-
-      req.on('error', reject);
-      req.on('timeout', () => {
-        req.destroy();
-        reject(new Error('Request timeout'));
-      });
-
-      req.end();
-    });
+    const updates = await requestTelegramUpdates(config, state, httpsRequestImpl);
 
     for (const update of updates) {
+      const updateId = typeof update.update_id === 'number' ? update.update_id : null;
+      if (updateId === null) {
+        continue;
+      }
       const msg = update.message;
       if (!msg) {
-        state.telegramLastUpdateId = update.update_id;
-        writeDaemonStateImpl(state);
+        commitTelegramCursor(state, updateId, writeDaemonStateImpl);
         continue;
       }
 
       if (!msg.reply_to_message?.message_id) {
-        state.telegramLastUpdateId = update.update_id;
-        writeDaemonStateImpl(state);
+        commitTelegramCursor(state, updateId, writeDaemonStateImpl);
         continue;
       }
 
-      if (String(msg.chat.id) !== config.telegramChatId) {
-        state.telegramLastUpdateId = update.update_id;
-        writeDaemonStateImpl(state);
+      if (String(msg.chat?.id) !== config.telegramChatId) {
+        commitTelegramCursor(state, updateId, writeDaemonStateImpl);
+        continue;
+      }
+
+      const senderId = msg.from?.id !== undefined ? String(msg.from.id) : null;
+      if (
+        config.authorizedTelegramUserIds.length > 0
+        && (!senderId || !config.authorizedTelegramUserIds.includes(senderId))
+      ) {
+        commitTelegramCursor(state, updateId, writeDaemonStateImpl);
         continue;
       }
 
       const mapping = lookupByMessageIdImpl('telegram', String(msg.reply_to_message.message_id));
       if (!mapping) {
-        state.telegramLastUpdateId = update.update_id;
-        writeDaemonStateImpl(state);
+        commitTelegramCursor(state, updateId, writeDaemonStateImpl);
         continue;
       }
 
       const text = msg.text || '';
       if (!text) {
-        state.telegramLastUpdateId = update.update_id;
-        writeDaemonStateImpl(state);
+        commitTelegramCursor(state, updateId, writeDaemonStateImpl);
         continue;
       }
 
       if (!rateLimiter.canProceed()) {
-        logImpl(`WARN: Rate limit exceeded, dropping Telegram message ${msg.message_id}`);
-        state.telegramLastUpdateId = update.update_id;
-        writeDaemonStateImpl(state);
+        logImpl(`WARN: Rate limit exceeded, deferring Telegram message ${msg.message_id}`);
         state.errors++;
-        continue;
+        break;
       }
 
-      state.telegramLastUpdateId = update.update_id;
-      writeDaemonStateImpl(state);
-
-      const success = injectReplyImpl(mapping.tmuxPaneId, text, 'telegram', config);
-      if (success) {
+      const injectionResult = normalizeInjectReplyResult(
+        injectReplyImpl(mapping.tmuxPaneId, text, 'telegram', config),
+      );
+      if (injectionResult.outcome === 'success') {
         state.messagesInjected++;
-        const acknowledgement = formatReplyAcknowledgement(captureReplyAcknowledgementSummaryImpl(mapping.tmuxPaneId));
-        try {
-          const replyBody = JSON.stringify({
-            chat_id: config.telegramChatId,
-            text: acknowledgement,
-            reply_to_message_id: msg.message_id,
-          });
+        commitTelegramCursor(state, updateId, writeDaemonStateImpl);
 
-          await new Promise<void>((resolve) => {
-            const replyReq = httpsRequestImpl(
-              {
-                hostname: 'api.telegram.org',
-                path: `/bot${config.telegramBotToken}/sendMessage`,
-                method: 'POST',
-                family: 4,
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Content-Length': Buffer.byteLength(replyBody),
-                },
-                timeout: 5000,
-              },
-              (res) => {
-                res.resume();
-                resolve();
-              }
-            );
-
-            replyReq.on('error', () => resolve());
-            replyReq.on('timeout', () => {
-              replyReq.destroy();
-              resolve();
+        const acknowledgement = buildReplyAcknowledgement(
+          mapping.tmuxPaneId,
+          config,
+          captureReplyAcknowledgementSummaryImpl,
+          formatReplyAcknowledgementImpl,
+        );
+        if (acknowledgement !== null) {
+          try {
+            await sendTelegramReplyMessage(config, httpsRequestImpl, {
+              chat_id: config.telegramChatId,
+              text: acknowledgement,
+              reply_to_message_id: msg.message_id,
             });
-
-            replyReq.write(replyBody);
-            replyReq.end();
-          });
-        } catch (e) {
-          logImpl(`WARN: Failed to send confirmation reply: ${e}`);
+          } catch (e) {
+            logImpl(`WARN: Failed to send confirmation reply: ${e}`);
+          }
         }
+      } else if (injectionResult.outcome === 'terminal-ignore') {
+        commitTelegramCursor(state, updateId, writeDaemonStateImpl);
       } else {
         state.errors++;
+        logImpl(`WARN: Deferring Telegram update ${updateId} after retryable intake failure${injectionResult.reason ? `: ${injectionResult.reason}` : ''}`);
+        break;
       }
     }
   } catch (error) {
@@ -952,16 +1241,11 @@ async function pollLoop(): Promise<void> {
   }
   let config = normalizeReplyListenerConfig(initialConfig);
 
-  const state = readDaemonState() || {
+  const state = readDaemonState() || normalizeReplyListenerState({
     isRunning: true,
     pid: process.pid,
     startedAt: new Date().toISOString(),
-    lastPollAt: null,
-    telegramLastUpdateId: null,
-    discordLastMessageId: null,
-    messagesInjected: 0,
-    errors: 0,
-  };
+  });
 
   state.isRunning = true;
   state.pid = process.pid;
@@ -1133,14 +1417,11 @@ export function startReplyListener(
       writePidFileImpl(pid);
 
       const state: ReplyListenerState = {
-        isRunning: true,
-        pid,
-        startedAt: new Date().toISOString(),
-        lastPollAt: null,
-        telegramLastUpdateId: null,
-        discordLastMessageId: null,
-        messagesInjected: 0,
-        errors: 0,
+        ...normalizeReplyListenerState({
+          isRunning: true,
+          pid,
+          startedAt: new Date().toISOString(),
+        }),
       };
       writeDaemonStateImpl(state);
       logImpl(`Reply listener daemon started with PID ${pid}`);

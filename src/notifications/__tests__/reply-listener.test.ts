@@ -28,7 +28,12 @@ function createBaseConfig(overrides: Partial<ReplyListenerDaemonConfig> = {}): R
     maxMessageLength: 500,
     rateLimitPerMinute: 10,
     includePrefix: true,
+    ackMode: 'minimal',
     authorizedDiscordUserIds: ['discord-user-1'],
+    authorizedTelegramUserIds: ['telegram-user-1'],
+    telegramPollTimeoutSeconds: 30,
+    telegramAllowedUpdates: ['message'],
+    telegramStartupBacklogPolicy: 'resume',
     discordEnabled: true,
     discordBotToken: 'discord-token',
     discordChannelId: 'discord-channel',
@@ -47,6 +52,7 @@ function createBaseState(): ReplyListenerState {
     lastPollAt: null,
     telegramLastUpdateId: null,
     discordLastMessageId: null,
+    telegramStartupPolicyApplied: false,
     messagesInjected: 0,
     errors: 0,
   };
@@ -298,7 +304,12 @@ describe('normalizeReplyListenerConfig', () => {
       maxMessageLength: -10,
       rateLimitPerMinute: -1,
       includePrefix: false,
+      ackMode: 'summary',
       authorizedDiscordUserIds: ['123', '', '  ', '456'],
+      authorizedTelegramUserIds: ['4001', '', '  ', '4002'],
+      telegramPollTimeoutSeconds: 0,
+      telegramAllowedUpdates: ['message', '', 'edited_message'],
+      telegramStartupBacklogPolicy: 'drop_pending',
       discordEnabled: true,
       discordBotToken: 'bot-token',
       discordChannelId: 'channel-id',
@@ -308,7 +319,12 @@ describe('normalizeReplyListenerConfig', () => {
     assert.equal(normalized.maxMessageLength, 1);
     assert.equal(normalized.rateLimitPerMinute, 1);
     assert.equal(normalized.includePrefix, false);
+    assert.equal(normalized.ackMode, 'summary');
     assert.deepEqual(normalized.authorizedDiscordUserIds, ['123', '456']);
+    assert.deepEqual(normalized.authorizedTelegramUserIds, ['4001', '4002']);
+    assert.equal(normalized.telegramPollTimeoutSeconds, 1);
+    assert.deepEqual(normalized.telegramAllowedUpdates, ['message', 'edited_message']);
+    assert.equal(normalized.telegramStartupBacklogPolicy, 'drop_pending');
   });
 
   it('infers enabled flags from credentials when omitted', () => {
@@ -318,7 +334,12 @@ describe('normalizeReplyListenerConfig', () => {
       maxMessageLength: 500,
       rateLimitPerMinute: 10,
       includePrefix: true,
+      ackMode: 'minimal',
       authorizedDiscordUserIds: [],
+      authorizedTelegramUserIds: [],
+      telegramPollTimeoutSeconds: 30,
+      telegramAllowedUpdates: ['message'],
+      telegramStartupBacklogPolicy: 'resume',
       telegramBotToken: 'tg-token',
       telegramChatId: 'tg-chat',
     });
@@ -481,8 +502,17 @@ describe('captureReplyAcknowledgementSummary', () => {
 });
 
 describe('formatReplyAcknowledgement', () => {
-  it('includes recent output when a summary is available', () => {
-    const message = formatReplyAcknowledgement('Line 1\nLine 2');
+  it('returns a minimal acknowledgement by default', () => {
+    const message = formatReplyAcknowledgement('Line 1\nLine 2', 'minimal');
+
+    assert.equal(
+      message,
+      'Injected into Codex CLI session.',
+    );
+  });
+
+  it('includes recent output when summary mode is enabled', () => {
+    const message = formatReplyAcknowledgement('Line 1\nLine 2', 'summary');
 
     assert.equal(
       message,
@@ -490,13 +520,19 @@ describe('formatReplyAcknowledgement', () => {
     );
   });
 
-  it('falls back when no summary is available', () => {
-    const message = formatReplyAcknowledgement(null);
+  it('falls back when summary mode has no recent output', () => {
+    const message = formatReplyAcknowledgement(null, 'summary');
 
     assert.equal(
       message,
       'Injected into Codex CLI session.\n\nRecent output summary unavailable.',
     );
+  });
+
+  it('suppresses acknowledgements when ack mode is off', () => {
+    const message = formatReplyAcknowledgement('Line 1', 'off');
+
+    assert.equal(message, null);
   });
 });
 
@@ -660,9 +696,9 @@ describe('pollDiscordOnce', () => {
     assert.equal(state.discordLastMessageId, 'discord-status-reused-id');
   });
 
-  it('injects authorized replies and posts a threaded acknowledgement with recent output', async () => {
+  it('injects authorized replies and posts a threaded acknowledgement with recent output in summary mode', async () => {
     resetReplyListenerTransientState();
-    const config = createBaseConfig({ discordMention: '<@123>' });
+    const config = createBaseConfig({ discordMention: '<@123>', ackMode: 'summary' });
     const state = createBaseState();
     const writes: ReplyListenerState[] = [];
     const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
@@ -872,11 +908,69 @@ describe('pollDiscordOnce', () => {
     assert.equal(injectCalled, false);
     assert.equal(state.messagesInjected, 0);
     assert.equal(state.errors, 1);
-    assert.equal(state.discordLastMessageId, 'discord-reply-3');
+    assert.equal(state.discordLastMessageId, null);
+  });
+
+  it('does not advance the Discord cursor when injection fails with a retryable error', async () => {
+    resetReplyListenerTransientState();
+    const state = createBaseState();
+
+    await pollDiscordOnce(
+      createBaseConfig(),
+      state,
+      new RateLimiter(10),
+      {
+        fetchImpl: async () => jsonResponse([
+          {
+            id: 'discord-retryable-failure',
+            author: { id: 'discord-user-1' },
+            content: 'retry me',
+            message_reference: { message_id: 'orig-discord-msg' },
+          },
+        ]),
+        lookupByMessageIdImpl: () => createMapping('discord-bot'),
+        injectReplyImpl: () => false,
+      },
+    );
+
+    assert.equal(state.messagesInjected, 0);
+    assert.equal(state.errors, 1);
+    assert.equal(state.discordLastMessageId, null);
   });
 });
 
 describe('pollTelegramOnce', () => {
+  it('uses long polling parameters and default allowed_updates', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    let observedPath = '';
+
+    await pollTelegramOnce(
+      config,
+      createBaseState(),
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: (_body, options) => {
+            observedPath = String(options.path);
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: [],
+              },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(
+      observedPath,
+      `/bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`,
+    );
+  });
+
   it('injects Telegram replies and sends a reply acknowledgement', async () => {
     resetReplyListenerTransientState();
     const config = createBaseConfig();
@@ -890,7 +984,7 @@ describe('pollTelegramOnce', () => {
       new RateLimiter(10),
       {
         httpsRequestImpl: createHttpsRequestMock({
-          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=0`]: () => ({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
             statusCode: 200,
             body: {
               ok: true,
@@ -900,6 +994,7 @@ describe('pollTelegramOnce', () => {
                   message: {
                     message_id: 333,
                     chat: { id: 777 },
+                    from: { id: 'telegram-user-1' },
                     text: 'continue',
                     reply_to_message: { message_id: 222 },
                   },
@@ -940,7 +1035,7 @@ describe('pollTelegramOnce', () => {
     assert.equal(parsedBody.reply_to_message_id, 333);
     assert.equal(
       parsedBody.text,
-      'Injected into Codex CLI session.\n\nRecent output:\nRecent telegram output',
+      'Injected into Codex CLI session.',
     );
   });
 
@@ -955,7 +1050,7 @@ describe('pollTelegramOnce', () => {
       new RateLimiter(10),
       {
         httpsRequestImpl: createHttpsRequestMock({
-          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=0`]: () => ({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
             statusCode: 200,
             body: {
               ok: true,
@@ -965,6 +1060,7 @@ describe('pollTelegramOnce', () => {
                   message: {
                     message_id: 334,
                     chat: { id: 999 },
+                    from: { id: 'telegram-user-1' },
                     text: 'wrong chat',
                     reply_to_message: { message_id: 222 },
                   },
@@ -987,6 +1083,50 @@ describe('pollTelegramOnce', () => {
     assert.equal(sendMessageAttempted, false);
   });
 
+  it('rejects unauthorized Telegram senders even when the chat matches', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 46,
+                  message: {
+                    message_id: 335,
+                    chat: { id: 777 },
+                    from: { id: 'intruder' },
+                    text: 'wrong sender',
+                    reply_to_message: { message_id: 222 },
+                  },
+                },
+              ],
+            },
+          }),
+        }),
+        lookupByMessageIdImpl: () => {
+          throw new Error('lookup should not run for unauthorized Telegram senders');
+        },
+        injectReplyImpl: () => {
+          throw new Error('injectReply should not run for unauthorized Telegram senders');
+        },
+      },
+    );
+
+    assert.equal(state.telegramLastUpdateId, 46);
+    assert.equal(state.messagesInjected, 0);
+    assert.equal(state.errors, 0);
+  });
+
   it('records an error when Telegram injection fails and does not send an acknowledgement', async () => {
     resetReplyListenerTransientState();
     const config = createBaseConfig();
@@ -999,7 +1139,7 @@ describe('pollTelegramOnce', () => {
       new RateLimiter(10),
       {
         httpsRequestImpl: createHttpsRequestMock({
-          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=0`]: () => ({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
             statusCode: 200,
             body: {
               ok: true,
@@ -1009,6 +1149,7 @@ describe('pollTelegramOnce', () => {
                   message: {
                     message_id: 335,
                     chat: { id: 777 },
+                    from: { id: 'telegram-user-1' },
                     text: 'blocked',
                     reply_to_message: { message_id: 222 },
                   },
@@ -1029,6 +1170,50 @@ describe('pollTelegramOnce', () => {
     assert.equal(sendMessageAttempted, false);
     assert.equal(state.messagesInjected, 0);
     assert.equal(state.errors, 1);
-    assert.equal(state.telegramLastUpdateId, 46);
+    assert.equal(state.telegramLastUpdateId, null);
+  });
+
+  it('drops pending Telegram backlog deterministically when configured', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig({ telegramStartupBacklogPolicy: 'drop_pending' });
+    const state = createBaseState();
+    let injectCalled = false;
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=0&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 50,
+                  message: {
+                    message_id: 340,
+                    chat: { id: 777 },
+                    from: { id: 'telegram-user-1' },
+                    text: 'stale backlog',
+                    reply_to_message: { message_id: 222 },
+                  },
+                },
+              ],
+            },
+          }),
+        }),
+        lookupByMessageIdImpl: () => createMapping('telegram'),
+        injectReplyImpl: () => {
+          injectCalled = true;
+          return true;
+        },
+      },
+    );
+
+    assert.equal(injectCalled, false);
+    assert.equal(state.telegramLastUpdateId, 50);
+    assert.equal(state.telegramStartupPolicyApplied, true);
   });
 });
