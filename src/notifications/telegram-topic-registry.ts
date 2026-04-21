@@ -99,6 +99,22 @@ function normalizeRecord(value: unknown): TelegramTopicRegistryRecord | null {
   };
 }
 
+function normalizeMessageThreadIdForLookup(messageThreadId: unknown): string | null {
+  const normalized = normalizeString(messageThreadId);
+  if (!normalized) {
+    return null;
+  }
+
+  if (/^\d+$/.test(normalized)) {
+    const parsed = Number(normalized);
+    if (Number.isSafeInteger(parsed)) {
+      return String(parsed);
+    }
+  }
+
+  return normalized;
+}
+
 function normalizeStore(value: unknown): TelegramTopicRegistryStore | null {
   if (Array.isArray(value)) {
     return {
@@ -338,6 +354,24 @@ export async function listTelegramTopicRegistryRecords(
   return await withRegistryLock(async () => {
     const store = await readRegistryUnsafe();
     return store.records.filter((record) => record.sourceChatKey === sourceChatKey);
+  });
+}
+
+export async function findTelegramTopicRegistryRecordByThreadId(
+  sourceChatKey: string,
+  messageThreadId: string | number | undefined,
+): Promise<TelegramTopicRegistryRecord | null> {
+  const normalizedThreadId = normalizeMessageThreadIdForLookup(messageThreadId);
+  if (!normalizedThreadId) {
+    return null;
+  }
+
+  return await withRegistryLock(async () => {
+    const store = await readRegistryUnsafe();
+    return store.records.find((record) => (
+      record.sourceChatKey === sourceChatKey
+      && normalizeMessageThreadIdForLookup(record.messageThreadId) === normalizedThreadId
+    )) ?? null;
   });
 }
 

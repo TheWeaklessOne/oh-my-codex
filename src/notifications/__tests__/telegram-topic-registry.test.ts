@@ -104,6 +104,48 @@ describe('telegram-topic-registry', () => {
     assert.equal(touched?.lastUsedAt, '2026-04-21T17:00:00.000Z');
   });
 
+  it('finds records by message thread id within the same Telegram source chat', async () => {
+    const mod = await importRegistryFresh();
+    await mod.upsertTelegramTopicRegistryRecord({
+      sourceChatKey: 'telegram:123456:777',
+      projectKey: 'project-key-1',
+      canonicalProjectPath: '/repos/worktree-a',
+      displayName: 'worktree-a',
+      topicName: 'worktree-a',
+      messageThreadId: '9001',
+    });
+
+    const found = await mod.findTelegramTopicRegistryRecordByThreadId('telegram:123456:777', 9001);
+    assert.ok(found);
+    assert.equal(found?.projectKey, 'project-key-1');
+    assert.equal(found?.canonicalProjectPath, '/repos/worktree-a');
+  });
+
+  it('keeps thread-id reverse lookup isolated by source chat key', async () => {
+    const mod = await importRegistryFresh();
+    await mod.upsertTelegramTopicRegistryRecord({
+      sourceChatKey: 'telegram:123456:777',
+      projectKey: 'project-key-1',
+      canonicalProjectPath: '/repos/worktree-a',
+      displayName: 'worktree-a',
+      messageThreadId: '9001',
+    });
+    await mod.upsertTelegramTopicRegistryRecord({
+      sourceChatKey: 'telegram:123456:888',
+      projectKey: 'project-key-2',
+      canonicalProjectPath: '/repos/worktree-b',
+      displayName: 'worktree-b',
+      messageThreadId: '9001',
+    });
+
+    const found = await mod.findTelegramTopicRegistryRecordByThreadId('telegram:123456:888', '9001');
+    assert.ok(found);
+    assert.equal(found?.projectKey, 'project-key-2');
+
+    const missing = await mod.findTelegramTopicRegistryRecordByThreadId('telegram:123456:999', '9001');
+    assert.equal(missing, null);
+  });
+
   it('serializes concurrent callers with the per-project lock', async () => {
     const mod = await importRegistryFresh();
     const order: string[] = [];

@@ -279,10 +279,15 @@ Behavior summary:
 - OMX computes stable project identity from the **canonical project path**, not only from the basename/project name.
 - On the first notification from a project, OMX lazily creates a forum topic with `createForumTopic`, stores the resulting `message_thread_id`, and immediately sends the notification into that topic in the same dispatch flow.
 - Later notifications from the same project reuse the stored `message_thread_id`.
+- When `notifications.reply.enabled` is also on, a **new non-reply Telegram message inside a known project topic** becomes a **session entrypoint**: OMX starts a fresh detached tmux session for that topic’s canonical project and submits the message as the first prompt.
+- Telegram topic entry stays **project-scoped**, while replies stay **message-scoped**: replying to a tracked OMX message still routes back to the exact originating pane/session via `reply_to_message.message_id`, even when multiple sessions share the same project topic.
+- Every topic-launched session emits a dedicated launch acknowledgement reply in the same topic, and OMX registers that acknowledgement for future reply correlation even if `session-start` lifecycle notifications are disabled.
+- Topic-launched sessions **do not auto-accept** Codex trust / permissions confirmations: if local confirmation is still required, OMX reports that back into the topic and cleans up the failed detached session instead of approving it remotely.
 - Projects with the same visible name do not collide: OMX keeps the routing key path-based and adds a short hash suffix to topic names when needed.
 - If topic creation fails and `fallbackToGeneral` is enabled, OMX logs a warning and sends the message to the root/general chat instead of failing the notify pipeline.
 - Deterministic forum/permissions failures are cooled down before OMX retries topic creation again.
-- Telegram reply listener polling stays **chat-scoped**, but OMX sends usage / unauthorized / status / acknowledgement replies back into the same topic when thread metadata is available.
+- Telegram reply listener polling stays **chat-scoped**. OMX does **not** guess projects from visible topic names, does **not** auto-launch from the root/general chat, and returns bounded diagnostics for unknown/unbound topics instead.
+- OMX sends usage / unauthorized / status / acknowledgement replies back into the same topic when thread metadata is available.
 
 ### Reply listener hardening knobs
 

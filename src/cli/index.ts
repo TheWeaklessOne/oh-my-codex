@@ -64,6 +64,7 @@ import { SKILL_ACTIVE_STATE_MODE, syncCanonicalSkillStateForMode } from "../stat
 import { isTrackedWorkflowMode } from "../state/workflow-transition.js";
 import { maybeCheckAndPromptUpdate, runImmediateUpdate } from "./update.js";
 import { maybePromptGithubStar } from "./star-prompt.js";
+import { resolveOmxSessionId } from "./session-id.js";
 import {
   generateOverlay,
   removeSessionModelInstructionsFile,
@@ -975,7 +976,7 @@ export async function launchWithHud(args: string[]): Promise<void> {
       }
     }
   }
-  const sessionId = `omx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const sessionId = resolveOmxSessionId(process.env);
 
   try {
     await maybeCheckAndPromptUpdate(cwd);
@@ -1076,7 +1077,7 @@ export async function execWithOverlay(args: string[]): Promise<void> {
     }
   }
 
-  const sessionId = `omx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const sessionId = resolveOmxSessionId(process.env);
 
   try {
     await maybeCheckAndPromptUpdate(cwd);

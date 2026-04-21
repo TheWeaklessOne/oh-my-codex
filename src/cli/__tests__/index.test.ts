@@ -775,7 +775,7 @@ describe("buildNotifyTempStartupMessages", () => {
       true,
     );
     assert.deepEqual(result.infoLines, [
-      "notify temp: active | providers=discord | persistent-routing=bypassed",
+      "notify temp: active | providers=discord | transport-scope=selected-only | persistent-policy=preserved",
     ]);
     assert.deepEqual(result.warningLines, []);
   });

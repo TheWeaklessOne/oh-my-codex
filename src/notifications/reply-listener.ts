@@ -15,7 +15,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, chmodSync, statSync, appendFileSync, renameSync } from 'fs';
-import { join } from 'path';
+import { basename, join } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir } from 'os';
 import { spawn, spawnSync } from 'child_process';
@@ -28,9 +28,14 @@ import {
 } from './tmux-detector.js';
 import {
   lookupBySourceMessage,
+  registerMessage,
   removeMessagesByPane,
   pruneStale,
 } from './session-registry.js';
+import {
+  findTelegramTopicRegistryRecordByThreadId,
+  type TelegramTopicRegistryRecord,
+} from './telegram-topic-registry.js';
 import { coerceTelegramMessageThreadId } from './telegram-topics.js';
 import {
   buildDiscordReplySource,
@@ -48,6 +53,15 @@ import {
   parseMentionAllowedMentions,
 } from './config.js';
 import { parseTmuxTail } from './formatter.js';
+import {
+  killDetachedManagedSession,
+  launchDetachedManagedSession,
+} from '../cli/managed-session-launch.js';
+import {
+  detectCodexBlockingPanePrompt,
+  submitPromptToCodexPane,
+  waitForCodexPaneReady,
+} from '../tmux/prompt-submit.js';
 import { spawnPlatformCommandSync } from '../utils/platform-command.js';
 import type {
   ReplyAcknowledgementMode,
@@ -73,6 +87,7 @@ const DAEMON_ENV_ALLOWLIST = [
   'OMX_TELEGRAM_BOT_TOKEN', 'OMX_TELEGRAM_NOTIFIER_BOT_TOKEN',
   'OMX_TELEGRAM_CHAT_ID', 'OMX_TELEGRAM_NOTIFIER_CHAT_ID', 'OMX_TELEGRAM_NOTIFIER_UID',
   'OMX_NOTIFY_PROFILE',
+  'CODEX_HOME',
   'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY', 'no_proxy',
   'SystemRoot', 'SYSTEMROOT', 'windir', 'COMSPEC',
 ] as const;
@@ -103,6 +118,10 @@ const REPLY_ACK_PREFIX = 'Injected into Codex CLI session.';
 const REPLY_ACK_FALLBACK = 'Recent output summary unavailable.';
 const TELEGRAM_UNAUTHORIZED_REPLY_MESSAGE = 'This Telegram sender is not authorized to control OMX replies for this source.';
 const TELEGRAM_REPLY_USAGE_MESSAGE = 'Reply to a tracked OMX notification message, or reply "status" to inspect the tracked OMX session.';
+const TELEGRAM_TOPIC_ENTRY_USAGE_MESSAGE = 'Start a new OMX session from a known project topic, or reply to a tracked OMX notification message.';
+const TELEGRAM_UNKNOWN_TOPIC_MESSAGE = 'This Telegram topic is not bound to an OMX project yet. Send a notification from OMX first, or reply to a tracked OMX message.';
+const TELEGRAM_TOPIC_TRUST_PROMPT_MESSAGE = 'Started a new OMX session for this topic, but Codex is waiting for a local trust confirmation. Trust the project locally, then retry the topic message.';
+const TELEGRAM_TOPIC_BYPASS_PROMPT_MESSAGE = 'Started a new OMX session for this topic, but Codex is waiting at a local permissions confirmation. Approve it locally or change the local permissions mode, then retry the topic message.';
 
 export interface ReplyListenerState {
   isRunning: boolean;
@@ -946,11 +965,19 @@ export interface ReplyListenerDiscordPollDeps {
 
 export interface ReplyListenerTelegramPollDeps {
   httpsRequestImpl?: typeof httpsRequest;
+  getNotificationConfigImpl?: typeof getNotificationConfig;
   lookupByMessageIdImpl?: (
     platform: string,
     messageId: string,
     sourceKey: string | null,
   ) => ReturnType<typeof lookupBySourceMessage>;
+  findTopicRecordByThreadIdImpl?: typeof findTelegramTopicRegistryRecordByThreadId;
+  launchDetachedManagedSessionImpl?: typeof launchDetachedManagedSession;
+  killDetachedManagedSessionImpl?: typeof killDetachedManagedSession;
+  detectCodexBlockingPanePromptImpl?: typeof detectCodexBlockingPanePrompt;
+  waitForCodexPaneReadyImpl?: typeof waitForCodexPaneReady;
+  submitPromptToCodexPaneImpl?: typeof submitPromptToCodexPane;
+  registerMessageImpl?: typeof registerMessage;
   injectReplyImpl?: (
     paneId: string,
     text: string,
@@ -967,6 +994,7 @@ export interface ReplyListenerTelegramPollDeps {
 export interface ReplyListenerPollDeps {
   fetchImpl?: typeof fetch;
   httpsRequestImpl?: typeof httpsRequest;
+  getNotificationConfigImpl?: typeof getNotificationConfig;
   injectReplyImpl?: (
     paneId: string,
     text: string,
@@ -982,6 +1010,13 @@ export interface ReplyListenerPollDeps {
     messageId: string,
     sourceKey: string | null,
   ) => ReturnType<typeof lookupBySourceMessage>;
+  findTopicRecordByThreadIdImpl?: typeof findTelegramTopicRegistryRecordByThreadId;
+  launchDetachedManagedSessionImpl?: typeof launchDetachedManagedSession;
+  killDetachedManagedSessionImpl?: typeof killDetachedManagedSession;
+  detectCodexBlockingPanePromptImpl?: typeof detectCodexBlockingPanePrompt;
+  waitForCodexPaneReadyImpl?: typeof waitForCodexPaneReady;
+  submitPromptToCodexPaneImpl?: typeof submitPromptToCodexPane;
+  registerMessageImpl?: typeof registerMessage;
   writeDaemonStateImpl?: typeof writeDaemonState;
   parseMentionAllowedMentionsImpl?: typeof parseMentionAllowedMentions;
   logImpl?: typeof log;
@@ -1463,14 +1498,29 @@ async function requestTelegramUpdates(
   });
 }
 
+interface TelegramReplySendResult {
+  messageId?: string;
+  messageThreadId?: string;
+}
+
+function normalizeTelegramNumericId(value: unknown): string | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(Math.floor(value));
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    return value.trim();
+  }
+  return undefined;
+}
+
 async function sendTelegramReplyMessage(
   config: ReplyListenerDaemonConfig,
   httpsRequestImpl: typeof httpsRequest,
   body: Record<string, unknown>,
-): Promise<void> {
+): Promise<TelegramReplySendResult | null> {
   const replyBody = JSON.stringify(body);
 
-  await new Promise<void>((resolve, reject) => {
+  return await new Promise<TelegramReplySendResult | null>((resolve, reject) => {
     const replyReq = httpsRequestImpl(
       {
         hostname: 'api.telegram.org',
@@ -1490,21 +1540,37 @@ async function sendTelegramReplyMessage(
           const responseBody = Buffer.concat(chunks).toString('utf-8');
           if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
             if (!responseBody.trim()) {
-              resolve();
+              resolve(null);
               return;
             }
 
             try {
-              const parsed = JSON.parse(responseBody) as { ok?: unknown; description?: unknown };
+              const parsed = JSON.parse(responseBody) as {
+                ok?: unknown;
+                description?: unknown;
+                result?: {
+                  message_id?: unknown;
+                  message_thread_id?: unknown;
+                };
+              };
               if (parsed.ok === false) {
                 reject(new Error(typeof parsed.description === 'string' ? parsed.description : 'Telegram Bot API returned ok=false'));
                 return;
               }
+              resolve({
+                ...(normalizeTelegramNumericId(parsed.result?.message_id)
+                  ? { messageId: normalizeTelegramNumericId(parsed.result?.message_id) }
+                  : {}),
+                ...(normalizeTelegramNumericId(parsed.result?.message_thread_id)
+                  ? { messageThreadId: normalizeTelegramNumericId(parsed.result?.message_thread_id) }
+                  : {}),
+              });
+              return;
             } catch {
               // Non-JSON 2xx responses are treated as transport success.
             }
 
-            resolve();
+            resolve(null);
             return;
           }
 
@@ -1532,8 +1598,8 @@ async function sendTelegramTextReply(
     messageThreadId?: number | string;
   },
   text: string,
-): Promise<void> {
-  await sendTelegramReplyMessage(config, httpsRequestImpl, {
+): Promise<TelegramReplySendResult | null> {
+  return await sendTelegramReplyMessage(config, httpsRequestImpl, {
     chat_id: config.telegramChatId,
     text,
     reply_to_message_id: target.replyToMessageId,
@@ -1561,6 +1627,228 @@ async function trySendTelegramTextReply(
     logImpl(`WARN: Failed to send Telegram reply (${context}): ${error}`);
     return false;
   }
+}
+
+function isTelegramProjectTopicEntryEnabled(
+  config: ReplyListenerDaemonConfig,
+  getNotificationConfigImpl: typeof getNotificationConfig,
+): boolean {
+  const profileName = typeof process.env.OMX_NOTIFY_PROFILE === 'string'
+    ? process.env.OMX_NOTIFY_PROFILE.trim()
+    : '';
+  let notificationConfig: ReturnType<typeof getNotificationConfig>;
+  try {
+    notificationConfig = getNotificationConfigImpl(profileName || undefined);
+  } catch {
+    return false;
+  }
+  const telegramConfig = notificationConfig?.telegram;
+  if (!telegramConfig || telegramConfig.enabled !== true) {
+    return false;
+  }
+  if (telegramConfig.chatId !== config.telegramChatId || telegramConfig.botToken !== config.telegramBotToken) {
+    return false;
+  }
+  return telegramConfig.projectTopics?.enabled === true;
+}
+
+function formatTelegramLaunchAcknowledgement(
+  record: TelegramTopicRegistryRecord,
+  sessionId: string,
+): string {
+  const scopeLabel = record.topicName || record.displayName || basename(record.canonicalProjectPath);
+  return `Started a new OMX session for ${scopeLabel}.\nSession: ${sessionId}`;
+}
+
+function formatTelegramTopicLaunchFailure(prefix: string, error: unknown): string {
+  const detail = error instanceof Error ? error.message.trim() : String(error).trim();
+  return detail ? `${prefix}\n\n${detail}` : prefix;
+}
+
+function formatTelegramTopicPromptBlockMessage(blockingPrompt: ReturnType<typeof detectCodexBlockingPanePrompt>): string | null {
+  if (blockingPrompt === 'trust') {
+    return TELEGRAM_TOPIC_TRUST_PROMPT_MESSAGE;
+  }
+  if (blockingPrompt === 'bypass') {
+    return TELEGRAM_TOPIC_BYPASS_PROMPT_MESSAGE;
+  }
+  return null;
+}
+
+async function handleTelegramTopicSessionLaunch(
+  config: ReplyListenerDaemonConfig,
+  state: ReplyListenerState,
+  source: ReplySourceDescriptor,
+  sourceRecord: TelegramTopicRegistryRecord,
+  msg: NonNullable<TelegramUpdate['message']>,
+  rateLimiter: ReplyListenerRateLimiter,
+  deps: Required<Pick<
+    ReplyListenerPollDeps,
+    | 'httpsRequestImpl'
+    | 'launchDetachedManagedSessionImpl'
+    | 'killDetachedManagedSessionImpl'
+    | 'detectCodexBlockingPanePromptImpl'
+    | 'waitForCodexPaneReadyImpl'
+    | 'submitPromptToCodexPaneImpl'
+    | 'registerMessageImpl'
+    | 'writeDaemonStateImpl'
+    | 'logImpl'
+  >>,
+): Promise<boolean> {
+  const inboundThreadId = msg.message_thread_id ?? sourceRecord.messageThreadId;
+  const normalizedText = msg.text?.trim() ?? '';
+  if (!normalizedText) {
+    return true;
+  }
+
+  if (!rateLimiter.canProceed()) {
+    deps.logImpl(`WARN: Rate limit exceeded, deferring Telegram message ${msg.message_id}`);
+    state.errors++;
+    recordSourceFailure(state, source, 'rate-limit', `Deferred Telegram message ${msg.message_id}`);
+    logSourceEvent(deps.logImpl, source, 'intake-deferred', {
+      category: 'rate-limit',
+      messageId: msg.message_id,
+    });
+    return false;
+  }
+
+  let launchResult: Awaited<ReturnType<typeof launchDetachedManagedSession>>;
+  try {
+    launchResult = await deps.launchDetachedManagedSessionImpl({
+      cwd: sourceRecord.canonicalProjectPath,
+      codexHomeOverride: process.env.CODEX_HOME,
+      notifyProfile: process.env.OMX_NOTIFY_PROFILE ?? null,
+    });
+  } catch (error) {
+    state.errors++;
+    recordSourceFailure(state, source, 'topic-launch-failure', String(error));
+    await trySendTelegramTextReply(
+      config,
+      deps.httpsRequestImpl,
+      {
+        replyToMessageId: msg.message_id,
+        messageThreadId: inboundThreadId,
+      },
+      formatTelegramTopicLaunchFailure(
+        'Failed to start a new OMX session for this topic.',
+        error,
+      ),
+      deps.logImpl,
+      'topic-launch-failure',
+    );
+    return true;
+  }
+
+  const cleanupFailedLaunch = async (reason: string): Promise<void> => {
+    try {
+      const cleaned = await deps.killDetachedManagedSessionImpl(launchResult.tmuxSessionName);
+      if (!cleaned) {
+        deps.logImpl(
+          `WARN: Failed to clean up detached OMX session ${launchResult.tmuxSessionName} after ${reason}`,
+        );
+      }
+    } catch (error) {
+      deps.logImpl(
+        `WARN: Failed to clean up detached OMX session ${launchResult.tmuxSessionName} after ${reason}: ${error}`,
+      );
+    }
+  };
+
+  const ready = deps.waitForCodexPaneReadyImpl(launchResult.leaderPaneId, 30_000);
+  if (!ready) {
+    await cleanupFailedLaunch('topic-launch-readiness-timeout');
+    state.errors++;
+    recordSourceFailure(
+      state,
+      source,
+      'topic-launch-readiness-timeout',
+      `Timed out waiting for pane ${launchResult.leaderPaneId} to become ready`,
+    );
+    await trySendTelegramTextReply(
+      config,
+      deps.httpsRequestImpl,
+      {
+        replyToMessageId: msg.message_id,
+        messageThreadId: inboundThreadId,
+      },
+      formatTelegramTopicPromptBlockMessage(
+        deps.detectCodexBlockingPanePromptImpl(launchResult.leaderPaneId),
+      ) ?? 'Started a new OMX session for this topic, but it did not become ready to accept the first prompt in time.',
+      deps.logImpl,
+      'topic-launch-readiness-timeout',
+    );
+    return true;
+  }
+
+  try {
+    const submitted = await deps.submitPromptToCodexPaneImpl(
+      launchResult.leaderPaneId,
+      normalizedText,
+    );
+    if (!submitted) {
+      throw new Error('tmux prompt submission did not complete successfully');
+    }
+  } catch (error) {
+    await cleanupFailedLaunch('topic-launch-submit-failure');
+    state.errors++;
+    recordSourceFailure(state, source, 'topic-launch-submit-failure', String(error));
+    const blockedPromptMessage = formatTelegramTopicPromptBlockMessage(
+      deps.detectCodexBlockingPanePromptImpl(launchResult.leaderPaneId),
+    );
+    await trySendTelegramTextReply(
+      config,
+      deps.httpsRequestImpl,
+      {
+        replyToMessageId: msg.message_id,
+        messageThreadId: inboundThreadId,
+      },
+      blockedPromptMessage ?? formatTelegramTopicLaunchFailure(
+        'Started a new OMX session for this topic, but failed to deliver the first prompt.',
+        error,
+      ),
+      deps.logImpl,
+      'topic-launch-submit-failure',
+    );
+    return true;
+  }
+
+  state.messagesInjected++;
+
+  try {
+    const acknowledgement = await sendTelegramTextReply(
+      config,
+      deps.httpsRequestImpl,
+      {
+        replyToMessageId: msg.message_id,
+        messageThreadId: inboundThreadId,
+      },
+      formatTelegramLaunchAcknowledgement(sourceRecord, launchResult.sessionId),
+    );
+
+    if (acknowledgement?.messageId) {
+      const registered = deps.registerMessageImpl({
+        platform: 'telegram',
+        messageId: acknowledgement.messageId,
+        source,
+        sessionId: launchResult.sessionId,
+        tmuxPaneId: launchResult.leaderPaneId,
+        tmuxSessionName: launchResult.tmuxSessionName,
+        event: 'session-start',
+        createdAt: new Date().toISOString(),
+        projectPath: sourceRecord.canonicalProjectPath,
+        projectKey: sourceRecord.projectKey,
+        messageThreadId: acknowledgement.messageThreadId ?? normalizeTelegramNumericId(inboundThreadId),
+        topicName: sourceRecord.topicName,
+      });
+      if (!registered) {
+        deps.logImpl(`WARN: Failed to register Telegram launch acknowledgement ${acknowledgement.messageId} for session ${launchResult.sessionId}`);
+      }
+    }
+  } catch (error) {
+    deps.logImpl(`WARN: Failed to send Telegram reply (topic-launch-acknowledgement): ${error}`);
+  }
+
+  return true;
 }
 
 interface TelegramStartupPolicyResult {
@@ -1634,13 +1922,22 @@ export async function pollTelegramOnce(
   const sourceState = ensureSourceState(state, source);
 
   const httpsRequestImpl = deps.httpsRequestImpl ?? httpsRequest;
+  const getNotificationConfigImpl = deps.getNotificationConfigImpl ?? getNotificationConfig;
   const injectReplyImpl = deps.injectReplyImpl ?? injectReply;
   const buildSessionStatusReplyImpl = deps.buildSessionStatusReplyImpl ?? buildDiscordSessionStatusReply;
   const captureReplyAcknowledgementSummaryImpl = deps.captureReplyAcknowledgementSummaryImpl ?? captureReplyAcknowledgementSummary;
   const formatReplyAcknowledgementImpl = deps.formatReplyAcknowledgementImpl ?? formatReplyAcknowledgement;
   const lookupByMessageIdImpl = deps.lookupByMessageIdImpl ?? lookupBySourceMessage;
+  const findTopicRecordByThreadIdImpl = deps.findTopicRecordByThreadIdImpl ?? findTelegramTopicRegistryRecordByThreadId;
+  const launchDetachedManagedSessionImpl = deps.launchDetachedManagedSessionImpl ?? launchDetachedManagedSession;
+  const killDetachedManagedSessionImpl = deps.killDetachedManagedSessionImpl ?? killDetachedManagedSession;
+  const detectCodexBlockingPanePromptImpl = deps.detectCodexBlockingPanePromptImpl ?? detectCodexBlockingPanePrompt;
+  const waitForCodexPaneReadyImpl = deps.waitForCodexPaneReadyImpl ?? waitForCodexPaneReady;
+  const submitPromptToCodexPaneImpl = deps.submitPromptToCodexPaneImpl ?? submitPromptToCodexPane;
+  const registerMessageImpl = deps.registerMessageImpl ?? registerMessage;
   const writeDaemonStateImpl = deps.writeDaemonStateImpl ?? writeDaemonState;
   const logImpl = deps.logImpl ?? log;
+  const projectTopicEntryEnabled = isTelegramProjectTopicEntryEnabled(config, getNotificationConfigImpl);
 
   try {
     const startupPolicy = await applyTelegramStartupBacklogPolicy(
@@ -1680,7 +1977,12 @@ export async function pollTelegramOnce(
 
       const isSenderAuthorized = isTelegramMessageFromAuthorizedSender(config, msg);
       if (!msg.reply_to_message?.message_id) {
-        if (text && isSenderAuthorized) {
+        if (!text || !isSenderAuthorized) {
+          commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
+          continue;
+        }
+
+        if (!projectTopicEntryEnabled) {
           await trySendTelegramTextReply(
             config,
             httpsRequestImpl,
@@ -1692,8 +1994,67 @@ export async function pollTelegramOnce(
             logImpl,
             'usage',
           );
+          commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
+          continue;
         }
-        commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
+
+        if (inboundThreadId === undefined || inboundThreadId === null) {
+          await trySendTelegramTextReply(
+            config,
+            httpsRequestImpl,
+            {
+              replyToMessageId: msg.message_id,
+              messageThreadId: inboundThreadId,
+            },
+            TELEGRAM_TOPIC_ENTRY_USAGE_MESSAGE,
+            logImpl,
+            'topic-entry-usage',
+          );
+          commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
+          continue;
+        }
+
+        const topicRecord = await findTopicRecordByThreadIdImpl(source.key, inboundThreadId);
+        if (!topicRecord) {
+          await trySendTelegramTextReply(
+            config,
+            httpsRequestImpl,
+            {
+              replyToMessageId: msg.message_id,
+              messageThreadId: inboundThreadId,
+            },
+            TELEGRAM_UNKNOWN_TOPIC_MESSAGE,
+            logImpl,
+            'unknown-topic',
+          );
+          commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
+          continue;
+        }
+
+        const handled = await handleTelegramTopicSessionLaunch(
+          config,
+          state,
+          source,
+          topicRecord,
+          msg,
+          rateLimiter,
+          {
+            httpsRequestImpl,
+            launchDetachedManagedSessionImpl,
+            killDetachedManagedSessionImpl,
+            detectCodexBlockingPanePromptImpl,
+            waitForCodexPaneReadyImpl,
+            submitPromptToCodexPaneImpl,
+            registerMessageImpl,
+            writeDaemonStateImpl,
+            logImpl,
+          },
+        );
+        if (handled) {
+          commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
+        } else {
+          break;
+        }
         continue;
       }
 

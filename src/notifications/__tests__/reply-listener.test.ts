@@ -634,12 +634,14 @@ describe('startReplyListener', () => {
     assert.equal(persisted.sourceStates[discordSource.key]?.discordLastMessageId, 'discord-message-91');
   });
 
-  it('forwards OMX_NOTIFY_PROFILE into the detached daemon environment for canonical config re-derivation', () => {
+  it('forwards OMX_NOTIFY_PROFILE and CODEX_HOME into the detached daemon environment for canonical config re-derivation', () => {
     const originalNotifyProfile = process.env.OMX_NOTIFY_PROFILE;
+    const originalCodexHome = process.env.CODEX_HOME;
     let spawnedEnv: NodeJS.ProcessEnv | undefined;
 
     try {
       process.env.OMX_NOTIFY_PROFILE = 'ops';
+      process.env.CODEX_HOME = '/tmp/custom-codex-home';
 
       const response = startReplyListener(createBaseConfig(), {
         ensureStateDirImpl: () => {},
@@ -659,9 +661,12 @@ describe('startReplyListener', () => {
 
       assert.equal(response.success, true);
       assert.equal(spawnedEnv?.OMX_NOTIFY_PROFILE, 'ops');
+      assert.equal(spawnedEnv?.CODEX_HOME, '/tmp/custom-codex-home');
     } finally {
       if (typeof originalNotifyProfile === 'string') process.env.OMX_NOTIFY_PROFILE = originalNotifyProfile;
       else delete process.env.OMX_NOTIFY_PROFILE;
+      if (typeof originalCodexHome === 'string') process.env.CODEX_HOME = originalCodexHome;
+      else delete process.env.CODEX_HOME;
     }
   });
 
@@ -1670,6 +1675,884 @@ describe('pollTelegramOnce', () => {
     );
 
     assert.equal(sendMessageAttempted, false);
+  });
+
+  it('launches a detached OMX session from a known Telegram project topic and registers the launch acknowledgement', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
+    const sentBodies: string[] = [];
+    const registeredMappings: SessionMapping[] = [];
+    const launchedSessions: Array<{ cwd: string; codexHomeOverride?: string; notifyProfile?: string | null }> = [];
+    const submittedPrompts: Array<{ paneId: string; text: string }> = [];
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 60,
+                  message: {
+                    message_id: 350,
+                    message_thread_id: 9001,
+                    chat: { id: 777, type: 'supergroup' },
+                    from: { id: 'telegram-user-1' },
+                    text: 'Investigate this topic from Telegram',
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sentBodies.push(body);
+            return {
+              statusCode: 200,
+              body: { ok: true, result: { message_id: 551, message_thread_id: 9001 } },
+            };
+          },
+        }),
+        getNotificationConfigImpl: () => ({
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: config.telegramBotToken,
+            chatId: config.telegramChatId,
+            projectTopics: { enabled: true },
+          },
+        }) as any,
+        findTopicRecordByThreadIdImpl: async (sourceKey, threadId) => {
+          assert.equal(sourceKey, telegramSource.key);
+          assert.equal(threadId, 9001);
+          return {
+            sourceChatKey: telegramSource.key,
+            projectKey: 'project-key-1',
+            canonicalProjectPath: '/repos/worktree-a',
+            displayName: 'worktree-a',
+            topicName: 'worktree-a',
+            messageThreadId: '9001',
+          };
+        },
+        launchDetachedManagedSessionImpl: async (options) => {
+          launchedSessions.push(options);
+          return {
+            sessionId: 'omx-topic-session-1',
+            tmuxSessionName: 'omx-worktree-a-main',
+            leaderPaneId: '%91',
+            cwd: '/repos/worktree-a',
+          };
+        },
+        waitForCodexPaneReadyImpl: (paneId, timeoutMs) => {
+          assert.equal(paneId, '%91');
+          assert.equal(timeoutMs, 30_000);
+          return true;
+        },
+        submitPromptToCodexPaneImpl: async (paneId, text) => {
+          submittedPrompts.push({ paneId, text });
+          return true;
+        },
+        registerMessageImpl: (mapping) => {
+          registeredMappings.push(mapping);
+          return true;
+        },
+      },
+    );
+
+    assert.equal(state.telegramLastUpdateId, 60);
+    assert.equal(state.messagesInjected, 1);
+    assert.equal(state.errors, 0);
+    assert.deepEqual(launchedSessions, [
+      {
+        cwd: '/repos/worktree-a',
+        codexHomeOverride: undefined,
+        notifyProfile: null,
+      },
+    ]);
+    assert.deepEqual(submittedPrompts, [
+      { paneId: '%91', text: 'Investigate this topic from Telegram' },
+    ]);
+    assert.equal(registeredMappings.length, 1);
+    assert.equal(registeredMappings[0]?.messageId, '551');
+    assert.equal(registeredMappings[0]?.sessionId, 'omx-topic-session-1');
+    assert.equal(registeredMappings[0]?.tmuxPaneId, '%91');
+    assert.equal(registeredMappings[0]?.messageThreadId, '9001');
+    assert.equal(registeredMappings[0]?.topicName, 'worktree-a');
+
+    const parsedBody = JSON.parse(sentBodies[0] ?? '{}') as {
+      text: string;
+      reply_to_message_id: number;
+      message_thread_id: number;
+    };
+    assert.equal(parsedBody.reply_to_message_id, 350);
+    assert.equal(parsedBody.message_thread_id, 9001);
+    assert.match(parsedBody.text, /started a new omx session/i);
+    assert.match(parsedBody.text, /omx-topic-session-1/);
+  });
+
+  it('routes replies to the registered Telegram launch acknowledgement back into the freshly started session', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
+    let registeredAck: SessionMapping | null = null;
+    const injected: Array<{ paneId: string; text: string; sessionName?: string }> = [];
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 64,
+                  message: {
+                    message_id: 360,
+                    message_thread_id: 9001,
+                    chat: { id: 777, type: 'supergroup' },
+                    from: { id: 'telegram-user-1' },
+                    text: 'launch from topic',
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: () => ({
+            statusCode: 200,
+            body: { ok: true, result: { message_id: 551, message_thread_id: 9001 } },
+          }),
+        }),
+        getNotificationConfigImpl: () => ({
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: config.telegramBotToken,
+            chatId: config.telegramChatId,
+            projectTopics: { enabled: true },
+          },
+        }) as any,
+        findTopicRecordByThreadIdImpl: async () => ({
+          sourceChatKey: telegramSource.key,
+          projectKey: 'project-key-1',
+          canonicalProjectPath: '/repos/worktree-a',
+          displayName: 'worktree-a',
+          topicName: 'worktree-a',
+          messageThreadId: '9001',
+        }),
+        launchDetachedManagedSessionImpl: async () => ({
+          sessionId: 'omx-topic-session-1',
+          tmuxSessionName: 'omx-worktree-a-main',
+          leaderPaneId: '%91',
+          cwd: '/repos/worktree-a',
+        }),
+        waitForCodexPaneReadyImpl: () => true,
+        submitPromptToCodexPaneImpl: async () => true,
+        registerMessageImpl: (mapping) => {
+          registeredAck = mapping;
+          return true;
+        },
+      },
+    );
+
+    assert.ok(registeredAck);
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=65&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 65,
+                  message: {
+                    message_id: 361,
+                    message_thread_id: 9001,
+                    chat: { id: 777, type: 'supergroup' },
+                    from: { id: 'telegram-user-1' },
+                    text: 'follow up in the launched session',
+                    reply_to_message: { message_id: 551 },
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: () => ({
+            statusCode: 200,
+            body: { ok: true, result: { message_id: 552, message_thread_id: 9001 } },
+          }),
+        }),
+        lookupByMessageIdImpl: (_platform, messageId, sourceKey) => {
+          if (messageId === '551' && sourceKey === telegramSource.key) {
+            return registeredAck;
+          }
+          return null;
+        },
+        injectReplyImpl: (paneId, text, _platform, _config, options) => {
+          injected.push({
+            paneId,
+            text,
+            sessionName: options?.expectedSessionName,
+          });
+          return true;
+        },
+      },
+    );
+
+    assert.deepEqual(injected, [
+      {
+        paneId: '%91',
+        text: 'follow up in the launched session',
+        sessionName: 'omx-worktree-a-main',
+      },
+    ]);
+    assert.equal(state.telegramLastUpdateId, 65);
+    assert.equal(state.messagesInjected, 2);
+  });
+
+  it('reports a bounded failure when a launched Telegram topic session never becomes ready for the first prompt', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
+    let sendMessageBody = '';
+    let registerCalled = false;
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 66,
+                  message: {
+                    message_id: 362,
+                    message_thread_id: 9001,
+                    chat: { id: 777, type: 'supergroup' },
+                    from: { id: 'telegram-user-1' },
+                    text: 'launch but never get ready',
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 553, message_thread_id: 9001 } } };
+          },
+        }),
+        getNotificationConfigImpl: () => ({
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: config.telegramBotToken,
+            chatId: config.telegramChatId,
+            projectTopics: { enabled: true },
+          },
+        }) as any,
+        findTopicRecordByThreadIdImpl: async () => ({
+          sourceChatKey: telegramSource.key,
+          projectKey: 'project-key-1',
+          canonicalProjectPath: '/repos/worktree-a',
+          displayName: 'worktree-a',
+          topicName: 'worktree-a',
+          messageThreadId: '9001',
+        }),
+        launchDetachedManagedSessionImpl: async () => ({
+          sessionId: 'omx-topic-session-2',
+          tmuxSessionName: 'omx-worktree-a-main',
+          leaderPaneId: '%92',
+          cwd: '/repos/worktree-a',
+        }),
+        waitForCodexPaneReadyImpl: () => false,
+        submitPromptToCodexPaneImpl: async () => {
+          throw new Error('submit should not run when readiness times out');
+        },
+        registerMessageImpl: () => {
+          registerCalled = true;
+          return true;
+        },
+      },
+    );
+
+    assert.equal(state.telegramLastUpdateId, 66);
+    assert.equal(state.messagesInjected, 0);
+    assert.equal(state.errors, 1);
+    assert.equal(registerCalled, false);
+    const parsedBody = JSON.parse(sendMessageBody) as { text: string; reply_to_message_id: number };
+    assert.equal(parsedBody.reply_to_message_id, 362);
+    assert.match(parsedBody.text, /did not become ready/i);
+  });
+
+  it('reports a bounded failure when a launched Telegram topic session cannot accept the first prompt', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
+    let sendMessageBody = '';
+    let registerCalled = false;
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 67,
+                  message: {
+                    message_id: 363,
+                    message_thread_id: 9001,
+                    chat: { id: 777, type: 'supergroup' },
+                    from: { id: 'telegram-user-1' },
+                    text: 'launch but fail prompt submit',
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 554, message_thread_id: 9001 } } };
+          },
+        }),
+        getNotificationConfigImpl: () => ({
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: config.telegramBotToken,
+            chatId: config.telegramChatId,
+            projectTopics: { enabled: true },
+          },
+        }) as any,
+        findTopicRecordByThreadIdImpl: async () => ({
+          sourceChatKey: telegramSource.key,
+          projectKey: 'project-key-1',
+          canonicalProjectPath: '/repos/worktree-a',
+          displayName: 'worktree-a',
+          topicName: 'worktree-a',
+          messageThreadId: '9001',
+        }),
+        launchDetachedManagedSessionImpl: async () => ({
+          sessionId: 'omx-topic-session-3',
+          tmuxSessionName: 'omx-worktree-a-main',
+          leaderPaneId: '%93',
+          cwd: '/repos/worktree-a',
+        }),
+        waitForCodexPaneReadyImpl: () => true,
+        submitPromptToCodexPaneImpl: async () => false,
+        registerMessageImpl: () => {
+          registerCalled = true;
+          return true;
+        },
+      },
+    );
+
+    assert.equal(state.telegramLastUpdateId, 67);
+    assert.equal(state.messagesInjected, 0);
+    assert.equal(state.errors, 1);
+    assert.equal(registerCalled, false);
+    const parsedBody = JSON.parse(sendMessageBody) as { text: string; reply_to_message_id: number };
+    assert.equal(parsedBody.reply_to_message_id, 363);
+    assert.match(parsedBody.text, /failed to deliver the first prompt/i);
+  });
+
+  it('returns a clear diagnostic for non-reply Telegram messages outside a project topic when topic entry is enabled', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    let sendMessageBody = '';
+
+    await pollTelegramOnce(
+      config,
+      createBaseState(),
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 61,
+                  message: {
+                    message_id: 351,
+                    chat: { id: 777, type: 'supergroup' },
+                    from: { id: 'telegram-user-1' },
+                    text: 'start something here',
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 552 } } };
+          },
+        }),
+        getNotificationConfigImpl: () => ({
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: config.telegramBotToken,
+            chatId: config.telegramChatId,
+            projectTopics: { enabled: true },
+          },
+        }) as any,
+        findTopicRecordByThreadIdImpl: async () => {
+          throw new Error('topic lookup should not run without a message_thread_id');
+        },
+        launchDetachedManagedSessionImpl: async () => {
+          throw new Error('launch should not run outside a topic');
+        },
+      },
+    );
+
+    const parsedBody = JSON.parse(sendMessageBody) as { text: string };
+    assert.match(parsedBody.text, /known project topic/i);
+  });
+
+  it('refuses to start a detached OMX session from an unknown Telegram topic', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    let sendMessageBody = '';
+
+    await pollTelegramOnce(
+      config,
+      createBaseState(),
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 62,
+                  message: {
+                    message_id: 352,
+                    message_thread_id: 9876,
+                    chat: { id: 777, type: 'supergroup' },
+                    from: { id: 'telegram-user-1' },
+                    text: 'start from an unknown topic',
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 553 } } };
+          },
+        }),
+        getNotificationConfigImpl: () => ({
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: config.telegramBotToken,
+            chatId: config.telegramChatId,
+            projectTopics: { enabled: true },
+          },
+        }) as any,
+        findTopicRecordByThreadIdImpl: async () => null,
+        launchDetachedManagedSessionImpl: async () => {
+          throw new Error('launch should not run when the topic is unbound');
+        },
+      },
+    );
+
+    const parsedBody = JSON.parse(sendMessageBody) as { text: string; message_thread_id: number };
+    assert.equal(parsedBody.message_thread_id, 9876);
+    assert.match(parsedBody.text, /not bound to an omx project/i);
+  });
+
+  it('reports detached topic launch failures back into the same Telegram topic', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
+    let sendMessageBody = '';
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 63,
+                  message: {
+                    message_id: 353,
+                    message_thread_id: 9001,
+                    chat: { id: 777, type: 'supergroup' },
+                    from: { id: 'telegram-user-1' },
+                    text: 'start from a failing topic',
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 554, message_thread_id: 9001 } } };
+          },
+        }),
+        getNotificationConfigImpl: () => ({
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: config.telegramBotToken,
+            chatId: config.telegramChatId,
+            projectTopics: { enabled: true },
+          },
+        }) as any,
+        findTopicRecordByThreadIdImpl: async () => ({
+          sourceChatKey: telegramSource.key,
+          projectKey: 'project-key-1',
+          canonicalProjectPath: '/repos/worktree-a',
+          displayName: 'worktree-a',
+          topicName: 'worktree-a',
+          messageThreadId: '9001',
+        }),
+        launchDetachedManagedSessionImpl: async () => {
+          throw new Error('tmux bootstrap failed');
+        },
+        registerMessageImpl: () => {
+          throw new Error('launch acknowledgements must not register after launch failure');
+        },
+      },
+    );
+
+    assert.equal(state.errors, 1);
+    const parsedBody = JSON.parse(sendMessageBody) as { text: string };
+    assert.match(parsedBody.text, /failed to start a new omx session/i);
+    assert.match(parsedBody.text, /tmux bootstrap failed/i);
+  });
+
+  it('cleans up the detached session when the topic-launched pane never becomes ready', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
+    const killedSessions: string[] = [];
+    let sendMessageBody = '';
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 64,
+                  message: {
+                    message_id: 354,
+                    message_thread_id: 9001,
+                    chat: { id: 777, type: 'supergroup' },
+                    from: { id: 'telegram-user-1' },
+                    text: 'start but never get ready',
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 555, message_thread_id: 9001 } } };
+          },
+        }),
+        getNotificationConfigImpl: () => ({
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: config.telegramBotToken,
+            chatId: config.telegramChatId,
+            projectTopics: { enabled: true },
+          },
+        }) as any,
+        findTopicRecordByThreadIdImpl: async () => ({
+          sourceChatKey: telegramSource.key,
+          projectKey: 'project-key-1',
+          canonicalProjectPath: '/repos/worktree-a',
+          displayName: 'worktree-a',
+          topicName: 'worktree-a',
+          messageThreadId: '9001',
+        }),
+        launchDetachedManagedSessionImpl: async () => ({
+          sessionId: 'omx-topic-session-2',
+          tmuxSessionName: 'omx-worktree-a-detached',
+          leaderPaneId: '%92',
+          cwd: '/repos/worktree-a',
+        }),
+        waitForCodexPaneReadyImpl: () => false,
+        killDetachedManagedSessionImpl: async (sessionName) => {
+          killedSessions.push(sessionName);
+          return true;
+        },
+        registerMessageImpl: () => {
+          throw new Error('readiness timeout must not register a launch acknowledgement');
+        },
+      },
+    );
+
+    assert.equal(state.errors, 1);
+    assert.deepEqual(killedSessions, ['omx-worktree-a-detached']);
+    const parsedBody = JSON.parse(sendMessageBody) as { text: string };
+    assert.match(parsedBody.text, /did not become ready/i);
+  });
+
+  it('surfaces a trust-confirmation diagnostic when a topic launch is blocked by Codex trust gating', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
+    let sendMessageBody = '';
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 65,
+                  message: {
+                    message_id: 356,
+                    message_thread_id: 9001,
+                    chat: { id: 777, type: 'supergroup' },
+                    from: { id: 'telegram-user-1' },
+                    text: 'start but trust prompt blocks',
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 557, message_thread_id: 9001 } } };
+          },
+        }),
+        getNotificationConfigImpl: () => ({
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: config.telegramBotToken,
+            chatId: config.telegramChatId,
+            projectTopics: { enabled: true },
+          },
+        }) as any,
+        findTopicRecordByThreadIdImpl: async () => ({
+          sourceChatKey: telegramSource.key,
+          projectKey: 'project-key-1',
+          canonicalProjectPath: '/repos/worktree-a',
+          displayName: 'worktree-a',
+          topicName: 'worktree-a',
+          messageThreadId: '9001',
+        }),
+        launchDetachedManagedSessionImpl: async () => ({
+          sessionId: 'omx-topic-session-2b',
+          tmuxSessionName: 'omx-worktree-a-trust-gated',
+          leaderPaneId: '%92',
+          cwd: '/repos/worktree-a',
+        }),
+        waitForCodexPaneReadyImpl: () => false,
+        detectCodexBlockingPanePromptImpl: () => 'trust',
+        killDetachedManagedSessionImpl: async () => true,
+      },
+    );
+
+    const parsedBody = JSON.parse(sendMessageBody) as { text: string };
+    assert.match(parsedBody.text, /trust the project locally/i);
+  });
+
+  it('cleans up the detached session when the first prompt cannot be submitted', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
+    const killedSessions: string[] = [];
+    let sendMessageBody = '';
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 65,
+                  message: {
+                    message_id: 355,
+                    message_thread_id: 9001,
+                    chat: { id: 777, type: 'supergroup' },
+                    from: { id: 'telegram-user-1' },
+                    text: 'start but fail to submit',
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 556, message_thread_id: 9001 } } };
+          },
+        }),
+        getNotificationConfigImpl: () => ({
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: config.telegramBotToken,
+            chatId: config.telegramChatId,
+            projectTopics: { enabled: true },
+          },
+        }) as any,
+        findTopicRecordByThreadIdImpl: async () => ({
+          sourceChatKey: telegramSource.key,
+          projectKey: 'project-key-1',
+          canonicalProjectPath: '/repos/worktree-a',
+          displayName: 'worktree-a',
+          topicName: 'worktree-a',
+          messageThreadId: '9001',
+        }),
+        launchDetachedManagedSessionImpl: async () => ({
+          sessionId: 'omx-topic-session-3',
+          tmuxSessionName: 'omx-worktree-a-submit-failure',
+          leaderPaneId: '%93',
+          cwd: '/repos/worktree-a',
+        }),
+        waitForCodexPaneReadyImpl: () => true,
+        submitPromptToCodexPaneImpl: async () => false,
+        killDetachedManagedSessionImpl: async (sessionName) => {
+          killedSessions.push(sessionName);
+          return true;
+        },
+        registerMessageImpl: () => {
+          throw new Error('submit failure must not register a launch acknowledgement');
+        },
+      },
+    );
+
+    assert.equal(state.errors, 1);
+    assert.deepEqual(killedSessions, ['omx-worktree-a-submit-failure']);
+    const parsedBody = JSON.parse(sendMessageBody) as { text: string };
+    assert.match(parsedBody.text, /failed to deliver the first prompt/i);
+  });
+
+  it('surfaces a permissions-confirmation diagnostic when a topic launch is blocked during first-prompt submission', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
+    let sendMessageBody = '';
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 66,
+                  message: {
+                    message_id: 357,
+                    message_thread_id: 9001,
+                    chat: { id: 777, type: 'supergroup' },
+                    from: { id: 'telegram-user-1' },
+                    text: 'start but permissions prompt blocks',
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 558, message_thread_id: 9001 } } };
+          },
+        }),
+        getNotificationConfigImpl: () => ({
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: config.telegramBotToken,
+            chatId: config.telegramChatId,
+            projectTopics: { enabled: true },
+          },
+        }) as any,
+        findTopicRecordByThreadIdImpl: async () => ({
+          sourceChatKey: telegramSource.key,
+          projectKey: 'project-key-1',
+          canonicalProjectPath: '/repos/worktree-a',
+          displayName: 'worktree-a',
+          topicName: 'worktree-a',
+          messageThreadId: '9001',
+        }),
+        launchDetachedManagedSessionImpl: async () => ({
+          sessionId: 'omx-topic-session-3b',
+          tmuxSessionName: 'omx-worktree-a-bypass-gated',
+          leaderPaneId: '%93',
+          cwd: '/repos/worktree-a',
+        }),
+        waitForCodexPaneReadyImpl: () => true,
+        submitPromptToCodexPaneImpl: async () => false,
+        detectCodexBlockingPanePromptImpl: () => 'bypass',
+        killDetachedManagedSessionImpl: async () => true,
+      },
+    );
+
+    const parsedBody = JSON.parse(sendMessageBody) as { text: string };
+    assert.match(parsedBody.text, /permissions confirmation/i);
   });
 
   it('rejects unauthorized Telegram senders even when the chat matches', async () => {

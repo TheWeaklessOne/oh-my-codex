@@ -17,10 +17,10 @@ import {
   normalizeTmuxCapture as sharedNormalizeTmuxCapture,
   paneHasActiveTask as sharedPaneHasActiveTask,
   paneIsBootstrapping as sharedPaneIsBootstrapping,
-  paneShowsCodexViewport as sharedPaneShowsCodexViewport,
   paneLooksReady as sharedPaneLooksReady,
 } from '../scripts/tmux-hook-engine.js';
 import { readActiveProviderEnvOverrides } from '../config/models.js';
+import { waitForCodexPaneReady } from '../tmux/prompt-submit.js';
 import { sleep, sleepSync } from '../utils/sleep.js';
 import {
   buildPlatformCommandSpec,
@@ -1495,71 +1495,23 @@ export function waitForWorkerReady(
   timeoutMs: number = 30_000,
   workerPaneId?: string,
 ): boolean {
-  const initialBackoffMs = 150;
-  const maxBackoffMs = 8000;
-  const startedAt = Date.now();
-  let blockedByTrustPrompt = false;
-  let promptDismissed = false;
-
-  const sendRobustEnter = (): void => {
-    const target = paneTarget(sessionName, workerIndex, workerPaneId);
-    // Trust + follow-up splash can require two submits in Codex TUI.
-    // Use C-m (carriage return) for raw-mode compatibility.
-    runTmux(['send-keys', '-t', target, 'C-m']);
-    sleepFractionalSeconds(0.12);
-    runTmux(['send-keys', '-t', target, 'C-m']);
-  };
-
-  const check = (): boolean => {
-    const target = paneTarget(sessionName, workerIndex, workerPaneId);
-    const result = runTmux(sharedBuildVisibleCapturePaneArgv(target));
-    if (!result.ok) return false;
-    if (dismissClaudeBypassPermissionsPromptIfPresent(target, result.stdout)) {
-      promptDismissed = true;
-      return false;
-    }
-    if (paneHasClaudeBypassPermissionsPrompt(result.stdout)) {
-      return false;
-    }
-    if (paneHasTrustPrompt(result.stdout)) {
-      // Default-on for team workers: they are spawned explicitly by the leader in the same cwd.
-      // Opt-out by setting OMX_TEAM_AUTO_TRUST=0.
-      if (process.env.OMX_TEAM_AUTO_TRUST !== '0') {
-        sendRobustEnter();
-        promptDismissed = true;
-        return false;
-      }
-      blockedByTrustPrompt = true;
-      return false;
-    }
-    if (paneLooksReady(result.stdout)) return true;
-    // Keep startup safety checks anchored to the visible pane. Only if the
-    // visible slice already proves a live Codex viewport do we consult recent
-    // scrollback for the prompt/helper text that may have slipped below the fold.
-    if (!sharedPaneShowsCodexViewport(result.stdout)) return false;
-
-    const scrollbackResult = runTmux(sharedBuildCapturePaneArgv(target, 80));
-    if (!scrollbackResult.ok) return false;
-    return paneLooksReady(scrollbackResult.stdout);
-  };
-
-  let delayMs = initialBackoffMs;
-  while (Date.now() - startedAt < timeoutMs) {
-    if (check()) return true;
-    if (blockedByTrustPrompt) return false;
-    // After dismissing a trust prompt, reset backoff so we re-check quickly
-    // instead of sleeping 2s/4s/8s while the worker is starting up.
-    if (promptDismissed) {
-      delayMs = initialBackoffMs;
-      promptDismissed = false;
-    }
-    const remaining = timeoutMs - (Date.now() - startedAt);
-    if (remaining <= 0) break;
-    sleepSeconds(Math.max(0, Math.min(delayMs, remaining)) / 1000);
-    delayMs = Math.min(maxBackoffMs, delayMs * 2);
-  }
-
-  return false;
+  return waitForCodexPaneReady(
+    paneTarget(sessionName, workerIndex, workerPaneId),
+    timeoutMs,
+    {
+      runTmuxSyncImpl: (argv) => {
+        const result = runTmux(argv);
+        return {
+          ok: result.ok,
+          stdout: result.ok ? result.stdout : '',
+          stderr: result.ok ? '' : result.stderr,
+        };
+      },
+      sleepSyncImpl: sleepSync,
+      autoAcceptTrustPrompt: process.env.OMX_TEAM_AUTO_TRUST !== '0',
+      autoAcceptBypassPrompt: process.env.OMX_TEAM_AUTO_ACCEPT_BYPASS !== '0',
+    },
+  );
 }
 
 /**
