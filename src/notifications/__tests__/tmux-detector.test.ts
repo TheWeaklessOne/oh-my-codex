@@ -106,6 +106,7 @@ describe('verifyPaneTarget', () => {
       inspectPaneMetadataImpl: () => ({
         paneId: '%9',
         currentCommand: 'codex',
+        startCommand: 'codex',
         sessionName: 'omx-session',
         tty: '/dev/ttys001',
       }),
@@ -122,6 +123,7 @@ describe('verifyPaneTarget', () => {
       inspectPaneMetadataImpl: () => ({
         paneId: '%9',
         currentCommand: 'codex',
+        startCommand: 'codex',
         sessionName: 'different-session',
         tty: '/dev/ttys002',
       }),
@@ -135,6 +137,118 @@ describe('verifyPaneTarget', () => {
     const result = verifyPaneTarget('%9', {
       capturePaneContentImpl: () => 'Codex > running task',
       inspectPaneMetadataImpl: () => null,
+    });
+
+    assert.equal(result.accepted, true);
+    assert.equal(result.reason, 'content-fallback');
+  });
+
+  it('does not treat generic shells as a metadata match on session name alone', () => {
+    const result = verifyPaneTarget('%9', {
+      expectedSessionName: 'omx-session',
+      capturePaneContentImpl: () => 'Codex > old transcript still visible',
+      inspectPaneMetadataImpl: () => ({
+        paneId: '%9',
+        currentCommand: 'zsh',
+        startCommand: 'zsh',
+        sessionName: 'omx-session',
+        tty: '/dev/ttys003',
+      }),
+    });
+
+    assert.equal(result.accepted, false);
+    assert.equal(result.reason, 'verification-failed');
+  });
+
+  it('accepts node wrappers only when the pane start command includes codex', () => {
+    const result = verifyPaneTarget('%9', {
+      expectedSessionName: 'omx-session',
+      capturePaneContentImpl: () => '',
+      inspectPaneMetadataImpl: () => ({
+        paneId: '%9',
+        currentCommand: 'node',
+        startCommand: 'node /usr/local/bin/codex chat',
+        sessionName: 'omx-session',
+        tty: '/dev/ttys004',
+      }),
+    });
+
+    assert.equal(result.accepted, true);
+    assert.equal(result.reason, 'metadata-match');
+  });
+
+  it('rejects codex-native-hook node wrappers as non-interactive helper panes', () => {
+    const result = verifyPaneTarget('%9', {
+      expectedSessionName: 'omx-session',
+      capturePaneContentImpl: () => '',
+      inspectPaneMetadataImpl: () => ({
+        paneId: '%9',
+        currentCommand: 'node',
+        startCommand: 'node /repo/dist/scripts/codex-native-hook.js',
+        sessionName: 'omx-session',
+        tty: '/dev/ttys005',
+      }),
+    });
+
+    assert.equal(result.accepted, false);
+    assert.equal(result.reason, 'verification-failed');
+  });
+
+  it('rejects codex-native-hook wrappers even when the pane output mentions omx or codex', () => {
+    const result = verifyPaneTarget('%9', {
+      expectedSessionName: 'omx-session',
+      capturePaneContentImpl: () => '[omx] codex-native-hook failed: waiting for startup',
+      inspectPaneMetadataImpl: () => ({
+        paneId: '%9',
+        currentCommand: 'node',
+        startCommand: 'node /repo/dist/scripts/codex-native-hook.js',
+        sessionName: 'omx-session',
+        tty: '/dev/ttys007',
+      }),
+    });
+
+    assert.equal(result.accepted, false);
+    assert.equal(result.reason, 'verification-failed');
+  });
+
+  it('rejects codex-native-hook-like pane output when metadata is unavailable', () => {
+    const result = verifyPaneTarget('%9', {
+      capturePaneContentImpl: () => '[omx] codex-native-hook failed: waiting for startup',
+      inspectPaneMetadataImpl: () => null,
+    });
+
+    assert.equal(result.accepted, false);
+    assert.equal(result.reason, 'verification-failed');
+  });
+
+  it('accepts npx codex wrappers when the start command resolves to codex', () => {
+    const result = verifyPaneTarget('%9', {
+      expectedSessionName: 'omx-session',
+      capturePaneContentImpl: () => '',
+      inspectPaneMetadataImpl: () => ({
+        paneId: '%9',
+        currentCommand: 'npx',
+        startCommand: 'npx codex chat --dangerously-skip-permissions',
+        sessionName: 'omx-session',
+        tty: '/dev/ttys006',
+      }),
+    });
+
+    assert.equal(result.accepted, true);
+    assert.equal(result.reason, 'metadata-match');
+  });
+
+  it('accepts live codex panes reported as node even when the pane started from a shell, if current content is convincingly codex', () => {
+    const result = verifyPaneTarget('%9', {
+      expectedSessionName: 'omx-session',
+      capturePaneContentImpl: () => 'Codex > Running agent task',
+      inspectPaneMetadataImpl: () => ({
+        paneId: '%9',
+        currentCommand: 'node',
+        startCommand: 'zsh',
+        sessionName: 'omx-session',
+        tty: '/dev/ttys008',
+      }),
     });
 
     assert.equal(result.accepted, true);

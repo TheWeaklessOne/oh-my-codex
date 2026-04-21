@@ -9,6 +9,7 @@ import {
   formatReplyAcknowledgement,
   redactSensitiveTokens,
   reconcileSourceRateLimiters,
+  resetStartupPoliciesForDaemonStart,
   sanitizeReplyInput,
   isReplyListenerProcess,
   normalizeReplyListenerConfig,
@@ -446,6 +447,39 @@ describe('reconcileSourceRateLimiters', () => {
   });
 });
 
+describe('resetStartupPoliciesForDaemonStart', () => {
+  it('clears persisted startup-policy flags across daemon restarts while preserving cursors', () => {
+    const telegramSource = buildTelegramReplySource('123456:telegram-token', '777');
+    const originalState: ReplyListenerState = {
+      ...createBaseState(),
+      telegramLastUpdateId: 88,
+      telegramStartupPolicyApplied: true,
+      sourceStates: {
+        [telegramSource.key]: {
+          sourceKey: telegramSource.key,
+          platform: 'telegram',
+          label: telegramSource.label,
+          telegramLastUpdateId: 88,
+          telegramStartupPolicyApplied: true,
+          lastPollAt: null,
+          lastIngestAt: null,
+          lastFailureAt: null,
+          lastFailureCategory: null,
+          lastFailureMessage: null,
+          failureCounts: {},
+        },
+      },
+    };
+
+    const reset = resetStartupPoliciesForDaemonStart(originalState);
+
+    assert.equal(reset.telegramLastUpdateId, 88);
+    assert.equal(reset.telegramStartupPolicyApplied, false);
+    assert.equal(reset.sourceStates[telegramSource.key]?.telegramLastUpdateId, 88);
+    assert.equal(reset.sourceStates[telegramSource.key]?.telegramStartupPolicyApplied, false);
+  });
+});
+
 describe('startReplyListener', () => {
   it('refreshes a running daemon config and preserves unaffected source cursors when only one source changes', () => {
     const previousConfig = createBaseConfig({
@@ -515,6 +549,76 @@ describe('startReplyListener', () => {
     assert.equal(persistedState.sourceStates[oldTelegramSource.key]?.telegramLastUpdateId, 44);
     assert.equal(response.state?.telegramLastUpdateId, null);
     assert.equal(response.state?.discordLastMessageId, 'discord-message-44');
+  });
+
+  it('preserves prior source cursors across a stopped-daemon restart before the new daemon boots', () => {
+    const previousConfig = createBaseConfig();
+    const telegramSource = buildTelegramReplySource(
+      previousConfig.telegramBotToken!,
+      previousConfig.telegramChatId!,
+    );
+    const discordSource = buildDiscordReplySource(
+      previousConfig.discordBotToken!,
+      previousConfig.discordChannelId!,
+    );
+    const previousState: ReplyListenerState = {
+      ...createBaseState(),
+      telegramLastUpdateId: 91,
+      discordLastMessageId: 'discord-message-91',
+      sourceStates: {
+        [telegramSource.key]: {
+          sourceKey: telegramSource.key,
+          platform: 'telegram',
+          label: telegramSource.label,
+          telegramLastUpdateId: 91,
+          telegramStartupPolicyApplied: true,
+          lastPollAt: null,
+          lastIngestAt: null,
+          lastFailureAt: null,
+          lastFailureCategory: null,
+          lastFailureMessage: null,
+          failureCounts: {},
+        },
+        [discordSource.key]: {
+          sourceKey: discordSource.key,
+          platform: 'discord-bot',
+          label: discordSource.label,
+          discordLastMessageId: 'discord-message-91',
+          telegramStartupPolicyApplied: false,
+          lastPollAt: null,
+          lastIngestAt: null,
+          lastFailureAt: null,
+          lastFailureCategory: null,
+          lastFailureMessage: null,
+          failureCounts: {},
+        },
+      },
+    };
+
+    let writtenState: ReplyListenerState | null = null;
+
+    const response = startReplyListener(createBaseConfig(), {
+      ensureStateDirImpl: () => {},
+      isDaemonRunningImpl: () => false,
+      isTmuxAvailableImpl: () => true,
+      readDaemonConfigImpl: () => previousConfig,
+      readDaemonStateImpl: () => previousState,
+      spawnImpl: (() => ({ pid: 43210, unref() {} })) as unknown as typeof import('node:child_process').spawn,
+      writeDaemonConfigImpl: () => {},
+      writeDaemonStateImpl: (nextState) => {
+        writtenState = cloneState(nextState);
+      },
+      writePidFileImpl: () => {},
+      logImpl: () => {},
+    });
+
+    assert.equal(response.success, true);
+    assert.ok(writtenState);
+    const persisted = writtenState as ReplyListenerState;
+    assert.equal(persisted.telegramLastUpdateId, 91);
+    assert.equal(persisted.discordLastMessageId, 'discord-message-91');
+    assert.equal(persisted.sourceStates[telegramSource.key]?.telegramLastUpdateId, 91);
+    assert.equal(persisted.sourceStates[discordSource.key]?.discordLastMessageId, 'discord-message-91');
   });
 });
 
@@ -1138,6 +1242,45 @@ describe('pollTelegramOnce', () => {
     assert.equal(sendMessageAttempted, false);
   });
 
+  it('does not attempt Telegram usage replies for non-reply messages from the wrong chat', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    let sendMessageAttempted = false;
+
+    await pollTelegramOnce(
+      config,
+      createBaseState(),
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 54,
+                  message: {
+                    message_id: 344,
+                    chat: { id: 999 },
+                    from: { id: 'telegram-user-1' },
+                    text: 'hello from elsewhere',
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: () => {
+            sendMessageAttempted = true;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 452 } } };
+          },
+        }),
+      },
+    );
+
+    assert.equal(sendMessageAttempted, false);
+  });
+
   it('rejects unauthorized Telegram senders even when the chat matches', async () => {
     resetReplyListenerTransientState();
     const config = createBaseConfig();
@@ -1426,5 +1569,224 @@ describe('pollTelegramOnce', () => {
     assert.equal(injectCalled, false);
     assert.equal(state.telegramLastUpdateId, 50);
     assert.equal(state.telegramStartupPolicyApplied, true);
+  });
+
+  it('retries drop_pending backlog handling when the startup discard fetch fails', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig({ telegramStartupBacklogPolicy: 'drop_pending' });
+    const state = createBaseState();
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=0&allowed_updates=%5B%22message%22%5D`]: () => {
+            throw new Error('startup fetch failed');
+          },
+        }),
+      },
+    );
+
+    assert.equal(state.telegramStartupPolicyApplied, false);
+    assert.equal(state.telegramLastUpdateId, null);
+    assert.equal(state.errors, 1);
+  });
+
+  it('retries drop_pending backlog handling when Telegram getUpdates returns ok=false on startup', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig({ telegramStartupBacklogPolicy: 'drop_pending' });
+    const state = createBaseState();
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=0&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: false,
+              description: 'backlog fetch failed',
+            },
+          }),
+        }),
+      },
+    );
+
+    assert.equal(state.telegramStartupPolicyApplied, false);
+    assert.equal(state.telegramLastUpdateId, null);
+    assert.equal(state.errors, 1);
+    assert.equal(state.lastError, 'backlog fetch failed');
+  });
+
+  it('surfaces Telegram getUpdates descriptions for non-2xx Bot API errors', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig({ telegramStartupBacklogPolicy: 'drop_pending' });
+    const state = createBaseState();
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=0&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 400,
+            body: {
+              ok: false,
+              description: 'bad request from Telegram',
+            },
+          }),
+        }),
+      },
+    );
+
+    assert.equal(state.telegramStartupPolicyApplied, false);
+    assert.equal(state.telegramLastUpdateId, null);
+    assert.equal(state.errors, 1);
+    assert.equal(state.lastError, 'bad request from Telegram');
+  });
+
+  it('replays pending Telegram backlog exactly once when replay_once is configured', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig({ telegramStartupBacklogPolicy: 'replay_once' });
+    const state = createBaseState();
+    let injectCalled = 0;
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=0&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 51,
+                  message: {
+                    message_id: 341,
+                    chat: { id: 777 },
+                    from: { id: 'telegram-user-1' },
+                    text: 'replay this once',
+                    reply_to_message: { message_id: 222 },
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: () => ({
+            statusCode: 200,
+            body: { ok: true, result: { message_id: 451 } },
+          }),
+        }),
+        lookupByMessageIdImpl: () => createMapping('telegram'),
+        injectReplyImpl: () => {
+          injectCalled += 1;
+          return true;
+        },
+      },
+    );
+
+    assert.equal(injectCalled, 1);
+    assert.equal(state.telegramStartupPolicyApplied, true);
+    assert.equal(state.telegramLastUpdateId, 51);
+  });
+
+  it('logs Telegram reply-send failures instead of silently swallowing them', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const logs: string[] = [];
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 52,
+                  message: {
+                    message_id: 342,
+                    chat: { id: 777 },
+                    from: { id: 'telegram-user-1' },
+                    text: 'status',
+                    reply_to_message: { message_id: 222 },
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: () => ({
+            statusCode: 500,
+            body: { ok: false, description: 'bot API unavailable' },
+          }),
+        }),
+        lookupByMessageIdImpl: () => createMapping('telegram'),
+        buildSessionStatusReplyImpl: async () => 'Tracked OMX session status',
+        logImpl: (message) => {
+          logs.push(message);
+        },
+      },
+    );
+
+    assert.ok(logs.some((entry) => entry.includes('WARN: Failed to send Telegram reply')));
+  });
+
+  it('treats Telegram ok=false reply bodies as failures and logs them', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const logs: string[] = [];
+
+    await pollTelegramOnce(
+      config,
+      createBaseState(),
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 53,
+                  message: {
+                    message_id: 343,
+                    chat: { id: 777 },
+                    from: { id: 'telegram-user-1' },
+                    text: 'status',
+                    reply_to_message: { message_id: 222 },
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: () => ({
+            statusCode: 200,
+            body: { ok: false, description: 'chat not found' },
+          }),
+        }),
+        lookupByMessageIdImpl: () => createMapping('telegram'),
+        buildSessionStatusReplyImpl: async () => 'Tracked OMX session status',
+        logImpl: (message) => {
+          logs.push(message);
+        },
+      },
+    );
+
+    assert.ok(logs.some((entry) => entry.includes('WARN: Failed to send Telegram reply')));
+    assert.ok(logs.some((entry) => entry.includes('chat not found')));
   });
 });

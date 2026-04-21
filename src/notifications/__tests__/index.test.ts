@@ -160,6 +160,15 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
       sessionId: `sess-ask-${Date.now()}`,
       projectPath,
       question: 'Need approval?',
+    }, undefined, {
+      dispatchNotificationsImpl: async (_config: unknown, event: string, _payload: unknown) => ({
+        event,
+        anySuccess: true,
+        results: [{
+          platform: 'webhook',
+          success: true,
+        }],
+      }),
     });
     const askElapsed = Date.now() - askStarted;
 
@@ -175,6 +184,15 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
     const startResult = await notifyLifecycle('session-start', {
       sessionId: `sess-start-${Date.now()}`,
       projectPath,
+    }, undefined, {
+      dispatchNotificationsImpl: async (_config: unknown, event: string, _payload: unknown) => ({
+        event,
+        anySuccess: true,
+        results: [{
+          platform: 'webhook',
+          success: true,
+        }],
+      }),
     });
     const startElapsed = Date.now() - startStarted;
 
@@ -182,10 +200,13 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
     assert.equal(startResult.anySuccess, true);
     assert.equal(openClawCalls, 1);
     assert.equal(openClawResolved, false, 'session-start should keep fire-and-forget OpenClaw dispatch');
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(openClawResolved, true, 'session-start should eventually finish the deferred OpenClaw dispatch');
     assert.ok(
       startElapsed < askElapsed,
       `session-start should remain faster than awaited ask-user-question dispatch (start=${startElapsed}ms ask=${askElapsed}ms)`,
     );
+    assert.ok(startElapsed < 60, `session-start should return before the 60ms OpenClaw dispatch delay, got ${startElapsed}ms`);
 
     rmSync(projectPath, { recursive: true, force: true });
     delete process.env.OMX_OPENCLAW;

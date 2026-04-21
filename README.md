@@ -273,6 +273,9 @@ If you enable inbound notification replies, OMX now keeps Telegram on polling-on
 - `authorizedTelegramUserIds` hardens Telegram replies beyond chat-level matching. If omitted, OMX keeps a compatibility fallback to chat-level authorization only.
 - `ackMode` defaults to `minimal`; use `summary` only when you explicitly want a redacted recent-pane tail in the acknowledgement, or `off` to suppress follow-up replies entirely.
 - `telegramStartupBacklogPolicy` supports `resume`, `drop_pending`, and `replay_once`.
+  - `resume` enters normal long polling immediately using the persisted cursor state.
+  - `drop_pending` performs a retry-safe startup sweep that discards the current pending backlog once the discard fetch succeeds.
+  - `replay_once` performs one non-blocking startup sweep of the current backlog, replays those pending updates once, then switches back to normal long polling.
 - `telegramPollTimeoutSeconds` controls Bot API long polling. Webhooks are intentionally out of scope for the local OMX reply listener.
 
 

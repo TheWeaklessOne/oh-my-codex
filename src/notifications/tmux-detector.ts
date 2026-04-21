@@ -46,6 +46,7 @@ export interface PaneAnalysis {
 export interface PaneMetadata {
   paneId: string;
   currentCommand: string | null;
+  startCommand: string | null;
   sessionName: string | null;
   tty: string | null;
 }
@@ -89,7 +90,7 @@ export function inspectPaneMetadata(paneId: string): PaneMetadata | null {
   try {
     const raw = execFileSync(
       resolveTmuxBinaryForPlatform() || 'tmux',
-      ['display-message', '-p', '-t', paneId, '#{pane_current_command}\t#{session_name}\t#{pane_tty}'],
+      ['display-message', '-p', '-t', paneId, '#{pane_current_command}\t#{pane_start_command}\t#{session_name}\t#{pane_tty}'],
       {
         encoding: 'utf-8',
         timeout: 3000,
@@ -98,10 +99,11 @@ export function inspectPaneMetadata(paneId: string): PaneMetadata | null {
       },
     ).trim();
 
-    const [currentCommandRaw, sessionNameRaw, ttyRaw] = raw.split('\t');
+    const [currentCommandRaw, startCommandRaw, sessionNameRaw, ttyRaw] = raw.split('\t');
     return {
       paneId,
       currentCommand: currentCommandRaw?.trim() || null,
+      startCommand: startCommandRaw?.trim() || null,
       sessionName: sessionNameRaw?.trim() || null,
       tty: ttyRaw?.trim() || null,
     };
@@ -121,10 +123,25 @@ export function verifyPaneTarget(
   const capturePaneContentImpl = options.capturePaneContentImpl ?? capturePaneContent;
   const inspectPaneMetadataImpl = options.inspectPaneMetadataImpl ?? inspectPaneMetadata;
   const metadata = inspectPaneMetadataImpl(paneId);
-  const analysis = analyzePaneContent(capturePaneContentImpl(paneId, 15));
+  const capturedContent = capturePaneContentImpl(paneId, 15);
+  const analysis = analyzePaneContent(capturedContent);
+  const normalizedCapturedContent = capturedContent.toLowerCase();
 
   const normalizedCommand = metadata?.currentCommand?.toLowerCase() ?? '';
-  const commandLooksInteractive = /(codex|omx|node|claude|python|bash|zsh|fish|sh)/.test(normalizedCommand);
+  const normalizedStartCommand = metadata?.startCommand?.toLowerCase() ?? '';
+  const looksLikeCodexNativeHookWrapper =
+    /^(node|npx)$/.test(normalizedCommand)
+    && /codex-native-hook(?:\.js)?/.test(normalizedStartCommand);
+  const contentLooksLikeCodexNativeHookWrapper =
+    /codex-native-hook(?:\.js)?/.test(normalizedCapturedContent);
+  const startCommandLooksLikeCodex =
+    /\bcodex(?:\.js)?\b/.test(normalizedStartCommand)
+    && !/codex-native-hook(?:\.js)?/.test(normalizedStartCommand);
+  const commandLooksInteractive = /^(codex|omx|claude)$/.test(normalizedCommand)
+    || (
+      /^(node|npx)$/.test(normalizedCommand)
+      && startCommandLooksLikeCodex
+    );
   const sessionMatches = options.expectedSessionName
     ? metadata?.sessionName === options.expectedSessionName
     : true;
@@ -138,10 +155,38 @@ export function verifyPaneTarget(
     };
   }
 
+  if (metadata && looksLikeCodexNativeHookWrapper) {
+    return {
+      accepted: false,
+      reason: 'verification-failed',
+      analysis,
+      metadata,
+    };
+  }
+
+  if (contentLooksLikeCodexNativeHookWrapper && !commandLooksInteractive) {
+    return {
+      accepted: false,
+      reason: 'verification-failed',
+      analysis,
+      metadata,
+    };
+  }
+
   if (metadata && sessionMatches && commandLooksInteractive) {
     return {
       accepted: true,
       reason: 'metadata-match',
+      analysis,
+      metadata,
+    };
+  }
+
+  const isGenericShellCommand = /^(bash|zsh|fish|sh|dash|ksh)$/.test(normalizedCommand);
+  if (metadata && isGenericShellCommand) {
+    return {
+      accepted: false,
+      reason: 'verification-failed',
       analysis,
       metadata,
     };

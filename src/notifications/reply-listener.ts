@@ -180,6 +180,25 @@ const DEFAULT_REPLY_LISTENER_STATE: ReplyListenerState = {
   errors: 0,
 };
 
+export function resetStartupPoliciesForDaemonStart(
+  state: ReplyListenerState,
+): ReplyListenerState {
+  const normalized = normalizeReplyListenerState(state);
+  normalized.telegramStartupPolicyApplied = false;
+
+  normalized.sourceStates = Object.fromEntries(
+    Object.entries(normalized.sourceStates).map(([sourceKey, sourceState]) => [
+      sourceKey,
+      {
+        ...sourceState,
+        telegramStartupPolicyApplied: false,
+      },
+    ]),
+  );
+
+  return normalized;
+}
+
 function createMinimalDaemonEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of DAEMON_ENV_ALLOWLIST) {
@@ -1296,11 +1315,21 @@ async function requestTelegramUpdates(
         res.on('end', () => {
           try {
             const body = JSON.parse(Buffer.concat(chunks).toString('utf-8')) as {
+              ok?: unknown;
+              description?: unknown;
               result?: TelegramUpdate[];
             };
             if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+              if (body.ok === false) {
+                reject(new Error(typeof body.description === 'string' ? body.description : 'Telegram Bot API returned ok=false'));
+                return;
+              }
               resolve(Array.isArray(body.result) ? body.result : []);
             } else {
+              if (body.ok === false && typeof body.description === 'string') {
+                reject(new Error(body.description));
+                return;
+              }
               reject(new Error(`HTTP ${res.statusCode}`));
             }
           } catch (error) {
@@ -1327,7 +1356,7 @@ async function sendTelegramReplyMessage(
 ): Promise<void> {
   const replyBody = JSON.stringify(body);
 
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve, reject) => {
     const replyReq = httpsRequestImpl(
       {
         hostname: 'api.telegram.org',
@@ -1341,20 +1370,79 @@ async function sendTelegramReplyMessage(
         timeout: 5000,
       },
       (res) => {
-        res.resume();
-        resolve();
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => {
+          const responseBody = Buffer.concat(chunks).toString('utf-8');
+          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+            if (!responseBody.trim()) {
+              resolve();
+              return;
+            }
+
+            try {
+              const parsed = JSON.parse(responseBody) as { ok?: unknown; description?: unknown };
+              if (parsed.ok === false) {
+                reject(new Error(typeof parsed.description === 'string' ? parsed.description : 'Telegram Bot API returned ok=false'));
+                return;
+              }
+            } catch {
+              // Non-JSON 2xx responses are treated as transport success.
+            }
+
+            resolve();
+            return;
+          }
+
+          reject(new Error(`HTTP ${res.statusCode ?? 'unknown'}${responseBody ? ` ${responseBody}` : ''}`));
+        });
       }
     );
 
-    replyReq.on('error', () => resolve());
+    replyReq.on('error', reject);
     replyReq.on('timeout', () => {
       replyReq.destroy();
-      resolve();
+      reject(new Error('Request timeout'));
     });
 
     replyReq.write(replyBody);
     replyReq.end();
   });
+}
+
+async function sendTelegramTextReply(
+  config: ReplyListenerDaemonConfig,
+  httpsRequestImpl: typeof httpsRequest,
+  replyToMessageId: number | string | undefined,
+  text: string,
+): Promise<void> {
+  await sendTelegramReplyMessage(config, httpsRequestImpl, {
+    chat_id: config.telegramChatId,
+    text,
+    reply_to_message_id: replyToMessageId,
+  });
+}
+
+async function trySendTelegramTextReply(
+  config: ReplyListenerDaemonConfig,
+  httpsRequestImpl: typeof httpsRequest,
+  replyToMessageId: number | string | undefined,
+  text: string,
+  logImpl: typeof log,
+  context: string,
+): Promise<boolean> {
+  try {
+    await sendTelegramTextReply(config, httpsRequestImpl, replyToMessageId, text);
+    return true;
+  } catch (error) {
+    logImpl(`WARN: Failed to send Telegram reply (${context}): ${error}`);
+    return false;
+  }
+}
+
+interface TelegramStartupPolicyResult {
+  handled: boolean;
+  startupUpdates?: TelegramUpdate[];
 }
 
 async function applyTelegramStartupBacklogPolicy(
@@ -1364,35 +1452,41 @@ async function applyTelegramStartupBacklogPolicy(
   httpsRequestImpl: typeof httpsRequest,
   writeDaemonStateImpl: typeof writeDaemonState,
   logImpl: typeof log,
-): Promise<boolean> {
+): Promise<TelegramStartupPolicyResult> {
   const sourceState = ensureSourceState(state, source);
   if (sourceState.telegramStartupPolicyApplied) {
-    return false;
+    return { handled: false };
   }
 
-  sourceState.telegramStartupPolicyApplied = true;
-  syncLegacyStateMirrors(state, config);
-
-  if (config.telegramStartupBacklogPolicy !== 'drop_pending') {
+  if (config.telegramStartupBacklogPolicy === 'resume') {
+    sourceState.telegramStartupPolicyApplied = true;
+    syncLegacyStateMirrors(state, config);
     writeDaemonStateImpl(state);
-    return false;
+    return { handled: false };
   }
 
   const updates = await requestTelegramUpdates(config, sourceState, httpsRequestImpl, { timeoutSeconds: 0 });
+  sourceState.telegramStartupPolicyApplied = true;
   const lastUpdateId = updates
     .map((update) => update.update_id)
     .filter((updateId): updateId is number => typeof updateId === 'number')
     .at(-1);
 
-  if (lastUpdateId !== undefined) {
+  if (config.telegramStartupBacklogPolicy === 'drop_pending' && lastUpdateId !== undefined) {
     sourceState.telegramLastUpdateId = lastUpdateId;
     sourceState.lastIngestAt = new Date().toISOString();
     syncLegacyStateMirrors(state, config);
     logImpl(`INFO: Dropped ${updates.length} pending Telegram update(s) on startup`);
   }
 
+  syncLegacyStateMirrors(state, config);
   writeDaemonStateImpl(state);
-  return true;
+  if (config.telegramStartupBacklogPolicy === 'drop_pending') {
+    return { handled: true };
+  }
+
+  logImpl(`INFO: Replaying ${updates.length} pending Telegram update(s) once on startup`);
+  return { handled: false, startupUpdates: updates };
 }
 
 async function pollTelegram(
@@ -1426,18 +1520,20 @@ export async function pollTelegramOnce(
   const logImpl = deps.logImpl ?? log;
 
   try {
-    if (await applyTelegramStartupBacklogPolicy(
+    const startupPolicy = await applyTelegramStartupBacklogPolicy(
       config,
       state,
       source,
       httpsRequestImpl,
       writeDaemonStateImpl,
       logImpl,
-    )) {
+    );
+    if (startupPolicy.handled) {
       return;
     }
 
-    const updates = await requestTelegramUpdates(config, sourceState, httpsRequestImpl);
+    const updates = startupPolicy.startupUpdates
+      ?? await requestTelegramUpdates(config, sourceState, httpsRequestImpl);
     sourceState.lastPollAt = new Date().toISOString();
 
     for (const update of updates) {
@@ -1453,19 +1549,22 @@ export async function pollTelegramOnce(
         continue;
       }
 
-      if (!msg.reply_to_message?.message_id) {
-        if (text) {
-          await sendTelegramReplyMessage(config, httpsRequestImpl, {
-            chat_id: config.telegramChatId,
-            text: TELEGRAM_REPLY_USAGE_MESSAGE,
-            reply_to_message_id: msg.message_id,
-          });
-        }
+      if (String(msg.chat?.id) !== config.telegramChatId) {
         commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
         continue;
       }
 
-      if (String(msg.chat?.id) !== config.telegramChatId) {
+      if (!msg.reply_to_message?.message_id) {
+        if (text) {
+          await trySendTelegramTextReply(
+            config,
+            httpsRequestImpl,
+            msg.message_id,
+            TELEGRAM_REPLY_USAGE_MESSAGE,
+            logImpl,
+            'usage',
+          );
+        }
         commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
         continue;
       }
@@ -1475,43 +1574,55 @@ export async function pollTelegramOnce(
         config.authorizedTelegramUserIds.length > 0
         && (!senderId || !config.authorizedTelegramUserIds.includes(senderId))
       ) {
-        await sendTelegramReplyMessage(config, httpsRequestImpl, {
-          chat_id: config.telegramChatId,
-          text: TELEGRAM_UNAUTHORIZED_REPLY_MESSAGE,
-          reply_to_message_id: msg.message_id,
-        });
+        await trySendTelegramTextReply(
+          config,
+          httpsRequestImpl,
+          msg.message_id,
+          TELEGRAM_UNAUTHORIZED_REPLY_MESSAGE,
+          logImpl,
+          'unauthorized',
+        );
         commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
         continue;
       }
 
       const mapping = lookupByMessageIdImpl('telegram', String(msg.reply_to_message.message_id), source.key);
       if (!mapping) {
-        await sendTelegramReplyMessage(config, httpsRequestImpl, {
-          chat_id: config.telegramChatId,
-          text: NO_TRACKED_SESSION_MESSAGE,
-          reply_to_message_id: msg.message_id,
-        });
+        await trySendTelegramTextReply(
+          config,
+          httpsRequestImpl,
+          msg.message_id,
+          NO_TRACKED_SESSION_MESSAGE,
+          logImpl,
+          'untracked',
+        );
         commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
         continue;
       }
 
       if (!text) {
-        await sendTelegramReplyMessage(config, httpsRequestImpl, {
-          chat_id: config.telegramChatId,
-          text: TELEGRAM_REPLY_USAGE_MESSAGE,
-          reply_to_message_id: msg.message_id,
-        });
+        await trySendTelegramTextReply(
+          config,
+          httpsRequestImpl,
+          msg.message_id,
+          TELEGRAM_REPLY_USAGE_MESSAGE,
+          logImpl,
+          'missing-text',
+        );
         commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
         continue;
       }
 
       if (isStatusCommand) {
         const statusMessage = await buildSessionStatusReplyImpl(mapping);
-        await sendTelegramReplyMessage(config, httpsRequestImpl, {
-          chat_id: config.telegramChatId,
-          text: statusMessage,
-          reply_to_message_id: msg.message_id,
-        });
+        await trySendTelegramTextReply(
+          config,
+          httpsRequestImpl,
+          msg.message_id,
+          statusMessage,
+          logImpl,
+          'status',
+        );
         commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
         continue;
       }
@@ -1543,22 +1654,24 @@ export async function pollTelegramOnce(
           formatReplyAcknowledgementImpl,
         );
         if (acknowledgement !== null) {
-          try {
-            await sendTelegramReplyMessage(config, httpsRequestImpl, {
-              chat_id: config.telegramChatId,
-              text: acknowledgement,
-              reply_to_message_id: msg.message_id,
-            });
-          } catch (e) {
-            logImpl(`WARN: Failed to send confirmation reply: ${e}`);
-          }
+          await trySendTelegramTextReply(
+            config,
+            httpsRequestImpl,
+            msg.message_id,
+            acknowledgement,
+            logImpl,
+            'acknowledgement',
+          );
         }
       } else if (injectionResult.outcome === 'terminal-ignore') {
-        await sendTelegramReplyMessage(config, httpsRequestImpl, {
-          chat_id: config.telegramChatId,
-          text: injectionResult.reason || 'The target OMX pane is no longer available for replies.',
-          reply_to_message_id: msg.message_id,
-        });
+        await trySendTelegramTextReply(
+          config,
+          httpsRequestImpl,
+          msg.message_id,
+          injectionResult.reason || 'The target OMX pane is no longer available for replies.',
+          logImpl,
+          'terminal-ignore',
+        );
         commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
       } else {
         state.errors++;
@@ -1599,7 +1712,10 @@ async function pollLoop(): Promise<void> {
   }
   let config = normalizeReplyListenerConfig(initialConfig);
 
-  const state = readDaemonState() || normalizeReplyListenerState({
+  const persistedState = readDaemonState();
+  const state = persistedState
+    ? resetStartupPoliciesForDaemonStart(persistedState)
+    : normalizeReplyListenerState({
     isRunning: true,
     pid: process.pid,
     startedAt: new Date().toISOString(),
@@ -1765,6 +1881,10 @@ export function startReplyListener(
     };
   }
 
+  const previousConfig = normalizeReplyListenerConfig(
+    readDaemonConfigImpl() ?? normalizedConfig,
+  );
+  const previousState = readDaemonStateImpl();
   writeDaemonConfigImpl(normalizedConfig);
   ensureStateDirImpl();
 
@@ -1790,13 +1910,20 @@ export function startReplyListener(
     if (pid) {
       writePidFileImpl(pid);
 
-      const state: ReplyListenerState = {
-        ...normalizeReplyListenerState({
-          isRunning: true,
-          pid,
-          startedAt: new Date().toISOString(),
-        }),
-      };
+      const stateBase = previousState
+        ? reconcileReplyListenerStateWithConfigChange(
+            previousConfig,
+            normalizedConfig,
+            previousState,
+          )
+        : normalizeReplyListenerState({});
+      const state: ReplyListenerState = normalizeReplyListenerState({
+        ...stateBase,
+        isRunning: true,
+        pid,
+        startedAt: new Date().toISOString(),
+        lastPollAt: null,
+      });
       writeDaemonStateImpl(state);
       logImpl(`Reply listener daemon started with PID ${pid}`);
 
