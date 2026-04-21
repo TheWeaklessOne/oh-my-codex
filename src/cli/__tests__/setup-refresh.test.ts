@@ -66,7 +66,7 @@ describe("omx setup refresh summary and dry-run behavior", () => {
       await mkdir(join(wd, ".omx", "state"), { recursive: true });
       await runSetupInTempDir(wd, { scope: "project" });
 
-      const skillPath = join(wd, ".codex", "skills", "help", "SKILL.md");
+      const skillPath = join(wd, ".codex", "skills", "omx", "help", "SKILL.md");
       await writeFile(skillPath, "# locally modified help\n");
 
       const output = await runSetupWithCapturedLogs(wd, {
@@ -91,7 +91,7 @@ describe("omx setup refresh summary and dry-run behavior", () => {
       await mkdir(join(wd, ".omx", "state"), { recursive: true });
       await runSetupInTempDir(wd, { scope: "project" });
 
-      const skillPath = join(wd, ".codex", "skills", "help", "SKILL.md");
+      const skillPath = join(wd, ".codex", "skills", "omx", "help", "SKILL.md");
       const customized = "# locally modified help\n";
       await writeFile(skillPath, customized);
 
@@ -164,7 +164,7 @@ describe("omx setup refresh summary and dry-run behavior", () => {
           ".codex/config.toml",
           ".codex/agents/local.toml",
           ".codex/prompts/local.md",
-          ".codex/skills/help/SKILL.md",
+          ".codex/skills/omx/help/SKILL.md",
           ".codex/skills/.system/cache.json",
         ],
         { cwd: wd, encoding: "utf-8" },
@@ -173,7 +173,7 @@ describe("omx setup refresh summary and dry-run behavior", () => {
       assert.match(status.stdout, /^!! \.codex\/config\.toml$/m);
       assert.match(status.stdout, /^\?\? \.codex\/agents\/local\.toml$/m);
       assert.match(status.stdout, /^\?\? \.codex\/prompts\/local\.md$/m);
-      assert.match(status.stdout, /^\?\? \.codex\/skills\/help\/SKILL\.md$/m);
+      assert.match(status.stdout, /^\?\? \.codex\/skills\/omx\/help\/SKILL\.md$/m);
       assert.match(status.stdout, /^!! \.codex\/skills\/\.system\/cache\.json$/m);
     } finally {
       await rm(wd, { recursive: true, force: true });

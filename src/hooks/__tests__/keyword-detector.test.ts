@@ -28,6 +28,12 @@ describe('keyword detector swarm/team compatibility', () => {
     assert.deepEqual(matches.map((m) => m.skill), ['analyze']);
   });
 
+  it('normalizes explicit $omx-prefixed skill tokens to internal skill names', () => {
+    const matches = detectKeywords('$omx:plan $omx:team ship it');
+    assert.deepEqual(matches.map((m) => m.skill), ['plan', 'team']);
+    assert.deepEqual(matches.map((m) => m.keyword), ['$omx:plan', '$omx:team']);
+  });
+
   it('limits explicit multi-skill invocation to the first contiguous $skill block', () => {
     const matches = detectKeywords('$ralplan Fix issue #1030 and ensure other directives ($ralph, $team, $deep-interview) are not affected');
     assert.deepEqual(matches.map((m) => m.skill), ['ralplan']);

@@ -185,15 +185,31 @@ async function readInstalledSkillsFromDir(
   if (!existsSync(dir)) return [];
 
   const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
-  return entries
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => ({
-      name: entry.name,
-      path: join(dir, entry.name),
-      scope,
-    }))
-    .filter((entry) => existsSync(join(entry.path, "SKILL.md")))
-    .sort((a, b) => a.name.localeCompare(b.name));
+  const skills: InstalledSkillDirectory[] = [];
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const entryPath = join(dir, entry.name);
+    if (existsSync(join(entryPath, "SKILL.md"))) {
+      skills.push({ name: entry.name, path: entryPath, scope });
+      continue;
+    }
+    if (entry.name.startsWith(".")) continue;
+
+    const nestedEntries = await readdir(entryPath, { withFileTypes: true }).catch(() => []);
+    for (const nestedEntry of nestedEntries) {
+      if (!nestedEntry.isDirectory()) continue;
+      const nestedPath = join(entryPath, nestedEntry.name);
+      if (!existsSync(join(nestedPath, "SKILL.md"))) continue;
+      skills.push({
+        name: `${entry.name}:${nestedEntry.name}`,
+        path: nestedPath,
+        scope,
+      });
+    }
+  }
+
+  return skills.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /**

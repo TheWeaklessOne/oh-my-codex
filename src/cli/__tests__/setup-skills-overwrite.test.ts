@@ -16,7 +16,7 @@ describe('omx setup skills overwrite behavior', () => {
 
       await setup({ scope: 'project' });
 
-      const wikiSkill = join(wd, '.codex', 'skills', 'wiki', 'SKILL.md');
+      const wikiSkill = join(wd, '.codex', 'skills', 'omx', 'wiki', 'SKILL.md');
       assert.equal(existsSync(wikiSkill), true);
       assert.ok((await readFile(wikiSkill, 'utf-8')).includes('description: "[OMX] '));
     } finally {
@@ -34,7 +34,7 @@ describe('omx setup skills overwrite behavior', () => {
 
       await setup({ scope: 'project' });
 
-      const installedHelpSkill = join(wd, '.codex', 'skills', 'help', 'SKILL.md');
+      const installedHelpSkill = join(wd, '.codex', 'skills', 'omx', 'help', 'SKILL.md');
       const shippedHelpSkill = join(previousCwd, 'skills', 'help', 'SKILL.md');
 
       assert.ok(
@@ -64,31 +64,35 @@ describe('omx setup skills overwrite behavior', () => {
 
       const skillsDir = join(wd, '.codex', 'skills');
       const installed = new Set(await readdir(skillsDir));
+      const omxInstalled = new Set(await readdir(join(skillsDir, 'omx')));
 
-      assert.equal(installed.has('analyze'), true);
-      assert.equal(installed.has('team'), true);
-      assert.equal(installed.has('worker'), true);
-      assert.equal(installed.has('autoresearch'), true);
-      assert.equal(installed.has('swarm'), false);
-      assert.equal(installed.has('ecomode'), false);
-      assert.equal(installed.has('ultraqa'), true);
-      assert.equal(installed.has('ralph-init'), false);
-      assert.equal(installed.has('frontend-ui-ux'), false);
-      assert.equal(installed.has('pipeline'), false);
-      assert.equal(installed.has('configure-notifications'), true);
-      assert.equal(installed.has('wiki'), true);
-      assert.equal(installed.has('configure-discord'), false);
-      assert.equal(installed.has('configure-telegram'), false);
-      assert.equal(installed.has('configure-slack'), false);
-      assert.equal(installed.has('configure-openclaw'), false);
+      assert.equal(installed.has('omx'), true);
+      assert.equal(installed.has('analyze'), false);
+      assert.equal(omxInstalled.has('analyze'), true);
+      assert.equal(omxInstalled.has('team'), true);
+      assert.equal(omxInstalled.has('worker'), true);
+      assert.equal(omxInstalled.has('autoresearch'), true);
+      assert.equal(omxInstalled.has('swarm'), false);
+      assert.equal(omxInstalled.has('ecomode'), false);
+      assert.equal(omxInstalled.has('ultraqa'), true);
+      assert.equal(omxInstalled.has('ralph-init'), false);
+      assert.equal(omxInstalled.has('frontend-ui-ux'), false);
+      assert.equal(omxInstalled.has('pipeline'), false);
+      assert.equal(omxInstalled.has('configure-notifications'), true);
+      assert.equal(omxInstalled.has('wiki'), true);
+      assert.equal(omxInstalled.has('configure-discord'), false);
+      assert.equal(omxInstalled.has('configure-telegram'), false);
+      assert.equal(omxInstalled.has('configure-slack'), false);
+      assert.equal(omxInstalled.has('configure-openclaw'), false);
       assert.match(
-        await readFile(join(skillsDir, 'analyze', 'SKILL.md'), 'utf-8'),
+        await readFile(join(skillsDir, 'omx', 'analyze', 'SKILL.md'), 'utf-8'),
         /^---\nname: analyze/m,
       );
       assert.match(
-        await readFile(join(skillsDir, 'autoresearch', 'SKILL.md'), 'utf-8'),
+        await readFile(join(skillsDir, 'omx', 'autoresearch', 'SKILL.md'), 'utf-8'),
         /^---\nname: autoresearch/m,
       );
+
     } finally {
       process.chdir(previousCwd);
       await rm(wd, { recursive: true, force: true });
@@ -106,7 +110,7 @@ describe('omx setup skills overwrite behavior', () => {
 
       const staleSkills = ['swarm', 'ecomode', 'configure-discord', 'configure-telegram', 'configure-slack', 'configure-openclaw'];
       for (const staleSkill of staleSkills) {
-        const staleDir = join(wd, '.codex', 'skills', staleSkill);
+        const staleDir = join(wd, '.codex', 'skills', 'omx', staleSkill);
         await mkdir(staleDir, { recursive: true });
         await writeFile(join(staleDir, 'SKILL.md'), `# stale ${staleSkill}\n`);
         assert.equal(existsSync(staleDir), true);
@@ -115,9 +119,9 @@ describe('omx setup skills overwrite behavior', () => {
       await setup({ scope: 'project', force: true });
 
       for (const staleSkill of staleSkills) {
-        assert.equal(existsSync(join(wd, '.codex', 'skills', staleSkill)), false);
+        assert.equal(existsSync(join(wd, '.codex', 'skills', 'omx', staleSkill)), false);
       }
-      assert.equal(existsSync(join(wd, '.codex', 'skills', 'team')), true);
+      assert.equal(existsSync(join(wd, '.codex', 'skills', 'omx', 'team')), true);
     } finally {
       process.chdir(previousCwd);
       await rm(wd, { recursive: true, force: true });
@@ -134,15 +138,15 @@ describe('omx setup skills overwrite behavior', () => {
       await setup({ scope: 'project' });
 
       const staleSkill = 'pipeline';
-      const staleDir = join(wd, '.codex', 'skills', staleSkill);
+      const staleDir = join(wd, '.codex', 'skills', 'omx', staleSkill);
       await mkdir(staleDir, { recursive: true });
       await writeFile(join(staleDir, 'SKILL.md'), `# stale ${staleSkill}\n`);
       assert.equal(existsSync(staleDir), true);
 
       await setup({ scope: 'project', force: true });
 
-      assert.equal(existsSync(join(wd, '.codex', 'skills', staleSkill)), false);
-      assert.equal(existsSync(join(wd, '.codex', 'skills', 'team')), true);
+      assert.equal(existsSync(join(wd, '.codex', 'skills', 'omx', staleSkill)), false);
+      assert.equal(existsSync(join(wd, '.codex', 'skills', 'omx', 'team')), true);
     } finally {
       process.chdir(previousCwd);
       await rm(wd, { recursive: true, force: true });
@@ -158,8 +162,8 @@ describe('omx setup skills overwrite behavior', () => {
 
       await setup({ scope: 'project' });
 
-      const wikiDir = join(wd, '.codex', 'skills', 'wiki');
-      const stalePipelineDir = join(wd, '.codex', 'skills', 'pipeline');
+      const wikiDir = join(wd, '.codex', 'skills', 'omx', 'wiki');
+      const stalePipelineDir = join(wd, '.codex', 'skills', 'omx', 'pipeline');
       assert.equal(existsSync(wikiDir), true);
 
       await mkdir(stalePipelineDir, { recursive: true });
@@ -185,7 +189,7 @@ describe('omx setup skills overwrite behavior', () => {
 
       await setup({ scope: 'project' });
 
-      const skillPath = join(wd, '.codex', 'skills', 'help', 'SKILL.md');
+      const skillPath = join(wd, '.codex', 'skills', 'omx', 'help', 'SKILL.md');
       assert.equal(existsSync(skillPath), true);
 
       const installed = await readFile(skillPath, 'utf-8');
@@ -241,7 +245,7 @@ describe('omx setup skills overwrite behavior', () => {
       await setup({ scope: 'project' });
       await setup({ scope: 'project' });
 
-      const installedHelpSkill = join(wd, '.codex', 'skills', 'help', 'SKILL.md');
+      const installedHelpSkill = join(wd, '.codex', 'skills', 'omx', 'help', 'SKILL.md');
       const content = await readFile(installedHelpSkill, 'utf-8');
       const matches = content.match(/\[OMX\] Guide on using oh-my-codex plugin/g) ?? [];
       assert.equal(matches.length, 1);
@@ -265,13 +269,13 @@ describe('omx setup skills overwrite behavior', () => {
       };
 
       await setup({ scope: 'project', verbose: true });
-      await mkdir(join(wd, '.codex', 'skills', 'swarm'), { recursive: true });
-      await writeFile(join(wd, '.codex', 'skills', 'swarm', 'SKILL.md'), '# stale swarm\n');
+      await mkdir(join(wd, '.codex', 'skills', 'omx', 'swarm'), { recursive: true });
+      await writeFile(join(wd, '.codex', 'skills', 'omx', 'swarm', 'SKILL.md'), '# stale swarm\n');
       await setup({ scope: 'project', force: true, verbose: true });
 
       const output = logs.join('\n');
       assert.match(output, /skipped swarm\/ \(status: alias\)/);
-      assert.match(output, /removed stale skill swarm\/ \(status: alias\)/);
+      assert.match(output, /removed stale skill omx\/swarm\/ \(status: alias\)/);
       assert.match(output, /skills: updated=/);
     } finally {
       console.log = originalLog;
@@ -280,7 +284,7 @@ describe('omx setup skills overwrite behavior', () => {
     }
   });
 
-  it('prints a migration hint when legacy ~/.agents/skills overlaps canonical user skills', async () => {
+  it('prints a generic migration hint when legacy ~/.agents/skills exists without overlapping namespaced OMX skills', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-setup-skills-'));
     const previousCwd = process.cwd();
     const previousHome = process.env.HOME;
@@ -303,8 +307,8 @@ describe('omx setup skills overwrite behavior', () => {
       await setup({ scope: 'user' });
 
       const output = logs.join('\n');
-      assert.match(output, /Migration hint: Detected 1 overlapping skill names between canonical .*\.codex\/skills and legacy .*\.agents\/skills\./);
-      assert.match(output, /Remove or archive ~\/\.agents\/skills after confirming .*\.codex\/skills is the version you want Codex to load\./);
+      assert.match(output, /Migration hint: Legacy ~\/.agents\/skills still exists \(1 skills\) alongside canonical .*\.codex\/skills\./);
+      assert.match(output, /archive or remove ~\/.agents\/skills if Enable\/Disable Skills shows duplicates\./);
     } finally {
       console.log = originalLog;
       process.chdir(previousCwd);

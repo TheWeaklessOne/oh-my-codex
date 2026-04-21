@@ -226,8 +226,8 @@ Specialists remain available through the role catalog and native child-agent sur
 Keyword routing is implemented primarily by native `UserPromptSubmit` hooks and the generated keyword registry. Treat hook-injected routing context as authoritative for the current turn, then load the named `SKILL.md` or prompt file as instructed.
 
 Fallback behavior when hook context is unavailable:
-- Explicit `$name` invocations run left-to-right and override implicit keywords.
-- Bare skill names do not activate skills by themselves; skill-name activation requires explicit `$skill` invocation. Natural-language routing phrases may still map to a workflow when they are not just the bare skill name. Examples: `analyze` / `investigate` → `$analyze` for read-only deep analysis with ranked synthesis, explicit confidence, and concrete file references; `deep interview`, `interview`, `don't assume`, or `ouroboros` → `$deep-interview`; `ralplan` / `consensus plan` → `$ralplan`; `cancel`, `stop`, or `abort` → `$cancel`.
+- Explicit `$omx:name` invocations run left-to-right and override implicit keywords; legacy `$name` remains accepted for backward compatibility.
+- Bare skill names do not activate skills by themselves; skill-name activation requires explicit `$skill` invocation. Natural-language routing phrases may still map to a workflow when they are not just the bare skill name. Examples: `analyze` / `investigate` → `$analyze` for read-only deep analysis with ranked synthesis, explicit confidence, and concrete file references; `deep interview`, `interview`, `don't assume`, or `ouroboros` → `$omx:deep-interview`; `ralplan` / `consensus plan` → `$omx:ralplan`; `cancel`, `stop`, or `abort` → `$omx:cancel`.
 - Keep the detailed keyword list in `src/hooks/keyword-registry.ts`; do not duplicate that table here.
 
 Runtime availability gate:

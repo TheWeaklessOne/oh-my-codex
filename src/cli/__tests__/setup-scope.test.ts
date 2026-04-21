@@ -192,15 +192,22 @@ describe("omx setup scope behavior", () => {
       assert.equal(existsSync(localAgents), true);
       assert.equal(existsSync(join(localAgents, "executor.toml")), true);
       assert.equal(
-        existsSync(join(localSkills, "omx-setup", "SKILL.md")),
+        existsSync(join(localSkills, "omx", "omx-setup", "SKILL.md")),
+        true,
+      );
+      const omxPluginManifest = JSON.parse(
+        await readFile(
+          join(localSkills, "omx", ".codex-plugin", "plugin.json"),
+          "utf-8",
+        ),
+      );
+      assert.equal(omxPluginManifest.name, "omx");
+      assert.equal(
+        existsSync(join(localSkills, "omx", "ask-claude", "SKILL.md")),
         true,
       );
       assert.equal(
-        existsSync(join(localSkills, "ask-claude", "SKILL.md")),
-        true,
-      );
-      assert.equal(
-        existsSync(join(localSkills, "ask-gemini", "SKILL.md")),
+        existsSync(join(localSkills, "omx", "ask-gemini", "SKILL.md")),
         true,
       );
       assert.ok(

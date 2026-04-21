@@ -240,16 +240,19 @@ describe("listInstalledSkillDirectories", () => {
       );
       const userHelpDir = join(codexHomeRoot, "skills", "help");
       const userOnlyDir = join(codexHomeRoot, "skills", "user-only");
+      const userNamespacedPlanDir = join(codexHomeRoot, "skills", "omx", "plan");
 
       await mkdir(projectHelpDir, { recursive: true });
       await mkdir(projectOnlyDir, { recursive: true });
       await mkdir(userHelpDir, { recursive: true });
       await mkdir(userOnlyDir, { recursive: true });
+      await mkdir(userNamespacedPlanDir, { recursive: true });
 
       await writeFile(join(projectHelpDir, "SKILL.md"), "# project help\n");
       await writeFile(join(projectOnlyDir, "SKILL.md"), "# project only\n");
       await writeFile(join(userHelpDir, "SKILL.md"), "# user help\n");
       await writeFile(join(userOnlyDir, "SKILL.md"), "# user only\n");
+      await writeFile(join(userNamespacedPlanDir, "SKILL.md"), "# user namespaced plan\n");
 
       const skills = await listInstalledSkillDirectories(projectRoot);
 
@@ -261,6 +264,7 @@ describe("listInstalledSkillDirectories", () => {
         [
           { name: "help", scope: "project" },
           { name: "project-only", scope: "project" },
+          { name: "omx:plan", scope: "user" },
           { name: "user-only", scope: "user" },
         ],
       );

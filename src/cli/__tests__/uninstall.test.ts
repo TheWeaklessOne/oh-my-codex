@@ -539,6 +539,30 @@ describe('omx uninstall', () => {
     }
   });
 
+  it('removes namespaced OMX skills and namespace manifest during uninstall', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-'));
+    try {
+      const home = join(wd, 'home');
+      await mkdir(home, { recursive: true });
+
+      const setup = runOmx(wd, ['setup', '--scope', 'project'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(setup.error)) return;
+      assert.equal(setup.status, 0, setup.stderr || setup.stdout);
+
+      const skillsDir = join(wd, '.codex', 'skills');
+      assert.equal(existsSync(join(skillsDir, 'omx', 'help', 'SKILL.md')), true);
+      assert.equal(existsSync(join(skillsDir, 'omx', '.codex-plugin', 'plugin.json')), true);
+
+      const res = runOmx(wd, ['uninstall', '--keep-config'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+
+      assert.equal(existsSync(join(skillsDir, 'omx')), false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('warns when overlapping legacy ~/.agents/skills remains after user-scope uninstall', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-'));
     try {

@@ -8,6 +8,7 @@ import { join } from 'path';
 import {
   codexHome, codexConfigPath, codexPromptsDir,
   userSkillsDir, projectSkillsDir, omxStateDir, detectLegacySkillRootOverlap,
+  listInstalledSkillDirectories,
 } from '../utils/paths.js';
 import { classifySpawnError, spawnPlatformCommandSync } from '../utils/platform-command.js';
 import { getCatalogExpectations } from './catalog-contract.js';
@@ -811,12 +812,12 @@ async function checkSkills(dir: string): Promise<Check> {
     return { name: 'Skills', status: 'warn', message: 'skills directory not found' };
   }
   try {
-    const entries = await readdir(dir, { withFileTypes: true });
-    const skillDirs = entries.filter(e => e.isDirectory());
-    if (skillDirs.length >= expectations.skillMin) {
-      return { name: 'Skills', status: 'pass', message: `${skillDirs.length} skills installed` };
+    const skills = (await listInstalledSkillDirectories(process.cwd()))
+      .filter((skill) => skill.path.startsWith(dir));
+    if (skills.length >= expectations.skillMin) {
+      return { name: 'Skills', status: 'pass', message: `${skills.length} skills installed` };
     }
-    return { name: 'Skills', status: 'warn', message: `${skillDirs.length} skills (expected >= ${expectations.skillMin})` };
+    return { name: 'Skills', status: 'warn', message: `${skills.length} skills (expected >= ${expectations.skillMin})` };
   } catch {
     return { name: 'Skills', status: 'fail', message: 'cannot read skills directory' };
   }

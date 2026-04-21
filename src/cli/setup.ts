@@ -145,6 +145,7 @@ const PROJECT_GITIGNORE_ENTRIES = [
 ] as const;
 const LEGACY_PROJECT_GITIGNORE_ENTRIES = [".codex/"] as const;
 const SETUP_ONLY_INSTALLABLE_SKILLS = new Set(["wiki"]);
+const OMX_SKILL_NAMESPACE = "omx";
 
 function applyScopePathRewritesToAgentsTemplate(
   content: string,
@@ -1088,7 +1089,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
   console.log("\nNext steps:");
   console.log("  1. Start Codex CLI in your project directory");
   console.log(
-    "  2. Use role/workflow keywords like $architect, $executor, and $plan in Codex",
+    "  2. Use role/workflow keywords like $architect, $executor, and $omx:plan in Codex",
   );
   console.log("  3. Browse skills with /skills; AGENTS keyword routing can also activate them implicitly");
   console.log("  4. The AGENTS.md orchestration brain is loaded automatically");
@@ -1540,6 +1541,7 @@ export async function installSkills(
   ): boolean =>
     isInstallableStatus(status) || SETUP_ONLY_INSTALLABLE_SKILLS.has(skillName);
   const entries = await readdir(srcDir, { withFileTypes: true });
+  const namespacedDstDir = join(dstDir, OMX_SKILL_NAMESPACE);
   const staleCandidateSkillNames = new Set(
     manifest?.skills.map((skill) => skill.name) ?? [],
   );
@@ -1557,7 +1559,7 @@ export async function installSkills(
     }
 
     const skillSrc = join(srcDir, entry.name);
-    const skillDst = join(dstDir, entry.name);
+    const skillDst = join(namespacedDstDir, entry.name);
     const skillMd = join(skillSrc, "SKILL.md");
     if (!existsSync(skillMd)) continue;
 
@@ -1612,12 +1614,29 @@ export async function installSkills(
     }
   }
 
-  if (options.force && manifest && existsSync(dstDir)) {
+  await ensureOmxSkillNamespaceManifest(
+    namespacedDstDir,
+    summary,
+    backupContext,
+    options,
+  );
+
+  const legacyFlatSkillNames = new Set(
+    [...staleCandidateSkillNames, ...installableSkills.map((skill) => skill.name)],
+  );
+  summary.removed += await cleanupLegacyFlatOmxSkills(
+    dstDir,
+    legacyFlatSkillNames,
+    backupContext,
+    options,
+  );
+
+  if (options.force && manifest && existsSync(namespacedDstDir)) {
     for (const staleSkill of staleCandidateSkillNames) {
       const status = skillStatusByName?.get(staleSkill);
       if (isSetupInstallableSkill(staleSkill, status)) continue;
 
-      const staleSkillDir = join(dstDir, staleSkill);
+      const staleSkillDir = join(namespacedDstDir, staleSkill);
       if (!existsSync(staleSkillDir)) continue;
 
       if (!options.dryRun) {
@@ -1629,12 +1648,73 @@ export async function installSkills(
           ? "would remove stale skill"
           : "removed stale skill";
         const label = status ?? "unlisted";
-        console.log(`  ${prefix} ${staleSkill}/ (status: ${label})`);
+        console.log(`  ${prefix} ${OMX_SKILL_NAMESPACE}/${staleSkill}/ (status: ${label})`);
       }
     }
   }
 
   return summary;
+}
+
+async function cleanupLegacyFlatOmxSkills(
+  skillsDir: string,
+  skillNames: Set<string>,
+  backupContext: SetupBackupContext,
+  options: SetupOptions,
+): Promise<number> {
+  if (!existsSync(skillsDir)) return 0;
+
+  let removed = 0;
+  for (const skillName of skillNames) {
+    if (skillName === OMX_SKILL_NAMESPACE) continue;
+    const legacySkillDir = join(skillsDir, skillName);
+    if (!existsSync(legacySkillDir)) continue;
+    if (!existsSync(join(legacySkillDir, "SKILL.md"))) continue;
+
+    await ensureBackup(
+      join(legacySkillDir, "SKILL.md"),
+      true,
+      backupContext,
+      options,
+    );
+    if (!options.dryRun) {
+      await rm(legacySkillDir, { recursive: true, force: true });
+    }
+    removed += 1;
+    if (options.verbose) {
+      const prefix = options.dryRun
+        ? "would remove legacy flat OMX skill"
+        : "removed legacy flat OMX skill";
+      console.log(`  ${prefix} ${skillName}/`);
+    }
+  }
+  return removed;
+}
+
+async function ensureOmxSkillNamespaceManifest(
+  namespacedSkillsDir: string,
+  summary: SetupCategorySummary,
+  backupContext: SetupBackupContext,
+  options: SetupOptions,
+): Promise<void> {
+  const manifestPath = join(namespacedSkillsDir, ".codex-plugin", "plugin.json");
+  const manifest = JSON.stringify(
+    {
+      name: OMX_SKILL_NAMESPACE,
+      description: "oh-my-codex workflow skills",
+      version: "0.1.0",
+    },
+    null,
+    2,
+  ) + "\n";
+  await syncManagedContent(
+    manifest,
+    manifestPath,
+    summary,
+    backupContext,
+    options,
+    `${OMX_SKILL_NAMESPACE} skill namespace manifest`,
+  );
 }
 
 async function updateManagedConfig(
