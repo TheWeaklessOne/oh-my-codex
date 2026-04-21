@@ -24,6 +24,7 @@ import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { randomUUID } from 'crypto';
 import { sleepSync } from '../utils/sleep.js';
+import type { ReplySourceDescriptor } from './reply-source.js';
 
 const REGISTRY_PATH = join(homedir(), '.omx', 'state', 'reply-session-registry.jsonl');
 const REGISTRY_LOCK_PATH = join(homedir(), '.omx', 'state', 'reply-session-registry.lock');
@@ -48,6 +49,7 @@ interface LockFileSnapshot {
 export interface SessionMapping {
   platform: "discord-bot" | "telegram";
   messageId: string;
+  source?: ReplySourceDescriptor;
   sessionId: string;
   tmuxPaneId: string;
   tmuxSessionName: string;
@@ -292,14 +294,35 @@ function readAllMappingsUnsafe(): SessionMapping[] {
 }
 
 export function lookupByMessageId(platform: string, messageId: string): SessionMapping | null {
+  return lookupBySourceMessage(platform, messageId, null);
+}
+
+export function lookupBySourceMessage(
+  platform: string,
+  messageId: string,
+  sourceKey: string | null,
+): SessionMapping | null {
   const mappings = loadAllMappings();
+  let legacyMatch: SessionMapping | null = null;
   for (let index = mappings.length - 1; index >= 0; index -= 1) {
     const mapping = mappings[index];
-    if (mapping.platform === platform && mapping.messageId === messageId) {
+    if (mapping.platform !== platform || mapping.messageId !== messageId) {
+      continue;
+    }
+
+    if (sourceKey && mapping.source?.key === sourceKey) {
+      return mapping;
+    }
+
+    if (!mapping.source && legacyMatch === null) {
+      legacyMatch = mapping;
+    }
+
+    if (!sourceKey) {
       return mapping;
     }
   }
-  return null;
+  return legacyMatch;
 }
 
 export function removeSession(sessionId: string): void {

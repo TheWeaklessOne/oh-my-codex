@@ -26,10 +26,15 @@ import {
   isTmuxAvailable,
 } from './tmux-detector.js';
 import {
-  lookupByMessageId,
+  lookupBySourceMessage,
   removeMessagesByPane,
   pruneStale,
 } from './session-registry.js';
+import {
+  buildDiscordReplySource,
+  buildTelegramReplySource,
+  type ReplySourceDescriptor,
+} from './reply-source.js';
 import {
   NO_TRACKED_SESSION_MESSAGE,
   buildDiscordSessionStatusReply,
@@ -93,9 +98,21 @@ export interface ReplyListenerState {
   telegramLastUpdateId: number | null;
   discordLastMessageId: string | null;
   telegramStartupPolicyApplied: boolean;
+  sourceStates: Record<string, ReplyListenerSourceState>;
   messagesInjected: number;
   errors: number;
   lastError?: string;
+}
+
+export interface ReplyListenerSourceState {
+  sourceKey: string;
+  platform: 'telegram' | 'discord-bot';
+  label: string;
+  telegramLastUpdateId?: number | null;
+  discordLastMessageId?: string | null;
+  telegramStartupPolicyApplied?: boolean;
+  lastPollAt?: string | null;
+  lastIngestAt?: string | null;
 }
 
 export interface ReplyListenerDaemonConfig extends ReplyConfig {
@@ -150,6 +167,7 @@ const DEFAULT_REPLY_LISTENER_STATE: ReplyListenerState = {
   telegramLastUpdateId: null,
   discordLastMessageId: null,
   telegramStartupPolicyApplied: false,
+  sourceStates: {},
   messagesInjected: 0,
   errors: 0,
 };
@@ -251,11 +269,119 @@ function normalizeTelegramStartupBacklogPolicy(value: unknown): TelegramStartupB
 }
 
 function normalizeReplyListenerState(state: Partial<ReplyListenerState>): ReplyListenerState {
+  const rawSourceStates = state.sourceStates && typeof state.sourceStates === 'object'
+    ? state.sourceStates
+    : {};
+  const sourceStates = Object.fromEntries(
+    Object.entries(rawSourceStates).map(([sourceKey, sourceState]) => {
+      const normalizedSourceState = sourceState as Partial<ReplyListenerSourceState>;
+      return [
+        sourceKey,
+        {
+          sourceKey,
+          platform: normalizedSourceState.platform === 'telegram' ? 'telegram' : 'discord-bot',
+          label: typeof normalizedSourceState.label === 'string' && normalizedSourceState.label.trim()
+            ? normalizedSourceState.label
+            : sourceKey,
+          telegramLastUpdateId:
+            typeof normalizedSourceState.telegramLastUpdateId === 'number'
+              ? normalizedSourceState.telegramLastUpdateId
+              : normalizedSourceState.telegramLastUpdateId === null
+                ? null
+                : undefined,
+          discordLastMessageId:
+            typeof normalizedSourceState.discordLastMessageId === 'string'
+              ? normalizedSourceState.discordLastMessageId
+              : normalizedSourceState.discordLastMessageId === null
+                ? null
+                : undefined,
+          telegramStartupPolicyApplied: normalizedSourceState.telegramStartupPolicyApplied === true,
+          lastPollAt: typeof normalizedSourceState.lastPollAt === 'string'
+            ? normalizedSourceState.lastPollAt
+            : null,
+          lastIngestAt: typeof normalizedSourceState.lastIngestAt === 'string'
+            ? normalizedSourceState.lastIngestAt
+            : null,
+        } satisfies ReplyListenerSourceState,
+      ];
+    }),
+  );
+
   return {
     ...DEFAULT_REPLY_LISTENER_STATE,
     ...state,
     telegramStartupPolicyApplied: state.telegramStartupPolicyApplied === true,
+    sourceStates,
   };
+}
+
+function getTelegramReplySource(config: ReplyListenerDaemonConfig): ReplySourceDescriptor | null {
+  if (!config.telegramEnabled || !config.telegramBotToken || !config.telegramChatId) {
+    return null;
+  }
+  return buildTelegramReplySource(config.telegramBotToken, config.telegramChatId);
+}
+
+function getDiscordReplySource(config: ReplyListenerDaemonConfig): ReplySourceDescriptor | null {
+  if (!config.discordEnabled || !config.discordBotToken || !config.discordChannelId) {
+    return null;
+  }
+  return buildDiscordReplySource(config.discordBotToken, config.discordChannelId);
+}
+
+function listActiveReplySources(config: ReplyListenerDaemonConfig): ReplySourceDescriptor[] {
+  return [
+    getDiscordReplySource(config),
+    getTelegramReplySource(config),
+  ].filter((source): source is ReplySourceDescriptor => source !== null);
+}
+
+function ensureSourceState(
+  state: ReplyListenerState,
+  source: ReplySourceDescriptor,
+  options: {
+    seedFromLegacy?: boolean;
+  } = {},
+): ReplyListenerSourceState {
+  const existing = state.sourceStates[source.key];
+  if (existing) {
+    return existing;
+  }
+
+  const seedFromLegacy = options.seedFromLegacy !== false;
+
+  const created: ReplyListenerSourceState = {
+    sourceKey: source.key,
+    platform: source.platform,
+    label: source.label,
+    telegramLastUpdateId: source.platform === 'telegram'
+      ? (seedFromLegacy ? state.telegramLastUpdateId : null)
+      : undefined,
+    discordLastMessageId: source.platform === 'discord-bot'
+      ? (seedFromLegacy ? state.discordLastMessageId : null)
+      : undefined,
+    telegramStartupPolicyApplied: source.platform === 'telegram'
+      ? (seedFromLegacy ? state.telegramStartupPolicyApplied : false)
+      : false,
+    lastPollAt: null,
+    lastIngestAt: null,
+  };
+  state.sourceStates[source.key] = created;
+  return created;
+}
+
+function syncLegacyStateMirrors(
+  state: ReplyListenerState,
+  config: ReplyListenerDaemonConfig,
+): void {
+  const telegramSource = getTelegramReplySource(config);
+  const telegramState = telegramSource ? ensureSourceState(state, telegramSource) : null;
+  state.telegramLastUpdateId = telegramState?.telegramLastUpdateId ?? null;
+  state.telegramStartupPolicyApplied = telegramState?.telegramStartupPolicyApplied === true;
+
+  const discordSource = getDiscordReplySource(config);
+  const discordState = discordSource ? ensureSourceState(state, discordSource) : null;
+  state.discordLastMessageId = discordState?.discordLastMessageId ?? null;
 }
 
 export function normalizeReplyListenerConfig(config: ReplyListenerDaemonConfig): ReplyListenerDaemonConfig {
@@ -308,17 +434,11 @@ export function normalizeReplyListenerConfig(config: ReplyListenerDaemonConfig):
 }
 
 function getTelegramSourceIdentity(config: ReplyListenerDaemonConfig): string | null {
-  if (!config.telegramEnabled || !config.telegramBotToken || !config.telegramChatId) {
-    return null;
-  }
-  return `${config.telegramBotToken}:${config.telegramChatId}`;
+  return getTelegramReplySource(config)?.key ?? null;
 }
 
 function getDiscordSourceIdentity(config: ReplyListenerDaemonConfig): string | null {
-  if (!config.discordEnabled || !config.discordBotToken || !config.discordChannelId) {
-    return null;
-  }
-  return `${config.discordBotToken}:${config.discordChannelId}`;
+  return getDiscordReplySource(config)?.key ?? null;
 }
 
 function reconcileReplyListenerStateWithConfigChange(
@@ -327,16 +447,22 @@ function reconcileReplyListenerStateWithConfigChange(
   currentState: ReplyListenerState,
 ): ReplyListenerState {
   const nextState = { ...currentState };
-
-  if (getTelegramSourceIdentity(previousConfig) !== getTelegramSourceIdentity(nextConfig)) {
-    nextState.telegramLastUpdateId = null;
-    nextState.telegramStartupPolicyApplied = false;
+  const previousTelegramKey = getTelegramSourceIdentity(previousConfig);
+  const nextTelegramSource = getTelegramReplySource(nextConfig);
+  if (nextTelegramSource && previousTelegramKey !== nextTelegramSource.key) {
+    ensureSourceState(nextState, nextTelegramSource, { seedFromLegacy: false });
   }
 
-  if (getDiscordSourceIdentity(previousConfig) !== getDiscordSourceIdentity(nextConfig)) {
-    nextState.discordLastMessageId = null;
+  const previousDiscordKey = getDiscordSourceIdentity(previousConfig);
+  const nextDiscordSource = getDiscordReplySource(nextConfig);
+  if (nextDiscordSource && previousDiscordKey !== nextDiscordSource.key) {
+    ensureSourceState(nextState, nextDiscordSource, { seedFromLegacy: false });
   }
 
+  listActiveReplySources(nextConfig).forEach((source) => {
+    ensureSourceState(nextState, source);
+  });
+  syncLegacyStateMirrors(nextState, nextConfig);
   return nextState;
 }
 
@@ -368,31 +494,43 @@ function normalizeInjectReplyResult(result: InjectReplyLikeResult): ReplyInjecti
 
 function commitDiscordCursor(
   state: ReplyListenerState,
+  config: ReplyListenerDaemonConfig,
+  source: ReplySourceDescriptor,
   messageId: string,
   writeDaemonStateImpl: typeof writeDaemonState,
 ): void {
-  state.discordLastMessageId = messageId;
+  const sourceState = ensureSourceState(state, source);
+  sourceState.discordLastMessageId = messageId;
+  sourceState.lastIngestAt = new Date().toISOString();
+  syncLegacyStateMirrors(state, config);
   writeDaemonStateImpl(state);
 }
 
 function commitTelegramCursor(
   state: ReplyListenerState,
+  config: ReplyListenerDaemonConfig,
+  source: ReplySourceDescriptor,
   updateId: number,
   writeDaemonStateImpl: typeof writeDaemonState,
 ): void {
-  state.telegramLastUpdateId = updateId;
+  const sourceState = ensureSourceState(state, source);
+  sourceState.telegramLastUpdateId = updateId;
+  sourceState.lastIngestAt = new Date().toISOString();
+  syncLegacyStateMirrors(state, config);
   writeDaemonStateImpl(state);
 }
 
 function buildTelegramGetUpdatesPath(
   config: ReplyListenerDaemonConfig,
-  state: ReplyListenerState,
+  sourceState: ReplyListenerSourceState,
   options: {
     timeoutSeconds?: number;
     offset?: number;
   } = {},
 ): string {
-  const offset = options.offset ?? (state.telegramLastUpdateId !== null ? state.telegramLastUpdateId + 1 : 0);
+  const offset = options.offset ?? (sourceState.telegramLastUpdateId !== null && sourceState.telegramLastUpdateId !== undefined
+    ? sourceState.telegramLastUpdateId + 1
+    : 0);
   const timeoutSeconds = options.timeoutSeconds ?? config.telegramPollTimeoutSeconds;
   const params = new URLSearchParams();
   params.set('offset', String(offset));
@@ -570,7 +708,11 @@ interface ReplyAcknowledgementDeps {
 
 export interface ReplyListenerDiscordPollDeps {
   fetchImpl?: typeof fetch;
-  lookupByMessageIdImpl?: typeof lookupByMessageId;
+  lookupByMessageIdImpl?: (
+    platform: string,
+    messageId: string,
+    sourceKey: string | null,
+  ) => ReturnType<typeof lookupBySourceMessage>;
   injectReplyImpl?: (
     paneId: string,
     text: string,
@@ -585,7 +727,11 @@ export interface ReplyListenerDiscordPollDeps {
 
 export interface ReplyListenerTelegramPollDeps {
   httpsRequestImpl?: typeof httpsRequest;
-  lookupByMessageIdImpl?: typeof lookupByMessageId;
+  lookupByMessageIdImpl?: (
+    platform: string,
+    messageId: string,
+    sourceKey: string | null,
+  ) => ReturnType<typeof lookupBySourceMessage>;
   injectReplyImpl?: (
     paneId: string,
     text: string,
@@ -610,7 +756,11 @@ export interface ReplyListenerPollDeps {
   buildSessionStatusReplyImpl?: typeof buildDiscordSessionStatusReply;
   captureReplyAcknowledgementSummaryImpl?: typeof captureReplyAcknowledgementSummary;
   formatReplyAcknowledgementImpl?: typeof formatReplyAcknowledgement;
-  lookupByMessageIdImpl?: typeof lookupByMessageId;
+  lookupByMessageIdImpl?: (
+    platform: string,
+    messageId: string,
+    sourceKey: string | null,
+  ) => ReturnType<typeof lookupBySourceMessage>;
   writeDaemonStateImpl?: typeof writeDaemonState;
   parseMentionAllowedMentionsImpl?: typeof parseMentionAllowedMentions;
   logImpl?: typeof log;
@@ -725,6 +875,27 @@ export function refreshReplyListenerRuntimeConfig(
   };
 }
 
+export function reconcileSourceRateLimiters(
+  config: ReplyListenerDaemonConfig,
+  currentRateLimiters: Map<string, ReplyListenerRateLimiter>,
+  previousConfig?: ReplyListenerDaemonConfig,
+): Map<string, ReplyListenerRateLimiter> {
+  const rateLimitChanged = previousConfig !== undefined
+    && previousConfig.rateLimitPerMinute !== config.rateLimitPerMinute;
+  const nextRateLimiters = new Map<string, ReplyListenerRateLimiter>();
+
+  for (const source of listActiveReplySources(config)) {
+    if (!rateLimitChanged && currentRateLimiters.has(source.key)) {
+      nextRateLimiters.set(source.key, currentRateLimiters.get(source.key)!);
+      continue;
+    }
+
+    nextRateLimiters.set(source.key, new RateLimiter(config.rateLimitPerMinute));
+  }
+
+  return nextRateLimiters;
+}
+
 function injectReply(
   paneId: string,
   text: string,
@@ -823,18 +994,22 @@ export async function pollDiscordOnce(
   if (config.authorizedDiscordUserIds.length === 0) return;
   if (Date.now() < discordBackoffUntil) return;
 
+  const source = getDiscordReplySource(config);
+  if (!source) return;
+  const sourceState = ensureSourceState(state, source);
+
   const fetchImpl = deps.fetchImpl ?? fetch;
   const injectReplyImpl = deps.injectReplyImpl ?? injectReply;
   const buildSessionStatusReplyImpl = deps.buildSessionStatusReplyImpl ?? buildDiscordSessionStatusReply;
   const captureReplyAcknowledgementSummaryImpl = deps.captureReplyAcknowledgementSummaryImpl ?? captureReplyAcknowledgementSummary;
   const formatReplyAcknowledgementImpl = deps.formatReplyAcknowledgementImpl ?? formatReplyAcknowledgement;
-  const lookupByMessageIdImpl = deps.lookupByMessageIdImpl ?? lookupByMessageId;
+  const lookupByMessageIdImpl = deps.lookupByMessageIdImpl ?? lookupBySourceMessage;
   const writeDaemonStateImpl = deps.writeDaemonStateImpl ?? writeDaemonState;
   const parseMentionAllowedMentionsImpl = deps.parseMentionAllowedMentionsImpl ?? parseMentionAllowedMentions;
   const logImpl = deps.logImpl ?? log;
 
   try {
-    const after = state.discordLastMessageId ? `?after=${state.discordLastMessageId}&limit=10` : '?limit=10';
+    const after = sourceState.discordLastMessageId ? `?after=${sourceState.discordLastMessageId}&limit=10` : '?limit=10';
     const url = `https://discord.com/api/v10/channels/${config.discordChannelId}/messages${after}`;
 
     const response = await fetchImpl(url, {
@@ -861,22 +1036,23 @@ export async function pollDiscordOnce(
 
     if (!Array.isArray(messages) || messages.length === 0) return;
 
+    sourceState.lastPollAt = new Date().toISOString();
     const sorted = [...messages].reverse();
 
     for (const msg of sorted) {
       const isStatusCommand = isDiscordStatusCommand(msg.content ?? '');
 
       if (!msg.message_reference?.message_id) {
-        commitDiscordCursor(state, msg.id, writeDaemonStateImpl);
+        commitDiscordCursor(state, config, source, msg.id, writeDaemonStateImpl);
         continue;
       }
 
       if (!config.authorizedDiscordUserIds.includes(msg.author.id)) {
-        commitDiscordCursor(state, msg.id, writeDaemonStateImpl);
+        commitDiscordCursor(state, config, source, msg.id, writeDaemonStateImpl);
         continue;
       }
 
-      const mapping = lookupByMessageIdImpl('discord-bot', msg.message_reference.message_id);
+      const mapping = lookupByMessageIdImpl('discord-bot', msg.message_reference.message_id, source.key);
       if (!mapping) {
         if (isStatusCommand) {
           await postDiscordReplyMessage(config, msg.id, NO_TRACKED_SESSION_MESSAGE, {
@@ -884,7 +1060,7 @@ export async function pollDiscordOnce(
             logImpl,
           });
         }
-        commitDiscordCursor(state, msg.id, writeDaemonStateImpl);
+        commitDiscordCursor(state, config, source, msg.id, writeDaemonStateImpl);
         continue;
       }
 
@@ -900,7 +1076,7 @@ export async function pollDiscordOnce(
           fetchImpl,
           logImpl,
         });
-        commitDiscordCursor(state, msg.id, writeDaemonStateImpl);
+        commitDiscordCursor(state, config, source, msg.id, writeDaemonStateImpl);
         continue;
       }
 
@@ -909,7 +1085,7 @@ export async function pollDiscordOnce(
       );
       if (injectionResult.outcome === 'success') {
         state.messagesInjected++;
-        commitDiscordCursor(state, msg.id, writeDaemonStateImpl);
+        commitDiscordCursor(state, config, source, msg.id, writeDaemonStateImpl);
 
         const acknowledgement = buildReplyAcknowledgement(
           mapping.tmuxPaneId,
@@ -958,7 +1134,7 @@ export async function pollDiscordOnce(
           }
         }
       } else if (injectionResult.outcome === 'terminal-ignore') {
-        commitDiscordCursor(state, msg.id, writeDaemonStateImpl);
+        commitDiscordCursor(state, config, source, msg.id, writeDaemonStateImpl);
       } else {
         state.errors++;
         logImpl(`WARN: Deferring Discord message ${msg.id} after retryable intake failure${injectionResult.reason ? `: ${injectionResult.reason}` : ''}`);
@@ -978,7 +1154,7 @@ export async function pollDiscordOnce(
 
 async function requestTelegramUpdates(
   config: ReplyListenerDaemonConfig,
-  state: ReplyListenerState,
+  sourceState: ReplyListenerSourceState,
   httpsRequestImpl: typeof httpsRequest,
   options: {
     timeoutSeconds?: number;
@@ -986,7 +1162,7 @@ async function requestTelegramUpdates(
   } = {},
 ): Promise<TelegramUpdate[]> {
   const timeoutSeconds = options.timeoutSeconds ?? config.telegramPollTimeoutSeconds;
-  const path = buildTelegramGetUpdatesPath(config, state, {
+  const path = buildTelegramGetUpdatesPath(config, sourceState, {
     timeoutSeconds,
     ...(options.offset !== undefined ? { offset: options.offset } : {}),
   });
@@ -1070,29 +1246,34 @@ async function sendTelegramReplyMessage(
 async function applyTelegramStartupBacklogPolicy(
   config: ReplyListenerDaemonConfig,
   state: ReplyListenerState,
+  source: ReplySourceDescriptor,
   httpsRequestImpl: typeof httpsRequest,
   writeDaemonStateImpl: typeof writeDaemonState,
   logImpl: typeof log,
 ): Promise<boolean> {
-  if (state.telegramStartupPolicyApplied) {
+  const sourceState = ensureSourceState(state, source);
+  if (sourceState.telegramStartupPolicyApplied) {
     return false;
   }
 
-  state.telegramStartupPolicyApplied = true;
+  sourceState.telegramStartupPolicyApplied = true;
+  syncLegacyStateMirrors(state, config);
 
   if (config.telegramStartupBacklogPolicy !== 'drop_pending') {
     writeDaemonStateImpl(state);
     return false;
   }
 
-  const updates = await requestTelegramUpdates(config, state, httpsRequestImpl, { timeoutSeconds: 0 });
+  const updates = await requestTelegramUpdates(config, sourceState, httpsRequestImpl, { timeoutSeconds: 0 });
   const lastUpdateId = updates
     .map((update) => update.update_id)
     .filter((updateId): updateId is number => typeof updateId === 'number')
     .at(-1);
 
   if (lastUpdateId !== undefined) {
-    state.telegramLastUpdateId = lastUpdateId;
+    sourceState.telegramLastUpdateId = lastUpdateId;
+    sourceState.lastIngestAt = new Date().toISOString();
+    syncLegacyStateMirrors(state, config);
     logImpl(`INFO: Dropped ${updates.length} pending Telegram update(s) on startup`);
   }
 
@@ -1117,11 +1298,15 @@ export async function pollTelegramOnce(
   if (config.telegramEnabled === false) return;
   if (!config.telegramBotToken || !config.telegramChatId) return;
 
+  const source = getTelegramReplySource(config);
+  if (!source) return;
+  const sourceState = ensureSourceState(state, source);
+
   const httpsRequestImpl = deps.httpsRequestImpl ?? httpsRequest;
   const injectReplyImpl = deps.injectReplyImpl ?? injectReply;
   const captureReplyAcknowledgementSummaryImpl = deps.captureReplyAcknowledgementSummaryImpl ?? captureReplyAcknowledgementSummary;
   const formatReplyAcknowledgementImpl = deps.formatReplyAcknowledgementImpl ?? formatReplyAcknowledgement;
-  const lookupByMessageIdImpl = deps.lookupByMessageIdImpl ?? lookupByMessageId;
+  const lookupByMessageIdImpl = deps.lookupByMessageIdImpl ?? lookupBySourceMessage;
   const writeDaemonStateImpl = deps.writeDaemonStateImpl ?? writeDaemonState;
   const logImpl = deps.logImpl ?? log;
 
@@ -1129,6 +1314,7 @@ export async function pollTelegramOnce(
     if (await applyTelegramStartupBacklogPolicy(
       config,
       state,
+      source,
       httpsRequestImpl,
       writeDaemonStateImpl,
       logImpl,
@@ -1136,7 +1322,8 @@ export async function pollTelegramOnce(
       return;
     }
 
-    const updates = await requestTelegramUpdates(config, state, httpsRequestImpl);
+    const updates = await requestTelegramUpdates(config, sourceState, httpsRequestImpl);
+    sourceState.lastPollAt = new Date().toISOString();
 
     for (const update of updates) {
       const updateId = typeof update.update_id === 'number' ? update.update_id : null;
@@ -1145,17 +1332,17 @@ export async function pollTelegramOnce(
       }
       const msg = update.message;
       if (!msg) {
-        commitTelegramCursor(state, updateId, writeDaemonStateImpl);
+        commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
         continue;
       }
 
       if (!msg.reply_to_message?.message_id) {
-        commitTelegramCursor(state, updateId, writeDaemonStateImpl);
+        commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
         continue;
       }
 
       if (String(msg.chat?.id) !== config.telegramChatId) {
-        commitTelegramCursor(state, updateId, writeDaemonStateImpl);
+        commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
         continue;
       }
 
@@ -1164,19 +1351,19 @@ export async function pollTelegramOnce(
         config.authorizedTelegramUserIds.length > 0
         && (!senderId || !config.authorizedTelegramUserIds.includes(senderId))
       ) {
-        commitTelegramCursor(state, updateId, writeDaemonStateImpl);
+        commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
         continue;
       }
 
-      const mapping = lookupByMessageIdImpl('telegram', String(msg.reply_to_message.message_id));
+      const mapping = lookupByMessageIdImpl('telegram', String(msg.reply_to_message.message_id), source.key);
       if (!mapping) {
-        commitTelegramCursor(state, updateId, writeDaemonStateImpl);
+        commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
         continue;
       }
 
       const text = msg.text || '';
       if (!text) {
-        commitTelegramCursor(state, updateId, writeDaemonStateImpl);
+        commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
         continue;
       }
 
@@ -1191,7 +1378,7 @@ export async function pollTelegramOnce(
       );
       if (injectionResult.outcome === 'success') {
         state.messagesInjected++;
-        commitTelegramCursor(state, updateId, writeDaemonStateImpl);
+        commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
 
         const acknowledgement = buildReplyAcknowledgement(
           mapping.tmuxPaneId,
@@ -1211,7 +1398,7 @@ export async function pollTelegramOnce(
           }
         }
       } else if (injectionResult.outcome === 'terminal-ignore') {
-        commitTelegramCursor(state, updateId, writeDaemonStateImpl);
+        commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
       } else {
         state.errors++;
         logImpl(`WARN: Deferring Telegram update ${updateId} after retryable intake failure${injectionResult.reason ? `: ${injectionResult.reason}` : ''}`);
@@ -1251,6 +1438,7 @@ async function pollLoop(): Promise<void> {
   state.pid = process.pid;
 
   let rateLimiter: ReplyListenerRateLimiter = new RateLimiter(config.rateLimitPerMinute);
+  let sourceRateLimiters = reconcileSourceRateLimiters(config, new Map());
   let lastPruneAt = Date.now();
 
   const shutdown = () => {
@@ -1277,6 +1465,7 @@ async function pollLoop(): Promise<void> {
       const refreshedRuntime = refreshReplyListenerRuntimeConfig(config, rateLimiter);
       config = refreshedRuntime.config;
       rateLimiter = refreshedRuntime.rateLimiter;
+      sourceRateLimiters = reconcileSourceRateLimiters(config, sourceRateLimiters, previousConfig);
       const reconciledState = reconcileReplyListenerStateWithConfigChange(
         previousConfig,
         config,
@@ -1284,6 +1473,8 @@ async function pollLoop(): Promise<void> {
       );
       state.telegramLastUpdateId = reconciledState.telegramLastUpdateId;
       state.discordLastMessageId = reconciledState.discordLastMessageId;
+      state.telegramStartupPolicyApplied = reconciledState.telegramStartupPolicyApplied;
+      state.sourceStates = reconciledState.sourceStates;
       if (refreshedRuntime.shouldStopDaemon) {
         log('Reply listener config disabled all reply platforms; shutting down daemon');
         state.isRunning = false;
@@ -1292,9 +1483,21 @@ async function pollLoop(): Promise<void> {
         break;
       }
       state.lastPollAt = new Date().toISOString();
+      syncLegacyStateMirrors(state, config);
 
-      await pollDiscord(config, state, rateLimiter);
-      await pollTelegram(config, state, rateLimiter);
+      const discordSource = getDiscordReplySource(config);
+      if (discordSource) {
+        const discordRateLimiter = sourceRateLimiters.get(discordSource.key) ?? new RateLimiter(config.rateLimitPerMinute);
+        sourceRateLimiters.set(discordSource.key, discordRateLimiter);
+        await pollDiscord(config, state, discordRateLimiter);
+      }
+
+      const telegramSource = getTelegramReplySource(config);
+      if (telegramSource) {
+        const telegramRateLimiter = sourceRateLimiters.get(telegramSource.key) ?? new RateLimiter(config.rateLimitPerMinute);
+        sourceRateLimiters.set(telegramSource.key, telegramRateLimiter);
+        await pollTelegram(config, state, telegramRateLimiter);
+      }
 
       if (Date.now() - lastPruneAt > PRUNE_INTERVAL_MS) {
         try {

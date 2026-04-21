@@ -8,6 +8,7 @@ import {
   captureReplyAcknowledgementSummary,
   formatReplyAcknowledgement,
   redactSensitiveTokens,
+  reconcileSourceRateLimiters,
   sanitizeReplyInput,
   isReplyListenerProcess,
   normalizeReplyListenerConfig,
@@ -20,6 +21,7 @@ import {
 import type { ReplyListenerDaemonConfig, ReplyListenerState } from '../reply-listener.js';
 import type { SessionMapping } from '../session-registry.js';
 import { NO_TRACKED_SESSION_MESSAGE } from '../session-status.js';
+import { buildDiscordReplySource, buildTelegramReplySource } from '../reply-source.js';
 
 function createBaseConfig(overrides: Partial<ReplyListenerDaemonConfig> = {}): ReplyListenerDaemonConfig {
   return {
@@ -53,6 +55,7 @@ function createBaseState(): ReplyListenerState {
     telegramLastUpdateId: null,
     discordLastMessageId: null,
     telegramStartupPolicyApplied: false,
+    sourceStates: {},
     messagesInjected: 0,
     errors: 0,
   };
@@ -66,6 +69,9 @@ function createMapping(platform: SessionMapping['platform']): SessionMapping {
   return {
     platform,
     messageId: platform === 'discord-bot' ? 'orig-discord-msg' : '222',
+    source: platform === 'discord-bot'
+      ? buildDiscordReplySource('discord-token', 'discord-channel')
+      : buildTelegramReplySource('123456:telegram-token', '777'),
     sessionId: 'session-1',
     tmuxPaneId: '%9',
     tmuxSessionName: 'omx-session',
@@ -413,24 +419,70 @@ describe('refreshReplyListenerRuntimeConfig', () => {
   });
 });
 
+describe('reconcileSourceRateLimiters', () => {
+  it('allocates independent rate limiters per active source and preserves unaffected entries', () => {
+    const config = createBaseConfig();
+    const initial = reconcileSourceRateLimiters(config, new Map());
+    const discordSourceKey = buildDiscordReplySource('discord-token', 'discord-channel').key;
+    const telegramSourceKey = buildTelegramReplySource('123456:telegram-token', '777').key;
+
+    const discordLimiter = initial.get(discordSourceKey);
+    const telegramLimiter = initial.get(telegramSourceKey);
+    assert.ok(discordLimiter);
+    assert.ok(telegramLimiter);
+    assert.notEqual(discordLimiter, telegramLimiter);
+
+    const rotatedTelegramConfig = createBaseConfig({
+      telegramBotToken: '123456:new-telegram-token',
+      telegramChatId: '999',
+    });
+    const refreshed = reconcileSourceRateLimiters(rotatedTelegramConfig, initial, config);
+    const rotatedTelegramSourceKey = buildTelegramReplySource('123456:new-telegram-token', '999').key;
+
+    assert.equal(refreshed.get(discordSourceKey), discordLimiter);
+    assert.ok(refreshed.get(rotatedTelegramSourceKey));
+    assert.notEqual(refreshed.get(rotatedTelegramSourceKey), telegramLimiter);
+    assert.equal(refreshed.has(telegramSourceKey), false);
+  });
+});
+
 describe('startReplyListener', () => {
-  it('refreshes a running daemon config and clears stale platform cursors when sources change', () => {
+  it('refreshes a running daemon config and preserves unaffected source cursors when only one source changes', () => {
     const previousConfig = createBaseConfig({
       telegramBotToken: '123456:old-telegram-token',
       telegramChatId: 'old-chat',
-      discordBotToken: 'old-discord-token',
-      discordChannelId: 'old-discord-channel',
     });
     const nextConfig = createBaseConfig({
       telegramBotToken: '123456:new-telegram-token',
       telegramChatId: 'new-chat',
-      discordBotToken: 'new-discord-token',
-      discordChannelId: 'new-discord-channel',
     });
+    const oldTelegramSource = buildTelegramReplySource('123456:old-telegram-token', 'old-chat');
+    const discordSource = buildDiscordReplySource('discord-token', 'discord-channel');
+    const newTelegramSource = buildTelegramReplySource('123456:new-telegram-token', 'new-chat');
     const state: ReplyListenerState = {
       ...createBaseState(),
       telegramLastUpdateId: 44,
       discordLastMessageId: 'discord-message-44',
+      sourceStates: {
+        [oldTelegramSource.key]: {
+          sourceKey: oldTelegramSource.key,
+          platform: 'telegram',
+          label: oldTelegramSource.label,
+          telegramLastUpdateId: 44,
+          telegramStartupPolicyApplied: true,
+          lastPollAt: null,
+          lastIngestAt: null,
+        },
+        [discordSource.key]: {
+          sourceKey: discordSource.key,
+          platform: 'discord-bot',
+          label: discordSource.label,
+          discordLastMessageId: 'discord-message-44',
+          telegramStartupPolicyApplied: false,
+          lastPollAt: null,
+          lastIngestAt: null,
+        },
+      },
     };
 
     let writtenConfig: ReplyListenerDaemonConfig | null = null;
@@ -457,9 +509,12 @@ describe('startReplyListener', () => {
     const persistedState = writtenState as ReplyListenerState;
     assert.equal(persistedConfig.telegramChatId, 'new-chat');
     assert.equal(persistedState.telegramLastUpdateId, null);
-    assert.equal(persistedState.discordLastMessageId, null);
+    assert.equal(persistedState.discordLastMessageId, 'discord-message-44');
+    assert.equal(persistedState.sourceStates[discordSource.key]?.discordLastMessageId, 'discord-message-44');
+    assert.equal(persistedState.sourceStates[newTelegramSource.key]?.telegramLastUpdateId ?? null, null);
+    assert.equal(persistedState.sourceStates[oldTelegramSource.key]?.telegramLastUpdateId, 44);
     assert.equal(response.state?.telegramLastUpdateId, null);
-    assert.equal(response.state?.discordLastMessageId, null);
+    assert.equal(response.state?.discordLastMessageId, 'discord-message-44');
   });
 });
 

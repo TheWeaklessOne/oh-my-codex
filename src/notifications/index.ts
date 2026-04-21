@@ -416,15 +416,27 @@ export async function notifyLifecycle(
     if (result.anySuccess && payload.tmuxPaneId) {
       try {
         const { registerMessage } = await import("./session-registry.js");
+        const {
+          buildDiscordReplySource,
+          buildTelegramReplySource,
+        } = await import("./reply-source.js");
         for (const r of result.results) {
           if (
             r.success &&
             r.messageId &&
             (r.platform === "discord-bot" || r.platform === "telegram")
           ) {
+            const source = r.platform === "discord-bot"
+              ? (config["discord-bot"]?.enabled && config["discord-bot"]?.botToken && config["discord-bot"]?.channelId
+                  ? buildDiscordReplySource(config["discord-bot"].botToken, config["discord-bot"].channelId)
+                  : undefined)
+              : (config.telegram?.enabled && config.telegram?.botToken && config.telegram?.chatId
+                  ? buildTelegramReplySource(config.telegram.botToken, config.telegram.chatId)
+                  : undefined);
             registerMessage({
               platform: r.platform,
               messageId: r.messageId,
+              ...(source ? { source } : {}),
               sessionId: payload.sessionId,
               tmuxPaneId: payload.tmuxPaneId,
               tmuxSessionName: payload.tmuxSession || "",

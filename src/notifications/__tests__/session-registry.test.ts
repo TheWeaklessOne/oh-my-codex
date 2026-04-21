@@ -6,6 +6,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import type { SessionMapping } from '../session-registry.js';
+import { buildDiscordReplySource, buildTelegramReplySource } from '../reply-source.js';
 
 // The session-registry module uses hardcoded paths under ~/.omx/state/.
 // We test the data shapes and logic patterns rather than filesystem integration
@@ -15,6 +16,7 @@ function createMockMapping(overrides?: Partial<SessionMapping>): SessionMapping 
   return {
     platform: 'discord-bot',
     messageId: randomUUID(),
+    source: buildDiscordReplySource('discord-token', 'channel-1'),
     sessionId: randomUUID(),
     tmuxPaneId: '%0',
     tmuxSessionName: 'test-session',
@@ -43,7 +45,10 @@ describe('SessionMapping shape', () => {
   });
 
   it('supports telegram platform', () => {
-    const mapping = createMockMapping({ platform: 'telegram' });
+    const mapping = createMockMapping({
+      platform: 'telegram',
+      source: buildTelegramReplySource('123456:telegram-token', '777'),
+    });
     assert.equal(mapping.platform, 'telegram');
   });
 
@@ -65,6 +70,14 @@ describe('SessionMapping shape', () => {
     const json = JSON.stringify(withoutPath);
     const parsed = JSON.parse(json);
     assert.equal(parsed.projectPath, undefined);
+  });
+
+  it('stores source-aware correlation metadata', () => {
+    const mapping = createMockMapping({
+      source: buildTelegramReplySource('123456:telegram-token', '777'),
+    });
+    assert.equal(mapping.source?.platform, 'telegram');
+    assert.ok(mapping.source?.key.includes('telegram:123456:777'));
   });
 });
 
@@ -161,6 +174,11 @@ describe('session-registry module exports', () => {
     assert.equal(typeof mod.lookupByMessageId, 'function');
   });
 
+  it('exports lookupBySourceMessage function', async () => {
+    const mod = await import('../session-registry.js');
+    assert.equal(typeof mod.lookupBySourceMessage, 'function');
+  });
+
   it('exports removeSession function', async () => {
     const mod = await import('../session-registry.js');
     assert.equal(typeof mod.removeSession, 'function');
@@ -252,6 +270,62 @@ describe('lookupByMessageId', () => {
       assert.ok(found);
       assert.equal(found.sessionId, 'session-later');
       assert.equal(found.tmuxPaneId, '%2');
+    } finally {
+      if (typeof originalHome === 'string') process.env.HOME = originalHome;
+      else delete process.env.HOME;
+      if (typeof originalUserProfile === 'string') process.env.USERPROFILE = originalUserProfile;
+      else delete process.env.USERPROFILE;
+      await rm(homeDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('lookupBySourceMessage', () => {
+  it('prefers the most recent exact source-key match and falls back to legacy rows when needed', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'omx-session-registry-source-aware-'));
+    const stateDir = join(homeDir, '.omx', 'state');
+    const registryPath = join(stateDir, 'reply-session-registry.jsonl');
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const currentSource = buildDiscordReplySource('discord-token', 'channel-1');
+    const otherSource = buildDiscordReplySource('discord-token-2', 'channel-2');
+
+    try {
+      await mkdir(stateDir, { recursive: true });
+      process.env.HOME = homeDir;
+      process.env.USERPROFILE = homeDir;
+
+      const legacy = createMockMapping({
+        messageId: 'shared-message',
+      });
+      delete legacy.source;
+
+      const wrongSource = createMockMapping({
+        messageId: 'shared-message',
+        source: otherSource,
+        sessionId: 'session-wrong-source',
+        tmuxPaneId: '%8',
+      });
+
+      const exact = createMockMapping({
+        messageId: 'shared-message',
+        source: currentSource,
+        sessionId: 'session-exact',
+        tmuxPaneId: '%9',
+      });
+
+      await writeFile(
+        registryPath,
+        [legacy, wrongSource, exact].map((entry) => JSON.stringify(entry)).join('\n') + '\n',
+        'utf-8',
+      );
+
+      const registry = await importSessionRegistryFresh();
+      const exactMatch = registry.lookupBySourceMessage('discord-bot', 'shared-message', currentSource.key);
+      assert.equal(exactMatch?.sessionId, 'session-exact');
+
+      const legacyFallback = registry.lookupBySourceMessage('discord-bot', 'shared-message', 'discord-bot:missing-source');
+      assert.equal(legacyFallback?.sessionId, legacy.sessionId);
     } finally {
       if (typeof originalHome === 'string') process.env.HOME = originalHome;
       else delete process.env.HOME;
