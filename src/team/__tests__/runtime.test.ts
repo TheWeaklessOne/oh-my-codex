@@ -1083,7 +1083,14 @@ case "\${1:-}" in
     exit 0
     ;;
   list-panes)
-    printf "%%1\\tnode\\t'codex'\\n"
+    case "$*" in
+      *"pane_current_command"*)
+        printf "%%1\\tnode\\t'codex'\\n%%2\\tgemini\\t'gemini'\\n%%3\\tnode\\t'node omx hud --watch'\\n"
+        ;;
+      *)
+        printf "%%1\\n%%2\\n%%3\\n"
+        ;;
+    esac
     exit 0
     ;;
   split-window)
