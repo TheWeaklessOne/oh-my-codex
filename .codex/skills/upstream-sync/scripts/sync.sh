@@ -5,9 +5,9 @@ usage() {
   cat <<'USAGE'
 Usage: sync.sh [--branch <name>] [--remote <name>] [--check-only] [--no-cli-update]
 
-Syncs the selected local work branch onto the current upstream release state, auto-resolves
-rebase conflicts in favor of the current work where possible, relinks the repo-backed CLI,
-and finishes with a short three-line report.
+Syncs local main to the newest release tag already merged into the selected remote main,
+optionally rebases one explicit work branch onto the refreshed local main, relinks the
+repo-backed CLI when the current checkout is main, and finishes with a short three-line report.
 USAGE
 }
 
@@ -54,32 +54,44 @@ have_command() {
 }
 
 ROOT=""
-BRANCH=""
 REMOTE=""
+FOLLOWUP_BRANCH=""
 CHECK_ONLY=0
 UPDATE_CLI=1
 CURRENT_BRANCH=""
 MAIN_REF=""
+TARGET_REF=""
+LATEST_TAG=""
+REMOTE_URL=""
+LOCAL_PACKAGE_VERSION=""
+INSTALLED_VERSION=""
+REMOTE_TAG_NAMESPACE="refs/upstream-sync/remote-tags"
+HANDOFF_DIR=""
+HANDOFF_PATH=""
+
 SUMMARY_STATUS="failed"
-SUMMARY_BRANCH="unknown"
+SUMMARY_BRANCH="main"
+SUMMARY_FOLLOWUP="none"
 SUMMARY_TARGET="unknown"
 SUMMARY_CLI="skipped"
 SUMMARY_CONFLICTS="0"
-LATEST_TAG=""
-TARGET_REF=""
-LOCAL_PACKAGE_VERSION=""
-INSTALLED_VERSION=""
-REMOTE_URL=""
-RELEASE_SUMMARY="none"
-FETCH_WARNING=""
-REMOTE_TAG_NAMESPACE="refs/upstream-sync/remote-tags"
-PROBE_DIR=""
-APPLY_DIR=""
-PRESERVE_PROBE_DIR=0
-PRESERVE_APPLY_DIR=0
-AUTO_RESOLVED_FILES=()
-PROBLEMS=()
 SUMMARY_PRINTED=0
+RELEASE_SUMMARY="none"
+
+PROBE_MAIN_DIR=""
+PROBE_MAIN_BRANCH=""
+PROBE_FOLLOWUP_DIR=""
+PROBE_FOLLOWUP_BRANCH=""
+APPLY_MAIN_DIR=""
+APPLY_MAIN_BRANCH=""
+APPLY_FOLLOWUP_DIR=""
+
+PRESERVE_PROBE_MAIN=0
+PRESERVE_PROBE_FOLLOWUP=0
+PRESERVE_APPLY_MAIN=0
+PRESERVE_APPLY_FOLLOWUP=0
+
+PROBLEMS=()
 
 append_problem() {
   local message="$1"
@@ -98,13 +110,7 @@ join_unique_array() {
 }
 
 format_problems() {
-  local auto_summary=""
   local joined=""
-
-  if [[ ${#AUTO_RESOLVED_FILES[@]} -gt 0 ]]; then
-    auto_summary=$(join_unique_array ', ' "${AUTO_RESOLVED_FILES[@]}")
-    [[ -n "$auto_summary" ]] && PROBLEMS+=("auto-resolved $auto_summary")
-  fi
 
   if [[ ${#PROBLEMS[@]} -eq 0 ]]; then
     printf 'none'
@@ -122,7 +128,7 @@ print_summary() {
   fi
   SUMMARY_PRINTED=1
   problems_line=$(format_problems)
-  log "move: ${SUMMARY_STATUS} | branch=${SUMMARY_BRANCH} | target=${SUMMARY_TARGET} | cli=${SUMMARY_CLI} | conflicts=${SUMMARY_CONFLICTS}"
+  log "move: ${SUMMARY_STATUS} | branch=${SUMMARY_BRANCH} | followup=${SUMMARY_FOLLOWUP} | target=${SUMMARY_TARGET} | cli=${SUMMARY_CLI} | conflicts=${SUMMARY_CONFLICTS}"
   log "problems: ${problems_line}"
   log "releases: ${RELEASE_SUMMARY:-none}"
 }
@@ -134,19 +140,44 @@ fail() {
   exit 1
 }
 
-cleanup_probe() {
-  if [[ -n "$PROBE_DIR" && -d "$PROBE_DIR" && "$PRESERVE_PROBE_DIR" -eq 0 ]]; then
-    git worktree remove --force "$PROBE_DIR" >/dev/null 2>&1 || rm -rf "$PROBE_DIR"
+delete_branch_if_exists() {
+  local branch="$1"
+  [[ -n "$branch" ]] || return 0
+  git show-ref --verify --quiet "refs/heads/$branch" || return 0
+  git branch -D "$branch" >/dev/null 2>&1 || true
+}
+
+cleanup_worktree() {
+  local dir="$1"
+  local branch="$2"
+  local preserve="$3"
+
+  if [[ -n "$dir" && -d "$dir" && "$preserve" -eq 0 ]]; then
+    git worktree remove --force "$dir" >/dev/null 2>&1 || rm -rf "$dir"
+  fi
+
+  if [[ -n "$branch" && "$preserve" -eq 0 ]]; then
+    delete_branch_if_exists "$branch"
   fi
 }
 
-cleanup_apply() {
-  if [[ -n "$APPLY_DIR" && -d "$APPLY_DIR" && "$PRESERVE_APPLY_DIR" -eq 0 ]]; then
-    git worktree remove --force "$APPLY_DIR" >/dev/null 2>&1 || rm -rf "$APPLY_DIR"
-  fi
+cleanup_probe_main() {
+  cleanup_worktree "$PROBE_MAIN_DIR" "$PROBE_MAIN_BRANCH" "$PRESERVE_PROBE_MAIN"
 }
 
-trap 'cleanup_apply; cleanup_probe' EXIT
+cleanup_probe_followup() {
+  cleanup_worktree "$PROBE_FOLLOWUP_DIR" "$PROBE_FOLLOWUP_BRANCH" "$PRESERVE_PROBE_FOLLOWUP"
+}
+
+cleanup_apply_main() {
+  cleanup_worktree "$APPLY_MAIN_DIR" "$APPLY_MAIN_BRANCH" "$PRESERVE_APPLY_MAIN"
+}
+
+cleanup_apply_followup() {
+  cleanup_worktree "$APPLY_FOLLOWUP_DIR" "" "$PRESERVE_APPLY_FOLLOWUP"
+}
+
+trap 'cleanup_apply_followup; cleanup_apply_main; cleanup_probe_followup; cleanup_probe_main' EXIT
 
 select_remote() {
   if [[ -n "$REMOTE" ]]; then
@@ -176,145 +207,172 @@ select_remote() {
   printf '%s\n' "$candidate"
 }
 
-rebase_in_progress() {
+ensure_clean_worktree() {
   local dir="$1"
-  local git_dir=""
-  git_dir=$(git -C "$dir" rev-parse --git-dir 2>/dev/null) || return 1
-  [[ -d "$git_dir/rebase-merge" || -d "$git_dir/rebase-apply" ]]
+  git -C "$dir" diff --quiet || return 1
+  git -C "$dir" diff --cached --quiet || return 1
 }
 
-ensure_clean_current_branch() {
-  if [[ "$CURRENT_BRANCH" != "$BRANCH" ]]; then
+branch_checked_out_elsewhere() {
+  local branch="$1"
+  local current_realpath=""
+  current_realpath=$(realpath_py "$ROOT")
+  git worktree list --porcelain | awk -v branch="refs/heads/${branch}" -v current="$current_realpath" '
+    /^worktree / { worktree=$2; next }
+    /^branch / {
+      if ($2 == branch && worktree != current) {
+        print worktree
+      }
+    }
+  ' | grep -q .
+}
+
+sanitize_for_branch() {
+  printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^-//; s/-$//'
+}
+
+count_conflicted_paths() {
+  local dir="$1"
+  git -C "$dir" diff --name-only --diff-filter=U | awk 'NF && !seen[$0]++ { count++ } END { print count+0 }'
+}
+
+collect_conflicted_paths() {
+  local dir="$1"
+  git -C "$dir" diff --name-only --diff-filter=U | awk 'NF && !seen[$0]++'
+}
+
+clear_handoff_record() {
+  [[ -n "$HANDOFF_PATH" ]] || return 0
+  rm -f "$HANDOFF_PATH"
+}
+
+write_handoff_record() {
+  local operation="$1"
+  local worktree_path="$2"
+  local temp_branch="$3"
+  local branch_name="$4"
+  local conflict_scope="$5"
+  local conflict_paths="$6"
+
+  mkdir -p "$HANDOFF_DIR"
+  HANDOFF_OPERATION="$operation" \
+  HANDOFF_WORKTREE="$worktree_path" \
+  HANDOFF_TEMP_BRANCH="$temp_branch" \
+  HANDOFF_BRANCH_NAME="$branch_name" \
+  HANDOFF_CONFLICT_SCOPE="$conflict_scope" \
+  HANDOFF_CONFLICT_PATHS="$conflict_paths" \
+  HANDOFF_TARGET_REF="$TARGET_REF" \
+  HANDOFF_TARGET_TAG="$LATEST_TAG" \
+  HANDOFF_CURRENT_BRANCH="$CURRENT_BRANCH" \
+  HANDOFF_REMOTE="$REMOTE" \
+  python3 - "$HANDOFF_PATH" <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+payload = {
+    "operation": os.environ.get("HANDOFF_OPERATION"),
+    "worktree_path": os.environ.get("HANDOFF_WORKTREE"),
+    "temp_branch": os.environ.get("HANDOFF_TEMP_BRANCH") or None,
+    "branch_name": os.environ.get("HANDOFF_BRANCH_NAME") or None,
+    "conflict_scope": os.environ.get("HANDOFF_CONFLICT_SCOPE"),
+    "conflict_paths": [line for line in os.environ.get("HANDOFF_CONFLICT_PATHS", "").splitlines() if line],
+    "target_ref": os.environ.get("HANDOFF_TARGET_REF"),
+    "target_tag": os.environ.get("HANDOFF_TARGET_TAG"),
+    "current_branch": os.environ.get("HANDOFF_CURRENT_BRANCH") or None,
+    "remote": os.environ.get("HANDOFF_REMOTE"),
+    "created_at": datetime.now(timezone.utc).isoformat(),
+}
+
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+}
+
+record_conflict_handoff() {
+  local operation="$1"
+  local worktree_path="$2"
+  local temp_branch="$3"
+  local branch_name="$4"
+  local conflict_scope="$5"
+  local conflict_paths=""
+
+  conflict_paths=$(collect_conflicted_paths "$worktree_path")
+  write_handoff_record "$operation" "$worktree_path" "$temp_branch" "$branch_name" "$conflict_scope" "$conflict_paths"
+}
+
+validate_main_ready_for_apply() {
+  if [[ "$CURRENT_BRANCH" == "main" ]]; then
+    ensure_clean_worktree "$ROOT" || {
+      append_problem "current main worktree is dirty"
+      return 1
+    }
     return 0
   fi
-  git diff --quiet || fail "current branch '$BRANCH' has unstaged changes"
-  git diff --cached --quiet || fail "current branch '$BRANCH' has staged changes"
-}
 
-resolve_conflict_preferring_local() {
-  local dir="$1"
-  local path="$2"
-  local stages=""
-
-  stages=$(git -C "$dir" ls-files -u -- "$path" | awk '{print $3}' | sort -u | tr '\n' ' ')
-  [[ -n "$stages" ]] || return 1
-
-  if printf ' %s ' "$stages" | grep -q ' 3 '; then
-    git -C "$dir" checkout --theirs -- "$path" >/dev/null 2>&1 || return 1
-    git -C "$dir" add -- "$path" >/dev/null 2>&1 || return 1
-  else
-    git -C "$dir" rm --quiet --ignore-unmatch -- "$path" >/dev/null 2>&1 || return 1
+  if branch_checked_out_elsewhere "main"; then
+    append_problem "local main is checked out in another worktree"
+    return 1
   fi
 
-  AUTO_RESOLVED_FILES+=("$path")
   return 0
 }
 
-continue_rebase_until_done() {
-  local dir="$1"
-  local stdout_file="$2"
-  local stderr_file="$3"
-  local unresolved_found=0
-  local path=""
+validate_followup_ready_for_apply() {
+  [[ -n "$FOLLOWUP_BRANCH" ]] || return 0
 
-  while rebase_in_progress "$dir"; do
-    unresolved_found=0
-    while IFS= read -r path; do
-      [[ -n "$path" ]] || continue
-      unresolved_found=1
-      resolve_conflict_preferring_local "$dir" "$path" || return 1
-    done < <(git -C "$dir" diff --name-only --diff-filter=U)
-
-    if [[ "$unresolved_found" -eq 1 ]]; then
-      if GIT_EDITOR=true git -C "$dir" rebase --continue >"$stdout_file" 2>"$stderr_file"; then
-        continue
-      fi
-      if rebase_in_progress "$dir"; then
-        continue
-      fi
-      return 1
-    fi
-
-    if GIT_EDITOR=true git -C "$dir" rebase --continue >"$stdout_file" 2>"$stderr_file"; then
-      continue
-    fi
-
-    if ! rebase_in_progress "$dir"; then
-      break
-    fi
-
-    if git -C "$dir" diff --name-only --diff-filter=U | grep -q .; then
-      continue
-    fi
-
-    if GIT_EDITOR=true git -C "$dir" rebase --skip >"$stdout_file" 2>"$stderr_file"; then
-      continue
-    fi
-
+  if [[ "$FOLLOWUP_BRANCH" == "main" ]]; then
+    append_problem "--branch main is invalid; omit --branch to sync only local main"
     return 1
-  done
+  fi
+
+  if [[ "$CURRENT_BRANCH" == "$FOLLOWUP_BRANCH" ]]; then
+    ensure_clean_worktree "$ROOT" || {
+      append_problem "current branch '$FOLLOWUP_BRANCH' has local changes"
+      return 1
+    }
+    return 0
+  fi
+
+  if branch_checked_out_elsewhere "$FOLLOWUP_BRANCH"; then
+    append_problem "followup branch '$FOLLOWUP_BRANCH' is checked out in another worktree"
+    return 1
+  fi
 
   return 0
 }
 
-run_rebase_with_autofix() {
+run_merge() {
   local dir="$1"
   local target_ref="$2"
   local stdout_file="$3"
   local stderr_file="$4"
+  git -C "$dir" merge --no-edit "$target_ref" >"$stdout_file" 2>"$stderr_file"
+}
 
-  if git -C "$dir" rebase -X theirs "$target_ref" >"$stdout_file" 2>"$stderr_file"; then
-    return 0
-  fi
+run_rebase() {
+  local dir="$1"
+  local target_ref="$2"
+  local stdout_file="$3"
+  local stderr_file="$4"
+  GIT_EDITOR=true git -C "$dir" rebase "$target_ref" >"$stdout_file" 2>"$stderr_file"
+}
 
-  rebase_in_progress "$dir" || return 1
-  continue_rebase_until_done "$dir" "$stdout_file" "$stderr_file" || return 1
-  rebase_in_progress "$dir" && return 1
-  return 0
+abort_merge_if_needed() {
+  local dir="$1"
+  git -C "$dir" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 || return 0
+  git -C "$dir" merge --abort >/dev/null 2>&1 || true
 }
 
 abort_rebase_if_needed() {
   local dir="$1"
-  if rebase_in_progress "$dir"; then
+  local git_dir=""
+  git_dir=$(git -C "$dir" rev-parse --git-dir 2>/dev/null) || return 0
+  if [[ -d "$git_dir/rebase-merge" || -d "$git_dir/rebase-apply" ]]; then
     git -C "$dir" rebase --abort >/dev/null 2>&1 || true
   fi
-}
-
-sync_local_main_branch() {
-  local main_ahead=0
-  local main_behind=0
-  local main_sync_dir=""
-
-  git show-ref --verify --quiet refs/heads/main || return 0
-  read -r main_ahead main_behind < <(git rev-list --left-right --count "main...$MAIN_REF")
-
-  if [[ "$main_behind" -eq 0 ]]; then
-    return 0
-  fi
-
-  if [[ "$main_ahead" -gt 0 ]]; then
-    append_problem 'local main diverged; left unchanged'
-    return 0
-  fi
-
-  if [[ "$CURRENT_BRANCH" == 'main' ]]; then
-    git diff --quiet || { append_problem "local main dirty; left unchanged"; return 0; }
-    git diff --cached --quiet || { append_problem "local main dirty; left unchanged"; return 0; }
-    git merge --ff-only "$MAIN_REF" >/dev/null 2>&1 || { append_problem 'local main fast-forward failed'; return 0; }
-    return 0
-  fi
-
-  if git worktree list --porcelain | awk '/^branch /{print $2}' | grep -qx 'refs/heads/main'; then
-    append_problem 'local main checked out elsewhere; left unchanged'
-    return 0
-  fi
-
-  main_sync_dir=$(mktemp -d "${TMPDIR:-/tmp}/upstream-sync.main.XXXXXX")
-  git worktree add "$main_sync_dir" main >/dev/null 2>&1 || { append_problem 'local main worktree setup failed'; rm -rf "$main_sync_dir"; return 0; }
-  if ! (cd "$main_sync_dir" && git merge --ff-only "$MAIN_REF" >/dev/null 2>&1); then
-    append_problem 'local main fast-forward failed'
-  fi
-  git worktree remove --force "$main_sync_dir" >/dev/null 2>&1 || rm -rf "$main_sync_dir"
 }
 
 have_remote_release_refs() {
@@ -325,8 +383,7 @@ refresh_remote_release_refs() {
   local remote="$1"
 
   if ! run_with_timeout 20 git fetch "$remote" --no-tags "+refs/heads/main:${MAIN_REF}" >/dev/null 2>&1; then
-    FETCH_WARNING="git fetch main from '$remote' timed out or failed; used cached main ref"
-    append_problem "$FETCH_WARNING"
+    append_problem "git fetch main from '$remote' timed out or failed; used cached main ref"
   fi
 
   if ! run_with_timeout 20 git fetch --prune "$remote" "+refs/tags/*:${REMOTE_TAG_NAMESPACE}/*" >/dev/null 2>&1; then
@@ -506,9 +563,8 @@ refresh_local_linked_cli() {
     return 0
   fi
 
-  if [[ "$CURRENT_BRANCH" != "$BRANCH" ]]; then
+  if [[ "$CURRENT_BRANCH" != "main" ]]; then
     SUMMARY_CLI='skipped'
-    append_problem "cli relink skipped; branch '$BRANCH' is not the current checkout"
     return 0
   fi
 
@@ -554,65 +610,143 @@ refresh_local_linked_cli() {
   return 0
 }
 
-run_probe() {
+run_probe_main_merge() {
   local stdout_file="$1"
   local stderr_file="$2"
-  PROBE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/upstream-sync.probe.XXXXXX")
-  git worktree add --detach "$PROBE_DIR" "$BRANCH" >/dev/null 2>&1 || fail 'probe worktree setup failed'
-  run_rebase_with_autofix "$PROBE_DIR" "$TARGET_REF" "$stdout_file" "$stderr_file"
+  PROBE_MAIN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/upstream-sync.probe.main.XXXXXX")
+  PROBE_MAIN_BRANCH="upstream-sync-probe-main-$(sanitize_for_branch "${LATEST_TAG}")-$$"
+  git worktree add -b "$PROBE_MAIN_BRANCH" "$PROBE_MAIN_DIR" main >/dev/null 2>&1 || fail 'probe main worktree setup failed'
+  run_merge "$PROBE_MAIN_DIR" "$TARGET_REF" "$stdout_file" "$stderr_file"
 }
 
-run_apply() {
+run_probe_followup_rebase() {
   local stdout_file="$1"
   local stderr_file="$2"
+  [[ -n "$FOLLOWUP_BRANCH" && "$FOLLOWUP_BRANCH" != "main" ]] || return 0
+  PROBE_FOLLOWUP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/upstream-sync.probe.followup.XXXXXX")
+  PROBE_FOLLOWUP_BRANCH="upstream-sync-probe-$(sanitize_for_branch "${FOLLOWUP_BRANCH}")-$$"
+  git worktree add -b "$PROBE_FOLLOWUP_BRANCH" "$PROBE_FOLLOWUP_DIR" "$FOLLOWUP_BRANCH" >/dev/null 2>&1 || fail "probe followup worktree setup failed for '$FOLLOWUP_BRANCH'"
+  run_rebase "$PROBE_FOLLOWUP_DIR" "$PROBE_MAIN_BRANCH" "$stdout_file" "$stderr_file"
+}
 
-  if [[ "$CURRENT_BRANCH" == "$BRANCH" ]]; then
-    ensure_clean_current_branch
-    run_rebase_with_autofix "$ROOT" "$TARGET_REF" "$stdout_file" "$stderr_file" || {
-      abort_rebase_if_needed "$ROOT"
+fast_forward_main_to_ref() {
+  local target_ref="$1"
+
+  if [[ "$CURRENT_BRANCH" == "main" ]]; then
+    ensure_clean_worktree "$ROOT" || {
+      append_problem "current main worktree is dirty"
+      return 1
+    }
+    git merge --ff-only "$target_ref" >/dev/null 2>&1 || {
+      append_problem "failed to fast-forward local main"
       return 1
     }
     return 0
   fi
 
-  if git worktree list --porcelain | awk '/^branch /{print $2}' | grep -qx "refs/heads/$BRANCH"; then
-    append_problem "branch '$BRANCH' is checked out in another worktree"
+  if branch_checked_out_elsewhere "main"; then
+    append_problem "local main is checked out in another worktree"
     return 1
   fi
 
-  APPLY_DIR=$(mktemp -d "${TMPDIR:-/tmp}/upstream-sync.apply.XXXXXX")
-  git worktree add "$APPLY_DIR" "$BRANCH" >/dev/null 2>&1 || {
-    append_problem 'apply worktree setup failed'
+  git update-ref refs/heads/main "$(git rev-parse "$target_ref")" || {
+    append_problem "failed to update local main"
+    return 1
+  }
+}
+
+run_apply_main_merge() {
+  local stdout_file="$1"
+  local stderr_file="$2"
+
+  APPLY_MAIN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/upstream-sync.apply.main.XXXXXX")
+  APPLY_MAIN_BRANCH="upstream-sync-main-$(sanitize_for_branch "${LATEST_TAG}")-$$"
+  git worktree add -b "$APPLY_MAIN_BRANCH" "$APPLY_MAIN_DIR" main >/dev/null 2>&1 || {
+    append_problem 'main apply worktree setup failed'
     return 1
   }
 
-  if ! run_rebase_with_autofix "$APPLY_DIR" "$TARGET_REF" "$stdout_file" "$stderr_file"; then
-    abort_rebase_if_needed "$APPLY_DIR"
+  if ! run_merge "$APPLY_MAIN_DIR" "$TARGET_REF" "$stdout_file" "$stderr_file"; then
+    SUMMARY_CONFLICTS="$(count_conflicted_paths "$APPLY_MAIN_DIR")(main)"
+    append_problem "main merge conflict left in $APPLY_MAIN_DIR on branch $APPLY_MAIN_BRANCH; continue there with an agent"
+    PRESERVE_APPLY_MAIN=1
     return 1
   fi
 
-  cleanup_apply
-  APPLY_DIR=""
+  if ! fast_forward_main_to_ref "$APPLY_MAIN_BRANCH"; then
+    PRESERVE_APPLY_MAIN=1
+    return 1
+  fi
+
+  return 0
+}
+
+run_apply_followup_rebase() {
+  local stdout_file="$1"
+  local stderr_file="$2"
+  [[ -n "$FOLLOWUP_BRANCH" && "$FOLLOWUP_BRANCH" != "main" ]] || return 0
+
+  if [[ "$CURRENT_BRANCH" == "$FOLLOWUP_BRANCH" ]]; then
+    ensure_clean_worktree "$ROOT" || {
+      append_problem "current branch '$FOLLOWUP_BRANCH' has local changes"
+      return 1
+    }
+    if ! run_rebase "$ROOT" main "$stdout_file" "$stderr_file"; then
+      SUMMARY_CONFLICTS="$(count_conflicted_paths "$ROOT")(followup)"
+      append_problem "followup rebase conflict on current branch '$FOLLOWUP_BRANCH'; resolve in $ROOT and continue the rebase with an agent"
+      return 1
+    fi
+    return 0
+  fi
+
+  if branch_checked_out_elsewhere "$FOLLOWUP_BRANCH"; then
+    append_problem "followup branch '$FOLLOWUP_BRANCH' is checked out in another worktree"
+    return 1
+  fi
+
+  APPLY_FOLLOWUP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/upstream-sync.apply.followup.XXXXXX")
+  git worktree add "$APPLY_FOLLOWUP_DIR" "$FOLLOWUP_BRANCH" >/dev/null 2>&1 || {
+    append_problem "followup worktree setup failed for '$FOLLOWUP_BRANCH'"
+    return 1
+  }
+
+  if ! run_rebase "$APPLY_FOLLOWUP_DIR" main "$stdout_file" "$stderr_file"; then
+    SUMMARY_CONFLICTS="$(count_conflicted_paths "$APPLY_FOLLOWUP_DIR")(followup)"
+    append_problem "followup rebase conflict left in $APPLY_FOLLOWUP_DIR for '$FOLLOWUP_BRANCH'; continue there with an agent"
+    PRESERVE_APPLY_FOLLOWUP=1
+    return 1
+  fi
+
   return 0
 }
 
 main() {
-  local probe_stdout=""
-  local probe_stderr=""
-  local apply_stdout=""
-  local apply_stderr=""
+  local probe_main_stdout=""
+  local probe_main_stderr=""
+  local probe_followup_stdout=""
+  local probe_followup_stderr=""
+  local apply_main_stdout=""
+  local apply_main_stderr=""
+  local apply_followup_stdout=""
+  local apply_followup_stderr=""
   local github_repo=""
-  local path_count="0"
+  local probe_main_ok=1
+  local probe_followup_ok=1
+  local main_preflight_ok=1
+  local followup_preflight_ok=1
 
   ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || fail 'run this inside the oh-my-codex git repository'
   cd "$ROOT"
   export GIT_TERMINAL_PROMPT=0
+  HANDOFF_DIR="$ROOT/.omx/state/upstream-sync"
+  HANDOFF_PATH="$HANDOFF_DIR/last-handoff.json"
+  clear_handoff_record
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --branch)
         [[ $# -ge 2 ]] || fail '--branch requires a value'
-        BRANCH="$2"
+        FOLLOWUP_BRANCH="$2"
         shift 2
         ;;
       --remote)
@@ -647,6 +781,11 @@ main() {
   refresh_remote_release_refs "$REMOTE"
 
   git show-ref --verify --quiet "$MAIN_REF" || fail "remote '$REMOTE' does not expose main"
+  git show-ref --verify --quiet refs/heads/main || fail 'local main branch not found'
+
+  if [[ -n "$FOLLOWUP_BRANCH" ]]; then
+    git show-ref --verify --quiet "refs/heads/$FOLLOWUP_BRANCH" || fail "branch '$FOLLOWUP_BRANCH' not found"
+  fi
 
   REMOTE_URL=$(git remote get-url "$REMOTE")
   if [[ "$REMOTE_URL" =~ github\.com[:/]([^/]+/[^/.]+)(\.git)?$ ]]; then
@@ -667,56 +806,127 @@ main() {
   [[ -n "$LATEST_TAG" ]] || fail "no release tags merged into ${REMOTE}/main"
   SUMMARY_TARGET="release ${LATEST_TAG}"
 
-  if [[ -z "$BRANCH" ]]; then
-    if [[ -n "$CURRENT_BRANCH" && "$CURRENT_BRANCH" != 'main' ]]; then
-      BRANCH="$CURRENT_BRANCH"
-    else
-      BRANCH=$(git for-each-ref --sort=-committerdate --format='%(refname:short)' refs/heads | awk '$0 != "main" { print; exit }')
-    fi
-  fi
-  [[ -n "$BRANCH" ]] || fail 'no local non-main branch found'
-  git show-ref --verify --quiet "refs/heads/$BRANCH" || fail "branch '$BRANCH' not found"
-  SUMMARY_BRANCH="$BRANCH"
-
   render_release_summary "$github_repo" "${LOCAL_PACKAGE_VERSION:-$INSTALLED_VERSION}" "$LATEST_TAG"
 
-  probe_stdout=$(mktemp "${TMPDIR:-/tmp}/upstream-sync.probe.stdout.XXXXXX")
-  probe_stderr=$(mktemp "${TMPDIR:-/tmp}/upstream-sync.probe.stderr.XXXXXX")
-  if ! run_probe "$probe_stdout" "$probe_stderr"; then
-    append_problem 'probe rebase failed'
+  if ! validate_main_ready_for_apply; then
+    main_preflight_ok=0
+  fi
+
+  if ! validate_followup_ready_for_apply; then
+    followup_preflight_ok=0
+  fi
+
+  if [[ "$main_preflight_ok" -ne 1 || "$followup_preflight_ok" -ne 1 ]]; then
     SUMMARY_STATUS='failed'
+    if [[ -n "$FOLLOWUP_BRANCH" && "$FOLLOWUP_BRANCH" != "main" ]]; then
+      SUMMARY_FOLLOWUP="${FOLLOWUP_BRANCH}(blocked)"
+    fi
     SUMMARY_CLI='skipped'
-    abort_rebase_if_needed "$PROBE_DIR"
     print_summary
     exit 1
   fi
 
+  probe_main_stdout=$(mktemp "${TMPDIR:-/tmp}/upstream-sync.probe.main.stdout.XXXXXX")
+  probe_main_stderr=$(mktemp "${TMPDIR:-/tmp}/upstream-sync.probe.main.stderr.XXXXXX")
+  if ! run_probe_main_merge "$probe_main_stdout" "$probe_main_stderr"; then
+    probe_main_ok=0
+  fi
+
+  if [[ -n "$FOLLOWUP_BRANCH" && "$FOLLOWUP_BRANCH" != "main" ]]; then
+    probe_followup_stdout=$(mktemp "${TMPDIR:-/tmp}/upstream-sync.probe.followup.stdout.XXXXXX")
+    probe_followup_stderr=$(mktemp "${TMPDIR:-/tmp}/upstream-sync.probe.followup.stderr.XXXXXX")
+    if ! run_probe_followup_rebase "$probe_followup_stdout" "$probe_followup_stderr"; then
+      probe_followup_ok=0
+    fi
+  fi
+
   if (( CHECK_ONLY )); then
+    if [[ "$probe_main_ok" -ne 1 ]]; then
+      append_problem 'probe main merge failed'
+      SUMMARY_STATUS='failed'
+      SUMMARY_CLI='skipped'
+      print_summary
+      exit 1
+    fi
+    if [[ -n "$FOLLOWUP_BRANCH" && "$FOLLOWUP_BRANCH" != "main" && "$probe_followup_ok" -ne 1 ]]; then
+      append_problem "probe followup rebase failed for '$FOLLOWUP_BRANCH'"
+      SUMMARY_STATUS='failed'
+      SUMMARY_FOLLOWUP="${FOLLOWUP_BRANCH}(probe-failed)"
+      SUMMARY_CLI='skipped'
+      print_summary
+      exit 1
+    fi
     SUMMARY_STATUS='dry-run'
     SUMMARY_CLI='skipped'
-    SUMMARY_CONFLICTS='0'
+    if [[ -n "$FOLLOWUP_BRANCH" && "$FOLLOWUP_BRANCH" != "main" ]]; then
+      SUMMARY_FOLLOWUP="${FOLLOWUP_BRANCH}(probed)"
+    fi
     print_summary
     exit 0
   fi
 
-  sync_local_main_branch
-
-  apply_stdout=$(mktemp "${TMPDIR:-/tmp}/upstream-sync.apply.stdout.XXXXXX")
-  apply_stderr=$(mktemp "${TMPDIR:-/tmp}/upstream-sync.apply.stderr.XXXXXX")
-  if ! run_apply "$apply_stdout" "$apply_stderr"; then
+  if [[ "$probe_main_ok" -ne 1 ]]; then
+    if [[ "$(count_conflicted_paths "$PROBE_MAIN_DIR")" -gt 0 ]]; then
+      SUMMARY_CONFLICTS="$(count_conflicted_paths "$PROBE_MAIN_DIR")(main)"
+      PRESERVE_PROBE_MAIN=1
+      record_conflict_handoff "probe-main-merge-conflict" "$PROBE_MAIN_DIR" "$PROBE_MAIN_BRANCH" "main" "main"
+      append_problem "main merge conflict; handoff=${HANDOFF_PATH#$ROOT/}"
+    else
+      append_problem 'probe main merge failed'
+    fi
     SUMMARY_STATUS='failed'
     SUMMARY_CLI='skipped'
-    path_count=$(printf '%s\n' "${AUTO_RESOLVED_FILES[@]:-}" | awk 'NF && !seen[$0]++ { count++ } END { print count+0 }')
-    SUMMARY_CONFLICTS="${path_count}(auto)"
     print_summary
     exit 1
   fi
 
-  path_count=$(printf '%s\n' "${AUTO_RESOLVED_FILES[@]:-}" | awk 'NF && !seen[$0]++ { count++ } END { print count+0 }')
-  if [[ "$path_count" -gt 0 ]]; then
-    SUMMARY_CONFLICTS="${path_count}(auto)"
-  else
-    SUMMARY_CONFLICTS='0'
+  if [[ -n "$FOLLOWUP_BRANCH" && "$FOLLOWUP_BRANCH" != "main" && "$probe_followup_ok" -ne 1 ]]; then
+    if [[ "$(count_conflicted_paths "$PROBE_FOLLOWUP_DIR")" -gt 0 ]]; then
+      SUMMARY_CONFLICTS="$(count_conflicted_paths "$PROBE_FOLLOWUP_DIR")(followup)"
+      PRESERVE_PROBE_FOLLOWUP=1
+      record_conflict_handoff "probe-followup-rebase-conflict" "$PROBE_FOLLOWUP_DIR" "$PROBE_FOLLOWUP_BRANCH" "$FOLLOWUP_BRANCH" "followup"
+      append_problem "followup rebase conflict; handoff=${HANDOFF_PATH#$ROOT/}"
+    else
+      append_problem "probe followup rebase failed for '$FOLLOWUP_BRANCH'"
+    fi
+    SUMMARY_STATUS='failed'
+    SUMMARY_FOLLOWUP="${FOLLOWUP_BRANCH}(probe-failed)"
+    SUMMARY_CLI='skipped'
+    print_summary
+    exit 1
+  fi
+
+  apply_main_stdout=$(mktemp "${TMPDIR:-/tmp}/upstream-sync.apply.main.stdout.XXXXXX")
+  apply_main_stderr=$(mktemp "${TMPDIR:-/tmp}/upstream-sync.apply.main.stderr.XXXXXX")
+  if ! run_apply_main_merge "$apply_main_stdout" "$apply_main_stderr"; then
+    if [[ "$PRESERVE_APPLY_MAIN" -eq 1 ]]; then
+      record_conflict_handoff "apply-main-merge-conflict" "$APPLY_MAIN_DIR" "$APPLY_MAIN_BRANCH" "main" "main"
+      append_problem "main merge conflict; handoff=${HANDOFF_PATH#$ROOT/}"
+    fi
+    SUMMARY_STATUS='failed'
+    SUMMARY_CLI='skipped'
+    print_summary
+    exit 1
+  fi
+
+  if [[ -n "$FOLLOWUP_BRANCH" && "$FOLLOWUP_BRANCH" != "main" ]]; then
+    apply_followup_stdout=$(mktemp "${TMPDIR:-/tmp}/upstream-sync.apply.followup.stdout.XXXXXX")
+    apply_followup_stderr=$(mktemp "${TMPDIR:-/tmp}/upstream-sync.apply.followup.stderr.XXXXXX")
+    if ! run_apply_followup_rebase "$apply_followup_stdout" "$apply_followup_stderr"; then
+      if [[ "$PRESERVE_APPLY_FOLLOWUP" -eq 1 ]]; then
+        record_conflict_handoff "apply-followup-rebase-conflict" "$APPLY_FOLLOWUP_DIR" "" "$FOLLOWUP_BRANCH" "followup"
+        append_problem "followup rebase conflict; handoff=${HANDOFF_PATH#$ROOT/}"
+      elif [[ "$CURRENT_BRANCH" == "$FOLLOWUP_BRANCH" && "$(count_conflicted_paths "$ROOT")" -gt 0 ]]; then
+        record_conflict_handoff "apply-followup-current-branch-rebase-conflict" "$ROOT" "" "$FOLLOWUP_BRANCH" "followup"
+        append_problem "followup rebase conflict in current checkout; handoff=${HANDOFF_PATH#$ROOT/}"
+      fi
+      SUMMARY_STATUS='partial'
+      SUMMARY_FOLLOWUP="${FOLLOWUP_BRANCH}(conflict)"
+      SUMMARY_CLI='skipped'
+      print_summary
+      exit 1
+    fi
+    SUMMARY_FOLLOWUP="${FOLLOWUP_BRANCH}(rebased)"
   fi
 
   refresh_local_linked_cli || {

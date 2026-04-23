@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, realpathSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, realpathSync, readFileSync, writeFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -13,6 +13,19 @@ const syncScript = join(repoRoot, '.codex', 'skills', 'upstream-sync', 'scripts'
 
 function git(cwd: string, args: string[]): string {
 	return execFileSync('git', args, { cwd, encoding: 'utf-8' }).trim();
+}
+
+function gitStatus(cwd: string, args: string[]): number {
+	const result = spawnSync('git', args, { cwd, encoding: 'utf-8' });
+	return result.status ?? 1;
+}
+
+function handoffPath(cwd: string): string {
+	return join(cwd, '.omx', 'state', 'upstream-sync', 'last-handoff.json');
+}
+
+function readHandoff(cwd: string): Record<string, unknown> {
+	return JSON.parse(readFileSync(handoffPath(cwd), 'utf-8')) as Record<string, unknown>;
 }
 
 function writeExecutable(path: string, content: string): void {
@@ -51,10 +64,12 @@ function summaryLines(stdout: string): string[] {
 		.filter(Boolean);
 }
 
+type LocalMainChangeMode = 'none' | 'fork-note' | 'readme-conflict';
+
 async function createSyncFixture(
 	branchName: string,
-	conflictMode: 'delete-agents' | 'clean',
 	options: {
+		localMainChange?: LocalMainChangeMode;
 		releaseTrailingMainCommit?: boolean;
 	} = {},
 ): Promise<{ repo: string; cleanupRoot: string }> {
@@ -62,6 +77,8 @@ async function createSyncFixture(
 	const cleanupRoot = realpathSync(rawRoot);
 	const repo = join(cleanupRoot, 'repo');
 	const remote = join(cleanupRoot, 'origin.git');
+	const upstreamRepo = join(cleanupRoot, 'upstream');
+	const localMainChange = options.localMainChange ?? 'none';
 
 	execFileSync('git', ['init', '--bare', remote], { stdio: 'ignore' });
 	execFileSync('git', ['init', repo], { stdio: 'ignore' });
@@ -79,6 +96,20 @@ async function createSyncFixture(
 	execFileSync('git', ['remote', 'add', 'origin', remote], { cwd: repo, stdio: 'ignore' });
 	execFileSync('git', ['push', '-u', 'origin', 'main'], { cwd: repo, stdio: 'ignore' });
 	execFileSync('git', ['push', 'origin', 'v0.1.0'], { cwd: repo, stdio: 'ignore' });
+	execFileSync('git', ['clone', remote, upstreamRepo], { stdio: 'ignore' });
+	execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: upstreamRepo, stdio: 'ignore' });
+	execFileSync('git', ['config', 'user.name', 'Upstream User'], { cwd: upstreamRepo, stdio: 'ignore' });
+	execFileSync('git', ['checkout', 'main'], { cwd: upstreamRepo, stdio: 'ignore' });
+
+	if (localMainChange === 'fork-note') {
+		await writeFile(join(repo, 'LOCAL_MAIN.md'), 'local main fork note\n', 'utf-8');
+		execFileSync('git', ['add', 'LOCAL_MAIN.md'], { cwd: repo, stdio: 'ignore' });
+		execFileSync('git', ['commit', '-m', 'local main fork note'], { cwd: repo, stdio: 'ignore' });
+	} else if (localMainChange === 'readme-conflict') {
+		await writeFile(join(repo, 'README.md'), 'local main change\n', 'utf-8');
+		execFileSync('git', ['add', 'README.md'], { cwd: repo, stdio: 'ignore' });
+		execFileSync('git', ['commit', '-m', 'local main readme change'], { cwd: repo, stdio: 'ignore' });
+	}
 
 	execFileSync('git', ['checkout', '-b', branchName], { cwd: repo, stdio: 'ignore' });
 	await writeFile(join(repo, 'AGENTS.md'), `work branch file for ${branchName}\n`, 'utf-8');
@@ -86,22 +117,17 @@ async function createSyncFixture(
 	execFileSync('git', ['commit', '-m', 'work branch change'], { cwd: repo, stdio: 'ignore' });
 
 	execFileSync('git', ['checkout', 'main'], { cwd: repo, stdio: 'ignore' });
-	if (conflictMode === 'delete-agents') {
-		await rm(join(repo, 'AGENTS.md'));
-		execFileSync('git', ['add', '-A', 'AGENTS.md'], { cwd: repo, stdio: 'ignore' });
-	} else {
-		await writeFile(join(repo, 'README.md'), 'upstream release update\n', 'utf-8');
-		execFileSync('git', ['add', 'README.md'], { cwd: repo, stdio: 'ignore' });
-	}
-	execFileSync('git', ['commit', '-m', 'upstream update'], { cwd: repo, stdio: 'ignore' });
-	execFileSync('git', ['tag', 'v0.1.1'], { cwd: repo, stdio: 'ignore' });
-	execFileSync('git', ['push', 'origin', 'main', '--tags'], { cwd: repo, stdio: 'ignore' });
+	await writeFile(join(upstreamRepo, 'README.md'), 'upstream release update\n', 'utf-8');
+	execFileSync('git', ['add', 'README.md'], { cwd: upstreamRepo, stdio: 'ignore' });
+	execFileSync('git', ['commit', '-m', 'upstream update'], { cwd: upstreamRepo, stdio: 'ignore' });
+	execFileSync('git', ['tag', 'v0.1.1'], { cwd: upstreamRepo, stdio: 'ignore' });
+	execFileSync('git', ['push', 'origin', 'main', '--tags'], { cwd: upstreamRepo, stdio: 'ignore' });
 
 	if (options.releaseTrailingMainCommit) {
-		await writeFile(join(repo, 'README.md'), 'post-release main tip\n', 'utf-8');
-		execFileSync('git', ['add', 'README.md'], { cwd: repo, stdio: 'ignore' });
-		execFileSync('git', ['commit', '-m', 'post-release main update'], { cwd: repo, stdio: 'ignore' });
-		execFileSync('git', ['push', 'origin', 'main'], { cwd: repo, stdio: 'ignore' });
+		await writeFile(join(upstreamRepo, 'README.md'), 'post-release main tip\n', 'utf-8');
+		execFileSync('git', ['add', 'README.md'], { cwd: upstreamRepo, stdio: 'ignore' });
+		execFileSync('git', ['commit', '-m', 'post-release main update'], { cwd: upstreamRepo, stdio: 'ignore' });
+		execFileSync('git', ['push', 'origin', 'main'], { cwd: upstreamRepo, stdio: 'ignore' });
 	}
 
 	execFileSync('git', ['checkout', branchName], { cwd: repo, stdio: 'ignore' });
@@ -177,27 +203,58 @@ async function installFakeCliTools(): Promise<{ env: Record<string, string>; log
 }
 
 describe('upstream-sync skill script', () => {
-	it('defaults to the current non-main branch and emits a short dry-run report', async () => {
+	it('defaults to syncing local main and emits a short dry-run report', async () => {
 		const branchName = 'feat/current-work';
-		const fixture = await createSyncFixture(branchName, 'clean');
+		const fixture = await createSyncFixture(branchName);
 
 		try {
+			const mainBefore = git(fixture.repo, ['rev-parse', 'main']);
 			const result = runSync(fixture.repo, ['--remote', 'origin', '--check-only', '--no-cli-update']);
 			assert.equal(result.status, 0, result.stderr || result.stdout);
 
 			const lines = summaryLines(result.stdout);
 			assert.equal(lines.length, 3, result.stdout);
-			assert.match(lines[0], new RegExp(`^move: dry-run \\| branch=${branchName} \\| target=release v0\\.1\\.1 \\| cli=skipped \\| conflicts=0$`));
+			assert.equal(
+				lines[0],
+				'move: dry-run | branch=main | followup=none | target=release v0.1.1 | cli=skipped | conflicts=0',
+			);
 			assert.equal(lines[1], 'problems: none');
 			assert.equal(lines[2], 'releases: v0.1.1 upstream update');
+			assert.equal(git(fixture.repo, ['branch', '--show-current']), branchName);
+			assert.equal(git(fixture.repo, ['rev-parse', 'main']), mainBefore);
 		} finally {
 			await rm(fixture.cleanupRoot, { recursive: true, force: true });
 		}
 	});
 
-	it('auto-resolves rebase conflicts in favor of the current work and reports them briefly', async () => {
-		const branchName = 'feat/conflict-sync';
-		const fixture = await createSyncFixture(branchName, 'delete-agents');
+	it('merges the upstream release into local main while preserving local-only main work', async () => {
+		const branchName = 'feat/local-main';
+		const fixture = await createSyncFixture(branchName, { localMainChange: 'fork-note' });
+
+		try {
+			const result = runSync(fixture.repo, ['--remote', 'origin', '--no-cli-update']);
+			assert.equal(result.status, 0, result.stderr || result.stdout);
+
+			const lines = summaryLines(result.stdout);
+			assert.equal(lines.length, 3, result.stdout);
+			assert.equal(
+				lines[0],
+				'move: ok | branch=main | followup=none | target=release v0.1.1 | cli=skipped | conflicts=0',
+			);
+			assert.equal(lines[1], 'problems: none');
+			assert.equal(lines[2], 'releases: v0.1.1 upstream update');
+
+			assert.equal(git(fixture.repo, ['show', 'main:LOCAL_MAIN.md']), 'local main fork note');
+			assert.equal(git(fixture.repo, ['show', 'main:README.md']), 'upstream release update');
+			assert.equal(gitStatus(fixture.repo, ['merge-base', '--is-ancestor', 'refs/remotes/origin/main', 'main']), 0);
+		} finally {
+			await rm(fixture.cleanupRoot, { recursive: true, force: true });
+		}
+	});
+
+	it('rebases the explicit follow-up branch onto the refreshed local main', async () => {
+		const branchName = 'feat/rebase-me';
+		const fixture = await createSyncFixture(branchName, { localMainChange: 'fork-note' });
 
 		try {
 			const result = runSync(fixture.repo, ['--branch', branchName, '--remote', 'origin', '--no-cli-update']);
@@ -205,46 +262,212 @@ describe('upstream-sync skill script', () => {
 
 			const lines = summaryLines(result.stdout);
 			assert.equal(lines.length, 3, result.stdout);
-			assert.match(lines[0], new RegExp(`^move: ok \\| branch=${branchName} \\| target=release v0\\.1\\.1 \\| cli=skipped \\| conflicts=1\\(auto\\)$`));
-			assert.equal(lines[1], 'problems: auto-resolved AGENTS.md');
+			assert.equal(
+				lines[0],
+				`move: ok | branch=main | followup=${branchName}(rebased) | target=release v0.1.1 | cli=skipped | conflicts=0`,
+			);
+			assert.equal(lines[1], 'problems: none');
 			assert.equal(lines[2], 'releases: v0.1.1 upstream update');
 
-			const conflicts = git(fixture.repo, ['diff', '--name-only', '--diff-filter=U']);
-			assert.equal(conflicts, '');
-
-			const counts = git(fixture.repo, ['rev-list', '--left-right', '--count', `${branchName}...refs/remotes/origin/main`]);
+			const counts = git(fixture.repo, ['rev-list', '--left-right', '--count', `${branchName}...main`]);
 			const [ahead, behind] = counts.split(/\s+/);
 			assert.equal(ahead, '1');
 			assert.equal(behind, '0');
-
-			const agents = await readFile(join(fixture.repo, 'AGENTS.md'), 'utf-8');
-			assert.match(agents, /work branch file for feat\/conflict-sync/);
+			assert.equal(git(fixture.repo, ['show', 'main:LOCAL_MAIN.md']), 'local main fork note');
+			assert.equal(git(fixture.repo, ['show', `${branchName}:AGENTS.md`]), `work branch file for ${branchName}`);
 		} finally {
 			await rm(fixture.cleanupRoot, { recursive: true, force: true });
 		}
 	});
 
-	it('rebases onto the latest release tag instead of unreleased remote main commits and reports release news briefly', async () => {
-		const branchName = 'feat/release-target';
-		const fixture = await createSyncFixture(branchName, 'clean', { releaseTrailingMainCommit: true });
+	it('preserves a conflict worktree for agent-authored main-merge resolution instead of auto-picking a side', async () => {
+		const branchName = 'feat/conflict-main';
+		const fixture = await createSyncFixture(branchName, { localMainChange: 'readme-conflict' });
 
 		try {
+			const result = runSync(fixture.repo, ['--remote', 'origin', '--no-cli-update']);
+			assert.notEqual(result.status, 0, result.stdout);
+
+			const lines = summaryLines(result.stdout);
+			assert.equal(lines.length, 3, result.stdout);
+			assert.equal(
+				lines[0],
+				'move: failed | branch=main | followup=none | target=release v0.1.1 | cli=skipped | conflicts=1(main)',
+			);
+			assert.equal(lines[1], 'problems: main merge conflict; handoff=.omx/state/upstream-sync/last-handoff.json');
+			assert.equal(existsSync(handoffPath(fixture.repo)), true);
+			const handoff = readHandoff(fixture.repo);
+			assert.equal(handoff.operation, 'probe-main-merge-conflict');
+			assert.equal(typeof handoff.worktree_path, 'string');
+			assert.equal(existsSync(String(handoff.worktree_path)), true);
+			assert.deepEqual(handoff.conflict_paths, ['README.md']);
+			assert.equal(git(fixture.repo, ['show', 'main:README.md']), 'local main change');
+		} finally {
+			if (existsSync(handoffPath(fixture.repo))) {
+				const handoff = readHandoff(fixture.repo);
+				if (typeof handoff.worktree_path === 'string' && existsSync(handoff.worktree_path)) {
+					await rm(handoff.worktree_path, { recursive: true, force: true });
+				}
+			}
+			await rm(fixture.cleanupRoot, { recursive: true, force: true });
+		}
+	});
+
+	it('fails before moving main when the current main checkout is dirty', async () => {
+		const branchName = 'feat/main-dirty';
+		const fixture = await createSyncFixture(branchName);
+
+		try {
+			execFileSync('git', ['checkout', 'main'], { cwd: fixture.repo, stdio: 'ignore' });
+			const mainBefore = git(fixture.repo, ['rev-parse', 'main']);
+			await writeFile(join(fixture.repo, 'README.md'), 'dirty local main\n', 'utf-8');
+
+			const result = runSync(fixture.repo, ['--remote', 'origin', '--no-cli-update']);
+			assert.notEqual(result.status, 0, result.stdout);
+
+			const lines = summaryLines(result.stdout);
+			assert.equal(lines.length, 3, result.stdout);
+			assert.equal(lines[0], 'move: failed | branch=main | followup=none | target=release v0.1.1 | cli=skipped | conflicts=0');
+			assert.equal(lines[1], 'problems: current main worktree is dirty');
+			assert.equal(git(fixture.repo, ['rev-parse', 'main']), mainBefore);
+		} finally {
+			await rm(fixture.cleanupRoot, { recursive: true, force: true });
+		}
+	});
+
+	it('fails before moving main when main is checked out in another worktree', async () => {
+		const branchName = 'feat/main-other-worktree';
+		const fixture = await createSyncFixture(branchName);
+		const extraWorktree = join(fixture.cleanupRoot, 'main-worktree');
+
+		try {
+			execFileSync('git', ['worktree', 'add', extraWorktree, 'main'], { cwd: fixture.repo, stdio: 'ignore' });
+			const mainBefore = git(fixture.repo, ['rev-parse', 'main']);
+
+			const result = runSync(fixture.repo, ['--remote', 'origin', '--no-cli-update']);
+			assert.notEqual(result.status, 0, result.stdout);
+
+			const lines = summaryLines(result.stdout);
+			assert.equal(lines.length, 3, result.stdout);
+			assert.equal(lines[0], 'move: failed | branch=main | followup=none | target=release v0.1.1 | cli=skipped | conflicts=0');
+			assert.equal(lines[1], 'problems: local main is checked out in another worktree');
+			assert.equal(git(fixture.repo, ['rev-parse', 'main']), mainBefore);
+		} finally {
+			await rm(fixture.cleanupRoot, { recursive: true, force: true });
+		}
+	});
+
+	it('fails dry-run and real run before moving main when the follow-up branch is checked out elsewhere', async () => {
+		const branchName = 'feat/followup-blocked';
+		const fixture = await createSyncFixture(branchName, { localMainChange: 'fork-note' });
+		const extraWorktree = join(fixture.cleanupRoot, 'followup-worktree');
+
+		try {
+			execFileSync('git', ['checkout', 'main'], { cwd: fixture.repo, stdio: 'ignore' });
+			execFileSync('git', ['worktree', 'add', extraWorktree, branchName], { cwd: fixture.repo, stdio: 'ignore' });
+
+			const mainBefore = git(fixture.repo, ['rev-parse', 'main']);
+			const followupBefore = git(fixture.repo, ['rev-parse', branchName]);
+
+			const dryRun = runSync(fixture.repo, ['--branch', branchName, '--remote', 'origin', '--check-only', '--no-cli-update']);
+			assert.notEqual(dryRun.status, 0, dryRun.stdout);
+			const dryRunLines = summaryLines(dryRun.stdout);
+			assert.equal(dryRunLines[0], `move: failed | branch=main | followup=${branchName}(blocked) | target=release v0.1.1 | cli=skipped | conflicts=0`);
+			assert.equal(dryRunLines[1], `problems: followup branch '${branchName}' is checked out in another worktree`);
+			assert.equal(git(fixture.repo, ['rev-parse', 'main']), mainBefore);
+			assert.equal(git(fixture.repo, ['rev-parse', branchName]), followupBefore);
+
+			const realRun = runSync(fixture.repo, ['--branch', branchName, '--remote', 'origin', '--no-cli-update']);
+			assert.notEqual(realRun.status, 0, realRun.stdout);
+			const realRunLines = summaryLines(realRun.stdout);
+			assert.equal(realRunLines[0], `move: failed | branch=main | followup=${branchName}(blocked) | target=release v0.1.1 | cli=skipped | conflicts=0`);
+			assert.equal(realRunLines[1], `problems: followup branch '${branchName}' is checked out in another worktree`);
+			assert.equal(git(fixture.repo, ['rev-parse', 'main']), mainBefore);
+			assert.equal(git(fixture.repo, ['rev-parse', branchName]), followupBefore);
+		} finally {
+			await rm(fixture.cleanupRoot, { recursive: true, force: true });
+		}
+	});
+
+	it('rejects --branch main explicitly', async () => {
+		const branchName = 'feat/reject-main';
+		const fixture = await createSyncFixture(branchName);
+
+		try {
+			const mainBefore = git(fixture.repo, ['rev-parse', 'main']);
+			const result = runSync(fixture.repo, ['--branch', 'main', '--remote', 'origin', '--no-cli-update']);
+			assert.notEqual(result.status, 0, result.stdout);
+
+			const lines = summaryLines(result.stdout);
+			assert.equal(lines.length, 3, result.stdout);
+			assert.equal(lines[0], 'move: failed | branch=main | followup=none | target=release v0.1.1 | cli=skipped | conflicts=0');
+			assert.equal(lines[1], 'problems: --branch main is invalid; omit --branch to sync only local main');
+			assert.equal(git(fixture.repo, ['rev-parse', 'main']), mainBefore);
+		} finally {
+			await rm(fixture.cleanupRoot, { recursive: true, force: true });
+		}
+	});
+
+	it('fails before moving main when follow-up probe detects a rebase conflict and records a stable handoff artifact', async () => {
+		const branchName = 'feat/followup-conflict';
+		const fixture = await createSyncFixture(branchName, { localMainChange: 'fork-note' });
+
+		try {
+			await writeFile(join(fixture.repo, 'README.md'), 'branch follow-up conflict\n', 'utf-8');
+			execFileSync('git', ['add', 'README.md'], { cwd: fixture.repo, stdio: 'ignore' });
+			execFileSync('git', ['commit', '-m', 'followup readme change'], { cwd: fixture.repo, stdio: 'ignore' });
+
+			const mainBefore = git(fixture.repo, ['rev-parse', 'main']);
+			const followupBefore = git(fixture.repo, ['rev-parse', branchName]);
+
 			const result = runSync(fixture.repo, ['--branch', branchName, '--remote', 'origin', '--no-cli-update']);
+			assert.notEqual(result.status, 0, result.stdout);
+
+			const lines = summaryLines(result.stdout);
+			assert.equal(lines.length, 3, result.stdout);
+			assert.equal(lines[0], `move: failed | branch=main | followup=${branchName}(probe-failed) | target=release v0.1.1 | cli=skipped | conflicts=1(followup)`);
+			assert.equal(lines[1], 'problems: followup rebase conflict; handoff=.omx/state/upstream-sync/last-handoff.json');
+			assert.equal(git(fixture.repo, ['rev-parse', 'main']), mainBefore);
+			assert.equal(git(fixture.repo, ['rev-parse', branchName]), followupBefore);
+			assert.equal(existsSync(handoffPath(fixture.repo)), true);
+			const handoff = readHandoff(fixture.repo);
+			assert.equal(handoff.operation, 'probe-followup-rebase-conflict');
+			assert.equal(typeof handoff.worktree_path, 'string');
+			assert.equal(existsSync(String(handoff.worktree_path)), true);
+			assert.deepEqual(handoff.conflict_paths, ['README.md']);
+		} finally {
+			if (existsSync(handoffPath(fixture.repo))) {
+				const handoff = readHandoff(fixture.repo);
+				if (typeof handoff.worktree_path === 'string' && existsSync(handoff.worktree_path)) {
+					await rm(handoff.worktree_path, { recursive: true, force: true });
+				}
+			}
+			await rm(fixture.cleanupRoot, { recursive: true, force: true });
+		}
+	});
+
+	it('uses the latest release tag rather than unreleased remote main commits', async () => {
+		const branchName = 'feat/release-target';
+		const fixture = await createSyncFixture(branchName, { releaseTrailingMainCommit: true });
+
+		try {
+			const result = runSync(fixture.repo, ['--remote', 'origin', '--no-cli-update']);
 			assert.equal(result.status, 0, result.stderr || result.stdout);
 
 			const lines = summaryLines(result.stdout);
 			assert.equal(lines.length, 3, result.stdout);
-			assert.match(lines[0], /^move: ok \| branch=feat\/release-target \| target=release v0\.1\.1 \| cli=skipped \| conflicts=0$/);
+			assert.equal(
+				lines[0],
+				'move: ok | branch=main | followup=none | target=release v0.1.1 | cli=skipped | conflicts=0',
+			);
 			assert.equal(lines[1], 'problems: none');
 			assert.equal(lines[2], 'releases: v0.1.1 upstream update');
 
-			const counts = git(fixture.repo, ['rev-list', '--left-right', '--count', `${branchName}...refs/remotes/origin/main`]);
+			const counts = git(fixture.repo, ['rev-list', '--left-right', '--count', 'main...refs/remotes/origin/main']);
 			const [ahead, behind] = counts.split(/\s+/);
-			assert.equal(ahead, '1');
+			assert.equal(ahead, '0');
 			assert.equal(behind, '1');
-
-			const readme = await readFile(join(fixture.repo, 'README.md'), 'utf-8');
-			assert.equal(readme, 'upstream release update\n');
+			assert.equal(git(fixture.repo, ['show', 'main:README.md']), 'upstream release update');
 		} finally {
 			await rm(fixture.cleanupRoot, { recursive: true, force: true });
 		}
@@ -252,72 +475,69 @@ describe('upstream-sync skill script', () => {
 
 	it('uses the remote release tag even when a same-name local tag conflicts', async () => {
 		const branchName = 'feat/conflicting-release-tag';
-		const fixture = await createSyncFixture(branchName, 'clean', { releaseTrailingMainCommit: true });
+		const fixture = await createSyncFixture(branchName, { releaseTrailingMainCommit: true });
 
 		try {
 			setAnnotatedTag(fixture.repo, 'v0.1.1', 'v0.1.0', 'local conflicting release tag');
 
-			const result = runSync(fixture.repo, ['--branch', branchName, '--remote', 'origin', '--no-cli-update']);
+			const result = runSync(fixture.repo, ['--remote', 'origin', '--no-cli-update']);
 			assert.equal(result.status, 0, result.stderr || result.stdout);
 
 			const lines = summaryLines(result.stdout);
 			assert.equal(lines.length, 3, result.stdout);
-			assert.match(lines[0], /^move: ok \| branch=feat\/conflicting-release-tag \| target=release v0\.1\.1 \| cli=skipped \| conflicts=0$/);
+			assert.equal(
+				lines[0],
+				'move: ok | branch=main | followup=none | target=release v0.1.1 | cli=skipped | conflicts=0',
+			);
 			assert.equal(lines[1], 'problems: none');
 			assert.equal(lines[2], 'releases: v0.1.1 upstream update');
-
-			const counts = git(fixture.repo, ['rev-list', '--left-right', '--count', `${branchName}...refs/remotes/origin/main`]);
-			const [ahead, behind] = counts.split(/\s+/);
-			assert.equal(ahead, '1');
-			assert.equal(behind, '1');
-
-			const readme = await readFile(join(fixture.repo, 'README.md'), 'utf-8');
-			assert.equal(readme, 'upstream release update\n');
+			assert.equal(git(fixture.repo, ['show', 'main:README.md']), 'upstream release update');
 		} finally {
 			await rm(fixture.cleanupRoot, { recursive: true, force: true });
 		}
 	});
 
-	it('ignores local-only v* shadow tags when choosing the release target', async () => {
+	it('ignores local-only shadow tags when choosing the release target', async () => {
 		const branchName = 'feat/local-shadow-tag';
-		const fixture = await createSyncFixture(branchName, 'clean', { releaseTrailingMainCommit: true });
+		const fixture = await createSyncFixture(branchName, { releaseTrailingMainCommit: true });
 
 		try {
 			setAnnotatedTag(fixture.repo, 'v9.9.9-shadow', 'v0.1.0', 'local shadow release tag');
 
-			const result = runSync(fixture.repo, ['--branch', branchName, '--remote', 'origin', '--no-cli-update']);
+			const result = runSync(fixture.repo, ['--remote', 'origin', '--no-cli-update']);
 			assert.equal(result.status, 0, result.stderr || result.stdout);
 
 			const lines = summaryLines(result.stdout);
 			assert.equal(lines.length, 3, result.stdout);
-			assert.match(lines[0], /^move: ok \| branch=feat\/local-shadow-tag \| target=release v0\.1\.1 \| cli=skipped \| conflicts=0$/);
+			assert.equal(
+				lines[0],
+				'move: ok | branch=main | followup=none | target=release v0.1.1 | cli=skipped | conflicts=0',
+			);
 			assert.equal(lines[1], 'problems: none');
 			assert.equal(lines[2], 'releases: v0.1.1 upstream update');
-
-			const counts = git(fixture.repo, ['rev-list', '--left-right', '--count', `${branchName}...refs/remotes/origin/main`]);
-			const [ahead, behind] = counts.split(/\s+/);
-			assert.equal(ahead, '1');
-			assert.equal(behind, '1');
-
-			const readme = await readFile(join(fixture.repo, 'README.md'), 'utf-8');
-			assert.equal(readme, 'upstream release update\n');
+			assert.equal(git(fixture.repo, ['show', 'main:README.md']), 'upstream release update');
 		} finally {
 			await rm(fixture.cleanupRoot, { recursive: true, force: true });
 		}
 	});
 
-	it('rebuilds and relinks the local repo-backed CLI and reports the move concisely', async () => {
+	it('rebuilds and relinks the local repo-backed CLI when current checkout is main', async () => {
 		const branchName = 'feat/link-sync';
-		const fixture = await createSyncFixture(branchName, 'clean');
+		const fixture = await createSyncFixture(branchName);
 		const fakeCli = await installFakeCliTools();
 
 		try {
-			const result = runSync(fixture.repo, ['--branch', branchName, '--remote', 'origin'], fakeCli.env);
+			execFileSync('git', ['checkout', 'main'], { cwd: fixture.repo, stdio: 'ignore' });
+
+			const result = runSync(fixture.repo, ['--remote', 'origin'], fakeCli.env);
 			assert.equal(result.status, 0, result.stderr || result.stdout);
 
 			const lines = summaryLines(result.stdout);
 			assert.equal(lines.length, 3, result.stdout);
-			assert.match(lines[0], /^move: ok \| branch=feat\/link-sync \| target=release v0\.1\.1 \| cli=linked \| conflicts=0$/);
+			assert.equal(
+				lines[0],
+				'move: ok | branch=main | followup=none | target=release v0.1.1 | cli=linked | conflicts=0',
+			);
 			assert.equal(lines[1], 'problems: none');
 			assert.equal(lines[2], 'releases: v0.1.1 upstream update');
 
