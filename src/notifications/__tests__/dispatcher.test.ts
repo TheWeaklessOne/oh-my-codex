@@ -1,6 +1,9 @@
 import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ClientRequestArgs, IncomingMessage } from 'node:http';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import type {
   DiscordNotificationConfig,
@@ -20,6 +23,8 @@ import {
   sendWebhook,
   dispatchNotifications,
 } from '../dispatcher.js';
+import { getTelegramTopicRegistryRecord } from '../telegram-topic-registry.js';
+import { normalizeTelegramProjectIdentity } from '../telegram-topics.js';
 
 const basePayload: FullNotificationPayload = {
   event: 'session-idle',
@@ -378,6 +383,66 @@ describe('sendTelegram', () => {
     assert.equal(result.success, false);
     assert.equal(result.error, 'Topic creation is cooling down.');
     assert.equal(httpsCalled, false);
+  });
+
+  it('persists topic metadata after a successful send when an existing topic destination is reused', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true },
+    };
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-dispatcher-telegram-'));
+    const identity = normalizeTelegramProjectIdentity(basePayload);
+    assert.ok(identity);
+
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+
+    try {
+      const result = await sendTelegram(
+        config,
+        basePayload,
+        {
+          resolveTelegramDestinationImpl: async () => ({
+            chatId: '777',
+            sourceChatKey: 'telegram:123456:777',
+            messageThreadId: '9001',
+            projectKey: identity.projectKey,
+            topicName: 'project',
+          }),
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendMessage`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: 432,
+                  message_thread_id: 9001,
+                },
+              },
+            }),
+          }),
+        },
+      );
+
+      assert.equal(result.success, true);
+      const record = await getTelegramTopicRegistryRecord(
+        'telegram:123456:777',
+        identity.projectKey,
+      );
+      assert.equal(record?.messageThreadId, '9001');
+      assert.equal(record?.topicName, 'project');
+      assert.ok(record?.lastUsedAt);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
   });
 });
 

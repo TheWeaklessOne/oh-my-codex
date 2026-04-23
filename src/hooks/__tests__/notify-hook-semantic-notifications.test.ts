@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -11,23 +12,42 @@ import { recordPendingReplyOrigin } from '../../notifications/reply-origin-state
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, '..', '..', '..');
 
-async function writeNotificationConfig(codexHome: string): Promise<void> {
+async function writeNotificationConfig(
+  codexHome: string,
+  overrides: Record<string, unknown> = {},
+): Promise<void> {
   await mkdir(codexHome, { recursive: true });
+  const baseNotifications = {
+    enabled: true,
+    verbosity: 'session',
+    webhook: {
+      enabled: true,
+      url: 'https://example.com/hooks/notify',
+    },
+    events: {
+      'session-start': { enabled: false },
+      'session-stop': { enabled: false },
+      'session-idle': { enabled: false },
+      'result-ready': { enabled: true },
+      'ask-user-question': { enabled: true },
+      'session-end': { enabled: true },
+    },
+  };
   await writeFile(join(codexHome, '.omx-config.json'), JSON.stringify({
     notifications: {
-      enabled: true,
-      verbosity: 'session',
+      ...baseNotifications,
+      ...overrides,
       webhook: {
-        enabled: true,
-        url: 'https://example.com/hooks/notify',
+        ...baseNotifications.webhook,
+        ...((typeof overrides.webhook === 'object' && overrides.webhook)
+          ? overrides.webhook as Record<string, unknown>
+          : {}),
       },
       events: {
-        'session-start': { enabled: false },
-        'session-stop': { enabled: false },
-        'session-idle': { enabled: false },
-        'result-ready': { enabled: true },
-        'ask-user-question': { enabled: true },
-        'session-end': { enabled: true },
+        ...baseNotifications.events,
+        ...((typeof overrides.events === 'object' && overrides.events)
+          ? overrides.events as Record<string, unknown>
+          : {}),
       },
     },
   }, null, 2));
@@ -53,6 +73,71 @@ globalThis.fetch = async (input, init = {}) => {
   return preloadPath;
 }
 
+async function writeTelegramCapturePreload(dir: string): Promise<string> {
+  const preloadPath = join(dir, 'mock-telegram.mjs');
+  await writeFile(preloadPath, `
+import { appendFileSync } from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { PassThrough } from 'node:stream';
+
+const capturePath = process.env.OMX_TELEGRAM_CAPTURE_PATH;
+const require = createRequire(import.meta.url);
+const https = require('node:https');
+
+https.request = (options, callback) => {
+  const listeners = new Map();
+  let requestBody = '';
+
+  const emit = (event, value) => {
+    for (const handler of listeners.get(event) ?? []) {
+      handler(value);
+    }
+  };
+
+  const request = {
+    on(event, handler) {
+      listeners.set(event, [...(listeners.get(event) ?? []), handler]);
+      return request;
+    },
+    write(chunk) {
+      requestBody += Buffer.isBuffer(chunk) ? chunk.toString('utf-8') : chunk;
+      return true;
+    },
+    end() {
+      queueMicrotask(() => {
+        if (capturePath) {
+          appendFileSync(capturePath, JSON.stringify({
+            url: String(options?.path ?? ''),
+            body: requestBody,
+          }) + '\\n');
+        }
+        const response = new PassThrough();
+        response.statusCode = 200;
+        callback?.(response);
+        response.end(JSON.stringify({
+          ok: true,
+          result: {
+            message_id: 321,
+            message_thread_id: 9001,
+          },
+        }));
+      });
+      return request;
+    },
+    destroy(error) {
+      if (error) emit('error', error);
+      return request;
+    },
+  };
+
+  return request;
+};
+
+syncBuiltinESMExports();
+`, 'utf-8');
+  return preloadPath;
+}
+
 async function readCapturedRequests(path: string): Promise<Array<{ url: string; body: string }>> {
   try {
     const raw = await readFile(path, 'utf-8');
@@ -64,6 +149,37 @@ async function readCapturedRequests(path: string): Promise<Array<{ url: string; 
   } catch {
     return [];
   }
+}
+
+async function writeTelegramTopicRegistryRecord(
+  homeDir: string,
+  workdir: string,
+  options: {
+    botId?: string;
+    chatId?: string;
+    topicName?: string;
+    messageThreadId?: string;
+  } = {},
+): Promise<void> {
+  const sourceChatKey = `telegram:${options.botId ?? '123456'}:${options.chatId ?? '777'}`;
+  const registryPath = join(homeDir, '.omx', 'state', 'telegram-topic-registry.json');
+  const projectKey = createHash('sha256').update(workdir).digest('hex');
+  await mkdir(join(homeDir, '.omx', 'state'), { recursive: true });
+  await writeFile(registryPath, JSON.stringify({
+    version: 1,
+    records: [
+      {
+        sourceChatKey,
+        projectKey,
+        canonicalProjectPath: workdir,
+        displayName: 'repo',
+        topicName: options.topicName ?? 'repo-topic',
+        messageThreadId: options.messageThreadId ?? '9001',
+        createdAt: '2026-04-23T00:00:00.000Z',
+        lastUsedAt: '2026-04-23T00:00:00.000Z',
+      },
+    ],
+  }, null, 2));
 }
 
 async function writeSessionIdleHookPlugin(workdir: string, capturePath: string): Promise<void> {
@@ -196,6 +312,49 @@ describe('notify-hook semantic notifications', () => {
       assert.equal(requests.length, 1);
       const body = JSON.parse(requests[0].body) as { event: string; message: string };
       assert.equal(body.event, 'result-ready');
+      assert.equal(body.message, rawMessage);
+      assert.doesNotMatch(body.message, /# Result Ready/);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('supports opting result-ready back into formatted notifications via config', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-result-ready-formatted-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+
+    try {
+      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
+      await writeNotificationConfig(codexHome, {
+        completedTurn: {
+          resultReadyMode: 'formatted-notification',
+        },
+      });
+
+      const rawMessage = 'Implemented meaningful Telegram notifications.\nCreated commit abc123 and all tests passed.';
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: 'sess-result-ready-formatted',
+        thread_id: 'thread-result-ready-formatted',
+        turn_id: 'turn-result-ready-formatted',
+        input_messages: [],
+        last_assistant_message: rawMessage,
+      }, {
+        CODEX_HOME: codexHome,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const requests = await readCapturedRequests(capturePath);
+      assert.equal(requests.length, 1);
+      const body = JSON.parse(requests[0].body) as { event: string; message: string };
+      assert.equal(body.event, 'result-ready');
       assert.match(body.message, /# Result Ready/);
       assert.match(body.message, /Created commit abc123 and all tests passed/i);
     } finally {
@@ -250,11 +409,8 @@ describe('notify-hook semantic notifications', () => {
       assert.equal(requests.length, 1);
       const body = JSON.parse(requests[0].body) as { event: string; message: string };
       assert.equal(body.event, 'result-ready');
-      assert.match(body.message, /# Result Ready/);
-      assert.match(body.message, /Created the requested files/i);
-      assert.match(body.message, /README\.md/i);
-      assert.match(body.message, /NOTES\.md/i);
-      assert.doesNotMatch(body.message, /\?\? TASK\.md/i);
+      assert.equal(body.message, rawMessage);
+      assert.match(body.message, /\?\? TASK\.md/i);
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }
@@ -303,16 +459,14 @@ describe('notify-hook semantic notifications', () => {
       assert.equal(requests.length, 1);
       const body = JSON.parse(requests[0].body) as { event: string; message: string };
       assert.equal(body.event, 'result-ready');
-      assert.match(body.message, /# Result Ready/);
-      assert.match(body.message, /README\.md/i);
-      assert.match(body.message, /NOTES\.md/i);
-      assert.doesNotMatch(body.message, /\?\? \.gitignore/i);
+      assert.equal(body.message, rawMessage);
+      assert.match(body.message, /\?\? \.gitignore/i);
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }
   });
 
-  it('prefers changed-file bullets over verification bullets in result-ready notifications', async () => {
+  it('sends the full raw assistant text even when semantic summaries prefer changed-file bullets', async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-result-ready-change-summary-'));
     const codexHome = join(tempRoot, 'codex-home');
     const capturePath = join(tempRoot, 'captures.ndjson');
@@ -354,10 +508,8 @@ describe('notify-hook semantic notifications', () => {
       assert.equal(requests.length, 1);
       const body = JSON.parse(requests[0].body) as { event: string; message: string };
       assert.equal(body.event, 'result-ready');
-      assert.match(body.message, /# Result Ready/);
-      assert.match(body.message, /README\.md/i);
-      assert.match(body.message, /NOTES\.md/i);
-      assert.doesNotMatch(body.message, /git status/i);
+      assert.equal(body.message, rawMessage);
+      assert.match(body.message, /git status/i);
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }
@@ -382,6 +534,48 @@ describe('notify-hook semantic notifications', () => {
         session_id: 'sess-input-needed',
         thread_id: 'thread-input-needed',
         turn_id: 'turn-input-needed',
+        input_messages: [],
+        last_assistant_message: rawMessage,
+      }, {
+        CODEX_HOME: codexHome,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const requests = await readCapturedRequests(capturePath);
+      assert.equal(requests.length, 1);
+      const body = JSON.parse(requests[0].body) as { event: string; message: string };
+      assert.equal(body.event, 'ask-user-question');
+      assert.equal(body.message, rawMessage);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('supports opting ask-user-question back into formatted notifications via config', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-input-needed-formatted-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+
+    try {
+      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
+      await writeNotificationConfig(codexHome, {
+        completedTurn: {
+          askUserQuestionMode: 'formatted-notification',
+        },
+      });
+
+      const rawMessage = 'Would you like me to continue with the cleanup?';
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: 'sess-input-needed-formatted',
+        thread_id: 'thread-input-needed-formatted',
+        turn_id: 'turn-input-needed-formatted',
         input_messages: [],
         last_assistant_message: rawMessage,
       }, {
@@ -439,7 +633,76 @@ describe('notify-hook semantic notifications', () => {
       assert.equal(requests.length, 1);
       const body = JSON.parse(requests[0].body) as { event: string; message: string };
       assert.equal(body.event, 'result-ready');
-      assert.match(body.message, /# Result Ready/);
+      assert.equal(body.message, rawMessage);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('reuses stored Telegram topic routing for structured follow-up turns', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-telegram-topic-followup-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'telegram-captures.ndjson');
+    const preloadPath = await writeTelegramCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const sessionId = 'sess-telegram-topic-followup';
+
+    try {
+      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
+      await writeNotificationConfig(codexHome, {
+        webhook: {
+          enabled: false,
+        },
+        telegram: {
+          enabled: true,
+          botToken: '123456:telegram-token',
+          chatId: '777',
+          projectTopics: {
+            enabled: true,
+          },
+        },
+      });
+      await writeTelegramTopicRegistryRecord(tempRoot, workdir, {
+        botId: '123456',
+        chatId: '777',
+        topicName: 'repo-topic',
+        messageThreadId: '9001',
+      });
+      await writePendingReplyOrigin(workdir, sessionId, {
+        platform: 'telegram',
+        inputText: 'Which time is it ?',
+      });
+
+      const rawMessage = 'It’s 11:47 PM on April 22, 2026 in Europe/Moscow (UTC+03:00).';
+      const latestInput = buildExpectedReplyInput('Which time is it ?', 'telegram');
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: sessionId,
+        thread_id: 'thread-telegram-topic-followup',
+        turn_id: 'turn-telegram-topic-followup',
+        input_messages: [latestInput],
+        last_assistant_message: rawMessage,
+      }, {
+        CODEX_HOME: codexHome,
+        HOME: tempRoot,
+        USERPROFILE: tempRoot,
+        OMX_TELEGRAM_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const requests = await readCapturedRequests(capturePath);
+      const sendMessageRequests = requests.filter((request) => /sendMessage/.test(request.url));
+      assert.equal(sendMessageRequests.length, 1);
+      const body = JSON.parse(sendMessageRequests[0].body) as {
+        text: string;
+        message_thread_id?: number;
+        parse_mode?: string;
+      };
+      assert.equal(body.text, rawMessage);
+      assert.equal(body.message_thread_id, 9001);
+      assert.equal('parse_mode' in body, false);
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }

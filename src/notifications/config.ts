@@ -7,8 +7,11 @@
 
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
-import { codexHome } from "../utils/paths.js";
+import { codexHome, defaultCodexHome } from "../utils/paths.js";
 import type {
+  CompletedTurnPlatformPresentationConfig,
+  CompletedTurnPresentationConfig,
+  CompletedTurnRenderMode,
   FullNotificationConfig,
   NotificationsBlock,
   NotificationEvent,
@@ -33,7 +36,7 @@ const TEMP_SELECTOR_PLATFORM_MAP = {
   slack: ["slack"],
 } as const satisfies Record<string, NotificationPlatform[]>;
 
-const TEMP_FILTERABLE_PLATFORMS = [
+const NOTIFICATION_PLATFORMS = [
   "discord",
   "discord-bot",
   "telegram",
@@ -41,15 +44,132 @@ const TEMP_FILTERABLE_PLATFORMS = [
   "webhook",
 ] as const satisfies readonly NotificationPlatform[];
 
-const CONFIG_FILE = join(codexHome(), ".omx-config.json");
+const TEMP_FILTERABLE_PLATFORMS = NOTIFICATION_PLATFORMS;
 
-function readRawConfig(): Record<string, unknown> | null {
-  if (!existsSync(CONFIG_FILE)) return null;
-  try {
-    return JSON.parse(readFileSync(CONFIG_FILE, "utf-8"));
-  } catch {
-    return null;
+const COMPLETED_TURN_RENDER_MODES = new Set<CompletedTurnRenderMode>([
+  "formatted-notification",
+  "raw-assistant-text",
+]);
+const DEFAULT_RESULT_READY_MODE: CompletedTurnRenderMode = "raw-assistant-text";
+const DEFAULT_ASK_USER_QUESTION_MODE: CompletedTurnRenderMode =
+  "raw-assistant-text";
+
+export interface NotificationConfigLoadOptions {
+  codexHomeOverride?: string;
+  env?: NodeJS.ProcessEnv;
+}
+
+function resolveNotificationConfigPathCandidates(
+  options: NotificationConfigLoadOptions = {},
+): string[] {
+  const env = options.env ?? process.env;
+  const primaryCodexHome = options.codexHomeOverride || codexHome(env);
+  const userCodexHome = defaultCodexHome();
+  const candidates = [
+    join(primaryCodexHome, ".omx-config.json"),
+    ...(primaryCodexHome === userCodexHome
+      ? []
+      : [join(userCodexHome, ".omx-config.json")]),
+  ];
+  return [...new Set(candidates)];
+}
+
+function readRawConfig(
+  options: NotificationConfigLoadOptions = {},
+): Record<string, unknown> | null {
+  const configPaths = resolveNotificationConfigPathCandidates(options);
+
+  for (let index = 0; index < configPaths.length; index += 1) {
+    const configPath = configPaths[index];
+    if (!existsSync(configPath)) continue;
+    try {
+      return JSON.parse(readFileSync(configPath, "utf-8"));
+    } catch {
+      if (index === 0) {
+        return null;
+      }
+      continue;
+    }
   }
+
+  return null;
+}
+
+function normalizeCompletedTurnRenderMode(
+  value: unknown,
+  fallback: CompletedTurnRenderMode,
+): CompletedTurnRenderMode {
+  return typeof value === "string" && COMPLETED_TURN_RENDER_MODES.has(value as CompletedTurnRenderMode)
+    ? value as CompletedTurnRenderMode
+    : fallback;
+}
+
+function normalizeCompletedTurnPlatformOverrides(
+  value: unknown,
+): CompletedTurnPresentationConfig["platformOverrides"] | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const overrides = Object.entries(value).reduce<NonNullable<
+    CompletedTurnPresentationConfig["platformOverrides"]
+  >>((acc, [platform, rawOverride]) => {
+    if (
+      !NOTIFICATION_PLATFORMS.includes(platform as NotificationPlatform)
+      || !rawOverride
+      || typeof rawOverride !== "object"
+      || Array.isArray(rawOverride)
+    ) {
+      return acc;
+    }
+
+    const overrideConfig = rawOverride as CompletedTurnPlatformPresentationConfig;
+    const normalizedOverride: CompletedTurnPlatformPresentationConfig = {};
+    if (overrideConfig.resultReadyMode !== undefined) {
+      normalizedOverride.resultReadyMode = normalizeCompletedTurnRenderMode(
+        overrideConfig.resultReadyMode,
+        DEFAULT_RESULT_READY_MODE,
+      );
+    }
+    if (overrideConfig.askUserQuestionMode !== undefined) {
+      normalizedOverride.askUserQuestionMode = normalizeCompletedTurnRenderMode(
+        overrideConfig.askUserQuestionMode,
+        DEFAULT_ASK_USER_QUESTION_MODE,
+      );
+    }
+
+    if (Object.keys(normalizedOverride).length > 0) {
+      acc[platform as NotificationPlatform] = normalizedOverride;
+    }
+    return acc;
+  }, {});
+
+  return Object.keys(overrides).length > 0 ? overrides : undefined;
+}
+
+export function normalizeCompletedTurnPresentationConfig(
+  config?: Partial<CompletedTurnPresentationConfig> | null,
+): CompletedTurnPresentationConfig {
+  return {
+    resultReadyMode: normalizeCompletedTurnRenderMode(
+      config?.resultReadyMode,
+      DEFAULT_RESULT_READY_MODE,
+    ),
+    askUserQuestionMode: normalizeCompletedTurnRenderMode(
+      config?.askUserQuestionMode,
+      DEFAULT_ASK_USER_QUESTION_MODE,
+    ),
+    platformOverrides: normalizeCompletedTurnPlatformOverrides(config?.platformOverrides),
+  };
+}
+
+function normalizeNotificationConfig(
+  config: FullNotificationConfig,
+): FullNotificationConfig {
+  return {
+    ...config,
+    completedTurn: normalizeCompletedTurnPresentationConfig(config.completedTurn),
+  };
 }
 
 function migrateStopHookCallbacks(
@@ -131,14 +251,16 @@ export function parseMentionAllowedMentions(
   return {};
 }
 
-export function buildConfigFromEnv(): FullNotificationConfig | null {
+export function buildConfigFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): FullNotificationConfig | null {
   const config: FullNotificationConfig = { enabled: false };
   let hasAnyPlatform = false;
 
-  const discordMention = validateMention(process.env.OMX_DISCORD_MENTION);
+  const discordMention = validateMention(env.OMX_DISCORD_MENTION);
 
-  const discordBotToken = process.env.OMX_DISCORD_NOTIFIER_BOT_TOKEN;
-  const discordChannel = process.env.OMX_DISCORD_NOTIFIER_CHANNEL;
+  const discordBotToken = env.OMX_DISCORD_NOTIFIER_BOT_TOKEN;
+  const discordChannel = env.OMX_DISCORD_NOTIFIER_CHANNEL;
   if (discordBotToken && discordChannel) {
     config["discord-bot"] = {
       enabled: true,
@@ -149,7 +271,7 @@ export function buildConfigFromEnv(): FullNotificationConfig | null {
     hasAnyPlatform = true;
   }
 
-  const discordWebhook = process.env.OMX_DISCORD_WEBHOOK_URL;
+  const discordWebhook = env.OMX_DISCORD_WEBHOOK_URL;
   if (discordWebhook) {
     config.discord = {
       enabled: true,
@@ -160,12 +282,12 @@ export function buildConfigFromEnv(): FullNotificationConfig | null {
   }
 
   const telegramToken =
-    process.env.OMX_TELEGRAM_BOT_TOKEN ||
-    process.env.OMX_TELEGRAM_NOTIFIER_BOT_TOKEN;
+    env.OMX_TELEGRAM_BOT_TOKEN ||
+    env.OMX_TELEGRAM_NOTIFIER_BOT_TOKEN;
   const telegramChatId =
-    process.env.OMX_TELEGRAM_CHAT_ID ||
-    process.env.OMX_TELEGRAM_NOTIFIER_CHAT_ID ||
-    process.env.OMX_TELEGRAM_NOTIFIER_UID;
+    env.OMX_TELEGRAM_CHAT_ID ||
+    env.OMX_TELEGRAM_NOTIFIER_CHAT_ID ||
+    env.OMX_TELEGRAM_NOTIFIER_UID;
   if (telegramToken && telegramChatId) {
     config.telegram = {
       enabled: true,
@@ -175,9 +297,9 @@ export function buildConfigFromEnv(): FullNotificationConfig | null {
     hasAnyPlatform = true;
   }
 
-  const slackWebhook = process.env.OMX_SLACK_WEBHOOK_URL;
+  const slackWebhook = env.OMX_SLACK_WEBHOOK_URL;
   if (slackWebhook) {
-    const slackMention = validateSlackMention(process.env.OMX_SLACK_MENTION);
+    const slackMention = validateSlackMention(env.OMX_SLACK_MENTION);
     config.slack = {
       enabled: true,
       webhookUrl: slackWebhook,
@@ -276,6 +398,7 @@ function mergeEnvIntoFileConfig(
 export function resolveProfileConfig(
   notifications: NotificationsBlock,
   profileName?: string,
+  env: NodeJS.ProcessEnv = process.env,
 ): FullNotificationConfig | null {
   const profiles = notifications.profiles;
   if (!profiles || Object.keys(profiles).length === 0) {
@@ -284,7 +407,7 @@ export function resolveProfileConfig(
 
   const name =
     profileName ||
-    process.env.OMX_NOTIFY_PROFILE ||
+    env.OMX_NOTIFY_PROFILE ||
     notifications.defaultProfile;
 
   if (!name) {
@@ -392,18 +515,20 @@ function filterTopLevelPlatformsForTempSelection(
 
 function resolvePersistentNotificationConfig(
   profileName?: string,
+  options: NotificationConfigLoadOptions = {},
 ): FullNotificationConfig | null {
-  const raw = readRawConfig();
+  const env = options.env ?? process.env;
+  const raw = readRawConfig(options);
 
   if (raw) {
     const notifications = raw.notifications as NotificationsBlock | undefined;
     if (notifications) {
-      const profileConfig = resolveProfileConfig(notifications, profileName);
+      const profileConfig = resolveProfileConfig(notifications, profileName, env);
       if (profileConfig) {
         if (typeof profileConfig.enabled !== "boolean") {
           return null;
         }
-        const envConfig = buildConfigFromEnv();
+        const envConfig = buildConfigFromEnv(env);
         const merged = envConfig
           ? mergeEnvIntoFileConfig(profileConfig, envConfig)
           : profileConfig;
@@ -413,13 +538,13 @@ function resolvePersistentNotificationConfig(
       if (typeof notifications.enabled !== "boolean") {
         return null;
       }
-      const envConfig = buildConfigFromEnv();
+      const envConfig = buildConfigFromEnv(env);
       if (envConfig) {
         return applyHookConfigIfPresent(
           normalizeCustomTransportGate(mergeEnvIntoFileConfig(notifications, envConfig)),
         );
       }
-      const envMention = validateMention(process.env.OMX_DISCORD_MENTION);
+      const envMention = validateMention(env.OMX_DISCORD_MENTION);
       if (envMention) {
         const patched = { ...notifications };
         if (patched["discord-bot"] && patched["discord-bot"].mention === undefined) {
@@ -434,7 +559,7 @@ function resolvePersistentNotificationConfig(
     }
   }
 
-  const envConfig = buildConfigFromEnv();
+  const envConfig = buildConfigFromEnv(env);
   if (envConfig) return applyHookConfigIfPresent(envConfig);
 
   if (raw) {
@@ -508,13 +633,14 @@ function applyMeaningfulTelegramTempDefaults(
 
 function buildTempModeConfigFromContract(
   baseConfig: FullNotificationConfig | null,
+  env: NodeJS.ProcessEnv = process.env,
 ): FullNotificationConfig | null {
-  const contract = readNotifyTempContractFromEnv(process.env);
-  const envActive = isNotifyTempEnvActive(process.env);
+  const contract = readNotifyTempContractFromEnv(env);
+  const envActive = isNotifyTempEnvActive(env);
   if (!contract?.active && !envActive) return null;
 
   const selectors = getTempBuiltinSelectors(contract);
-  const seedConfig = baseConfig ?? buildConfigFromEnv() ?? { enabled: false };
+  const seedConfig = baseConfig ?? buildConfigFromEnv(env) ?? { enabled: false };
   return applyMeaningfulTelegramTempDefaults(
     selectTempModeTransports(
       seedConfig,
@@ -527,11 +653,13 @@ function buildTempModeConfigFromContract(
 
 export function getNotificationConfig(
   profileName?: string,
+  options: NotificationConfigLoadOptions = {},
 ): FullNotificationConfig | null {
-  const persistentConfig = resolvePersistentNotificationConfig(profileName);
-  const tempModeConfig = buildTempModeConfigFromContract(persistentConfig);
-  if (tempModeConfig) return tempModeConfig;
-  return persistentConfig;
+  const env = options.env ?? process.env;
+  const persistentConfig = resolvePersistentNotificationConfig(profileName, options);
+  const tempModeConfig = buildTempModeConfigFromContract(persistentConfig, env);
+  const effectiveConfig = tempModeConfig ?? persistentConfig;
+  return effectiveConfig ? normalizeNotificationConfig(effectiveConfig) : null;
 }
 
 const VALID_VERBOSITY_LEVELS: VerbosityLevel[] = ["verbose", "agent", "session", "minimal"];

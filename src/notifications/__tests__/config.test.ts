@@ -1,14 +1,21 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   validateMention,
   validateSlackMention,
   parseMentionAllowedMentions,
   buildConfigFromEnv,
+  getNotificationConfig,
   getReplyListenerPlatformConfig,
 } from '../config.js';
 
 const ENV_KEYS = [
+  'CODEX_HOME',
+  'HOME',
+  'OMX_NOTIFY_PROFILE',
   'OMX_DISCORD_NOTIFIER_BOT_TOKEN',
   'OMX_DISCORD_NOTIFIER_CHANNEL',
   'OMX_DISCORD_WEBHOOK_URL',
@@ -25,10 +32,23 @@ const ENV_KEYS = [
   'OMX_REPLY_POLL_INTERVAL_MS',
   'OMX_REPLY_RATE_LIMIT',
 ];
+const ORIGINAL_ENV = Object.fromEntries(
+  ENV_KEYS.map((key) => [key, process.env[key]]),
+) as Record<string, string | undefined>;
 
 function clearEnvVars(): void {
   for (const key of ENV_KEYS) {
     delete process.env[key];
+  }
+}
+
+function restoreEnvVars(): void {
+  for (const key of ENV_KEYS) {
+    if (ORIGINAL_ENV[key] === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = ORIGINAL_ENV[key];
+    }
   }
 }
 
@@ -132,7 +152,7 @@ describe('buildConfigFromEnv', () => {
   });
 
   afterEach(() => {
-    clearEnvVars();
+    restoreEnvVars();
   });
 
   it('returns null when no env vars set', () => {
@@ -271,6 +291,231 @@ describe('buildConfigFromEnv', () => {
     assert.ok(config);
     assert.equal(config['discord-bot']!.mention, '<@12345678901234567>');
     assert.equal(config.discord!.mention, '<@12345678901234567>');
+  });
+});
+
+describe('getNotificationConfig', () => {
+  beforeEach(() => {
+    clearEnvVars();
+  });
+
+  afterEach(() => {
+    restoreEnvVars();
+  });
+
+  it('inherits user notification policy when project CODEX_HOME has no .omx-config.json', async () => {
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-notification-config-'));
+    const userCodexHome = join(tempHome, '.codex');
+    const projectCodexHome = join(tempHome, 'project', '.codex');
+
+    try {
+      await mkdir(userCodexHome, { recursive: true });
+      await mkdir(projectCodexHome, { recursive: true });
+      await writeFile(join(userCodexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          webhook: {
+            enabled: true,
+            url: 'https://example.com/webhook',
+          },
+          telegram: {
+            enabled: true,
+            botToken: '123456:telegram-token',
+            chatId: '777',
+            projectTopics: {
+              enabled: true,
+            },
+          },
+        },
+      }, null, 2));
+      process.env.HOME = tempHome;
+      process.env.CODEX_HOME = projectCodexHome;
+
+      const config = getNotificationConfig();
+      assert.ok(config);
+      assert.equal(config.webhook?.enabled, true);
+      assert.equal(config.telegram?.projectTopics?.enabled, true);
+      assert.equal(config.completedTurn?.resultReadyMode, 'raw-assistant-text');
+      assert.equal(config.completedTurn?.askUserQuestionMode, 'raw-assistant-text');
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps project-local notification config authoritative when it exists', async () => {
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-notification-config-'));
+    const userCodexHome = join(tempHome, '.codex');
+    const projectCodexHome = join(tempHome, 'project', '.codex');
+
+    try {
+      await mkdir(userCodexHome, { recursive: true });
+      await mkdir(projectCodexHome, { recursive: true });
+      await writeFile(join(userCodexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          webhook: {
+            enabled: true,
+            url: 'https://example.com/user-webhook',
+          },
+          completedTurn: {
+            resultReadyMode: 'formatted-notification',
+          },
+        },
+      }, null, 2));
+      await writeFile(join(projectCodexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          webhook: {
+            enabled: true,
+            url: 'https://example.com/project-webhook',
+          },
+        },
+      }, null, 2));
+      process.env.HOME = tempHome;
+      process.env.CODEX_HOME = projectCodexHome;
+
+      const config = getNotificationConfig();
+      assert.ok(config);
+      assert.equal(config.webhook?.url, 'https://example.com/project-webhook');
+      assert.equal(config.completedTurn?.resultReadyMode, 'raw-assistant-text');
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('supports explicit codexHomeOverride fallback independently of process.env.CODEX_HOME', async () => {
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-notification-config-'));
+    const userCodexHome = join(tempHome, '.codex');
+    const projectCodexHome = join(tempHome, 'project', '.codex');
+    const unrelatedCodexHome = join(tempHome, 'elsewhere', '.codex');
+
+    try {
+      await mkdir(userCodexHome, { recursive: true });
+      await mkdir(projectCodexHome, { recursive: true });
+      await mkdir(unrelatedCodexHome, { recursive: true });
+      await writeFile(join(userCodexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          webhook: {
+            enabled: true,
+            url: 'https://example.com/user-webhook',
+          },
+        },
+      }, null, 2));
+      await writeFile(join(unrelatedCodexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          webhook: {
+            enabled: true,
+            url: 'https://example.com/unrelated-webhook',
+          },
+        },
+      }, null, 2));
+      process.env.HOME = tempHome;
+      process.env.CODEX_HOME = unrelatedCodexHome;
+
+      const config = getNotificationConfig(undefined, {
+        codexHomeOverride: projectCodexHome,
+      });
+
+      assert.ok(config);
+      assert.equal(config.webhook?.url, 'https://example.com/user-webhook');
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('uses the provided env for profile and transport resolution', async () => {
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-notification-config-'));
+    const userCodexHome = join(tempHome, '.codex');
+
+    try {
+      await mkdir(userCodexHome, { recursive: true });
+      await writeFile(join(userCodexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          defaultProfile: 'default',
+          profiles: {
+            default: {
+              enabled: true,
+              webhook: {
+                enabled: true,
+                url: 'https://example.com/default-webhook',
+              },
+            },
+            alternate: {
+              enabled: true,
+              webhook: {
+                enabled: true,
+                url: 'https://example.com/alternate-webhook',
+              },
+            },
+          },
+        },
+      }, null, 2));
+      process.env.HOME = tempHome;
+      process.env.OMX_NOTIFY_PROFILE = 'default';
+
+      const config = getNotificationConfig(undefined, {
+        env: {
+          ...process.env,
+          HOME: tempHome,
+          OMX_NOTIFY_PROFILE: 'alternate',
+        },
+      });
+
+      assert.ok(config);
+      assert.equal(config.webhook?.url, 'https://example.com/alternate-webhook');
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('uses the provided env for temp-mode filtering', async () => {
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-notification-config-'));
+    const userCodexHome = join(tempHome, '.codex');
+
+    try {
+      await mkdir(userCodexHome, { recursive: true });
+      await writeFile(join(userCodexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: '123456:telegram-token',
+            chatId: '777',
+          },
+          webhook: {
+            enabled: true,
+            url: 'https://example.com/webhook',
+          },
+        },
+      }, null, 2));
+      process.env.HOME = tempHome;
+      delete process.env.OMX_NOTIFY_TEMP_CONTRACT;
+
+      const config = getNotificationConfig(undefined, {
+        env: {
+          ...process.env,
+          HOME: tempHome,
+          OMX_NOTIFY_TEMP_CONTRACT: JSON.stringify({
+            active: true,
+            selectors: ['telegram'],
+            canonicalSelectors: ['telegram'],
+            warnings: [],
+            source: 'env',
+          }),
+        },
+      });
+
+      assert.ok(config);
+      assert.equal(config.telegram?.enabled, true);
+      assert.equal(config.webhook, undefined);
+      assert.equal(config.events?.['result-ready']?.enabled, true);
+      assert.equal(config.events?.['session-start']?.enabled, false);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
   });
 });
 

@@ -534,6 +534,7 @@ async function main() {
   if (!isTeamWorker) {
     try {
       const { notifyCompletedTurn } = await import('../notifications/index.js');
+      const { getNotificationConfig } = await import('../notifications/config.js');
       const {
         shouldSendCompletedTurnNotification,
         recordCompletedTurnNotificationSent,
@@ -546,10 +547,12 @@ async function main() {
       const replyOrigin = notifySessionId
         ? await consumePendingReplyOrigin(cwd, notifySessionId, latestUserInput)
         : null;
+      const notificationConfig = getNotificationConfig();
       const decision = planCompletedTurnNotification({
         semanticOutcome,
         replyOrigin,
         turnId: safeString(payload['turn-id'] || payload.turn_id || ''),
+        notificationConfig,
       });
       const completedTurnHookFingerprint = buildCompletedTurnHookFingerprint(
         decision,
@@ -581,6 +584,8 @@ async function main() {
                 ? (semanticOutcome.question || semanticOutcome.summary || 'Input is needed to continue.')
                 : undefined,
             assistantText: lastAssistantMessage,
+          }, undefined, {
+            getNotificationConfigImpl: () => notificationConfig,
           });
           if (completedTurnResult && completedTurnResult.anySuccess) {
             recordCompletedTurnNotificationSent(

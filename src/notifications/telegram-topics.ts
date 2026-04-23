@@ -876,17 +876,37 @@ export async function resolveTelegramDestination(
   payload: Pick<FullNotificationPayload, 'projectPath' | 'projectName'>,
   deps: TelegramTopicResolutionDeps = {},
 ): Promise<TelegramResolvedDestination> {
-  const projectTopics = normalizeProjectTopicsConfig(config.projectTopics);
   const sourceChatKey = getTelegramSourceChatKey(config);
+  const identity = normalizeTelegramProjectIdentity(payload);
+  const projectTopics = normalizeProjectTopicsConfig(config.projectTopics);
 
   if (!projectTopics) {
+    if (identity) {
+      const existingRecord = await getTelegramTopicRegistryRecord(
+        sourceChatKey,
+        identity.projectKey,
+      );
+      if (existingRecord?.messageThreadId) {
+        logTopicWarning(
+          deps.logger,
+          'topic-routing-disabled-with-existing-record',
+          'Telegram topic registry record exists, but projectTopics is disabled in the effective notification config; delivering to the root chat.',
+          {
+            sourceChatKey,
+            projectKey: identity.projectKey,
+            canonicalProjectPath: identity.canonicalProjectPath,
+            messageThreadId: existingRecord.messageThreadId,
+            topicName: existingRecord.topicName,
+          },
+        );
+      }
+    }
     return {
       chatId: config.chatId,
       sourceChatKey,
     };
   }
 
-  const identity = normalizeTelegramProjectIdentity(payload);
   if (!identity) {
     return buildFallbackDestination(
       config,

@@ -10,9 +10,14 @@ import { dirname, isAbsolute, join, resolve } from "path";
 import { homedir } from "os";
 import { fileURLToPath } from "url";
 
+/** Default user-level Codex CLI home directory (~/.codex/) */
+export function defaultCodexHome(): string {
+  return join(homedir(), ".codex");
+}
+
 /** Codex CLI home directory (~/.codex/) */
-export function codexHome(): string {
-  return process.env.CODEX_HOME || join(homedir(), ".codex");
+export function codexHome(env: NodeJS.ProcessEnv = process.env): string {
+  return env.CODEX_HOME || defaultCodexHome();
 }
 
 export const OMX_ENTRY_PATH_ENV = "OMX_ENTRY_PATH";

@@ -1,6 +1,9 @@
 import { formatNotification } from "./formatter.js";
 import type {
+  CompletedTurnPresentationConfig,
+  CompletedTurnRenderMode,
   FullNotificationPayload,
+  FullNotificationConfig,
   NotificationEvent,
   NotificationPlatform,
   NotificationTransportOverrides,
@@ -17,10 +20,6 @@ export interface CompletedTurnReplyOrigin {
   injectedInput: string;
   createdAt: string;
 }
-
-export type CompletedTurnRenderMode =
-  | "formatted-notification"
-  | "raw-assistant-text";
 
 export interface CompletedTurnTransportRenderPolicy {
   mode: CompletedTurnRenderMode;
@@ -60,6 +59,120 @@ type CompletedTurnEffectiveEvent = Extract<
   NotificationEvent,
   "result-ready" | "ask-user-question"
 >;
+
+const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
+
+function shouldFallbackToFormattedNotification(
+  policy: CompletedTurnTransportRenderPolicy,
+  assistantText: string,
+  platform?: NotificationPlatform,
+): boolean {
+  if (policy.mode !== "raw-assistant-text") {
+    return false;
+  }
+
+  if (assistantText.trim().length === 0) {
+    return true;
+  }
+
+  return (
+    platform === "telegram"
+    && Array.from(assistantText).length > TELEGRAM_MAX_MESSAGE_LENGTH
+  );
+}
+
+function resolveCompletedTurnRenderedMessage(
+  policy: CompletedTurnTransportRenderPolicy,
+  payload: FullNotificationPayload,
+  assistantText: string,
+  platform?: NotificationPlatform,
+): { message: string; parseMode?: "Markdown" | "HTML" | null } {
+  if (
+    policy.mode === "raw-assistant-text"
+    && !shouldFallbackToFormattedNotification(policy, assistantText, platform)
+  ) {
+    return {
+      message: assistantText,
+      ...(Object.prototype.hasOwnProperty.call(policy, "parseMode")
+        ? { parseMode: policy.parseMode }
+        : {}),
+    };
+  }
+
+  return {
+    message: formatNotification(payload),
+  };
+}
+
+function resolveCompletedTurnRenderMode(
+  event: CompletedTurnEffectiveEvent,
+  config?: CompletedTurnPresentationConfig | null,
+  platform?: NotificationPlatform,
+): CompletedTurnRenderMode {
+  const platformOverride = platform
+    ? config?.platformOverrides?.[platform]
+    : undefined;
+  if (event === "result-ready") {
+    return platformOverride?.resultReadyMode ?? config?.resultReadyMode ?? "raw-assistant-text";
+  }
+  return (
+    platformOverride?.askUserQuestionMode
+    ?? config?.askUserQuestionMode
+    ?? "raw-assistant-text"
+  );
+}
+
+function buildTransportRenderPolicy(
+  mode: CompletedTurnRenderMode,
+  platform?: NotificationPlatform,
+): CompletedTurnTransportRenderPolicy {
+  return {
+    mode,
+    ...(platform === "telegram" && mode === "raw-assistant-text"
+      ? { parseMode: null }
+      : {}),
+  };
+}
+
+function buildCompletedTurnTransportPolicy(
+  event: CompletedTurnEffectiveEvent,
+  notificationConfig?: Pick<FullNotificationConfig, "completedTurn"> | null,
+): CompletedTurnNotificationDecision["transportPolicy"] {
+  const completedTurnConfig = notificationConfig?.completedTurn;
+  const platforms: NotificationPlatform[] = [
+    "discord",
+    "discord-bot",
+    "telegram",
+    "slack",
+    "webhook",
+  ];
+  const defaultPolicy = buildTransportRenderPolicy(
+    resolveCompletedTurnRenderMode(event, completedTurnConfig),
+  );
+  const overrides = platforms.reduce<NonNullable<
+    CompletedTurnNotificationDecision["transportPolicy"]["overrides"]
+  >>(
+    (acc, platform) => {
+      const platformPolicy = buildTransportRenderPolicy(
+        resolveCompletedTurnRenderMode(event, completedTurnConfig, platform),
+        platform,
+      );
+      if (
+        platformPolicy.mode !== defaultPolicy.mode
+        || Object.prototype.hasOwnProperty.call(platformPolicy, "parseMode")
+      ) {
+        acc[platform] = platformPolicy;
+      }
+      return acc;
+    },
+    {},
+  );
+
+  return {
+    default: defaultPolicy,
+    ...(Object.keys(overrides).length > 0 ? { overrides } : {}),
+  };
+}
 
 function buildCompletedTurnFingerprint(
   decision: Pick<
@@ -119,6 +232,7 @@ export function planCompletedTurnNotification(input: {
   semanticOutcome: CompletedTurnSemanticOutcome;
   replyOrigin?: CompletedTurnReplyOrigin | null;
   turnId?: string;
+  notificationConfig?: Pick<FullNotificationConfig, "completedTurn"> | null;
 }): CompletedTurnNotificationDecision | null {
   const { semanticOutcome } = input;
   const replyOrigin = input.replyOrigin ?? null;
@@ -137,19 +251,6 @@ export function planCompletedTurnNotification(input: {
     return null;
   }
 
-  const transportPolicy: CompletedTurnNotificationDecision["transportPolicy"] = {
-    default: { mode: "formatted-notification" },
-  };
-
-  if (replyOrigin?.platform === "telegram" && effectiveEvent === "result-ready") {
-    transportPolicy.overrides = {
-      telegram: {
-        mode: "raw-assistant-text",
-        parseMode: null,
-      },
-    };
-  }
-
   const decision: CompletedTurnNotificationDecision = {
     effectiveEvent,
     effectiveFingerprint: "",
@@ -163,7 +264,10 @@ export function planCompletedTurnNotification(input: {
     },
     semanticOutcome,
     replyOrigin,
-    transportPolicy,
+    transportPolicy: buildCompletedTurnTransportPolicy(
+      effectiveEvent,
+      input.notificationConfig,
+    ),
   };
 
   decision.effectiveFingerprint = buildCompletedTurnFingerprint({
@@ -181,11 +285,11 @@ export function renderCompletedTurnMessage(
   payload: FullNotificationPayload,
   assistantText: string,
 ): string {
-  if (policy.mode === "raw-assistant-text") {
-    return assistantText;
-  }
-
-  return formatNotification(payload);
+  return resolveCompletedTurnRenderedMessage(
+    policy,
+    payload,
+    assistantText,
+  ).message;
 }
 
 export function buildCompletedTurnTransportOverrides(
@@ -204,10 +308,16 @@ export function buildCompletedTurnTransportOverrides(
       return acc;
     }
 
+    const rendered = resolveCompletedTurnRenderedMessage(
+      policy,
+      payload,
+      assistantText,
+      platform as NotificationPlatform,
+    );
     acc[platform as NotificationPlatform] = {
-      message: renderCompletedTurnMessage(policy, payload, assistantText),
-      ...(Object.prototype.hasOwnProperty.call(policy, "parseMode")
-        ? { parseMode: policy.parseMode }
+      message: rendered.message,
+      ...(Object.prototype.hasOwnProperty.call(rendered, "parseMode")
+        ? { parseMode: rendered.parseMode }
         : {}),
     };
     return acc;

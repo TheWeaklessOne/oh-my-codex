@@ -241,6 +241,30 @@ If you want Telegram to receive only meaningful turn results and real input requ
 }
 ```
 
+Completed-turn presentation is now configurable separately from lifecycle delivery:
+
+```json
+{
+  "notifications": {
+    "completedTurn": {
+      "resultReadyMode": "raw-assistant-text",
+      "askUserQuestionMode": "raw-assistant-text",
+      "platformOverrides": {
+        "telegram": {
+          "resultReadyMode": "raw-assistant-text"
+        }
+      }
+    }
+  }
+}
+```
+
+- `result-ready` defaults to `raw-assistant-text`, so the visible notification body is the full assistant answer.
+- `ask-user-question` also defaults to `raw-assistant-text`.
+- Lifecycle events (`session-start`, `session-stop`, `session-idle`, `session-end`) keep the existing formatter-based rendering.
+- You can switch either completed-turn event back to `formatted-notification` globally or per platform without changing code.
+- When OMX runs with a project-scoped `CODEX_HOME`, it reads `.codex/.omx-config.json` first and falls back to `~/.codex/.omx-config.json` if the project file is absent.
+
 `omx --telegram` now narrows the active transport for that run while preserving the configured notification policy/profile.
 
 ### Telegram project-per-topic routing
@@ -278,7 +302,7 @@ Behavior summary:
 
 - OMX computes stable project identity from the **canonical project path**, not only from the basename/project name.
 - On the first notification from a project, OMX lazily creates a forum topic with `createForumTopic`, stores the resulting `message_thread_id`, and immediately sends the notification into that topic in the same dispatch flow.
-- Later notifications from the same project reuse the stored `message_thread_id`.
+- Later notifications from the same project reuse the stored `message_thread_id`, including detached completed-turn `result-ready` sends.
 - When `notifications.reply.enabled` is also on, a **new non-reply Telegram message inside a known project topic** becomes a **session entrypoint**: OMX starts a fresh detached tmux session for that topic’s canonical project and submits the message as the first prompt.
 - Telegram topic entry stays **project-scoped**, while replies stay **message-scoped**: replying to a tracked OMX message still routes back to the exact originating pane/session via `reply_to_message.message_id`, even when multiple sessions share the same project topic.
 - Every topic-launched session emits a dedicated launch acknowledgement reply in the same topic, and OMX registers that acknowledgement for future reply correlation even if `session-start` lifecycle notifications are disabled.

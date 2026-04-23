@@ -33,6 +33,23 @@ export type NotificationPlatform =
   | "slack"
   | "webhook";
 
+export type CompletedTurnRenderMode =
+  | "formatted-notification"
+  | "raw-assistant-text";
+
+export interface CompletedTurnPlatformPresentationConfig {
+  resultReadyMode?: CompletedTurnRenderMode;
+  askUserQuestionMode?: CompletedTurnRenderMode;
+}
+
+export interface CompletedTurnPresentationConfig {
+  resultReadyMode: CompletedTurnRenderMode;
+  askUserQuestionMode: CompletedTurnRenderMode;
+  platformOverrides?: Partial<
+    Record<NotificationPlatform, CompletedTurnPlatformPresentationConfig>
+  >;
+}
+
 /** Discord webhook configuration */
 export interface DiscordNotificationConfig {
   enabled: boolean;
@@ -167,6 +184,9 @@ export interface FullNotificationConfig {
   custom_webhook_command?: CustomWebhookCommandConfig;
   /** Generic custom CLI transport alias (OpenClaw-compatible bridge) */
   custom_cli_command?: CustomCliCommandConfig;
+
+  /** Completed-turn rendering policy for result/question notifications */
+  completedTurn?: CompletedTurnPresentationConfig;
 
   /** Per-event configuration */
   events?: Partial<Record<NotificationEvent, EventNotificationConfig>>;

@@ -2393,12 +2393,12 @@ ${launchAppendix}${dirtyWorktreeGuidance}`
 
   // 6. Emit temp notification startup summary + warnings, then send session-start lifecycle notification (best effort)
   try {
+    const { getNotificationConfig } =
+      await import("../notifications/config.js");
     if (notifyTempContract?.active) {
       process.env[OMX_NOTIFY_TEMP_CONTRACT_ENV] =
         serializeNotifyTempContract(notifyTempContract);
-      const { getNotificationConfig } =
-        await import("../notifications/config.js");
-      const resolved = getNotificationConfig();
+      const resolved = getNotificationConfig(undefined, { codexHomeOverride });
       const startup = buildNotifyTempStartupMessages(
         notifyTempContract,
         Boolean(resolved?.enabled),
@@ -2417,6 +2417,9 @@ ${launchAppendix}${dirtyWorktreeGuidance}`
       sessionId,
       projectPath: cwd,
       projectName: basename(cwd),
+    }, undefined, {
+      getNotificationConfigImpl: (profileName?: string) =>
+        getNotificationConfig(profileName, { codexHomeOverride }),
     });
   } catch (err) {
     process.stderr.write(`[cli/index] operation failed: ${err}\n`);

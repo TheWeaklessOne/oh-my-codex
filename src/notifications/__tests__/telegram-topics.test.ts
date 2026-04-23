@@ -470,6 +470,55 @@ describe('telegram-topics', () => {
     assert.equal(persisted?.topicName, 'project-a');
   });
 
+  it('warns when a topic record exists but the effective config disables projectTopics', async () => {
+    const topics = await importTopicsFresh();
+    const registry = await importRegistryFresh();
+    const sourceChatKey = 'telegram:123456:777';
+    const identity = topics.normalizeTelegramProjectIdentity({
+      projectPath: '/repos/project-a',
+      projectName: 'project-a',
+    });
+    assert.ok(identity);
+
+    await registry.updateTelegramTopicRegistryRecord(
+      sourceChatKey,
+      identity!.projectKey,
+      () => ({
+        sourceChatKey,
+        projectKey: identity!.projectKey,
+        canonicalProjectPath: identity!.canonicalProjectPath,
+        displayName: identity!.displayName,
+        topicName: 'project-a',
+        messageThreadId: '9005',
+        createdAt: '2026-04-21T16:00:00.000Z',
+        lastUsedAt: '2026-04-21T16:00:00.000Z',
+      }),
+    );
+
+    const warnings: Array<{ warningCode?: string; warningMessage?: string }> = [];
+    const destination = await topics.resolveTelegramDestination(
+      createConfig({ projectTopics: undefined }),
+      {
+        projectPath: '/repos/project-a',
+        projectName: 'project-a',
+      },
+      {
+        logger: {
+          warn(_line: string, details?: { warningCode?: string; warningMessage?: string }) {
+            warnings.push(details ?? {});
+          },
+        },
+      },
+    );
+
+    assert.equal(destination.messageThreadId, undefined);
+    assert.equal(destination.chatId, '777');
+    assert.equal(
+      warnings[0]?.warningCode,
+      'topic-routing-disabled-with-existing-record',
+    );
+  });
+
   it('derives the same project key from a symlinked project path via canonical path identity', async () => {
     const topics = await importTopicsFresh();
     const realRoot = join(tempHome, 'real-project');

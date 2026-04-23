@@ -1,8 +1,9 @@
 import { after, before, beforeEach, afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import type { FullNotificationConfig } from '../types.js';
 
 const ENV_KEYS = ['CODEX_HOME', 'TMUX', 'TMUX_PANE', 'PATH'] as const;
 
@@ -490,5 +491,75 @@ describe('notifyLifecycle reply listener sync', () => {
     assert.deepEqual(syncedConfigs, [config]);
     assert.ok(result);
     assert.equal(result.anySuccess, true);
+  });
+
+  it('can resolve session-start notifications through an explicit codexHomeOverride chain', async () => {
+    const originalHome = process.env.HOME;
+    const originalCodexHome = process.env.CODEX_HOME;
+    const tempHome = mkdtempSync(join(tmpdir(), 'omx-notify-index-explicit-home-'));
+    const userCodexHome = join(tempHome, '.codex');
+    const projectCodexHome = join(tempHome, 'project', '.codex');
+    const unrelatedCodexHome = join(tempHome, 'elsewhere', '.codex');
+    const projectPath = mkdtempSync(join(tmpdir(), 'omx-notify-index-explicit-home-project-'));
+
+    try {
+      mkdirSync(userCodexHome, { recursive: true });
+      mkdirSync(projectCodexHome, { recursive: true });
+      mkdirSync(unrelatedCodexHome, { recursive: true });
+      writeFileSync(join(userCodexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          webhook: {
+            enabled: true,
+            url: 'https://example.com/user-webhook',
+          },
+        },
+      }, null, 2));
+      process.env.HOME = tempHome;
+      process.env.CODEX_HOME = unrelatedCodexHome;
+
+      const capturedConfigs: unknown[] = [];
+      const { notifyLifecycle } = await import(`../index.js?session-start-explicit-home=${Date.now()}`);
+      const { getNotificationConfig } = await import(`../config.js?session-start-explicit-home=${Date.now()}`);
+
+      const result = await notifyLifecycle(
+        'session-start',
+        {
+          sessionId: `sess-explicit-home-${Date.now()}`,
+          projectPath,
+          projectName: 'project',
+        },
+        undefined,
+        {
+          getNotificationConfigImpl: (profileName?: string) =>
+            getNotificationConfig(profileName, { codexHomeOverride: projectCodexHome }),
+          isEventEnabledImpl: () => true,
+          ensureReplyListenerForConfigImpl: () => {},
+          dispatchNotificationsImpl: async (config: FullNotificationConfig) => {
+            capturedConfigs.push(config);
+            return {
+              event: 'session-start',
+              anySuccess: true,
+              results: [],
+            };
+          },
+        },
+      );
+
+      assert.ok(result);
+      assert.equal(result.anySuccess, true);
+      assert.equal(capturedConfigs.length, 1);
+      assert.equal(
+        (capturedConfigs[0] as { webhook?: { url?: string } }).webhook?.url,
+        'https://example.com/user-webhook',
+      );
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = originalCodexHome;
+      rmSync(projectPath, { recursive: true, force: true });
+      rmSync(tempHome, { recursive: true, force: true });
+    }
   });
 });

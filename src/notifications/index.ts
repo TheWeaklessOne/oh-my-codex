@@ -27,6 +27,9 @@ export type {
   SlackNotificationConfig,
   WebhookNotificationConfig,
   EventNotificationConfig,
+  CompletedTurnRenderMode,
+  CompletedTurnPresentationConfig,
+  CompletedTurnPlatformPresentationConfig,
   ReplyConfig,
   NotificationProfilesConfig,
   NotificationsBlock,
@@ -42,7 +45,6 @@ export type {
   CompletedTurnHookMetadata,
   CompletedTurnNotificationDecision,
   CompletedTurnReplyOrigin,
-  CompletedTurnRenderMode,
   CompletedTurnTransportRenderPolicy,
   ReplyOriginPlatform,
 } from "./completed-turn.js";
