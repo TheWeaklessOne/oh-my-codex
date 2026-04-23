@@ -133,6 +133,7 @@ import {
   type NotifyTempContract,
   type ParseNotifyTempContractResult,
 } from "../notifications/temp-contract.js";
+import { emitOmxWarpTabTitle } from "../warp/integration.js";
 
 export function resolveNotifyFallbackWatcherScript(pkgRoot = getPackageRoot()): string {
   return resolveDistScript(pkgRoot, "notify-fallback-watcher.js");
@@ -2374,6 +2375,14 @@ ${launchAppendix}${dirtyWorktreeGuidance}`
   // 3. Write session state
   await resetSessionMetrics(cwd, sessionId);
   await writeSessionStart(cwd, sessionId);
+
+  // 3.5. Sync Warp tab title on session start (best effort)
+  try {
+    emitOmxWarpTabTitle(cwd);
+  } catch (err) {
+    process.stderr.write(`[cli/index] operation failed: ${err}\n`);
+    // Non-fatal
+  }
 
   // 4. Start notify fallback watcher (best effort)
   try {
