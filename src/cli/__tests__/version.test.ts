@@ -18,5 +18,6 @@ describe('version', () => {
     }
 
     assert.equal(logs[0], `oh-my-codex v${pkg.version}`);
+    assert.equal(logs[1], 'Source: forked local dev build');
   });
 });
