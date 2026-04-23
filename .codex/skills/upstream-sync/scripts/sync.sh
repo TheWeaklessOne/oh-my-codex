@@ -66,11 +66,13 @@ SUMMARY_TARGET="unknown"
 SUMMARY_CLI="skipped"
 SUMMARY_CONFLICTS="0"
 LATEST_TAG=""
+TARGET_REF=""
 LOCAL_PACKAGE_VERSION=""
 INSTALLED_VERSION=""
 REMOTE_URL=""
 RELEASE_SUMMARY="none"
 FETCH_WARNING=""
+REMOTE_TAG_NAMESPACE="refs/upstream-sync/remote-tags"
 PROBE_DIR=""
 APPLY_DIR=""
 PRESERVE_PROBE_DIR=0
@@ -315,6 +317,39 @@ sync_local_main_branch() {
   git worktree remove --force "$main_sync_dir" >/dev/null 2>&1 || rm -rf "$main_sync_dir"
 }
 
+have_remote_release_refs() {
+  git for-each-ref --format='%(refname)' "${REMOTE_TAG_NAMESPACE}/v*" | grep -q .
+}
+
+refresh_remote_release_refs() {
+  local remote="$1"
+
+  if ! run_with_timeout 20 git fetch "$remote" --no-tags "+refs/heads/main:${MAIN_REF}" >/dev/null 2>&1; then
+    FETCH_WARNING="git fetch main from '$remote' timed out or failed; used cached main ref"
+    append_problem "$FETCH_WARNING"
+  fi
+
+  if ! run_with_timeout 20 git fetch --prune "$remote" "+refs/tags/*:${REMOTE_TAG_NAMESPACE}/*" >/dev/null 2>&1; then
+    append_problem "git fetch release tags from '$remote' timed out or failed; used cached release refs"
+  fi
+}
+
+resolve_latest_release_ref() {
+  git for-each-ref --merged="$MAIN_REF" --sort=-version:refname --format='%(refname)' "${REMOTE_TAG_NAMESPACE}/v*" | head -1
+}
+
+write_release_tags_file() {
+  local tags_file="$1"
+
+  if have_remote_release_refs; then
+    git for-each-ref --sort=version:refname --format='%(refname)%09%(subject)' "${REMOTE_TAG_NAMESPACE}/v*" \
+      | sed "s#^${REMOTE_TAG_NAMESPACE}/##" >"$tags_file"
+    return 0
+  fi
+
+  git for-each-ref --sort=version:refname --format='%(refname:short)%09%(subject)' refs/tags >"$tags_file"
+}
+
 fetch_release_payload() {
   local repo="$1"
   [[ -n "$repo" ]] || return 1
@@ -349,7 +384,7 @@ render_release_summary() {
   local payload=""
 
   tags_file=$(mktemp "${TMPDIR:-/tmp}/upstream-sync.tags.XXXXXX")
-  git for-each-ref --sort=version:refname --format='%(refname:short)%09%(subject)' refs/tags >"$tags_file"
+  write_release_tags_file "$tags_file"
 
   if payload=$(fetch_release_payload "$repo"); then
     payload_file=$(mktemp "${TMPDIR:-/tmp}/upstream-sync.releases.XXXXXX.json")
@@ -524,7 +559,7 @@ run_probe() {
   local stderr_file="$2"
   PROBE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/upstream-sync.probe.XXXXXX")
   git worktree add --detach "$PROBE_DIR" "$BRANCH" >/dev/null 2>&1 || fail 'probe worktree setup failed'
-  run_rebase_with_autofix "$PROBE_DIR" "$LATEST_TAG" "$stdout_file" "$stderr_file"
+  run_rebase_with_autofix "$PROBE_DIR" "$TARGET_REF" "$stdout_file" "$stderr_file"
 }
 
 run_apply() {
@@ -533,7 +568,7 @@ run_apply() {
 
   if [[ "$CURRENT_BRANCH" == "$BRANCH" ]]; then
     ensure_clean_current_branch
-    run_rebase_with_autofix "$ROOT" "$LATEST_TAG" "$stdout_file" "$stderr_file" || {
+    run_rebase_with_autofix "$ROOT" "$TARGET_REF" "$stdout_file" "$stderr_file" || {
       abort_rebase_if_needed "$ROOT"
       return 1
     }
@@ -551,7 +586,7 @@ run_apply() {
     return 1
   }
 
-  if ! run_rebase_with_autofix "$APPLY_DIR" "$LATEST_TAG" "$stdout_file" "$stderr_file"; then
+  if ! run_rebase_with_autofix "$APPLY_DIR" "$TARGET_REF" "$stdout_file" "$stderr_file"; then
     abort_rebase_if_needed "$APPLY_DIR"
     return 1
   fi
@@ -609,10 +644,7 @@ main() {
   LOCAL_PACKAGE_VERSION=$(read_local_package_version)
   INSTALLED_VERSION=$(read_installed_version)
 
-  if ! run_with_timeout 20 git fetch "$REMOTE" --tags >/dev/null; then
-    FETCH_WARNING="git fetch from '$REMOTE' timed out or failed; used cached refs"
-    append_problem "$FETCH_WARNING"
-  fi
+  refresh_remote_release_refs "$REMOTE"
 
   git show-ref --verify --quiet "$MAIN_REF" || fail "remote '$REMOTE' does not expose main"
 
@@ -621,7 +653,17 @@ main() {
     github_repo="${BASH_REMATCH[1]}"
   fi
 
-  LATEST_TAG=$(git tag --merged "$MAIN_REF" --sort=-version:refname 'v*' | head -1)
+  TARGET_REF=$(resolve_latest_release_ref)
+  if [[ -n "$TARGET_REF" ]]; then
+    LATEST_TAG="${TARGET_REF#${REMOTE_TAG_NAMESPACE}/}"
+  else
+    if have_remote_release_refs; then
+      fail "no release tags merged into ${REMOTE}/main"
+    fi
+    append_problem "remote release refs unavailable; used local tags"
+    LATEST_TAG=$(git tag --merged "$MAIN_REF" --sort=-version:refname 'v*' | head -1)
+    TARGET_REF="$LATEST_TAG"
+  fi
   [[ -n "$LATEST_TAG" ]] || fail "no release tags merged into ${REMOTE}/main"
   SUMMARY_TARGET="release ${LATEST_TAG}"
 

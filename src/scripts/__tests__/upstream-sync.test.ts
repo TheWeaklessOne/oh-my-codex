@@ -20,6 +20,10 @@ function writeExecutable(path: string, content: string): void {
 	chmodSync(path, 0o755);
 }
 
+function setAnnotatedTag(cwd: string, tagName: string, target: string, message: string): void {
+	execFileSync('git', ['tag', '-fa', tagName, target, '-m', message], { cwd, stdio: 'ignore' });
+}
+
 function runSync(
 	cwd: string,
 	args: string[],
@@ -231,6 +235,62 @@ describe('upstream-sync skill script', () => {
 			const lines = summaryLines(result.stdout);
 			assert.equal(lines.length, 3, result.stdout);
 			assert.match(lines[0], /^move: ok \| branch=feat\/release-target \| target=release v0\.1\.1 \| cli=skipped \| conflicts=0$/);
+			assert.equal(lines[1], 'problems: none');
+			assert.equal(lines[2], 'releases: v0.1.1 upstream update');
+
+			const counts = git(fixture.repo, ['rev-list', '--left-right', '--count', `${branchName}...refs/remotes/origin/main`]);
+			const [ahead, behind] = counts.split(/\s+/);
+			assert.equal(ahead, '1');
+			assert.equal(behind, '1');
+
+			const readme = await readFile(join(fixture.repo, 'README.md'), 'utf-8');
+			assert.equal(readme, 'upstream release update\n');
+		} finally {
+			await rm(fixture.cleanupRoot, { recursive: true, force: true });
+		}
+	});
+
+	it('uses the remote release tag even when a same-name local tag conflicts', async () => {
+		const branchName = 'feat/conflicting-release-tag';
+		const fixture = await createSyncFixture(branchName, 'clean', { releaseTrailingMainCommit: true });
+
+		try {
+			setAnnotatedTag(fixture.repo, 'v0.1.1', 'v0.1.0', 'local conflicting release tag');
+
+			const result = runSync(fixture.repo, ['--branch', branchName, '--remote', 'origin', '--no-cli-update']);
+			assert.equal(result.status, 0, result.stderr || result.stdout);
+
+			const lines = summaryLines(result.stdout);
+			assert.equal(lines.length, 3, result.stdout);
+			assert.match(lines[0], /^move: ok \| branch=feat\/conflicting-release-tag \| target=release v0\.1\.1 \| cli=skipped \| conflicts=0$/);
+			assert.equal(lines[1], 'problems: none');
+			assert.equal(lines[2], 'releases: v0.1.1 upstream update');
+
+			const counts = git(fixture.repo, ['rev-list', '--left-right', '--count', `${branchName}...refs/remotes/origin/main`]);
+			const [ahead, behind] = counts.split(/\s+/);
+			assert.equal(ahead, '1');
+			assert.equal(behind, '1');
+
+			const readme = await readFile(join(fixture.repo, 'README.md'), 'utf-8');
+			assert.equal(readme, 'upstream release update\n');
+		} finally {
+			await rm(fixture.cleanupRoot, { recursive: true, force: true });
+		}
+	});
+
+	it('ignores local-only v* shadow tags when choosing the release target', async () => {
+		const branchName = 'feat/local-shadow-tag';
+		const fixture = await createSyncFixture(branchName, 'clean', { releaseTrailingMainCommit: true });
+
+		try {
+			setAnnotatedTag(fixture.repo, 'v9.9.9-shadow', 'v0.1.0', 'local shadow release tag');
+
+			const result = runSync(fixture.repo, ['--branch', branchName, '--remote', 'origin', '--no-cli-update']);
+			assert.equal(result.status, 0, result.stderr || result.stdout);
+
+			const lines = summaryLines(result.stdout);
+			assert.equal(lines.length, 3, result.stdout);
+			assert.match(lines[0], /^move: ok \| branch=feat\/local-shadow-tag \| target=release v0\.1\.1 \| cli=skipped \| conflicts=0$/);
 			assert.equal(lines[1], 'problems: none');
 			assert.equal(lines[2], 'releases: v0.1.1 upstream update');
 
