@@ -478,6 +478,34 @@ function selectTempModeTransports(
   return selected;
 }
 
+function hasExplicitEventPolicy(
+  config: FullNotificationConfig,
+): boolean {
+  return Boolean(config.events && Object.keys(config.events).length > 0);
+}
+
+function applyMeaningfulTelegramTempDefaults(
+  config: FullNotificationConfig,
+  selectors: Set<string>,
+): FullNotificationConfig {
+  if (!selectors.has("telegram") || hasExplicitEventPolicy(config)) {
+    return config;
+  }
+
+  return {
+    ...config,
+    events: {
+      ...(config.events ?? {}),
+      "session-start": { enabled: false },
+      "session-stop": { enabled: false },
+      "session-idle": { enabled: false },
+      "result-ready": { enabled: true },
+      "ask-user-question": { enabled: true },
+      "session-end": { enabled: true },
+    },
+  };
+}
+
 function buildTempModeConfigFromContract(
   baseConfig: FullNotificationConfig | null,
 ): FullNotificationConfig | null {
@@ -487,10 +515,13 @@ function buildTempModeConfigFromContract(
 
   const selectors = getTempBuiltinSelectors(contract);
   const seedConfig = baseConfig ?? buildConfigFromEnv() ?? { enabled: false };
-  return selectTempModeTransports(
-    seedConfig,
+  return applyMeaningfulTelegramTempDefaults(
+    selectTempModeTransports(
+      seedConfig,
+      selectors,
+      isOpenClawSelectedInTempContract(contract),
+    ),
     selectors,
-    isOpenClawSelectedInTempContract(contract),
   );
 }
 

@@ -15,6 +15,8 @@ export type {
   NotificationPlatform,
   FullNotificationConfig,
   FullNotificationPayload,
+  NotificationTransportOverride,
+  NotificationTransportOverrides,
   NotificationResult,
   DispatchResult,
   DiscordNotificationConfig,
@@ -30,6 +32,20 @@ export type {
   NotificationsBlock,
   VerbosityLevel,
 } from "./types.js";
+export {
+  buildCompletedTurnHookFingerprint,
+  buildCompletedTurnTransportOverrides,
+  planCompletedTurnNotification,
+  renderCompletedTurnMessage,
+} from "./completed-turn.js";
+export type {
+  CompletedTurnHookMetadata,
+  CompletedTurnNotificationDecision,
+  CompletedTurnReplyOrigin,
+  CompletedTurnRenderMode,
+  CompletedTurnTransportRenderPolicy,
+  ReplyOriginPlatform,
+} from "./completed-turn.js";
 
 export {
   dispatchNotifications,
@@ -175,6 +191,12 @@ import { formatNotification } from "./formatter.js";
 import { dispatchNotifications } from "./dispatcher.js";
 import { getCurrentTmuxSession, sanitizeTmuxAlertText } from "./tmux.js";
 import { startReplyListener, stopReplyListener } from "./reply-listener.js";
+import {
+  buildCompletedTurnTransportOverrides,
+  renderCompletedTurnMessage,
+  type CompletedTurnNotificationDecision,
+  type CompletedTurnTransportRenderPolicy,
+} from "./completed-turn.js";
 import { basename } from "path";
 import { omxStateDir } from "../utils/paths.js";
 import {
@@ -257,6 +279,110 @@ interface NotifyLifecycleDeps {
   isEventEnabledImpl?: typeof isEventEnabled;
   ensureReplyListenerForConfigImpl?: typeof ensureReplyListenerForConfig;
   dispatchNotificationsImpl?: typeof dispatchNotifications;
+}
+
+interface NotifyCompletedTurnDeps extends NotifyLifecycleDeps {}
+
+async function maybeRegisterReplyMappings(
+  config: FullNotificationConfig,
+  payload: FullNotificationPayload,
+  result: DispatchResult,
+): Promise<void> {
+  if (!result.anySuccess || !payload.tmuxPaneId) {
+    return;
+  }
+
+  try {
+    const { registerMessage } = await import("./session-registry.js");
+    const {
+      buildDiscordReplySource,
+      buildTelegramReplySource,
+    } = await import("./reply-source.js");
+    for (const r of result.results) {
+      if (
+        r.success &&
+        r.messageId &&
+        (r.platform === "discord-bot" || r.platform === "telegram")
+      ) {
+        const source = r.platform === "discord-bot"
+          ? (config["discord-bot"]?.enabled && config["discord-bot"]?.botToken && config["discord-bot"]?.channelId
+              ? buildDiscordReplySource(config["discord-bot"].botToken, config["discord-bot"].channelId)
+              : undefined)
+          : (config.telegram?.enabled && config.telegram?.botToken && config.telegram?.chatId
+              ? buildTelegramReplySource(config.telegram.botToken, config.telegram.chatId)
+              : undefined);
+        registerMessage({
+          platform: r.platform,
+          messageId: r.messageId,
+          ...(source ? { source } : {}),
+          sessionId: payload.sessionId,
+          tmuxPaneId: payload.tmuxPaneId,
+          tmuxSessionName: payload.tmuxSession || "",
+          event: payload.event,
+          createdAt: new Date().toISOString(),
+          projectPath: payload.projectPath,
+          projectKey: r.projectKey,
+          messageThreadId: r.messageThreadId,
+          topicName: r.topicName,
+        });
+      }
+    }
+  } catch {
+    // Non-fatal: reply correlation is best-effort
+  }
+}
+
+function buildOpenClawContext(payload: FullNotificationPayload): {
+  sessionId: string;
+  projectPath?: string;
+  tmuxSession?: string;
+  contextSummary?: string;
+  reason?: string;
+  question?: string;
+  tmuxTail?: string;
+} {
+  return {
+    sessionId: payload.sessionId,
+    projectPath: payload.projectPath,
+    tmuxSession: payload.tmuxSession,
+    contextSummary: payload.contextSummary,
+    reason: payload.reason,
+    question: payload.question,
+    tmuxTail: payload.tmuxTail,
+  };
+}
+
+async function buildOpenClawDispatch(
+  event: NotificationEvent,
+  payload: FullNotificationPayload,
+): Promise<(() => Promise<void>) | null> {
+  const openClawEvent = toOpenClawEvent(event);
+  if (openClawEvent === null) {
+    return null;
+  }
+
+  const tempContract = readNotifyTempContractFromEnv(process.env);
+  const openClawContext = buildOpenClawContext(payload);
+  return async (): Promise<void> => {
+    try {
+      const openClawAllowed = await shouldDispatchOpenClaw(
+        openClawEvent,
+        tempContract,
+        process.env,
+      );
+      if (!openClawAllowed) return;
+
+      const { wakeOpenClaw } = await import("../openclaw/index.js");
+      if (openClawEvent === "ask-user-question") {
+        await wakeOpenClaw(openClawEvent, openClawContext);
+        return;
+      }
+
+      void wakeOpenClaw(openClawEvent, openClawContext);
+    } catch {
+      // OpenClaw failures must never affect notification dispatch
+    }
+  };
 }
 
 export async function shouldDispatchOpenClaw(
@@ -380,44 +506,7 @@ export async function notifyLifecycle(
     }
 
     const openClawEvent = toOpenClawEvent(event);
-    let dispatchOpenClawLater: (() => Promise<void>) | null = null;
-    if (openClawEvent !== null) {
-      const tempContract = readNotifyTempContractFromEnv(process.env);
-      const openClawContext = {
-        sessionId: payload.sessionId,
-        projectPath: payload.projectPath,
-        tmuxSession: payload.tmuxSession,
-        contextSummary: payload.contextSummary,
-        reason: payload.reason,
-        question: payload.question,
-        tmuxTail: payload.tmuxTail,
-        // Reply context env vars are read inside wakeOpenClaw;
-        // callers do not need to pass them explicitly.
-      };
-      dispatchOpenClawLater = async (): Promise<void> => {
-        try {
-          const openClawAllowed = await shouldDispatchOpenClaw(
-            openClawEvent,
-            tempContract,
-            process.env,
-          );
-          if (!openClawAllowed) return;
-
-          const { wakeOpenClaw } = await import("../openclaw/index.js");
-          if (openClawEvent === "ask-user-question") {
-            // ask-user-question must launch through the current foreground hook path
-            // so downstream answer routing stays attached to the live session.
-            await wakeOpenClaw(openClawEvent, openClawContext);
-            return;
-          }
-
-          // Other lifecycle hooks remain fire-and-forget to avoid delaying notification return.
-          void wakeOpenClaw(openClawEvent, openClawContext);
-        } catch {
-          // OpenClaw failures must never affect notification dispatch
-        }
-      };
-    }
+    const dispatchOpenClawLater = await buildOpenClawDispatch(event, payload);
 
     if (openClawEvent !== "ask-user-question" && dispatchOpenClawLater) {
       // Let the non-blocking OpenClaw eligibility/import path overlap the primary
@@ -437,47 +526,117 @@ export async function notifyLifecycle(
       await dispatchOpenClawLater();
     }
 
-    if (result.anySuccess && payload.tmuxPaneId) {
-      try {
-        const { registerMessage } = await import("./session-registry.js");
-        const {
-          buildDiscordReplySource,
-          buildTelegramReplySource,
-        } = await import("./reply-source.js");
-        for (const r of result.results) {
-          if (
-            r.success &&
-            r.messageId &&
-            (r.platform === "discord-bot" || r.platform === "telegram")
-          ) {
-            const source = r.platform === "discord-bot"
-              ? (config["discord-bot"]?.enabled && config["discord-bot"]?.botToken && config["discord-bot"]?.channelId
-                  ? buildDiscordReplySource(config["discord-bot"].botToken, config["discord-bot"].channelId)
-                  : undefined)
-              : (config.telegram?.enabled && config.telegram?.botToken && config.telegram?.chatId
-                  ? buildTelegramReplySource(config.telegram.botToken, config.telegram.chatId)
-                  : undefined);
-            registerMessage({
-              platform: r.platform,
-              messageId: r.messageId,
-              ...(source ? { source } : {}),
-              sessionId: payload.sessionId,
-              tmuxPaneId: payload.tmuxPaneId,
-              tmuxSessionName: payload.tmuxSession || "",
-              event: payload.event,
-              createdAt: new Date().toISOString(),
-              projectPath: payload.projectPath,
-              projectKey: r.projectKey,
-              messageThreadId: r.messageThreadId,
-              topicName: r.topicName,
-            });
-          }
-        }
-      } catch {
-        // Non-fatal: reply correlation is best-effort
-      }
+    await maybeRegisterReplyMappings(config, payload, result);
+
+    return result;
+  } catch (error) {
+    console.error(
+      "[notifications] Error:",
+      error instanceof Error ? error.message : error,
+    );
+    return null;
+  }
+}
+
+export async function notifyCompletedTurn(
+  decision: CompletedTurnNotificationDecision,
+  data: Partial<FullNotificationPayload> & {
+    sessionId: string;
+    assistantText: string;
+  },
+  profileName?: string,
+  deps: NotifyCompletedTurnDeps = {},
+): Promise<DispatchResult | null> {
+  try {
+    const getNotificationConfigImpl =
+      deps.getNotificationConfigImpl ?? getNotificationConfig;
+    const isEventEnabledImpl = deps.isEventEnabledImpl ?? isEventEnabled;
+    const ensureReplyListenerForConfigImpl =
+      deps.ensureReplyListenerForConfigImpl ?? ensureReplyListenerForConfig;
+    const dispatchNotificationsImpl =
+      deps.dispatchNotificationsImpl ?? dispatchNotifications;
+
+    const config = getNotificationConfigImpl(profileName);
+    ensureReplyListenerForConfigImpl(config);
+
+    if (!config || !isEventEnabledImpl(config, decision.effectiveEvent)) {
+      return null;
     }
 
+    const { getCurrentTmuxPaneId } = await import("./tmux.js");
+    const payload: FullNotificationPayload = {
+      event: decision.effectiveEvent,
+      sessionId: data.sessionId,
+      message: "",
+      timestamp: data.timestamp || new Date().toISOString(),
+      tmuxSession: data.tmuxSession ?? getCurrentTmuxSession() ?? undefined,
+      tmuxPaneId: data.tmuxPaneId ?? getCurrentTmuxPaneId() ?? undefined,
+      projectPath: data.projectPath,
+      projectName:
+        data.projectName ||
+        (data.projectPath ? basename(data.projectPath) : undefined),
+      modesUsed: data.modesUsed,
+      contextSummary: data.contextSummary,
+      durationMs: data.durationMs,
+      agentsSpawned: data.agentsSpawned,
+      agentsCompleted: data.agentsCompleted,
+      reason: data.reason,
+      activeMode: data.activeMode,
+      iteration: data.iteration,
+      maxIterations: data.maxIterations,
+      question: data.question,
+      incompleteTasks: data.incompleteTasks,
+    };
+
+    const verbosity = getVerbosity(config);
+    if (
+      shouldIncludeTmuxTail(verbosity)
+      && !data.tmuxTail
+      && AUTO_CAPTURE_TMUX_TAIL_EVENTS.has(decision.effectiveEvent)
+    ) {
+      const { captureTmuxPaneWithLiveness } = await import("./tmux.js");
+      const tmuxCapture = captureTmuxPaneWithLiveness(payload.tmuxPaneId);
+      payload.tmuxTail = sanitizeTmuxAlertText(tmuxCapture.content);
+      payload.tmuxTailLive = tmuxCapture.live;
+    } else {
+      payload.tmuxTail = sanitizeTmuxAlertText(data.tmuxTail);
+      payload.tmuxTailLive = data.tmuxTailLive;
+    }
+
+    const defaultPolicy: CompletedTurnTransportRenderPolicy =
+      decision.transportPolicy.default;
+    payload.message = renderCompletedTurnMessage(
+      defaultPolicy,
+      payload,
+      data.assistantText,
+    );
+    payload.transportOverrides = buildCompletedTurnTransportOverrides(
+      decision,
+      payload,
+      data.assistantText,
+    );
+
+    const openClawEvent = toOpenClawEvent(decision.effectiveEvent);
+    const dispatchOpenClawLater = await buildOpenClawDispatch(
+      decision.effectiveEvent,
+      payload,
+    );
+
+    if (openClawEvent !== "ask-user-question" && dispatchOpenClawLater) {
+      void dispatchOpenClawLater();
+    }
+
+    const result = await dispatchNotificationsImpl(
+      config,
+      decision.effectiveEvent,
+      payload,
+    );
+
+    if (openClawEvent === "ask-user-question" && dispatchOpenClawLater) {
+      await dispatchOpenClawLater();
+    }
+
+    await maybeRegisterReplyMappings(config, payload, result);
     return result;
   } catch (error) {
     console.error(

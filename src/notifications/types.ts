@@ -172,6 +172,17 @@ export interface FullNotificationConfig {
   events?: Partial<Record<NotificationEvent, EventNotificationConfig>>;
 }
 
+export interface NotificationTransportOverride {
+  /** Per-platform message override when a planner wants custom rendering */
+  message?: string;
+  /** Transport-specific parse mode override; null disables parse_mode entirely */
+  parseMode?: "Markdown" | "HTML" | null;
+}
+
+export type NotificationTransportOverrides = Partial<
+  Record<NotificationPlatform, NotificationTransportOverride>
+>;
+
 /** Payload sent with each notification */
 export interface FullNotificationPayload {
   /** The event that triggered this notification */
@@ -216,6 +227,8 @@ export interface FullNotificationPayload {
   tmuxTail?: string;
   /** Whether the tmux tail came from a session/pane proven live at capture time */
   tmuxTailLive?: boolean;
+  /** Generic per-platform rendering overrides */
+  transportOverrides?: NotificationTransportOverrides;
   /** Agent name (populated by extensibility plugins, not set by core Codex CLI hooks) */
   agentName?: string;
   /** Agent type (populated by extensibility plugins, not set by core Codex CLI hooks) */

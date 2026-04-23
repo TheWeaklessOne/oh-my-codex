@@ -58,9 +58,13 @@ import {
   resolveOperationalSessionName,
 } from './notify-hook/operational-events.js';
 import {
-  buildCompletedTurnFingerprint,
   classifyCompletedTurn,
 } from '../runtime/turn-semantics.js';
+import {
+  buildCompletedTurnHookFingerprint,
+  planCompletedTurnNotification,
+} from '../notifications/completed-turn.js';
+import { consumePendingReplyOrigin } from '../notifications/reply-origin-state.js';
 import {
   parseTeamWorkerEnv,
   resolveTeamStateDirForWorker,
@@ -83,11 +87,6 @@ const RALPH_ACTIVE_PROGRESS_PHASES = new Set([
   'fix',
   'fixing',
 ]);
-
-function buildIdleNotificationFingerprint(payload: Record<string, unknown>): string {
-  const lastAssistantMessage = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '');
-  return buildCompletedTurnFingerprint(classifyCompletedTurn(lastAssistantMessage));
-}
 
 function isTurnCompletePayload(payload: Record<string, unknown>): boolean {
   const type = safeString(payload.type || '').trim().toLowerCase();
@@ -534,29 +533,46 @@ async function main() {
   //    coarse internal session-idle hook path (lead session only, best effort).
   if (!isTeamWorker) {
     try {
-      const { notifyLifecycle } = await import('../notifications/index.js');
+      const { notifyCompletedTurn } = await import('../notifications/index.js');
       const {
         shouldSendCompletedTurnNotification,
         recordCompletedTurnNotificationSent,
         shouldSendSessionIdleHookEvent,
         recordSessionIdleHookEventSent,
       } = await import('../notifications/idle-cooldown.js');
-      const idleFingerprint = buildIdleNotificationFingerprint(payload);
       const notifySessionId = getEffectiveSessionId();
       const lastAssistantMessage = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '');
       const semanticOutcome = classifyCompletedTurn(lastAssistantMessage);
-      const semanticEvent = semanticOutcome.notificationEvent;
-      const humanFacingFingerprint = buildCompletedTurnFingerprint(semanticOutcome);
+      const replyOrigin = notifySessionId
+        ? await consumePendingReplyOrigin(cwd, notifySessionId, latestUserInput)
+        : null;
+      const decision = planCompletedTurnNotification({
+        semanticOutcome,
+        replyOrigin,
+        turnId: safeString(payload['turn-id'] || payload.turn_id || ''),
+      });
+      const completedTurnHookFingerprint = buildCompletedTurnHookFingerprint(
+        decision,
+        semanticOutcome,
+      );
 
-      const shouldNotifyLifecycle = notifySessionId
-        && semanticEvent
-        && shouldSendCompletedTurnNotification(stateDir, notifySessionId, humanFacingFingerprint);
+      const shouldNotifyCompletedTurn = notifySessionId
+        && decision
+        && shouldSendCompletedTurnNotification(
+          stateDir,
+          notifySessionId,
+          decision.effectiveFingerprint,
+        );
       const shouldDispatchSessionIdleHookEvent = notifySessionId
-        && shouldSendSessionIdleHookEvent(stateDir, notifySessionId, idleFingerprint);
+        && shouldSendSessionIdleHookEvent(
+          stateDir,
+          notifySessionId,
+          completedTurnHookFingerprint,
+        );
 
-      if (shouldNotifyLifecycle || shouldDispatchSessionIdleHookEvent) {
-        if (shouldNotifyLifecycle) {
-          const idleResult = await notifyLifecycle(semanticEvent!, {
+      if (shouldNotifyCompletedTurn || shouldDispatchSessionIdleHookEvent) {
+        if (shouldNotifyCompletedTurn) {
+          const completedTurnResult = await notifyCompletedTurn(decision!, {
             sessionId: notifySessionId,
             projectPath: cwd,
             contextSummary: semanticOutcome.summary || undefined,
@@ -564,9 +580,14 @@ async function main() {
               semanticOutcome.kind === 'input-needed'
                 ? (semanticOutcome.question || semanticOutcome.summary || 'Input is needed to continue.')
                 : undefined,
+            assistantText: lastAssistantMessage,
           });
-          if (idleResult && idleResult.anySuccess) {
-            recordCompletedTurnNotificationSent(stateDir, notifySessionId, humanFacingFingerprint);
+          if (completedTurnResult && completedTurnResult.anySuccess) {
+            recordCompletedTurnNotificationSent(
+              stateDir,
+              notifySessionId,
+              decision!.effectiveFingerprint,
+            );
           }
         }
 
@@ -583,10 +604,12 @@ async function main() {
                 extra: {
                   project_path: cwd,
                   reason: 'post_turn_idle_notification',
-                  semantic_phase: semanticOutcome.kind,
-                  semantic_summary: semanticOutcome.summary || null,
-                  semantic_question: semanticOutcome.question || null,
-                  semantic_notification_event: semanticEvent || null,
+                  semantic_phase: decision?.hookMetadata.semanticPhase || semanticOutcome.kind,
+                  semantic_summary: decision?.hookMetadata.semanticSummary || semanticOutcome.summary || null,
+                  semantic_question: decision?.hookMetadata.semanticQuestion || semanticOutcome.question || null,
+                  semantic_notification_event: decision?.hookMetadata.semanticNotificationEvent || null,
+                  semantic_classifier_event: decision?.hookMetadata.semanticClassifierEvent || semanticOutcome.notificationEvent || null,
+                  reply_origin_platform: decision?.hookMetadata.replyOriginPlatform || null,
                 },
               }),
             }, {
@@ -597,7 +620,11 @@ async function main() {
             });
             const hookDispatchResult = await dispatchHookEvent(event, { cwd });
             if (hookDispatchResult.results.some((result) => result.ok)) {
-              recordSessionIdleHookEventSent(stateDir, notifySessionId, idleFingerprint);
+              recordSessionIdleHookEventSent(
+                stateDir,
+                notifySessionId,
+                completedTurnHookFingerprint,
+              );
             }
           } catch {
             // Non-fatal

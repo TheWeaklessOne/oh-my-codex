@@ -235,6 +235,58 @@ describe('sendTelegram', () => {
     assert.equal(parsedBody.message_thread_id, 9001);
   });
 
+  it('omits parse_mode when the payload explicitly disables telegram parsing', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+    };
+    let requestBody = '';
+
+    const result = await sendTelegram(
+      config,
+      {
+        ...basePayload,
+        message: '# Raw markdown-like text\n\n- keep symbols untouched',
+        transportOverrides: {
+          telegram: {
+            parseMode: null,
+          },
+        },
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+            requestBody = body;
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: 111,
+                },
+              },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, true);
+    const parsedBody = JSON.parse(requestBody) as {
+      chat_id: string;
+      text: string;
+      parse_mode?: string;
+    };
+    assert.equal(parsedBody.chat_id, '777');
+    assert.equal(parsedBody.text, '# Raw markdown-like text\n\n- keep symbols untouched');
+    assert.equal('parse_mode' in parsedBody, false);
+  });
+
   it('sends to the root chat without a thread id when topic routing falls back', async () => {
     const config: TelegramNotificationConfig = {
       enabled: true,
@@ -428,6 +480,91 @@ describe('dispatchNotifications', () => {
     assert.ok(result.results.length > 0);
     // Both should fail (invalid URLs)
     assert.equal(result.anySuccess, false);
+  });
+
+  it('applies per-platform message overrides without changing other transports', async () => {
+    const config: FullNotificationConfig = {
+      enabled: true,
+      webhook: { enabled: true, url: 'https://example.com/webhook' },
+    };
+
+    const fetchCalls: Array<{ url: string; body: string }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      fetchCalls.push({
+        url: typeof input === 'string' ? input : input instanceof URL ? String(input) : input.url,
+        body: typeof init?.body === 'string' ? init.body : '',
+      });
+      return new Response('', { status: 200 });
+    };
+
+    try {
+      let telegramRequestBody = '';
+      const result = await dispatchNotifications(
+        config,
+        'result-ready',
+        {
+          ...basePayload,
+          event: 'result-ready',
+          message: '# Result Ready\n\n**Summary:** Tests passed.',
+          transportOverrides: {
+            telegram: {
+              message: 'Raw Telegram reply body',
+              parseMode: null,
+            },
+          },
+        },
+      );
+
+      assert.equal(result.anySuccess, true);
+      assert.equal(fetchCalls.length, 1);
+      const webhookBody = JSON.parse(fetchCalls[0].body) as { message: string };
+      assert.equal(webhookBody.message, '# Result Ready\n\n**Summary:** Tests passed.');
+
+      const telegramResult = await sendTelegram(
+        { enabled: true, botToken: '123456:abc', chatId: '777' },
+        {
+          ...basePayload,
+          message: '# Result Ready\n\n**Summary:** Tests passed.',
+          transportOverrides: {
+            telegram: {
+              message: 'Raw Telegram reply body',
+              parseMode: null,
+            },
+          },
+        },
+        {
+          resolveTelegramDestinationImpl: async () => ({
+            chatId: '777',
+            sourceChatKey: 'telegram:123456:777',
+          }),
+          httpsRequestImpl: createHttpsRequestMock({
+            'POST /bot123456:abc/sendMessage': (body) => {
+              telegramRequestBody = body;
+              return {
+                statusCode: 200,
+                body: {
+                  ok: true,
+                  result: {
+                    message_id: 777,
+                  },
+                },
+              };
+            },
+          }),
+        },
+      );
+
+      assert.equal(telegramResult.success, true);
+      const telegramBody = JSON.parse(telegramRequestBody) as {
+        text: string;
+        parse_mode?: string;
+      };
+      assert.equal(telegramBody.text, 'Raw Telegram reply body');
+      assert.equal('parse_mode' in telegramBody, false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   it('uses event-level platform config when present', async () => {

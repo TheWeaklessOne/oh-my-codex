@@ -10,7 +10,9 @@ import { tmpdir } from 'os';
 
 import {
   getIdleNotificationCooldownSeconds,
+  shouldSendCompletedTurnNotification,
   shouldSendIdleNotification,
+  recordCompletedTurnNotificationSent,
   recordIdleNotificationSent,
   shouldSendSessionIdleHookEvent,
   recordSessionIdleHookEventSent,
@@ -166,6 +168,40 @@ describe('shouldSendIdleNotification', () => {
     recordIdleNotificationSent(stateDir, sessionId);
 
     assert.equal(shouldSendIdleNotification(stateDir, sessionId), false);
+  });
+
+  it('keeps completed-turn cooldown isolated from idle cooldown state', () => {
+    process.env.OMX_IDLE_COOLDOWN_SECONDS = '60';
+    const sessionId = 'test-session-isolated-completed-turn';
+    recordIdleNotificationSent(stateDir, sessionId, '{"phase":"idle","summary":"Waiting for input"}');
+
+    assert.equal(
+      shouldSendCompletedTurnNotification(
+        stateDir,
+        sessionId,
+        '{"scope":"completed-turn","effectiveEvent":"result-ready","summary":"All tests passed"}',
+      ),
+      true,
+    );
+  });
+
+  it('keeps idle cooldown isolated from completed-turn cooldown state', () => {
+    process.env.OMX_IDLE_COOLDOWN_SECONDS = '60';
+    const sessionId = 'test-session-isolated-idle';
+    recordCompletedTurnNotificationSent(
+      stateDir,
+      sessionId,
+      '{"scope":"completed-turn","effectiveEvent":"result-ready","summary":"All tests passed"}',
+    );
+
+    assert.equal(
+      shouldSendIdleNotification(
+        stateDir,
+        sessionId,
+        '{"phase":"idle","summary":"Waiting for input"}',
+      ),
+      true,
+    );
   });
 });
 

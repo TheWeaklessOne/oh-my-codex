@@ -16,6 +16,7 @@ import type {
   FullNotificationPayload,
   NotificationResult,
   NotificationPlatform,
+  NotificationTransportOverride,
   DispatchResult,
   FullNotificationConfig,
   NotificationEvent,
@@ -138,6 +139,28 @@ function mergeTelegramPlatformOverrides(
   return merged;
 }
 
+function getTransportOverride(
+  payload: FullNotificationPayload,
+  platform: NotificationPlatform,
+): NotificationTransportOverride | undefined {
+  return payload.transportOverrides?.[platform];
+}
+
+function resolveTransportPayload(
+  payload: FullNotificationPayload,
+  platform: NotificationPlatform,
+): FullNotificationPayload {
+  const override = getTransportOverride(payload, platform);
+  if (!override?.message) {
+    return payload;
+  }
+
+  return {
+    ...payload,
+    message: override.message,
+  };
+}
+
 export async function sendDiscord(
   config: DiscordNotificationConfig,
   payload: FullNotificationPayload,
@@ -155,8 +178,9 @@ export async function sendDiscord(
   }
 
   try {
+    const message = getTransportOverride(payload, "discord")?.message ?? payload.message;
     const { content, allowed_mentions } = composeDiscordContent(
-      payload.message,
+      message,
       config.mention,
     );
     const body: Record<string, unknown> = { content, allowed_mentions };
@@ -209,8 +233,9 @@ export async function sendDiscordBot(
   }
 
   try {
+    const message = getTransportOverride(payload, "discord-bot")?.message ?? payload.message;
     const { content, allowed_mentions } = composeDiscordContent(
-      payload.message,
+      message,
       config.mention,
     );
     const url = `https://discord.com/api/v10/channels/${channelId}/messages`;
@@ -294,9 +319,16 @@ export async function sendTelegram(
       config.botToken,
       "sendMessage",
       {
+        ...(() => {
+          const transportOverride = getTransportOverride(payload, "telegram");
+          const effectiveParseMode =
+            Object.prototype.hasOwnProperty.call(transportOverride ?? {}, "parseMode")
+              ? transportOverride?.parseMode
+              : (config.parseMode ?? "Markdown");
+          return effectiveParseMode ? { parse_mode: effectiveParseMode } : {};
+        })(),
         chat_id: destination.chatId,
-        text: payload.message,
-        parse_mode: config.parseMode || "Markdown",
+        text: getTransportOverride(payload, "telegram")?.message ?? payload.message,
         ...(destination.messageThreadId
             ? {
                 message_thread_id: coerceTelegramMessageThreadId(
@@ -362,7 +394,8 @@ export async function sendSlack(
   }
 
   try {
-    const body: Record<string, unknown> = { text: payload.message };
+    const message = getTransportOverride(payload, "slack")?.message ?? payload.message;
+    const body: Record<string, unknown> = { text: message };
     if (config.channel) {
       body.channel = config.channel;
     }
@@ -412,6 +445,7 @@ export async function sendWebhook(
   }
 
   try {
+    const message = getTransportOverride(payload, "webhook")?.message ?? payload.message;
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       ...config.headers,
@@ -423,7 +457,7 @@ export async function sendWebhook(
       body: JSON.stringify({
         event: payload.event,
         session_id: payload.sessionId,
-        message: payload.message,
+        message,
         timestamp: payload.timestamp,
         tmux_session: payload.tmuxSession,
         project_name: payload.projectName,
@@ -559,7 +593,7 @@ export async function dispatchNotifications(
     event,
   );
   if (discordConfig?.enabled) {
-    promises.push(sendDiscord(discordConfig, payload));
+    promises.push(sendDiscord(discordConfig, resolveTransportPayload(payload, "discord")));
   }
 
   const telegramConfig = getEffectivePlatformConfig<TelegramNotificationConfig>(
@@ -568,7 +602,7 @@ export async function dispatchNotifications(
     event,
   );
   if (telegramConfig?.enabled) {
-    promises.push(sendTelegram(telegramConfig, payload));
+    promises.push(sendTelegram(telegramConfig, resolveTransportPayload(payload, "telegram")));
   }
 
   const slackConfig = getEffectivePlatformConfig<SlackNotificationConfig>(
@@ -577,7 +611,7 @@ export async function dispatchNotifications(
     event,
   );
   if (slackConfig?.enabled) {
-    promises.push(sendSlack(slackConfig, payload));
+    promises.push(sendSlack(slackConfig, resolveTransportPayload(payload, "slack")));
   }
 
   const webhookConfig = getEffectivePlatformConfig<WebhookNotificationConfig>(
@@ -586,7 +620,7 @@ export async function dispatchNotifications(
     event,
   );
   if (webhookConfig?.enabled) {
-    promises.push(sendWebhook(webhookConfig, payload));
+    promises.push(sendWebhook(webhookConfig, resolveTransportPayload(payload, "webhook")));
   }
 
   const discordBotConfig =
@@ -596,7 +630,7 @@ export async function dispatchNotifications(
       event,
     );
   if (discordBotConfig?.enabled) {
-    promises.push(sendDiscordBot(discordBotConfig, payload));
+    promises.push(sendDiscordBot(discordBotConfig, resolveTransportPayload(payload, "discord-bot")));
   }
 
   if (promises.length === 0) {

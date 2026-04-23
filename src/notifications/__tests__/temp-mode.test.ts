@@ -207,6 +207,34 @@ describe('notification temp mode', () => {
     assert.equal(config.events?.['result-ready']?.enabled, true);
   });
 
+  it('temp mode applies meaningful telegram defaults when no explicit event policy exists', async () => {
+    await writeCodexConfig({
+      notifications: {
+        enabled: true,
+        verbosity: 'session',
+      },
+    });
+    process.env.OMX_TELEGRAM_BOT_TOKEN = 'env-telegram-token';
+    process.env.OMX_TELEGRAM_CHAT_ID = 'env-telegram-chat';
+    process.env.OMX_NOTIFY_TEMP_CONTRACT = JSON.stringify({
+      active: true,
+      selectors: ['telegram'],
+      canonicalSelectors: ['telegram'],
+      warnings: [],
+      source: 'cli',
+    });
+
+    const config = await getNotificationConfigFresh();
+    assert.ok(config);
+    assert.equal(config.telegram?.enabled, true);
+    assert.equal(config.events?.['session-start']?.enabled, false);
+    assert.equal(config.events?.['session-stop']?.enabled, false);
+    assert.equal(config.events?.['session-idle']?.enabled, false);
+    assert.equal(config.events?.['result-ready']?.enabled, true);
+    assert.equal(config.events?.['ask-user-question']?.enabled, true);
+    assert.equal(config.events?.['session-end']?.enabled, true);
+  });
+
   it('temp mode enables openclaw config only when explicitly selected', async () => {
     process.env.OMX_OPENCLAW = '1';
     process.env.OMX_NOTIFY_TEMP_CONTRACT = JSON.stringify({

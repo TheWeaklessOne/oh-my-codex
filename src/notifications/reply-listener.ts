@@ -53,6 +53,7 @@ import {
   parseMentionAllowedMentions,
 } from './config.js';
 import { parseTmuxTail } from './formatter.js';
+import { recordPendingReplyOrigin } from './reply-origin-state.js';
 import {
   killDetachedManagedSession,
   launchDetachedManagedSession,
@@ -1179,9 +1180,7 @@ function injectReply(
     };
   }
 
-  const prefix = config.includePrefix ? `[reply:${platform}] ` : '';
-  const sanitized = sanitizeReplyInput(prefix + text);
-  const truncated = sanitized.slice(0, config.maxMessageLength);
+  const truncated = buildInjectedReplyInput(text, platform, config);
   const success = sendToPane(paneId, truncated, true);
 
   if (success) {
@@ -1193,6 +1192,16 @@ function injectReply(
   return success
     ? { outcome: 'success' }
     : { outcome: 'retryable-failure', reason: 'tmux send failed' };
+}
+
+export function buildInjectedReplyInput(
+  text: string,
+  platform: string,
+  config: Pick<ReplyListenerDaemonConfig, 'includePrefix' | 'maxMessageLength'>,
+): string {
+  const prefix = config.includePrefix ? `[reply:${platform}] ` : '';
+  const sanitized = sanitizeReplyInput(prefix + text);
+  return sanitized.slice(0, config.maxMessageLength);
 }
 
 async function postDiscordReplyMessage(
@@ -1357,6 +1366,10 @@ export async function pollDiscordOnce(
       );
       if (injectionResult.outcome === 'success') {
         state.messagesInjected++;
+        await recordPendingReplyOrigin(mapping.projectPath, mapping.sessionId, {
+          platform: 'discord',
+          injectedInput: buildInjectedReplyInput(msg.content, 'discord', config),
+        }).catch(() => {});
         commitDiscordCursor(state, config, source, msg.id, writeDaemonStateImpl);
 
         const acknowledgement = buildReplyAcknowledgement(
@@ -2142,6 +2155,10 @@ export async function pollTelegramOnce(
       );
       if (injectionResult.outcome === 'success') {
         state.messagesInjected++;
+        await recordPendingReplyOrigin(mapping.projectPath, mapping.sessionId, {
+          platform: 'telegram',
+          injectedInput: buildInjectedReplyInput(text, 'telegram', config),
+        }).catch(() => {});
         commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
 
         const acknowledgement = buildReplyAcknowledgement(

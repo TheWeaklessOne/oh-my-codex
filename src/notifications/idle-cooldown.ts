@@ -20,6 +20,7 @@ const DEFAULT_COOLDOWN_SECONDS = 60;
 const SESSION_ID_SAFE_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/;
 const MAX_IDLE_FINGERPRINT_LENGTH = 512;
 const IDLE_NOTIFICATION_STATE_FILE = 'idle-notif-cooldown.json';
+const COMPLETED_TURN_NOTIFICATION_STATE_FILE = 'completed-turn-notif-cooldown.json';
 const SESSION_IDLE_HOOK_STATE_FILE = 'session-idle-hook-state.json';
 
 interface IdleNotificationState {
@@ -77,6 +78,10 @@ function getScopedStatePath(stateDir: string, fileName: string, sessionId?: stri
 
 function getCooldownStatePath(stateDir: string, sessionId?: string): string {
   return getScopedStatePath(stateDir, IDLE_NOTIFICATION_STATE_FILE, sessionId);
+}
+
+function getCompletedTurnStatePath(stateDir: string, sessionId?: string): string {
+  return getScopedStatePath(stateDir, COMPLETED_TURN_NOTIFICATION_STATE_FILE, sessionId);
 }
 
 function getSessionIdleHookStatePath(stateDir: string, sessionId?: string): string {
@@ -159,7 +164,27 @@ export function shouldSendCompletedTurnNotification(
   sessionId?: string,
   fingerprint?: string,
 ): boolean {
-  return shouldSendIdleNotification(stateDir, sessionId, fingerprint);
+  const cooldownSecs = getIdleNotificationCooldownSeconds();
+  const normalizedFingerprint = normalizeIdleFingerprint(fingerprint);
+
+  if (cooldownSecs === 0) return true;
+
+  const state = readIdleNotificationState(getCompletedTurnStatePath(stateDir, sessionId));
+  if (!state) return true;
+
+  if (normalizedFingerprint) {
+    return state.fingerprint !== normalizedFingerprint;
+  }
+
+  if (state.lastSentAt) {
+    const lastSentMs = new Date(state.lastSentAt).getTime();
+    if (Number.isFinite(lastSentMs)) {
+      const elapsedSecs = (Date.now() - lastSentMs) / 1000;
+      if (elapsedSecs < cooldownSecs) return false;
+    }
+  }
+
+  return true;
 }
 
 /**
@@ -181,7 +206,11 @@ export function recordCompletedTurnNotificationSent(
   sessionId?: string,
   fingerprint?: string,
 ): void {
-  recordIdleNotificationSent(stateDir, sessionId, fingerprint);
+  const normalizedFingerprint = normalizeIdleFingerprint(fingerprint);
+  writeIdleNotificationState(getCompletedTurnStatePath(stateDir, sessionId), {
+    lastSentAt: new Date().toISOString(),
+    fingerprint: normalizedFingerprint || undefined,
+  });
 }
 
 /**
