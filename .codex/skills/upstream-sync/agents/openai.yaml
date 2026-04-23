@@ -1,0 +1,4 @@
+interface:
+  display_name: "Upstream Sync"
+  short_description: "Sync local OMX work to the current upstream release"
+  default_prompt: "Use $upstream-sync to sync the current OMX work branch onto the current upstream release and relink the repo CLI."

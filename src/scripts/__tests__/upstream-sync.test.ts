@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(testDir, '..', '..', '..');
-const syncScript = join(repoRoot, '.codex', 'skills', 'mission-upstream-sync', 'scripts', 'sync.sh');
+const syncScript = join(repoRoot, '.codex', 'skills', 'upstream-sync', 'scripts', 'sync.sh');
 
 function git(cwd: string, args: string[]): string {
 	return execFileSync('git', args, { cwd, encoding: 'utf-8' }).trim();
@@ -38,6 +38,13 @@ function runSync(
 		stdout: result.stdout || '',
 		stderr: result.stderr || '',
 	};
+}
+
+function summaryLines(stdout: string): string[] {
+	return stdout
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean);
 }
 
 async function createSyncFixture(
@@ -165,41 +172,46 @@ async function installFakeCliTools(): Promise<{ env: Record<string, string>; log
 	};
 }
 
-describe('mission-upstream-sync skill script', () => {
-	it('defaults to the current non-main branch when no --branch is provided', async () => {
+describe('upstream-sync skill script', () => {
+	it('defaults to the current non-main branch and emits a short dry-run report', async () => {
 		const branchName = 'feat/current-work';
 		const fixture = await createSyncFixture(branchName, 'clean');
 
 		try {
 			const result = runSync(fixture.repo, ['--remote', 'origin', '--check-only', '--no-cli-update']);
 			assert.equal(result.status, 0, result.stderr || result.stdout);
-			assert.match(result.stdout, /==> Working branch status/);
-			assert.match(result.stdout, new RegExp(`Target branch:\\s+${branchName}`));
-			assert.doesNotMatch(result.stdout, /Mission branch status/);
+
+			const lines = summaryLines(result.stdout);
+			assert.equal(lines.length, 3, result.stdout);
+			assert.match(lines[0], new RegExp(`^move: dry-run \\| branch=${branchName} \\| target=release v0\\.1\\.1 \\| cli=skipped \\| conflicts=0$`));
+			assert.equal(lines[1], 'problems: none');
+			assert.equal(lines[2], 'releases: v0.1.1 upstream update');
 		} finally {
 			await rm(fixture.cleanupRoot, { recursive: true, force: true });
 		}
 	});
 
-	it('stops on probe conflicts and leaves resolution to the invoking agent', async () => {
+	it('auto-resolves rebase conflicts in favor of the current work and reports them briefly', async () => {
 		const branchName = 'feat/conflict-sync';
 		const fixture = await createSyncFixture(branchName, 'delete-agents');
 
 		try {
 			const result = runSync(fixture.repo, ['--branch', branchName, '--remote', 'origin', '--no-cli-update']);
-			assert.equal(result.status, 1, result.stderr || result.stdout);
-			assert.match(result.stdout, /Probe result:\s+conflict/);
-			assert.match(result.stdout, /Rebase result:\s+conflict/);
-			assert.match(result.stdout, /AGENTS\.md/);
-			assert.doesNotMatch(result.stdout, /auto-resolved/i);
+			assert.equal(result.status, 0, result.stderr || result.stdout);
+
+			const lines = summaryLines(result.stdout);
+			assert.equal(lines.length, 3, result.stdout);
+			assert.match(lines[0], new RegExp(`^move: ok \\| branch=${branchName} \\| target=release v0\\.1\\.1 \\| cli=skipped \\| conflicts=1\\(auto\\)$`));
+			assert.equal(lines[1], 'problems: auto-resolved AGENTS.md');
+			assert.equal(lines[2], 'releases: v0.1.1 upstream update');
 
 			const conflicts = git(fixture.repo, ['diff', '--name-only', '--diff-filter=U']);
-			assert.match(conflicts, /AGENTS\.md/);
+			assert.equal(conflicts, '');
 
 			const counts = git(fixture.repo, ['rev-list', '--left-right', '--count', `${branchName}...refs/remotes/origin/main`]);
 			const [ahead, behind] = counts.split(/\s+/);
 			assert.equal(ahead, '1');
-			assert.equal(behind, '1');
+			assert.equal(behind, '0');
 
 			const agents = await readFile(join(fixture.repo, 'AGENTS.md'), 'utf-8');
 			assert.match(agents, /work branch file for feat\/conflict-sync/);
@@ -208,14 +220,19 @@ describe('mission-upstream-sync skill script', () => {
 		}
 	});
 
-	it('rebases onto the latest release tag instead of unreleased remote main commits', async () => {
+	it('rebases onto the latest release tag instead of unreleased remote main commits and reports release news briefly', async () => {
 		const branchName = 'feat/release-target';
 		const fixture = await createSyncFixture(branchName, 'clean', { releaseTrailingMainCommit: true });
 
 		try {
 			const result = runSync(fixture.repo, ['--branch', branchName, '--remote', 'origin', '--no-cli-update']);
 			assert.equal(result.status, 0, result.stderr || result.stdout);
-			assert.match(result.stdout, /Sync target:\s+release v0\.1\.1/);
+
+			const lines = summaryLines(result.stdout);
+			assert.equal(lines.length, 3, result.stdout);
+			assert.match(lines[0], /^move: ok \| branch=feat\/release-target \| target=release v0\.1\.1 \| cli=skipped \| conflicts=0$/);
+			assert.equal(lines[1], 'problems: none');
+			assert.equal(lines[2], 'releases: v0.1.1 upstream update');
 
 			const counts = git(fixture.repo, ['rev-list', '--left-right', '--count', `${branchName}...refs/remotes/origin/main`]);
 			const [ahead, behind] = counts.split(/\s+/);
@@ -229,7 +246,7 @@ describe('mission-upstream-sync skill script', () => {
 		}
 	});
 
-	it('rebuilds and relinks the local repo-backed CLI instead of installing the published npm package', async () => {
+	it('rebuilds and relinks the local repo-backed CLI and reports the move concisely', async () => {
 		const branchName = 'feat/link-sync';
 		const fixture = await createSyncFixture(branchName, 'clean');
 		const fakeCli = await installFakeCliTools();
@@ -237,8 +254,12 @@ describe('mission-upstream-sync skill script', () => {
 		try {
 			const result = runSync(fixture.repo, ['--branch', branchName, '--remote', 'origin'], fakeCli.env);
 			assert.equal(result.status, 0, result.stderr || result.stdout);
-			assert.match(result.stdout, /==> Local CLI sync/);
-			assert.match(result.stdout, /Linked CLI root:/);
+
+			const lines = summaryLines(result.stdout);
+			assert.equal(lines.length, 3, result.stdout);
+			assert.match(lines[0], /^move: ok \| branch=feat\/link-sync \| target=release v0\.1\.1 \| cli=linked \| conflicts=0$/);
+			assert.equal(lines[1], 'problems: none');
+			assert.equal(lines[2], 'releases: v0.1.1 upstream update');
 
 			const npmLog = readFileSync(fakeCli.logPath, 'utf-8');
 			assert.match(npmLog, /^npm run build$/m);
