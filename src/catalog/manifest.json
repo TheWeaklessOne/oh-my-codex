@@ -43,6 +43,12 @@
       "status": "active"
     },
     {
+      "name": "pipeline",
+      "category": "execution",
+      "status": "active",
+      "core": false
+    },
+    {
       "name": "swarm",
       "category": "execution",
       "status": "alias",

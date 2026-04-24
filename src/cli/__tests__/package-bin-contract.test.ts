@@ -4,6 +4,8 @@ import { readFileSync, rmSync } from 'node:fs';
 import { arch, platform } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { getSetupInstallableSkillNames } from '../../catalog/installable.js';
+import { readCatalogManifest } from '../../catalog/reader.js';
 
 type PackageJson = {
   files?: string[];
@@ -40,13 +42,15 @@ describe('package bin contract', () => {
     assert.equal(pkg.scripts?.['clean:native-package-assets'], 'node dist/scripts/cleanup-explore-harness.js');
     assert.equal(pkg.scripts?.['sync:plugin'], 'node dist/scripts/sync-plugin-mirror.js');
     assert.equal(pkg.scripts?.['sync:plugin:check'], 'node dist/scripts/sync-plugin-mirror.js --check');
-    assert.equal(pkg.scripts?.prepack, 'npm run build && npm run sync:plugin && npm run clean:native-package-assets');
+    assert.equal(pkg.scripts?.['verify:plugin-bundle'], 'node dist/scripts/sync-plugin-mirror.js --check');
+    assert.equal(pkg.scripts?.prepack, 'npm run build && npm run sync:plugin && npm run verify:plugin-bundle && npm run clean:native-package-assets');
     assert.equal(pkg.scripts?.postinstall, 'node src/scripts/postinstall-bootstrap.js');
     assert.equal(pkg.scripts?.postpack, 'npm run clean:native-package-assets');
     assert.equal(pkg.scripts?.['test:explore'], 'cargo test -p omx-explore-harness && node --test dist/cli/__tests__/explore.test.js dist/hooks/__tests__/explore-routing.test.js dist/hooks/__tests__/explore-sparkshell-guidance-contract.test.js');
     assert.equal(pkg.scripts?.['test:team:cross-rebase-smoke:compiled'], 'node --test dist/team/__tests__/cross-rebase-smoke.test.js');
     assert.equal(pkg.scripts?.['test:node'], 'node dist/scripts/run-test-files.js dist');
-    assert.equal(pkg.scripts?.['test:ci:compiled'], 'npm run test:node && node dist/scripts/generate-catalog-docs.js --check');
+    assert.equal(pkg.scripts?.test, 'npm run build && npm run verify:plugin-bundle && npm run test:node && node dist/scripts/generate-catalog-docs.js --check');
+    assert.equal(pkg.scripts?.['test:ci:compiled'], 'npm run verify:plugin-bundle && npm run test:node && node dist/scripts/generate-catalog-docs.js --check');
     assert.equal(
       pkg.scripts?.['coverage:team-critical'],
       "npm run build && c8 --all --src dist/team --src dist/state --include 'dist/team/**/*.js' --include 'dist/state/**/*.js' --exclude '**/__tests__/**' --reporter=text-summary --reporter=lcov --reporter=json-summary --report-dir coverage/team --check-coverage --lines=78 --functions=90 --branches=70 --statements=78 node dist/scripts/run-test-files.js dist/team/__tests__ dist/state/__tests__",
@@ -69,7 +73,7 @@ describe('package bin contract', () => {
     );
     assert.equal(
       pkg.scripts?.['test:plugin-boundaries:compiled'],
-      'node --test dist/cli/__tests__/codex-plugin-layout.test.js dist/cli/__tests__/package-bin-contract.test.js dist/cli/__tests__/setup-hooks-shared-ownership.test.js',
+      'node --test dist/cli/__tests__/codex-plugin-layout.test.js dist/cli/__tests__/package-bin-contract.test.js dist/cli/__tests__/setup-hooks-shared-ownership.test.js dist/catalog/__tests__/plugin-bundle-ssot.test.js',
     );
     assert.equal(pkg.scripts?.['test:compat:node'], 'npm run build && node dist/scripts/run-test-files.js dist/compat/__tests__');
 
@@ -131,8 +135,6 @@ describe('package bin contract', () => {
     const codeIntelServerEntry = results[0]?.files?.find((file) => file.path === 'dist/mcp/code-intel-server.js');
     const traceServerEntry = results[0]?.files?.find((file) => file.path === 'dist/mcp/trace-server.js');
     const wikiServerEntry = results[0]?.files?.find((file) => file.path === 'dist/mcp/wiki-server.js');
-    const pluginRalphSkillEntry = results[0]?.files?.find((file) => file.path === 'plugins/oh-my-codex/skills/ralph/SKILL.md');
-    const pluginWorkerSkillEntry = results[0]?.files?.find((file) => file.path === 'plugins/oh-my-codex/skills/worker/SKILL.md');
     const rootRalphSkillEntry = results[0]?.files?.find((file) => file.path === 'skills/ralph/SKILL.md');
     const promptEntry = results[0]?.files?.find((file) => file.path === 'prompts/executor.md');
     const templateEntry = results[0]?.files?.find((file) => file.path === 'templates/AGENTS.md');
@@ -159,8 +161,15 @@ describe('package bin contract', () => {
     assert.ok(codeIntelServerEntry, 'expected npm pack output to include dist/mcp/code-intel-server.js for omx mcp-serve');
     assert.ok(traceServerEntry, 'expected npm pack output to include dist/mcp/trace-server.js for omx mcp-serve');
     assert.ok(wikiServerEntry, 'expected npm pack output to include dist/mcp/wiki-server.js for omx mcp-serve');
-    assert.ok(pluginRalphSkillEntry, 'expected npm pack output to include mirrored plugin ralph skill');
-    assert.ok(pluginWorkerSkillEntry, 'expected npm pack output to include mirrored plugin worker skill');
+    const packedFilePaths = new Set((results[0]?.files ?? []).map((file) => file.path));
+    const installableSkillNames = [...getSetupInstallableSkillNames(readCatalogManifest(process.cwd()))].sort();
+    for (const skillName of installableSkillNames) {
+      assert.equal(
+        packedFilePaths.has(`plugins/oh-my-codex/skills/${skillName}/SKILL.md`),
+        true,
+        `expected npm pack output to include mirrored plugin ${skillName} skill`,
+      );
+    }
     assert.ok(rootRalphSkillEntry, 'expected npm pack output to keep canonical root skills');
     assert.ok(promptEntry, 'expected npm pack output to keep prompts');
     assert.ok(templateEntry, 'expected npm pack output to keep templates');
