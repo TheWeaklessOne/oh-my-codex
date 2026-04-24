@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { writeUserInstallStamp } from "../../cli/update.js";
+import { preferLogicalPath } from "../../utils/paths.js";
 import {
   isGlobalInstallLifecycle,
   runPostinstall,
@@ -193,7 +194,7 @@ describe("runPostinstall", () => {
       });
 
       assert.equal(result.status, "setup-ran");
-      assert.equal(process.cwd(), packageRoot);
+      assert.equal(preferLogicalPath(process.cwd()), preferLogicalPath(packageRoot));
       assert.equal(
         JSON.parse(await readFile(scopeFile, "utf-8")).scope,
         "project",

@@ -22,11 +22,11 @@ const docsToScan = [
 ];
 
 const forbiddenCountLiterals = [
-  /\b30\b/,
-  /\b40\b/,
-  /30\+/,
-  /\(40\)/,
-  /expected\s+30\+/,
+  /\b30\+\s*(?:skills?|prompts?|agents?|roles?)\b/i,
+  /\b30\s+(?:skills?|prompts?|agents?|roles?)\b/i,
+  /\b40\s+(?:skills?|prompts?|agents?|roles?)\b/i,
+  /\(40\s+(?:skills?|prompts?|agents?|roles?)\)/i,
+  /\bexpected\s+30\+\b/i,
 ];
 
 function canonicalize(value: unknown): unknown {

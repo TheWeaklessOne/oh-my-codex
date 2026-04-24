@@ -28,6 +28,7 @@ import {
   detectLegacySkillRootOverlap,
   omxPlansDir,
   omxLogsDir,
+  preferLogicalPath,
 } from "../utils/paths.js";
 import {
   buildMergedConfig,
@@ -712,7 +713,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
     modelUpgradePrompt,
   } = options;
   const pkgRoot = getPackageRoot();
-  const projectRoot = process.cwd();
+  const projectRoot = preferLogicalPath(process.cwd());
   const resolvedScope = await resolveSetupScope(projectRoot, requestedScope);
   const scopeDirs = resolveScopeDirectories(resolvedScope.scope, projectRoot);
   const scopeSourceMessage =

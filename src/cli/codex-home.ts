@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
-import { codexConfigPath } from "../utils/paths.js";
+import { codexConfigPath, preferLogicalPath } from "../utils/paths.js";
 import { SETUP_SCOPES, type SetupScope } from "./setup.js";
 
 /**
@@ -48,7 +48,7 @@ export function resolveCodexHomeForLaunch(
   if (env.CODEX_HOME && env.CODEX_HOME.trim() !== "") return env.CODEX_HOME;
   const persistedScope = readPersistedSetupScope(cwd);
   if (persistedScope === "project") {
-    return join(cwd, ".codex");
+    return join(preferLogicalPath(cwd), ".codex");
   }
   return undefined;
 }

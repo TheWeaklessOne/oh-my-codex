@@ -333,11 +333,12 @@ const SEMANTIC_STALL_PROMPT_PATTERNS = [
   /\bdrive forward\b/g,
   /\bi'?ll continue from\b/g,
 ];
+const NORMALIZED_DEFAULT_MARKER = normalizeSemanticText(DEFAULT_MARKER);
 
 function normalizeStallDetectionText(text) {
   return normalizeSemanticText(stripOrchestrationIntentTags(safeString(text)))
     .split('\n')
-    .filter((line) => !line.includes(DEFAULT_MARKER))
+    .filter((line) => !line.includes(NORMALIZED_DEFAULT_MARKER))
     .join('\n');
 }
 

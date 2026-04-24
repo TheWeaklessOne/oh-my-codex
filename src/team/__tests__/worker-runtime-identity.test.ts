@@ -105,12 +105,14 @@ process.on('SIGTERM', () => process.exit(0));
     const prevTmux = process.env.TMUX;
     const prevLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
     const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const prevWorkerLaunchArgs = process.env.OMX_TEAM_WORKER_LAUNCH_ARGS;
     const prevCaptureDir = process.env.OMX_ARGV_CAPTURE_DIR;
 
     process.env.PATH = `${binDir}:${prevPath ?? ''}`;
     delete process.env.TMUX;
     process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'prompt';
     process.env.OMX_TEAM_WORKER_CLI = 'codex';
+    delete process.env.OMX_TEAM_WORKER_LAUNCH_ARGS;
     process.env.OMX_ARGV_CAPTURE_DIR = captureDir;
 
     let runtime: TeamRuntime | null = null;
@@ -178,6 +180,8 @@ process.on('SIGTERM', () => process.exit(0));
       else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
       if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
       else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof prevWorkerLaunchArgs === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_ARGS = prevWorkerLaunchArgs;
+      else delete process.env.OMX_TEAM_WORKER_LAUNCH_ARGS;
       if (typeof prevCaptureDir === 'string') process.env.OMX_ARGV_CAPTURE_DIR = prevCaptureDir;
       else delete process.env.OMX_ARGV_CAPTURE_DIR;
       await rm(cwd, { recursive: true, force: true });

@@ -20,7 +20,9 @@ const ENV_KEYS = [
   'OMX_OPENCLAW',
 ] as const;
 
+const ORIGINAL_HOME = process.env.HOME;
 let tempCodexHome: string;
+let tempHomeRoot: string;
 
 async function writeCodexConfig(contents: unknown): Promise<void> {
   await mkdir(tempCodexHome, { recursive: true });
@@ -42,15 +44,18 @@ describe('notification temp mode', () => {
   beforeEach(async () => {
     clearEnv();
     resetOpenClawConfigCache();
-    tempCodexHome = await mkdtemp(join(tmpdir(), 'omx-notify-temp-'));
+    tempHomeRoot = await mkdtemp(join(tmpdir(), 'omx-notify-home-'));
+    tempCodexHome = join(tempHomeRoot, '.codex-explicit');
     process.env.CODEX_HOME = tempCodexHome;
+    process.env.HOME = tempHomeRoot;
   });
 
   afterEach(async () => {
     clearEnv();
+    if (typeof ORIGINAL_HOME === 'string') process.env.HOME = ORIGINAL_HOME;
     resetOpenClawConfigCache();
-    if (tempCodexHome) {
-      await rm(tempCodexHome, { recursive: true, force: true });
+    if (tempHomeRoot) {
+      await rm(tempHomeRoot, { recursive: true, force: true });
     }
   });
 
