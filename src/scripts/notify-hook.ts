@@ -21,6 +21,7 @@
 import { writeFile, appendFile, mkdir, readFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
+import { homedir } from 'os';
 
 import { safeString, asNumber } from './notify-hook/utils.js';
 import {
@@ -97,6 +98,108 @@ function isTurnCompletePayload(payload: Record<string, unknown>): boolean {
   return type === '' || type === 'agent-turn-complete' || type === 'turn-complete';
 }
 
+function codexSessionDateDirs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const roots = [
+    safeString(env.CODEX_HOME).trim(),
+    join(safeString(env.HOME).trim() || homedir(), '.codex'),
+  ].filter(Boolean);
+  const now = new Date();
+  const days = [now, new Date(now.getTime() - 24 * 60 * 60 * 1000)];
+  const dirs = roots.flatMap((root) => days.map((day) => join(
+    root,
+    'sessions',
+    String(day.getUTCFullYear()),
+    String(day.getUTCMonth() + 1).padStart(2, '0'),
+    String(day.getUTCDate()).padStart(2, '0'),
+  )));
+  return Array.from(new Set(dirs));
+}
+
+function parseJsonLine(line: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(line) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function isOmxExploreSessionMetaPayload(payload: Record<string, unknown>): boolean {
+  const originator = safeString(payload.originator).toLowerCase();
+  const source = safeString(payload.source).toLowerCase();
+  const baseInstructions = recordValue(payload.base_instructions);
+  const baseInstructionsText = safeString(baseInstructions.text || payload.base_instructions);
+  return originator === 'codex_exec'
+    && source === 'exec'
+    && (
+      baseInstructionsText.includes('OMX Explore Lightweight Instructions')
+      || baseInstructionsText.includes('executing the `omx explore` command path')
+    );
+}
+
+async function resolveTurnOriginFromRecentCodexSession(
+  cwd: string,
+  threadId: string,
+  env: NodeJS.ProcessEnv = process.env,
+) {
+  const normalizedThreadId = threadId.trim();
+  if (!normalizedThreadId) return null;
+
+  for (const dir of codexSessionDateDirs(env)) {
+    if (!existsSync(dir)) continue;
+    const names = await readdir(dir).catch(() => [] as string[]);
+    for (const name of names.filter((entry) => entry.startsWith('rollout-') && entry.endsWith('.jsonl')).sort().reverse()) {
+      const path = join(dir, name);
+      const content = await readFile(path, 'utf-8').catch(() => '');
+      if (!content.includes(normalizedThreadId)) continue;
+
+      const lines = content.split('\n').slice(0, 40);
+      let sessionMetaPayload: Record<string, unknown> | null = null;
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const record = parseJsonLine(line);
+        if (!record) continue;
+        if (record.type !== 'session_meta') continue;
+        const payload = record.payload && typeof record.payload === 'object' && !Array.isArray(record.payload)
+          ? record.payload as Record<string, unknown>
+          : null;
+        if (
+          payload
+          && safeString(payload.id).trim() === normalizedThreadId
+          && safeString(payload.cwd).trim() === cwd
+        ) {
+          sessionMetaPayload = payload;
+        }
+      }
+
+      if (!sessionMetaPayload) continue;
+      if (isOmxExploreSessionMetaPayload(sessionMetaPayload)) {
+        return {
+          kind: 'internal-helper' as const,
+          threadId: normalizedThreadId,
+          source: 'omx-explore',
+        };
+      }
+
+      const parsedOrigin = resolveTurnOrigin({
+        session_meta: sessionMetaPayload,
+        thread_id: normalizedThreadId,
+      }, env);
+      if (parsedOrigin.kind !== 'unknown') return parsedOrigin;
+    }
+  }
+
+  return null;
+}
+
 async function main() {
   const rawPayload = process.argv[process.argv.length - 1];
   if (!rawPayload || rawPayload.startsWith('-')) {
@@ -136,6 +239,19 @@ async function main() {
   currentOmxSessionId = await readCurrentSessionId(stateDir).catch(() => '') || '';
 
   let turnOrigin = resolveTurnOrigin(payload, process.env);
+  if (turnOrigin.kind === 'unknown' && payloadThreadId) {
+    const sessionOrigin = await resolveTurnOriginFromRecentCodexSession(
+      cwd,
+      payloadThreadId,
+      process.env,
+    ).catch(() => null);
+    if (sessionOrigin) {
+      turnOrigin = {
+        ...turnOrigin,
+        ...sessionOrigin,
+      };
+    }
+  }
   if (!isTeamWorker && getEffectiveSessionId() && payloadThreadId) {
     try {
       const { readSubagentTrackingState } = await import('../subagents/tracker.js');
@@ -189,7 +305,7 @@ async function main() {
     try {
       const threadId = safeString(payload['thread-id'] || payload.thread_id || '');
       const turnId = safeString(payload['turn-id'] || payload.turn_id || '');
-      if (getEffectiveSessionId() && threadId) {
+      if (getEffectiveSessionId() && threadId && turnOrigin.kind !== 'internal-helper') {
         const { recordSubagentTurnForSession } = await import('../subagents/tracker.js');
         const trackingKind = turnOrigin.kind === 'leader'
           ? 'leader'
@@ -509,59 +625,75 @@ async function main() {
     }
   }
 
-  // 7. Dispatch native turn-complete hook event (best effort, post-dedupe)
-  try {
-    const { buildNativeHookEvent, buildDerivedHookEvent } = await import('../hooks/extensibility/events.js');
-    const { dispatchHookEvent } = await import('../hooks/extensibility/dispatcher.js');
-    const sessionIdForHooks = getEffectiveSessionId();
-    const threadIdForHooks = safeString(payload['thread-id'] || payload.thread_id || '');
-    const turnIdForHooks = safeString(payload['turn-id'] || payload.turn_id || '');
-    const modeForHooks = safeString(payload.mode || '');
-    const outputPreview = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '').slice(0, 400);
-    const event = buildNativeHookEvent('turn-complete', {
-      source: safeString(payload.source || 'native'),
-      type: safeString(payload.type || 'agent-turn-complete'),
-      input_messages: normalizeInputMessages(payload),
-      output_preview: outputPreview,
-      native_session_id: payloadSessionId || null,
-      omx_session_id: sessionIdForHooks || null,
-      ...readRepositoryMetadata(cwd),
-      session_name: resolveOperationalSessionName(cwd, sessionIdForHooks),
-      project_path: cwd,
-      project_name: safeString(payload.project_name || ''),
-    }, {
-      session_id: sessionIdForHooks,
-      thread_id: threadIdForHooks,
-      turn_id: turnIdForHooks,
-      mode: modeForHooks,
+  // 7. Dispatch native turn-complete hook event (best effort, post-dedupe).
+  // Non-leader/internal-helper turns may contain private helper/subagent output,
+  // so suppress extensibility hooks with the same policy as human-facing
+  // completed-turn notifications.
+  const suppressExternalCompletedTurn = isExternalCompletedTurnSuppressedOrigin(turnOrigin);
+  if (suppressExternalCompletedTurn) {
+    await logNotifyHookEvent(logsDir, {
+      timestamp: new Date().toISOString(),
+      type: 'turn_complete_hooks_suppressed_non_leader',
+      origin_kind: turnOrigin.kind,
+      thread_id: safeString(payload['thread-id'] || payload.thread_id || ''),
+      parent_thread_id: turnOrigin.parentThreadId || null,
+      agent_nickname: turnOrigin.agentNickname || null,
+      agent_role: turnOrigin.agentRole || null,
     });
-    await dispatchHookEvent(event, { cwd });
-
-    for (const signal of deriveAssistantSignalEvents(outputPreview)) {
-      const derivedEvent = buildDerivedHookEvent(signal.event, buildOperationalContext({
-        cwd,
-        normalizedEvent: signal.normalized_event,
-        sessionId: sessionIdForHooks,
-        text: outputPreview,
-        status: signal.normalized_event,
-        errorSummary: signal.error_summary,
-        extra: {
-          native_session_id: payloadSessionId || null,
-          omx_session_id: sessionIdForHooks || null,
-          source_event: safeString(payload.type || 'agent-turn-complete'),
-        },
-      }), {
+  } else {
+    try {
+      const { buildNativeHookEvent, buildDerivedHookEvent } = await import('../hooks/extensibility/events.js');
+      const { dispatchHookEvent } = await import('../hooks/extensibility/dispatcher.js');
+      const sessionIdForHooks = getEffectiveSessionId();
+      const threadIdForHooks = safeString(payload['thread-id'] || payload.thread_id || '');
+      const turnIdForHooks = safeString(payload['turn-id'] || payload.turn_id || '');
+      const modeForHooks = safeString(payload.mode || '');
+      const outputPreview = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '').slice(0, 400);
+      const event = buildNativeHookEvent('turn-complete', {
+        source: safeString(payload.source || 'native'),
+        type: safeString(payload.type || 'agent-turn-complete'),
+        input_messages: normalizeInputMessages(payload),
+        output_preview: outputPreview,
+        native_session_id: payloadSessionId || null,
+        omx_session_id: sessionIdForHooks || null,
+        ...readRepositoryMetadata(cwd),
+        session_name: resolveOperationalSessionName(cwd, sessionIdForHooks),
+        project_path: cwd,
+        project_name: safeString(payload.project_name || ''),
+      }, {
         session_id: sessionIdForHooks,
         thread_id: threadIdForHooks,
         turn_id: turnIdForHooks,
         mode: modeForHooks,
-        confidence: signal.confidence,
-        parser_reason: signal.parser_reason,
       });
-      await dispatchHookEvent(derivedEvent, { cwd });
+      await dispatchHookEvent(event, { cwd });
+
+      for (const signal of deriveAssistantSignalEvents(outputPreview)) {
+        const derivedEvent = buildDerivedHookEvent(signal.event, buildOperationalContext({
+          cwd,
+          normalizedEvent: signal.normalized_event,
+          sessionId: sessionIdForHooks,
+          text: outputPreview,
+          status: signal.normalized_event,
+          errorSummary: signal.error_summary,
+          extra: {
+            native_session_id: payloadSessionId || null,
+            omx_session_id: sessionIdForHooks || null,
+            source_event: safeString(payload.type || 'agent-turn-complete'),
+          },
+        }), {
+          session_id: sessionIdForHooks,
+          thread_id: threadIdForHooks,
+          turn_id: turnIdForHooks,
+          mode: modeForHooks,
+          confidence: signal.confidence,
+          parser_reason: signal.parser_reason,
+        });
+        await dispatchHookEvent(derivedEvent, { cwd });
+      }
+    } catch {
+      // Non-fatal: extensibility modules may not be built yet
     }
-  } catch {
-    // Non-fatal: extensibility modules may not be built yet
   }
 
   // 8. Dispatch semantic human-facing notifications while preserving the
@@ -579,7 +711,6 @@ async function main() {
       const notifySessionId = getEffectiveSessionId();
       const lastAssistantMessage = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '');
       const hasAssistantText = lastAssistantMessage.trim().length > 0;
-      const suppressExternalCompletedTurn = isExternalCompletedTurnSuppressedOrigin(turnOrigin);
       if (suppressExternalCompletedTurn && hasAssistantText) {
         await logNotifyHookEvent(logsDir, {
           timestamp: new Date().toISOString(),

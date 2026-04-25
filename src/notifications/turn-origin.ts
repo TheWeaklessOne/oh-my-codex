@@ -2,6 +2,7 @@ export type TurnOriginKind =
   | "leader"
   | "native-subagent"
   | "team-worker"
+  | "internal-helper"
   | "unknown";
 
 export interface TurnOrigin {
@@ -60,6 +61,15 @@ function normalizeExplicitKind(value: unknown): TurnOriginKind | "" {
     || normalized === "worker"
   ) {
     return "team-worker";
+  }
+  if (
+    normalized === "internal-helper"
+    || normalized === "internal_helper"
+    || normalized === "helper"
+    || normalized === "omx-helper"
+    || normalized === "omx_helper"
+  ) {
+    return "internal-helper";
   }
   if (normalized === "unknown") return "unknown";
   return "";
@@ -134,7 +144,7 @@ function extractSubagentSourceOrigin(
     };
   }
 
-  if (sourceKind === "leader" || sourceKind === "team-worker") {
+  if (sourceKind === "leader" || sourceKind === "team-worker" || sourceKind === "internal-helper") {
     return {
       ...fallback,
       kind: sourceKind,
@@ -204,6 +214,14 @@ export function resolveTurnOrigin(
     };
   }
 
+  if (env.OMX_SUPPRESS_COMPLETED_TURN === "1") {
+    return {
+      ...fallback,
+      kind: "internal-helper",
+      source: firstString(env.OMX_SUPPRESS_COMPLETED_TURN_REASON, fallback.source, "omx-internal-helper"),
+    };
+  }
+
   const topLevel = extractOriginFromContainer(payload, fallback);
   if (topLevel) return topLevel;
 
@@ -236,5 +254,7 @@ export function resolveTurnOrigin(
 }
 
 export function isExternalCompletedTurnSuppressedOrigin(origin: TurnOrigin): boolean {
-  return origin.kind === "native-subagent" || origin.kind === "team-worker";
+  return origin.kind === "native-subagent"
+    || origin.kind === "team-worker"
+    || origin.kind === "internal-helper";
 }

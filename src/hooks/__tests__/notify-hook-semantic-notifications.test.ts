@@ -208,6 +208,30 @@ export async function onHookEvent(event) {
 `, 'utf-8');
 }
 
+async function writeCaptureAllHookPlugin(workdir: string, capturePath: string): Promise<void> {
+  const hooksDir = join(workdir, '.omx', 'hooks');
+  await mkdir(hooksDir, { recursive: true });
+  await writeFile(join(hooksDir, 'capture-all-events.mjs'), `
+import { appendFileSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
+
+const capturePath = ${JSON.stringify(capturePath)};
+
+export async function onHookEvent(event) {
+  mkdirSync(dirname(capturePath), { recursive: true });
+  appendFileSync(capturePath, JSON.stringify({
+    event: event.event || '',
+    source: event.source || '',
+    session_id: event.session_id || '',
+    thread_id: event.thread_id || '',
+    turn_id: event.turn_id || '',
+    output_preview: event.context?.output_preview || '',
+    text: event.context?.text || '',
+  }) + '\\n');
+}
+`, 'utf-8');
+}
+
 async function readCapturedHookEvents(path: string): Promise<Array<Record<string, string>>> {
   try {
     const raw = await readFile(path, 'utf-8');
@@ -297,6 +321,48 @@ async function writeSubagentTrackingFixture(
       },
     },
   }, null, 2));
+}
+
+function todayCodexSessionDir(home: string): string {
+  const now = new Date();
+  return join(
+    home,
+    '.codex',
+    'sessions',
+    String(now.getUTCFullYear()),
+    String(now.getUTCMonth() + 1).padStart(2, '0'),
+    String(now.getUTCDate()).padStart(2, '0'),
+  );
+}
+
+async function writeRolloutSessionMeta(
+  home: string,
+  sessionMeta: Record<string, unknown>,
+): Promise<void> {
+  const dir = todayCodexSessionDir(home);
+  await mkdir(dir, { recursive: true });
+  const threadId = String(sessionMeta.id || `thread-${Date.now()}`);
+  await writeFile(
+    join(dir, `rollout-test-${threadId}.jsonl`),
+    `${JSON.stringify({
+      timestamp: new Date().toISOString(),
+      type: 'session_meta',
+      payload: sessionMeta,
+    })}\n`,
+  );
+}
+
+async function writeRolloutRecords(
+  home: string,
+  threadId: string,
+  records: Array<Record<string, unknown>>,
+): Promise<void> {
+  const dir = todayCodexSessionDir(home);
+  await mkdir(dir, { recursive: true });
+  await writeFile(
+    join(dir, `rollout-test-${threadId}.jsonl`),
+    `${records.map((record) => JSON.stringify(record)).join('\n')}\n`,
+  );
 }
 
 function runNotifyHook(
@@ -857,6 +923,182 @@ describe('notify-hook semantic notifications', () => {
 
       const requests = await readCapturedRequests(capturePath);
       assert.equal(requests.filter((request) => /sendMessage/.test(request.url)).length, 0);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('uses rollout session metadata to suppress first native subagent completed-turn payloads', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-rollout-subagent-suppressed-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const sessionId = 'sess-rollout-subagent-suppressed';
+    const leaderThreadId = 'thread-rollout-leader';
+    const subagentThreadId = 'thread-rollout-subagent';
+
+    try {
+      await writeNotificationConfig(codexHome);
+      await writeRolloutSessionMeta(tempRoot, {
+        id: subagentThreadId,
+        cwd: workdir,
+        source: {
+          subagent: {
+            thread_spawn: {
+              parent_thread_id: leaderThreadId,
+            },
+            agent_nickname: 'Godel',
+            agent_role: 'code-reviewer',
+          },
+        },
+        agent_nickname: 'Godel',
+        agent_role: 'code-reviewer',
+      });
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: sessionId,
+        thread_id: subagentThreadId,
+        turn_id: 'turn-rollout-subagent',
+        input_messages: [],
+        last_assistant_message: '{"findings":[{"severity":"high"}]}',
+      }, {
+        CODEX_HOME: codexHome,
+        HOME: tempRoot,
+        USERPROFILE: tempRoot,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const requests = await readCapturedRequests(capturePath);
+      assert.equal(requests.length, 0);
+
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = (await readFile(notifyLog, 'utf-8'))
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const suppressedEntry = entries.find((entry) => entry.type === 'completed_turn_suppressed_non_leader');
+      assert.equal(suppressedEntry?.origin_kind, 'native-subagent');
+      assert.equal(suppressedEntry?.parent_thread_id, leaderThreadId);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('suppresses env-marked internal helper turns before extensibility hooks and tracking', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-env-helper-suppressed-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const hookCapturePath = join(tempRoot, 'hook-events.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const sessionId = 'sess-env-helper-suppressed';
+    const helperThreadId = 'thread-env-helper';
+
+    try {
+      await mkdir(workdir, { recursive: true });
+      await writeNotificationConfig(codexHome);
+      await writeCaptureAllHookPlugin(workdir, hookCapturePath);
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: sessionId,
+        thread_id: helperThreadId,
+        turn_id: 'turn-env-helper',
+        input_messages: [],
+        last_assistant_message: 'secret helper output that must stay internal',
+      }, {
+        CODEX_HOME: codexHome,
+        HOME: tempRoot,
+        USERPROFILE: tempRoot,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        OMX_SUPPRESS_COMPLETED_TURN: '1',
+        OMX_SUPPRESS_COMPLETED_TURN_REASON: 'omx-explore',
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      assert.equal((await readCapturedRequests(capturePath)).length, 0);
+      assert.deepEqual(await readCapturedHookEvents(hookCapturePath), []);
+
+      const trackerPath = join(workdir, '.omx', 'state', 'subagent-tracking.json');
+      assert.doesNotMatch(await readFile(trackerPath, 'utf-8').catch(() => ''), new RegExp(helperThreadId));
+
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = (await readFile(notifyLog, 'utf-8'))
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      assert.ok(entries.some((entry) => entry.type === 'turn_complete_hooks_suppressed_non_leader'));
+      assert.ok(entries.some((entry) => entry.type === 'completed_turn_suppressed_non_leader'));
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not classify ordinary leader rollouts as helpers based on prompt text alone', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-prompt-prefix-leader-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const sessionId = 'sess-prompt-prefix-leader';
+    const threadId = 'thread-prompt-prefix-leader';
+
+    try {
+      await writeNotificationConfig(codexHome);
+      await writeRolloutRecords(tempRoot, threadId, [
+        {
+          timestamp: new Date().toISOString(),
+          type: 'session_meta',
+          payload: {
+            id: threadId,
+            cwd: workdir,
+            originator: 'codex_exec',
+            source: 'exec',
+            base_instructions: { text: 'ordinary codex exec instructions' },
+          },
+        },
+        {
+          timestamp: new Date().toISOString(),
+          type: 'event_msg',
+          payload: {
+            type: 'user_message',
+            message: 'You are OMX Explore, but this is quoted by a user in an ordinary leader turn.',
+          },
+        },
+      ]);
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: 'turn-prompt-prefix-leader',
+        input_messages: [],
+        last_assistant_message: 'ordinary leader final should notify',
+      }, {
+        CODEX_HOME: codexHome,
+        HOME: tempRoot,
+        USERPROFILE: tempRoot,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const requests = await readCapturedRequests(capturePath);
+      assert.equal(requests.length, 1);
+
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const logContent = await readFile(notifyLog, 'utf-8').catch(() => '');
+      assert.doesNotMatch(logContent, /completed_turn_suppressed_non_leader/);
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }

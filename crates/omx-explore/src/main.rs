@@ -241,6 +241,8 @@ fn invoke_codex(args: &Args, model: &str, prompt_contract: &str) -> io::Result<A
         .arg(&output_path)
         .arg(&final_prompt)
         .env(HARNESS_ROOT_ENV, &args.cwd)
+        .env("OMX_SUPPRESS_COMPLETED_TURN", "1")
+        .env("OMX_SUPPRESS_COMPLETED_TURN_REASON", "omx-explore")
         .env("PATH", &allowlist.bin_dir)
         .env("SHELL", &allowlist.shell_path);
     sanitize_explore_subprocess_env(&mut command);

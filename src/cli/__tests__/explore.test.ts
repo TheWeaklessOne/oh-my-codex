@@ -151,6 +151,8 @@ set -e
 {
   printf 'PATH=%s\n' "$PATH"
   printf 'SHELL=%s\n' "\${SHELL:-}"
+  printf 'OMX_SUPPRESS_COMPLETED_TURN=%s\n' "\${OMX_SUPPRESS_COMPLETED_TURN:-}"
+  printf 'OMX_SUPPRESS_COMPLETED_TURN_REASON=%s\n' "\${OMX_SUPPRESS_COMPLETED_TURN_REASON:-}"
   printf 'ALLOWED_STATUS=%s\n' "$allowed_status"
   printf 'BLOCKED_STATUS=%s\n' "$blocked_status"
   printf -- '--ARGV--\n'
@@ -957,12 +959,14 @@ describe('exploreCommand', () => {
         const captured = await readFile(capturePath, 'utf-8');
         assert.match(captured, /PATH=.*omx-explore-allowlist-/);
         assert.match(captured, /SHELL=.*omx-explore-allowlist-.*\/bin\/bash$/m);
-      assert.match(captured, /ALLOWED_STATUS=0/);
-      assert.match(captured, /BLOCKED_STATUS=(?!0)\d+/);
-      assert.match(captured, /--ARGV--[\s\S]*\nexec\n/);
-      assert.match(captured, /model_instructions_file=.*explore-lightweight-AGENTS\.md/);
-      assert.match(captured, /--ALLOWED_STDOUT--[\s\S]*ripgrep/i);
-      assert.match(captured, /--BLOCKED_STDERR--[\s\S]*not on the omx explore allowlist/);
+        assert.match(captured, /OMX_SUPPRESS_COMPLETED_TURN=1/);
+        assert.match(captured, /OMX_SUPPRESS_COMPLETED_TURN_REASON=omx-explore/);
+        assert.match(captured, /ALLOWED_STATUS=0/);
+        assert.match(captured, /BLOCKED_STATUS=(?!0)\d+/);
+        assert.match(captured, /--ARGV--[\s\S]*\nexec\n/);
+        assert.match(captured, /model_instructions_file=.*explore-lightweight-AGENTS\.md/);
+        assert.match(captured, /--ALLOWED_STDOUT--[\s\S]*ripgrep/i);
+        assert.match(captured, /--BLOCKED_STDERR--[\s\S]*not on the omx explore allowlist/);
       });
     } finally {
       await rm(wd, { recursive: true, force: true });

@@ -30,6 +30,17 @@ function todaySessionDir(baseHome: string): string {
   );
 }
 
+function todayCodexHomeSessionDir(codexHome: string): string {
+  const now = new Date();
+  return join(
+    codexHome,
+    'sessions',
+    String(now.getUTCFullYear()),
+    String(now.getUTCMonth() + 1).padStart(2, '0'),
+    String(now.getUTCDate()).padStart(2, '0')
+  );
+}
+
 async function readLines(path: string): Promise<string[]> {
   const content = await readFile(path, 'utf-8').catch(() => '');
   return content.split('\n').map(s => s.trim()).filter(Boolean);
@@ -535,6 +546,211 @@ describe('notify-fallback watcher', () => {
       const turnEntries = await readJsonLines(turnLog);
       assert.equal(turnEntries[0]?.origin_kind, 'native-subagent');
       assert.equal(turnEntries[0]?.origin_parent_thread_id, leaderThreadId);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(tempHome, { recursive: true, force: true });
+      await rm(rolloutPath, { force: true });
+    }
+  });
+
+  it('does not forward omx explore helper completions as user-visible notifications', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-explore-helper-'));
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-home-'));
+    const sid = randomUUID();
+    const sessionDir = todaySessionDir(tempHome);
+    const rolloutPath = join(sessionDir, `rollout-test-fallback-explore-helper-${sid}.jsonl`);
+
+    try {
+      await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
+      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+
+      const threadId = `explore-${sid}`;
+      const turnId = `turn-explore-${sid}`;
+      const nowIso = new Date(Date.now() + 2_000).toISOString();
+      const lines = [
+        {
+          timestamp: nowIso,
+          type: 'session_meta',
+          payload: {
+            id: threadId,
+            cwd: wd,
+            originator: 'codex_exec',
+            source: 'exec',
+            base_instructions: {
+              text: '# OMX Explore Lightweight Instructions\n\nYou are executing the `omx explore` command path.',
+            },
+          },
+        },
+        {
+          timestamp: nowIso,
+          type: 'event_msg',
+          payload: {
+            type: 'user_message',
+            message: 'You are OMX Explore, a low-cost read-only repository exploration harness.\nUser request:\nMap notification completion path.',
+          },
+        },
+        {
+          timestamp: nowIso,
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: turnId,
+            last_agent_message: '## Files\n- src/scripts/notify-hook.ts',
+          },
+        },
+      ];
+      await writeFile(rolloutPath, `${lines.map(v => JSON.stringify(v)).join('\n')}\n`);
+
+      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const result = spawnSync(
+        process.execPath,
+        [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
+        { encoding: 'utf-8', env: buildCleanNotifyEnv({ HOME: tempHome }) }
+      );
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const turnLog = join(wd, '.omx', 'logs', `turns-${new Date().toISOString().split('T')[0]}.jsonl`);
+      assert.deepEqual(await readLines(turnLog), []);
+
+      const fallbackLog = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const fallbackEntries = await readJsonLines(fallbackLog);
+      assert.equal(fallbackEntries[0]?.type, 'fallback_notify_skipped');
+      assert.equal(fallbackEntries[0]?.reason, 'omx_explore_helper');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(tempHome, { recursive: true, force: true });
+      await rm(rolloutPath, { force: true });
+    }
+  });
+
+  it('does not suppress ordinary leader completions based on an omx explore prompt quote alone', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-prompt-prefix-leader-'));
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-home-'));
+    const sid = randomUUID();
+    const sessionDir = todaySessionDir(tempHome);
+    const rolloutPath = join(sessionDir, `rollout-test-fallback-prompt-prefix-leader-${sid}.jsonl`);
+
+    try {
+      await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
+      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+
+      const threadId = `leader-${sid}`;
+      const turnId = `turn-leader-${sid}`;
+      const nowIso = new Date(Date.now() + 2_000).toISOString();
+      const lines = [
+        {
+          timestamp: nowIso,
+          type: 'session_meta',
+          payload: {
+            id: threadId,
+            cwd: wd,
+            originator: 'codex_exec',
+            source: 'exec',
+            base_instructions: { text: 'ordinary codex exec instructions' },
+          },
+        },
+        {
+          timestamp: nowIso,
+          type: 'event_msg',
+          payload: {
+            type: 'user_message',
+            message: 'You are OMX Explore, but this is quoted in an ordinary leader prompt.',
+          },
+        },
+        {
+          timestamp: nowIso,
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: turnId,
+            last_agent_message: 'ordinary leader completion',
+          },
+        },
+      ];
+      await writeFile(rolloutPath, `${lines.map(v => JSON.stringify(v)).join('\n')}\n`);
+
+      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const result = spawnSync(
+        process.execPath,
+        [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
+        { encoding: 'utf-8', env: buildCleanNotifyEnv({ HOME: tempHome }) }
+      );
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const turnLog = join(wd, '.omx', 'logs', `turns-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const turns = await readJsonLines(turnLog);
+      assert.equal(turns.length, 1);
+      assert.notEqual(turns[0]?.origin_kind, 'internal-helper');
+
+      const fallbackLog = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const fallbackEntries = await readJsonLines(fallbackLog);
+      assert.ok(fallbackEntries.some((entry) => entry.type === 'fallback_notify' && entry.reason === 'sent'));
+      assert.equal(fallbackEntries.some((entry) => entry.type === 'fallback_notify_skipped'), false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(tempHome, { recursive: true, force: true });
+      await rm(rolloutPath, { force: true });
+    }
+  });
+
+  it('discovers omx explore helper rollouts under CODEX_HOME session roots', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-codex-home-explore-'));
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-home-'));
+    const codexHome = join(tempHome, 'project-codex-home');
+    const sid = randomUUID();
+    const sessionDir = todayCodexHomeSessionDir(codexHome);
+    const rolloutPath = join(sessionDir, `rollout-test-fallback-codex-home-explore-${sid}.jsonl`);
+
+    try {
+      await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
+      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+
+      const threadId = `explore-codex-home-${sid}`;
+      const turnId = `turn-explore-codex-home-${sid}`;
+      const nowIso = new Date(Date.now() + 2_000).toISOString();
+      await writeFile(rolloutPath, `${[
+        {
+          timestamp: nowIso,
+          type: 'session_meta',
+          payload: {
+            id: threadId,
+            cwd: wd,
+            originator: 'codex_exec',
+            source: 'exec',
+            base_instructions: {
+              text: '# OMX Explore Lightweight Instructions\n\nYou are executing the `omx explore` command path.',
+            },
+          },
+        },
+        {
+          timestamp: nowIso,
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: turnId,
+            last_agent_message: '## Files\n- src/scripts/notify-hook.ts',
+          },
+        },
+      ].map(v => JSON.stringify(v)).join('\n')}\n`);
+
+      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const result = spawnSync(
+        process.execPath,
+        [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
+        { encoding: 'utf-8', env: buildCleanNotifyEnv({ HOME: join(tempHome, 'home'), CODEX_HOME: codexHome }) }
+      );
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const fallbackLog = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const fallbackEntries = await readJsonLines(fallbackLog);
+      assert.equal(fallbackEntries[0]?.type, 'fallback_notify_skipped');
+      assert.equal(fallbackEntries[0]?.reason, 'omx_explore_helper');
     } finally {
       await rm(wd, { recursive: true, force: true });
       await rm(tempHome, { recursive: true, force: true });

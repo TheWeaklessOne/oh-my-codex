@@ -159,6 +159,8 @@ interface WatcherFileMeta {
   threadId: string;
   sessionMeta?: Record<string, unknown>;
   origin: TurnOrigin;
+  suppressCompletedTurn: boolean;
+  suppressReason?: string;
   offset: number;
   size: number;
   partial: string;
@@ -168,6 +170,8 @@ interface WatcherSessionMeta {
   threadId: string;
   sessionMeta: Record<string, unknown>;
   origin: TurnOrigin;
+  suppressCompletedTurn: boolean;
+  suppressReason?: string;
 }
 
 interface RalphContinueSteerState {
@@ -1565,32 +1569,51 @@ async function enforceLifecycleGuards(): Promise<boolean> {
   return false;
 }
 
+function codexSessionRoots(): string[] {
+  const roots = [
+    safeString(process.env.CODEX_HOME),
+    join(safeString(process.env.HOME) || homedir(), '.codex'),
+    join(homedir(), '.codex'),
+  ].filter(Boolean);
+  return Array.from(new Set(roots));
+}
+
 function sessionDirs(): string[] {
   const now = new Date();
-  const today = join(
-    homedir(),
-    '.codex',
-    'sessions',
-    String(now.getUTCFullYear()),
-    String(now.getUTCMonth() + 1).padStart(2, '0'),
-    String(now.getUTCDate()).padStart(2, '0')
-  );
   const yesterdayDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-  const yesterday = join(
-    homedir(),
-    '.codex',
+  const days = [now, yesterdayDate];
+  return Array.from(new Set(codexSessionRoots().flatMap((root) => days.map((day) => join(
+    root,
     'sessions',
-    String(yesterdayDate.getUTCFullYear()),
-    String(yesterdayDate.getUTCMonth() + 1).padStart(2, '0'),
-    String(yesterdayDate.getUTCDate()).padStart(2, '0')
-  );
-  return Array.from(new Set([today, yesterday]));
+    String(day.getUTCFullYear()),
+    String(day.getUTCMonth() + 1).padStart(2, '0'),
+    String(day.getUTCDate()).padStart(2, '0'),
+  )))));
 }
 
 async function readFirstLine(path: string): Promise<string> {
   const content = await readFile(path, 'utf-8');
   const idx = content.indexOf('\n');
   return idx >= 0 ? content.slice(0, idx) : content;
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function isOmxExploreSessionMetaPayload(payload: Record<string, unknown>): boolean {
+  const originator = safeString(payload.originator).toLowerCase();
+  const source = safeString(payload.source).toLowerCase();
+  const baseInstructions = recordValue(payload.base_instructions);
+  const baseInstructionsText = safeString(baseInstructions.text || payload.base_instructions);
+  return originator === 'codex_exec'
+    && source === 'exec'
+    && (
+      baseInstructionsText.includes('OMX Explore Lightweight Instructions')
+      || baseInstructionsText.includes('executing the `omx explore` command path')
+    );
 }
 
 function parseSessionMetaLine(line: string): WatcherSessionMeta | null {
@@ -1613,10 +1636,23 @@ function parseSessionMetaLine(line: string): WatcherSessionMeta | null {
     ...parsedOrigin,
     threadId: parsedOrigin.threadId || threadId,
   };
+  const exploreHelper = isOmxExploreSessionMetaPayload(payload);
+  const effectiveOrigin: TurnOrigin = exploreHelper
+    ? {
+        ...origin,
+        kind: 'internal-helper',
+        source: 'omx-explore',
+      }
+    : origin;
+  const suppressCompletedTurn = effectiveOrigin.kind === 'internal-helper';
   return {
     threadId,
     sessionMeta: payload,
-    origin,
+    origin: effectiveOrigin,
+    suppressCompletedTurn,
+    ...(suppressCompletedTurn
+      ? { suppressReason: exploreHelper ? 'omx_explore_helper' : effectiveOrigin.source || 'internal_helper' }
+      : {}),
   };
 }
 
@@ -1695,6 +1731,17 @@ async function processLine(meta: WatcherFileMeta, line: string, filePath: string
   if (seenTurnKeys.has(key)) return;
   seenTurnKeys.add(key);
 
+  if (meta.suppressCompletedTurn || meta.origin.kind === 'internal-helper') {
+    await eventLog({
+      type: 'fallback_notify_skipped',
+      thread_id: meta.threadId,
+      turn_id: turnId,
+      file: filePath,
+      reason: meta.suppressReason || meta.origin.source || 'internal_helper_completed_turn',
+    });
+    return;
+  }
+
   const payload = buildNotifyPayload(
     meta,
     turnId,
@@ -1716,6 +1763,8 @@ async function ensureTrackedFiles(): Promise<void> {
       threadId: sessionMeta.threadId,
       sessionMeta: sessionMeta.sessionMeta,
       origin: sessionMeta.origin,
+      suppressCompletedTurn: sessionMeta.suppressCompletedTurn,
+      suppressReason: sessionMeta.suppressReason,
       offset,
       size,
       partial: '',
