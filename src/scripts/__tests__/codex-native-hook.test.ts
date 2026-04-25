@@ -22,6 +22,7 @@ import {
 } from "../codex-native-hook.js";
 import { writeSessionStart } from "../../hooks/session.js";
 import { resetTriageConfigCache } from "../../hooks/triage-config.js";
+import { executeStateOperation } from "../../state/operations.js";
 
 function nativeHookScriptPath(): string {
   return join(process.cwd(), "dist", "scripts", "codex-native-hook.js");
@@ -5136,10 +5137,10 @@ esac
       assert.deepEqual(result.outputJson, {
         decision: "block",
         reason:
-          "OMX Ralph is still active (phase: executing); continue the task and gather fresh verification evidence before stopping.",
+          "OMX Ralph is still active (phase: executing; state: .omx/state/ralph-state.json); continue the task and gather fresh verification evidence before stopping.",
         stopReason: "ralph_executing",
         systemMessage:
-          "OMX Ralph is still active (phase: executing); continue the task and gather fresh verification evidence before stopping.",
+          "OMX Ralph is still active (phase: executing; state: .omx/state/ralph-state.json); continue the task and gather fresh verification evidence before stopping.",
       });
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -5171,10 +5172,10 @@ esac
       assert.deepEqual(result.outputJson, {
         decision: "block",
         reason:
-          "OMX Ralph is still active (phase: executing); continue the task and gather fresh verification evidence before stopping.",
+          "OMX Ralph is still active (phase: executing; state: .omx/state/sessions/sess-live-ralph/ralph-state.json); continue the task and gather fresh verification evidence before stopping.",
         stopReason: "ralph_executing",
         systemMessage:
-          "OMX Ralph is still active (phase: executing); continue the task and gather fresh verification evidence before stopping.",
+          "OMX Ralph is still active (phase: executing; state: .omx/state/sessions/sess-live-ralph/ralph-state.json); continue the task and gather fresh verification evidence before stopping.",
       });
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -5254,6 +5255,87 @@ esac
 
       assert.equal(result.omxEventName, "stop");
       assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not hard-block Stop on stale session-scoped Ralph starting state after visible active modes are cleared", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-cleared-stale-ralph-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-cleared-ralph";
+      await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+      await writeJson(join(stateDir, "sessions", sessionId, "ralph-state.json"), {
+        active: true,
+        mode: "ralph",
+        current_phase: "starting",
+        session_id: sessionId,
+      });
+      await writeJson(join(stateDir, "skill-active-state.json"), {
+        active: false,
+        skill: "ralph",
+        active_skills: [],
+      });
+
+      const listActive = await executeStateOperation("state_list_active", {
+        workingDirectory: cwd,
+      });
+      assert.deepEqual(listActive.payload, { active_modes: [] });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: sessionId,
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks Stop on visible active session-scoped Ralph starting state and reports its path", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-visible-starting-ralph-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-visible-ralph";
+      await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+      await writeJson(join(stateDir, "sessions", sessionId, "ralph-state.json"), {
+        active: true,
+        mode: "ralph",
+        current_phase: "starting",
+        session_id: sessionId,
+      });
+      await writeJson(join(stateDir, "sessions", sessionId, "skill-active-state.json"), {
+        active: true,
+        skill: "ralph",
+        phase: "starting",
+        active_skills: [{ skill: "ralph", phase: "starting", active: true, session_id: sessionId }],
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: sessionId,
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason:
+          "OMX Ralph is still active (phase: starting; state: .omx/state/sessions/sess-visible-ralph/ralph-state.json); continue the task and gather fresh verification evidence before stopping.",
+        stopReason: "ralph_starting",
+        systemMessage:
+          "OMX Ralph is still active (phase: starting; state: .omx/state/sessions/sess-visible-ralph/ralph-state.json); continue the task and gather fresh verification evidence before stopping.",
+      });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -5399,10 +5481,10 @@ esac
       const expected = {
         decision: "block",
         reason:
-          "OMX Ralph is still active (phase: executing); continue the task and gather fresh verification evidence before stopping.",
+          "OMX Ralph is still active (phase: executing; state: .omx/state/ralph-state.json); continue the task and gather fresh verification evidence before stopping.",
         stopReason: "ralph_executing",
         systemMessage:
-          "OMX Ralph is still active (phase: executing); continue the task and gather fresh verification evidence before stopping.",
+          "OMX Ralph is still active (phase: executing; state: .omx/state/ralph-state.json); continue the task and gather fresh verification evidence before stopping.",
       };
 
       const first = await dispatchCodexNativeHook(payload, { cwd });

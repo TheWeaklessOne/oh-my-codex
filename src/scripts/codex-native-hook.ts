@@ -1,7 +1,7 @@
 import { execFileSync } from "child_process";
 import { existsSync, readFileSync } from "fs";
 import { mkdir, readFile, readdir, writeFile } from "fs/promises";
-import { join, resolve } from "path";
+import { join, relative, resolve } from "path";
 import { pathToFileURL } from "url";
 import { readModeState, readModeStateForSession, updateModeState } from "../modes/base.js";
 import {
@@ -291,10 +291,28 @@ async function readActiveAutoresearchState(
   return state;
 }
 
+interface ActiveRalphStopState {
+  state: Record<string, unknown>;
+  path: string;
+}
+
+function isRalphStartingPhase(state: Record<string, unknown>): boolean {
+  return safeString(state.current_phase ?? state.currentPhase).trim().toLowerCase() === "starting";
+}
+
+async function isVisibleRalphActiveForSession(cwd: string, sessionId: string): Promise<boolean> {
+  const canonicalState = await readVisibleSkillActiveState(cwd, sessionId);
+  if (!canonicalState) return false;
+  return listActiveSkills(canonicalState).some((entry) => (
+    entry.skill === "ralph"
+    && matchesSkillStopContext(entry, canonicalState, sessionId, "")
+  ));
+}
+
 async function readActiveRalphState(
   stateDir: string,
   preferredSessionId?: string,
-): Promise<Record<string, unknown> | null> {
+): Promise<ActiveRalphStopState | null> {
   const cwd = resolve(stateDir, "..", "..");
   const [rawSessionInfo, usableSessionInfo] = await Promise.all([
     readSessionState(cwd),
@@ -316,17 +334,26 @@ async function readActiveRalphState(
     if (staleCurrentSessionId && sessionId === staleCurrentSessionId) {
       continue;
     }
-    const sessionScoped = await readStopSessionPinnedState("ralph-state.json", cwd, sessionId);
+    const sessionScopedPath = getStateFilePath("ralph-state.json", cwd, sessionId);
+    const sessionScoped = await readJsonIfExists(sessionScopedPath);
+    if (
+      sessionScoped?.active === true
+      && isRalphStartingPhase(sessionScoped)
+      && !(await isVisibleRalphActiveForSession(cwd, sessionId))
+    ) {
+      continue;
+    }
     if (sessionScoped?.active === true && shouldContinueRun(sessionScoped)) {
-      return sessionScoped;
+      return { state: sessionScoped, path: sessionScopedPath };
     }
   }
 
   if (sessionCandidates.length > 0) return null;
 
-  const direct = await readJsonIfExists(join(stateDir, "ralph-state.json"));
+  const directPath = join(stateDir, "ralph-state.json");
+  const direct = await readJsonIfExists(directPath);
   if (direct?.active === true && shouldContinueRun(direct)) {
-    return direct;
+    return { state: direct, path: directPath };
   }
 
   return null;
@@ -1359,6 +1386,12 @@ function buildRepeatableStopSignature(
   ].join("|");
 }
 
+function formatStopStatePath(cwd: string, statePath: string): string {
+  const relativePath = relative(cwd, statePath);
+  if (!relativePath || relativePath.startsWith("..")) return statePath;
+  return relativePath.replace(/\\/g, "/");
+}
+
 function readNativeStopSessionKey(
   payload: CodexHookPayload,
   canonicalSessionId?: string,
@@ -1864,10 +1897,11 @@ async function buildStopHookOutput(
     return null;
   }
 
-  const currentPhase = safeString(ralphState?.current_phase).trim() || "executing";
+  const currentPhase = safeString(ralphState.state.current_phase).trim() || "executing";
+  const blockingPath = formatStopStatePath(cwd, ralphState.path);
   const stopReason = `ralph_${currentPhase}`;
   const systemMessage =
-    `OMX Ralph is still active (phase: ${currentPhase}); continue the task and gather fresh verification evidence before stopping.`;
+    `OMX Ralph is still active (phase: ${currentPhase}; state: ${blockingPath}); continue the task and gather fresh verification evidence before stopping.`;
 
   return await returnPersistentStopBlock(
     payload,
