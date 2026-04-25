@@ -82,6 +82,62 @@ describe('launchDetachedManagedSession', () => {
     );
   });
 
+  it('uses the stable OMX CLI resolver when no explicit entry path is provided', async () => {
+    const observed: { args?: string[] } = {};
+    let resolverCalled = false;
+
+    const result = await launchDetachedManagedSession(
+      {
+        cwd: '/repo/project-a',
+        sessionId: 'omx-explicit-session-3',
+      },
+      {
+        resolveOmxCliEntryPathImpl: () => {
+          resolverCalled = true;
+          return '/repo/dist/cli/omx.js';
+        },
+        buildPlatformCommandSpecImpl: (command, args) => ({ command, args }),
+        spawnPlatformCommandSyncImpl: (command, args) => {
+          observed.args = [...args];
+          return {
+            spec: { command, args, resolvedPath: command },
+            result: {
+              pid: 123,
+              output: [],
+              stdout: '%43\n',
+              stderr: '',
+              status: 0,
+              signal: null,
+            },
+          };
+        },
+      },
+    );
+
+    assert.equal(resolverCalled, true);
+    assert.equal(result.leaderPaneId, '%43');
+    assert.match(observed.args?.at(-1) ?? '', /\/repo\/dist\/cli\/omx\.js/);
+  });
+
+  it('fails closed when the stable OMX CLI resolver has no launchable entry', async () => {
+    await assert.rejects(
+      () => launchDetachedManagedSession(
+        {
+          cwd: '/repo/project-a',
+          sessionId: 'omx-explicit-session-4',
+        },
+        {
+          resolveOmxCliEntryPathImpl: () => null,
+          buildPlatformCommandSpecImpl: (command, args) => ({ command, args }),
+          spawnPlatformCommandSyncImpl: () => {
+            throw new Error('tmux must not be called without a CLI entry path');
+          },
+        },
+      ),
+      /OMX CLI launcher path/i,
+    );
+  });
+
   it('kills a detached tmux session by name', async () => {
     const observed: { command?: string; args?: string[] } = {};
 

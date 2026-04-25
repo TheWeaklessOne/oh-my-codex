@@ -77,10 +77,18 @@ export function resolveOmxEntryPath(
   return resolveLauncherPath(rawPath, startupCwd);
 }
 
-function isOmxCliEntryPath(value: string | null | undefined): boolean {
+function isOmxCliEntryPath(value: string | null | undefined): value is string {
   if (typeof value !== "string") return false;
   const normalized = value.trim().replace(/\\/g, "/");
-  return normalized.endsWith('/dist/cli/omx.js') || normalized.endsWith('/omx.js')
+  return normalized.endsWith('/dist/cli/omx.js') || normalized.endsWith('/omx.js');
+}
+
+function resolvePackagedOmxCliEntryPath(
+  packageRootDir: string,
+  cwd: string,
+): string | null {
+  const fallback = resolveLauncherPath(join(packageRootDir, 'dist', 'cli', 'omx.js'), cwd);
+  return existsSync(fallback) ? fallback : null;
 }
 
 export function resolveOmxCliEntryPath(
@@ -92,11 +100,20 @@ export function resolveOmxCliEntryPath(
   } = {},
 ): string | null {
   const entry = resolveOmxEntryPath(options);
-  if (isOmxCliEntryPath(entry)) return entry;
+  const hasExplicitCliArgv1 =
+    typeof options.argv1 === "string" && options.argv1.trim() !== "";
 
   const packageRootDir = options.packageRootDir || packageRoot();
-  const fallback = resolveLauncherPath(join(packageRootDir, 'dist', 'cli', 'omx.js'), options.cwd || process.cwd());
-  return existsSync(fallback) ? fallback : entry;
+  const fallback = resolvePackagedOmxCliEntryPath(
+    packageRootDir,
+    options.cwd || process.cwd(),
+  );
+
+  if (hasExplicitCliArgv1 && isOmxCliEntryPath(entry) && existsSync(entry)) {
+    return entry;
+  }
+
+  return fallback;
 }
 
 export function rememberOmxLaunchContext(

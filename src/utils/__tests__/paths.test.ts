@@ -659,4 +659,104 @@ describe("OMX launcher path resolution", () => {
     }
   });
 
+  it("prefers the packaged CLI entry over a stale ambient OMX_ENTRY_PATH", async () => {
+    const daemonCwd = await mkdtemp(join(tmpdir(), "omx-launcher-cli-ambient-cwd-"));
+    const packageRootDir = await mkdtemp(join(tmpdir(), "omx-launcher-cli-ambient-root-"));
+    const staleRootDir = await mkdtemp(join(tmpdir(), "omx-launcher-cli-ambient-stale-"));
+    try {
+      const cliDir = join(packageRootDir, "dist", "cli");
+      const cliPath = join(cliDir, "omx.js");
+      const staleCliPath = join(staleRootDir, "omx.js");
+      await mkdir(cliDir, { recursive: true });
+      await writeFile(cliPath, "#!/usr/bin/env node\n", "utf-8");
+      await writeFile(staleCliPath, "#!/usr/bin/env node\n", "utf-8");
+
+      const resolved = resolveOmxCliEntryPath({
+        cwd: daemonCwd,
+        env: {
+          ...process.env,
+          [OMX_ENTRY_PATH_ENV]: staleCliPath,
+          [OMX_STARTUP_CWD_ENV]: daemonCwd,
+        },
+        packageRootDir,
+      });
+
+      assert.equal(resolved, cliPath);
+    } finally {
+      await rm(daemonCwd, { recursive: true, force: true });
+      await rm(packageRootDir, { recursive: true, force: true });
+      await rm(staleRootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns null for ambient non-packaged launcher paths when no packaged CLI exists", async () => {
+    const daemonCwd = await mkdtemp(join(tmpdir(), "omx-launcher-cli-missing-cwd-"));
+    const packageRootDir = await mkdtemp(join(tmpdir(), "omx-launcher-cli-missing-root-"));
+    const staleRootDir = await mkdtemp(join(tmpdir(), "omx-launcher-cli-missing-stale-"));
+    try {
+      const staleHookPath = join(staleRootDir, "codex-native-hook.js");
+      const staleCliPath = join(staleRootDir, "omx.js");
+      await writeFile(staleHookPath, "#!/usr/bin/env node\n", "utf-8");
+      await writeFile(staleCliPath, "#!/usr/bin/env node\n", "utf-8");
+
+      assert.equal(
+        resolveOmxCliEntryPath({
+          argv1: null,
+          cwd: daemonCwd,
+          env: {
+            ...process.env,
+            [OMX_ENTRY_PATH_ENV]: staleHookPath,
+            [OMX_STARTUP_CWD_ENV]: daemonCwd,
+          },
+          packageRootDir,
+        }),
+        null,
+      );
+
+      assert.equal(
+        resolveOmxCliEntryPath({
+          cwd: daemonCwd,
+          env: {
+            ...process.env,
+            [OMX_ENTRY_PATH_ENV]: staleCliPath,
+            [OMX_STARTUP_CWD_ENV]: daemonCwd,
+          },
+          packageRootDir,
+        }),
+        null,
+      );
+    } finally {
+      await rm(daemonCwd, { recursive: true, force: true });
+      await rm(packageRootDir, { recursive: true, force: true });
+      await rm(staleRootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the packaged CLI entry when a node -e daemon has no argv1", async () => {
+    const daemonCwd = await mkdtemp(join(tmpdir(), "omx-launcher-cli-daemon-cwd-"));
+    const packageRootDir = await mkdtemp(join(tmpdir(), "omx-launcher-cli-daemon-root-"));
+    try {
+      const cliDir = join(packageRootDir, "dist", "cli");
+      const cliPath = join(cliDir, "omx.js");
+      await mkdir(cliDir, { recursive: true });
+      await writeFile(cliPath, "#!/usr/bin/env node\n", "utf-8");
+
+      const resolved = resolveOmxCliEntryPath({
+        argv1: null,
+        cwd: daemonCwd,
+        env: {
+          ...process.env,
+          [OMX_ENTRY_PATH_ENV]: "",
+          [OMX_STARTUP_CWD_ENV]: daemonCwd,
+        },
+        packageRootDir,
+      });
+
+      assert.equal(resolved, cliPath);
+    } finally {
+      await rm(daemonCwd, { recursive: true, force: true });
+      await rm(packageRootDir, { recursive: true, force: true });
+    }
+  });
+
 });

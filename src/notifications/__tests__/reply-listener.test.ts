@@ -29,6 +29,7 @@ import type { SessionMapping } from '../session-registry.js';
 import { NO_TRACKED_SESSION_MESSAGE } from '../session-status.js';
 import { buildDiscordReplySource, buildTelegramReplySource } from '../reply-source.js';
 import { markMockTelegramTransportForTests } from '../../utils/test-env.js';
+import { OMX_ENTRY_PATH_ENV, OMX_STARTUP_CWD_ENV } from '../../utils/paths.js';
 
 function createBaseConfig(overrides: Partial<ReplyListenerDaemonConfig> = {}): ReplyListenerDaemonConfig {
   return {
@@ -636,14 +637,18 @@ describe('startReplyListener', () => {
     assert.equal(persisted.sourceStates[discordSource.key]?.discordLastMessageId, 'discord-message-91');
   });
 
-  it('forwards OMX_NOTIFY_PROFILE and CODEX_HOME into the detached daemon environment for canonical config re-derivation', () => {
+  it('forwards canonical config and stable launcher context into the detached daemon environment', () => {
     const originalNotifyProfile = process.env.OMX_NOTIFY_PROFILE;
     const originalCodexHome = process.env.CODEX_HOME;
+    const originalEntryPath = process.env[OMX_ENTRY_PATH_ENV];
+    const originalStartupCwd = process.env[OMX_STARTUP_CWD_ENV];
     let spawnedEnv: NodeJS.ProcessEnv | undefined;
 
     try {
       process.env.OMX_NOTIFY_PROFILE = 'ops';
       process.env.CODEX_HOME = '/tmp/custom-codex-home';
+      process.env[OMX_ENTRY_PATH_ENV] = '/tmp/codex-native-hook.js';
+      delete process.env[OMX_STARTUP_CWD_ENV];
 
       const response = startReplyListener(createBaseConfig(), {
         ensureStateDirImpl: () => {},
@@ -664,11 +669,18 @@ describe('startReplyListener', () => {
       assert.equal(response.success, true);
       assert.equal(spawnedEnv?.OMX_NOTIFY_PROFILE, 'ops');
       assert.equal(spawnedEnv?.CODEX_HOME, '/tmp/custom-codex-home');
+      assert.match(spawnedEnv?.[OMX_ENTRY_PATH_ENV] ?? '', /dist\/cli\/omx\.js$/);
+      assert.notEqual(spawnedEnv?.[OMX_ENTRY_PATH_ENV], '/tmp/codex-native-hook.js');
+      assert.equal(spawnedEnv?.[OMX_STARTUP_CWD_ENV], process.cwd());
     } finally {
       if (typeof originalNotifyProfile === 'string') process.env.OMX_NOTIFY_PROFILE = originalNotifyProfile;
       else delete process.env.OMX_NOTIFY_PROFILE;
       if (typeof originalCodexHome === 'string') process.env.CODEX_HOME = originalCodexHome;
       else delete process.env.CODEX_HOME;
+      if (typeof originalEntryPath === 'string') process.env[OMX_ENTRY_PATH_ENV] = originalEntryPath;
+      else delete process.env[OMX_ENTRY_PATH_ENV];
+      if (typeof originalStartupCwd === 'string') process.env[OMX_STARTUP_CWD_ENV] = originalStartupCwd;
+      else delete process.env[OMX_STARTUP_CWD_ENV];
     }
   });
 
@@ -1633,6 +1645,20 @@ describe('pollTelegramOnce', () => {
     resetReplyListenerTransientState();
     const config = createBaseConfig();
     const state = createBaseState();
+    const source = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
+    state.sourceStates[source.key] = {
+      sourceKey: source.key,
+      platform: 'telegram',
+      label: source.label,
+      telegramLastUpdateId: null,
+      telegramStartupPolicyApplied: true,
+      lastPollAt: '2026-03-20T00:00:00.000Z',
+      lastIngestAt: null,
+      lastFailureAt: '2026-03-20T00:00:01.000Z',
+      lastFailureCategory: 'retryable-injection',
+      lastFailureMessage: 'previous pane verification failure',
+      failureCounts: { 'retryable-injection': 1 },
+    };
     const writes: ReplyListenerState[] = [];
     let sendMessageBody = '';
 
@@ -1683,6 +1709,9 @@ describe('pollTelegramOnce', () => {
     assert.equal(state.messagesInjected, 1);
     assert.equal(state.errors, 0);
     assert.equal(state.telegramLastUpdateId, 44);
+    assert.equal(state.sourceStates[source.key]?.lastFailureAt, null);
+    assert.equal(state.sourceStates[source.key]?.lastFailureCategory, null);
+    assert.equal(state.sourceStates[source.key]?.lastFailureMessage, null);
     assert.ok(writes.length >= 1);
 
     const parsedBody = JSON.parse(sendMessageBody) as {
@@ -1788,6 +1817,19 @@ describe('pollTelegramOnce', () => {
     const config = createBaseConfig();
     const state = createBaseState();
     const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
+    state.sourceStates[telegramSource.key] = {
+      sourceKey: telegramSource.key,
+      platform: 'telegram',
+      label: telegramSource.label,
+      telegramLastUpdateId: null,
+      telegramStartupPolicyApplied: true,
+      lastPollAt: '2026-03-20T00:00:00.000Z',
+      lastIngestAt: null,
+      lastFailureAt: '2026-03-20T00:00:01.000Z',
+      lastFailureCategory: 'topic-launch-failure',
+      lastFailureMessage: 'previous launcher resolution failure',
+      failureCounts: { 'topic-launch-failure': 1 },
+    };
     const sentBodies: string[] = [];
     const registeredMappings: SessionMapping[] = [];
     const launchedSessions: Array<{ cwd: string; codexHomeOverride?: string; notifyProfile?: string | null }> = [];
@@ -1874,6 +1916,9 @@ describe('pollTelegramOnce', () => {
     assert.equal(state.telegramLastUpdateId, 60);
     assert.equal(state.messagesInjected, 1);
     assert.equal(state.errors, 0);
+    assert.equal(state.sourceStates[telegramSource.key]?.lastFailureAt, null);
+    assert.equal(state.sourceStates[telegramSource.key]?.lastFailureCategory, null);
+    assert.equal(state.sourceStates[telegramSource.key]?.lastFailureMessage, null);
     assert.deepEqual(launchedSessions, [
       {
         cwd: '/repos/worktree-a',
@@ -1900,6 +1945,92 @@ describe('pollTelegramOnce', () => {
     assert.equal(parsedBody.message_thread_id, 9001);
     assert.match(parsedBody.text, /started a new omx session/i);
     assert.match(parsedBody.text, /omx-topic-session-1/);
+  });
+
+  it('keeps topic-launch diagnostics when acknowledgement registration fails', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
+    state.sourceStates[telegramSource.key] = {
+      sourceKey: telegramSource.key,
+      platform: 'telegram',
+      label: telegramSource.label,
+      telegramLastUpdateId: null,
+      telegramStartupPolicyApplied: true,
+      lastPollAt: '2026-03-20T00:00:00.000Z',
+      lastIngestAt: null,
+      lastFailureAt: '2026-03-20T00:00:01.000Z',
+      lastFailureCategory: 'topic-launch-failure',
+      lastFailureMessage: 'previous launcher resolution failure',
+      failureCounts: { 'topic-launch-failure': 1 },
+    };
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 61,
+                  message: {
+                    message_id: 351,
+                    message_thread_id: 9001,
+                    chat: { id: 777, type: 'supergroup' },
+                    from: { id: 'telegram-user-1' },
+                    text: 'launch from topic but registration fails',
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: () => ({
+            statusCode: 200,
+            body: { ok: true, result: { message_id: 559, message_thread_id: 9001 } },
+          }),
+        }),
+        getNotificationConfigImpl: () => ({
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: config.telegramBotToken,
+            chatId: config.telegramChatId,
+            projectTopics: { enabled: true },
+          },
+        }) as any,
+        findTopicRecordByThreadIdImpl: async () => ({
+          sourceChatKey: telegramSource.key,
+          projectKey: 'project-key-1',
+          canonicalProjectPath: '/repos/worktree-a',
+          displayName: 'worktree-a',
+          topicName: 'worktree-a',
+          messageThreadId: '9001',
+        }),
+        launchDetachedManagedSessionImpl: async () => ({
+          sessionId: 'omx-topic-session-registration-fail',
+          tmuxSessionName: 'omx-worktree-a-registration-fail',
+          leaderPaneId: '%91',
+          cwd: '/repos/worktree-a',
+        }),
+        waitForCodexPaneReadyImpl: () => true,
+        submitPromptToCodexPaneImpl: async () => true,
+        registerMessageImpl: () => false,
+      },
+    );
+
+    assert.equal(state.telegramLastUpdateId, 61);
+    assert.equal(state.messagesInjected, 1);
+    assert.equal(state.errors, 1);
+    assert.equal(state.sourceStates[telegramSource.key]?.lastFailureCategory, 'topic-launch-ack-registration-failure');
+    assert.match(state.sourceStates[telegramSource.key]?.lastFailureMessage ?? '', /559/);
+    assert.equal(state.sourceStates[telegramSource.key]?.failureCounts?.['topic-launch-failure'], 1);
+    assert.equal(state.sourceStates[telegramSource.key]?.failureCounts?.['topic-launch-ack-registration-failure'], 1);
   });
 
   it('routes replies to the registered Telegram launch acknowledgement back into the freshly started session', async () => {

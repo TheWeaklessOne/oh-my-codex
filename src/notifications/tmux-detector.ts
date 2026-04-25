@@ -137,11 +137,21 @@ export function verifyPaneTarget(
   const startCommandLooksLikeCodex =
     /\bcodex(?:\.js)?\b/.test(normalizedStartCommand)
     && !/codex-native-hook(?:\.js)?/.test(normalizedStartCommand);
+  const isGenericShellCommand = /^(bash|zsh|fish|sh|dash|ksh)$/.test(normalizedCommand);
+  const detachedOmxLeaderWrapperLaunchesCodex =
+    /\bexec\b[\s'"\\]*codex(?:\.js)?\b/.test(normalizedStartCommand);
+  const looksLikeOmxDetachedCodexLeaderWrapper =
+    isGenericShellCommand
+    && detachedOmxLeaderWrapperLaunchesCodex
+    && /omx_detached_session_cleanup/.test(normalizedStartCommand)
+    && /omx_codex_pid/.test(normalizedStartCommand)
+    && /model_instructions_file=/.test(normalizedStartCommand);
   const commandLooksInteractive = /^(codex|omx|claude)$/.test(normalizedCommand)
     || (
       /^(node|npx)$/.test(normalizedCommand)
       && startCommandLooksLikeCodex
-    );
+    )
+    || looksLikeOmxDetachedCodexLeaderWrapper;
   const sessionMatches = options.expectedSessionName
     ? metadata?.sessionName === options.expectedSessionName
     : true;
@@ -182,8 +192,16 @@ export function verifyPaneTarget(
     };
   }
 
-  const isGenericShellCommand = /^(bash|zsh|fish|sh|dash|ksh)$/.test(normalizedCommand);
   if (metadata && isGenericShellCommand) {
+    return {
+      accepted: false,
+      reason: 'verification-failed',
+      analysis,
+      metadata,
+    };
+  }
+
+  if (!metadata && options.expectedSessionName) {
     return {
       accepted: false,
       reason: 'verification-failed',

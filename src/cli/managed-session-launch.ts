@@ -1,6 +1,6 @@
 import type { SpawnSyncOptionsWithStringEncoding, SpawnSyncReturns } from 'node:child_process';
 import { parsePaneIdFromTmuxOutput } from '../hud/tmux.js';
-import { resolveOmxEntryPath } from '../utils/paths.js';
+import { resolveOmxCliEntryPath } from '../utils/paths.js';
 import { buildPlatformCommandSpec, spawnPlatformCommandSync } from '../utils/platform-command.js';
 import {
   buildDetachedTmuxSessionName,
@@ -26,6 +26,7 @@ export interface DetachedManagedSessionLaunchResult {
 
 interface ManagedSessionLaunchDeps {
   omxEntryPath?: string | null;
+  resolveOmxCliEntryPathImpl?: typeof resolveOmxCliEntryPath;
   buildPlatformCommandSpecImpl?: typeof buildPlatformCommandSpec;
   spawnPlatformCommandSyncImpl?: (
     command: string,
@@ -55,9 +56,10 @@ export async function launchDetachedManagedSession(
 ): Promise<DetachedManagedSessionLaunchResult> {
   const sessionId = options.sessionId?.trim() || generateOmxSessionId();
   const tmuxSessionName = buildDetachedTmuxSessionName(options.cwd, sessionId);
-  const omxEntryPath = deps.omxEntryPath ?? resolveOmxEntryPath();
+  const resolveOmxCliEntryPathImpl = deps.resolveOmxCliEntryPathImpl ?? resolveOmxCliEntryPath;
+  const omxEntryPath = deps.omxEntryPath ?? resolveOmxCliEntryPathImpl();
   if (!omxEntryPath) {
-    throw new Error('Unable to resolve the OMX launcher path for detached managed session launch');
+    throw new Error('Unable to resolve the OMX CLI launcher path for detached managed session launch');
   }
 
   const cliArgs = Array.isArray(options.cliArgs) ? [...options.cliArgs] : [];

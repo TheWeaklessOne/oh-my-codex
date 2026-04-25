@@ -64,6 +64,11 @@ import {
   waitForCodexPaneReady,
 } from '../tmux/prompt-submit.js';
 import { spawnPlatformCommandSync } from '../utils/platform-command.js';
+import {
+  OMX_ENTRY_PATH_ENV,
+  OMX_STARTUP_CWD_ENV,
+  resolveOmxCliEntryPath,
+} from '../utils/paths.js';
 import { shouldBlockLiveNotificationNetworkInTests } from '../utils/test-env.js';
 import type {
   ReplyAcknowledgementMode,
@@ -89,6 +94,7 @@ const DAEMON_ENV_ALLOWLIST = [
   'OMX_TELEGRAM_BOT_TOKEN', 'OMX_TELEGRAM_NOTIFIER_BOT_TOKEN',
   'OMX_TELEGRAM_CHAT_ID', 'OMX_TELEGRAM_NOTIFIER_CHAT_ID', 'OMX_TELEGRAM_NOTIFIER_UID',
   'OMX_NOTIFY_PROFILE',
+  OMX_ENTRY_PATH_ENV, OMX_STARTUP_CWD_ENV,
   'CODEX_HOME',
   'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY', 'no_proxy',
   'SystemRoot', 'SYSTEMROOT', 'windir', 'COMSPEC',
@@ -267,6 +273,22 @@ export function resetStartupPoliciesForDaemonStart(
   return normalized;
 }
 
+function resolveDaemonLaunchContext(
+  cwd: string = process.cwd(),
+  env: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const launchContext: NodeJS.ProcessEnv = {};
+  const startupCwd = String(env[OMX_STARTUP_CWD_ENV] ?? '').trim() || cwd;
+  const omxEntryPath = resolveOmxCliEntryPath({ cwd, env });
+
+  launchContext[OMX_STARTUP_CWD_ENV] = startupCwd;
+  if (omxEntryPath) {
+    launchContext[OMX_ENTRY_PATH_ENV] = omxEntryPath;
+  }
+
+  return launchContext;
+}
+
 function createMinimalDaemonEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of DAEMON_ENV_ALLOWLIST) {
@@ -274,6 +296,7 @@ function createMinimalDaemonEnv(): NodeJS.ProcessEnv {
       env[key] = process.env[key];
     }
   }
+  Object.assign(env, resolveDaemonLaunchContext());
   return env;
 }
 
@@ -1858,26 +1881,48 @@ async function handleTelegramTopicSessionLaunch(
       formatTelegramLaunchAcknowledgement(sourceRecord, launchResult.sessionId),
     );
 
-    if (acknowledgement?.messageId) {
-      const registered = deps.registerMessageImpl({
-        platform: 'telegram',
-        messageId: acknowledgement.messageId,
+    if (!acknowledgement?.messageId) {
+      state.errors++;
+      recordSourceFailure(
+        state,
         source,
-        sessionId: launchResult.sessionId,
-        tmuxPaneId: launchResult.leaderPaneId,
-        tmuxSessionName: launchResult.tmuxSessionName,
-        event: 'session-start',
-        createdAt: new Date().toISOString(),
-        projectPath: sourceRecord.canonicalProjectPath,
-        projectKey: sourceRecord.projectKey,
-        messageThreadId: acknowledgement.messageThreadId ?? normalizeTelegramNumericId(inboundThreadId),
-        topicName: sourceRecord.topicName,
-      });
-      if (!registered) {
-        deps.logImpl(`WARN: Failed to register Telegram launch acknowledgement ${acknowledgement.messageId} for session ${launchResult.sessionId}`);
-      }
+        'topic-launch-acknowledgement-failure',
+        `Telegram launch acknowledgement for session ${launchResult.sessionId} did not return a message id`,
+      );
+      deps.logImpl(`WARN: Telegram launch acknowledgement for session ${launchResult.sessionId} did not return a message id`);
+      return true;
     }
+
+    const registered = deps.registerMessageImpl({
+      platform: 'telegram',
+      messageId: acknowledgement.messageId,
+      source,
+      sessionId: launchResult.sessionId,
+      tmuxPaneId: launchResult.leaderPaneId,
+      tmuxSessionName: launchResult.tmuxSessionName,
+      event: 'session-start',
+      createdAt: new Date().toISOString(),
+      projectPath: sourceRecord.canonicalProjectPath,
+      projectKey: sourceRecord.projectKey,
+      messageThreadId: acknowledgement.messageThreadId ?? normalizeTelegramNumericId(inboundThreadId),
+      topicName: sourceRecord.topicName,
+    });
+    if (!registered) {
+      state.errors++;
+      recordSourceFailure(
+        state,
+        source,
+        'topic-launch-ack-registration-failure',
+        `Failed to register Telegram launch acknowledgement ${acknowledgement.messageId} for session ${launchResult.sessionId}`,
+      );
+      deps.logImpl(`WARN: Failed to register Telegram launch acknowledgement ${acknowledgement.messageId} for session ${launchResult.sessionId}`);
+      return true;
+    }
+
+    clearSourceFailure(state, source);
   } catch (error) {
+    state.errors++;
+    recordSourceFailure(state, source, 'topic-launch-acknowledgement-failure', String(error));
     deps.logImpl(`WARN: Failed to send Telegram reply (topic-launch-acknowledgement): ${error}`);
   }
 
@@ -2182,6 +2227,7 @@ export async function pollTelegramOnce(
       );
       if (injectionResult.outcome === 'success') {
         state.messagesInjected++;
+        clearSourceFailure(state, source);
         await recordPendingReplyOrigin(mapping.projectPath, mapping.sessionId, {
           platform: 'telegram',
           injectedInput: buildInjectedReplyInput(text, 'telegram', config),

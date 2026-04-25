@@ -143,6 +143,17 @@ describe('verifyPaneTarget', () => {
     assert.equal(result.reason, 'content-fallback');
   });
 
+  it('rejects content fallback when metadata is unavailable for a session-bound target', () => {
+    const result = verifyPaneTarget('%9', {
+      expectedSessionName: 'omx-session',
+      capturePaneContentImpl: () => 'Codex > old transcript still visible',
+      inspectPaneMetadataImpl: () => null,
+    });
+
+    assert.equal(result.accepted, false);
+    assert.equal(result.reason, 'verification-failed');
+  });
+
   it('does not treat generic shells as a metadata match on session name alone', () => {
     const result = verifyPaneTarget('%9', {
       expectedSessionName: 'omx-session',
@@ -158,6 +169,48 @@ describe('verifyPaneTarget', () => {
 
     assert.equal(result.accepted, false);
     assert.equal(result.reason, 'verification-failed');
+  });
+
+  it('does not accept arbitrary shell commands that only mention codex', () => {
+    const result = verifyPaneTarget('%9', {
+      expectedSessionName: 'omx-session',
+      capturePaneContentImpl: () => 'Codex > old transcript still visible',
+      inspectPaneMetadataImpl: () => ({
+        paneId: '%9',
+        currentCommand: 'bash',
+        startCommand: 'bash -lc "echo codex && sleep 1000"',
+        sessionName: 'omx-session',
+        tty: '/dev/ttys003',
+      }),
+    });
+
+    assert.equal(result.accepted, false);
+    assert.equal(result.reason, 'verification-failed');
+  });
+
+  it('accepts OMX detached Codex shell wrappers when the session metadata matches', () => {
+    const result = verifyPaneTarget('%9', {
+      expectedSessionName: 'omx-session',
+      capturePaneContentImpl: () => '',
+      inspectPaneMetadataImpl: () => ({
+        paneId: '%9',
+        currentCommand: 'bash',
+        startCommand: [
+          '/bin/sh -c',
+          'omx_codex_pid="";',
+          'omx_detached_session_cleanup() { kill -TERM "$omx_codex_pid"; };',
+          'trap omx_detached_session_cleanup 0 INT TERM HUP;',
+          '/bin/zsh -c "exec codex -c model_instructions_file=\\"/repo/.omx/state/sessions/omx-session/AGENTS.md\\"" <&3 &',
+          'omx_codex_pid=$!;',
+          'wait "$omx_codex_pid";',
+        ].join(' '),
+        sessionName: 'omx-session',
+        tty: '/dev/ttys003',
+      }),
+    });
+
+    assert.equal(result.accepted, true);
+    assert.equal(result.reason, 'metadata-match');
   });
 
   it('accepts node wrappers only when the pane start command includes codex', () => {
