@@ -32,16 +32,22 @@ import {
   normalizeTelegramProjectIdentity,
   performTelegramBotApiRequest,
   resolveTelegramDestination,
-  TelegramBotApiError,
   type TelegramResolvedDestination,
   type TelegramTopicResolutionDeps,
 } from "./telegram-topics.js";
+import {
+  classifyTelegramBotApiError,
+  isTelegramDeliveryTopicMismatchError,
+  isTelegramRichPayloadError,
+  isTelegramStaleTopicError,
+} from "./telegram-errors.js";
 import { updateTelegramTopicRegistryRecord } from "./telegram-topic-registry.js";
 import { shouldBlockLiveNotificationNetworkInTests } from "../utils/test-env.js";
 
 const SEND_TIMEOUT_MS = 10_000;
 const DISPATCH_TIMEOUT_MS = 15_000;
 const DISCORD_MAX_CONTENT_LENGTH = 2000;
+const TELEGRAM_RENDER_DEBUG_ENV = "OMX_TELEGRAM_RENDER_DEBUG";
 
 interface TelegramSendMessageResult {
   message_id?: number | string;
@@ -449,7 +455,7 @@ export async function sendTelegram(
         topicName: destination.topicName,
       };
     } catch (error) {
-      const staleTopicError = isRecoverableTelegramTopicError(error);
+      const staleTopicError = isTelegramStaleTopicError(error);
       if (
         staleTopicError
         && destination
@@ -475,7 +481,33 @@ export async function sendTelegram(
         continue;
       }
 
-      if (!staleTopicError) {
+      const deliveryMismatchError = isTelegramDeliveryTopicMismatchError(error);
+      if (
+        deliveryMismatchError
+        && destination
+        && !refreshedStaleTopic
+        && shouldMarkStaleTelegramTopic(config, destination)
+      ) {
+        refreshedStaleTopic = true;
+        await markTelegramTopicDestinationStaleBestEffort(
+          payload,
+          destination,
+          "topic-delivery-mismatch",
+          error instanceof Error ? error.message : String(error),
+        );
+        if (!canRetryStaleTelegramTopic(config, destination)) {
+          return {
+            platform: "telegram",
+            success: false,
+            error: error instanceof Error ? error.message : "Unknown error",
+            projectKey: destination.projectKey,
+            topicName: destination.topicName,
+          };
+        }
+        continue;
+      }
+
+      if (!staleTopicError && !deliveryMismatchError) {
         await persistTelegramDestinationMappingBestEffort(
           config,
           payload,
@@ -500,7 +532,8 @@ async function sendTelegramMessageToDestination(
   deps: TelegramTopicResolutionDeps,
 ): Promise<TelegramDestinationSendResult> {
   const preparedMessage = prepareTelegramMessage(config, payload);
-  const sentEntityChunks = preparedMessage.chunks.some((chunk) => chunk.entities?.length);
+  const sendsRichPayload = Boolean(preparedMessage.parseMode)
+    || preparedMessage.chunks.some((chunk) => chunk.entities?.length);
 
   try {
     return await sendPreparedTelegramChunks(
@@ -511,10 +544,11 @@ async function sendTelegramMessageToDestination(
       deps,
     );
   } catch (error) {
-    if (!sentEntityChunks || !isTelegramEntitySendError(error)) {
+    if (!sendsRichPayload || !isTelegramRichPayloadError(error)) {
       throw error;
     }
 
+    logTelegramRichFallbackIfEnabled(error, preparedMessage.rawFallbackChunks.length);
     return sendPreparedTelegramChunks(
       config,
       {},
@@ -662,18 +696,21 @@ async function sendTelegramMessageChunk(
   )) ?? {};
 }
 
-function isTelegramEntitySendError(error: unknown): boolean {
-  if (!(error instanceof TelegramBotApiError) || error.methodName !== "sendMessage") {
-    return false;
+function logTelegramRichFallbackIfEnabled(error: unknown, rawChunkCount: number): void {
+  const debugValue = process.env[TELEGRAM_RENDER_DEBUG_ENV]?.trim().toLowerCase();
+  const debugEnabled = debugValue === "1" || debugValue === "true" || debugValue === "yes";
+  if (!debugEnabled) {
+    return;
   }
 
-  const description = `${error.description || ""} ${error.message}`.toLowerCase();
-  return (
-    description.includes("entity")
-    || description.includes("entities")
-    || description.includes("can't parse")
-    || description.includes("cant parse")
-  );
+  const classification = classifyTelegramBotApiError(error);
+  console.warn("[notifications] telegram rich payload fallback", {
+    category: classification.category,
+    methodName: classification.methodName,
+    statusCode: classification.statusCode,
+    errorCode: classification.errorCode,
+    rawChunkCount,
+  });
 }
 
 async function deleteTelegramMessageBestEffort(
@@ -758,22 +795,6 @@ function findTelegramTopicDeliveryMismatch(
   results: readonly TelegramSendMessageResult[],
 ): TelegramSendMessageResult | null {
   return results.find((result) => isTelegramTopicDeliveryMismatch(destination, result)) ?? null;
-}
-
-function isRecoverableTelegramTopicError(error: unknown): boolean {
-  if (!(error instanceof TelegramBotApiError)) {
-    return false;
-  }
-
-  if (error.methodName !== "sendMessage") {
-    return false;
-  }
-
-  const description = `${error.description || ""} ${error.message}`.toLowerCase();
-  return (
-    description.includes("message thread not found")
-    || (description.includes("topic") && description.includes("not found"))
-  );
 }
 
 function shouldMarkStaleTelegramTopic(

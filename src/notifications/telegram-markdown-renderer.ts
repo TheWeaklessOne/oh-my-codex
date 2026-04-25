@@ -16,17 +16,28 @@ import type {
   ListItem,
   Nodes,
   Parent,
+  PhrasingContent,
   Root,
   Table,
   TableCell,
 } from "mdast";
-import { isSafeTelegramLinkUrl, TelegramTextBuilder } from "./telegram-entities.js";
-import type { TelegramRenderedMessage } from "./types.js";
+import {
+  classifyTelegramLinkUrl,
+  type TelegramLinkSafetyResult,
+  TelegramTextBuilder,
+} from "./telegram-entities.js";
+import type {
+  TelegramMessageEntityType,
+  TelegramRenderedMessage,
+  TelegramRenderWarning,
+} from "./types.js";
 
 interface RenderContext {
   listDepth: number;
   inBlockquote: boolean;
   definitions: Map<string, Definition>;
+  warnings: string[];
+  structuredWarnings: TelegramRenderWarning[];
 }
 
 export interface TelegramMarkdownRenderOptions {
@@ -34,6 +45,11 @@ export interface TelegramMarkdownRenderOptions {
 }
 
 const DEFAULT_TABLE_MAX_WIDTH = 96;
+export const TELEGRAM_TABLE_CARD_COLUMN_THRESHOLD = 4;
+export const TELEGRAM_TABLE_CARD_TEXT_LENGTH_THRESHOLD = 700;
+export const TELEGRAM_TABLE_CARD_ROW_SEPARATOR = "\n---\n";
+const SPOILER_DELIMITER = "||";
+const EXPANDABLE_BLOCKQUOTE_MARKER = "[!EXPANDABLE]";
 
 function normalizeReferenceIdentifier(identifier: string | undefined): string {
   return (identifier ?? "").trim().replace(/\s+/gu, " ").toLowerCase();
@@ -54,7 +70,27 @@ function baseContext(definitions: Map<string, Definition>): RenderContext {
     listDepth: 0,
     inBlockquote: false,
     definitions,
+    warnings: [],
+    structuredWarnings: [],
   };
+}
+
+function childContext(
+  context: RenderContext,
+  overrides: Partial<Pick<RenderContext, "listDepth" | "inBlockquote">> = {},
+): RenderContext {
+  return {
+    ...context,
+    ...overrides,
+  };
+}
+
+function pushRendererWarning(
+  context: RenderContext,
+  warning: TelegramRenderWarning,
+): void {
+  context.warnings.push(warning.message);
+  context.structuredWarnings.push(warning);
 }
 
 function parseMarkdown(markdown: string): Root {
@@ -117,16 +153,15 @@ function renderBlock(
       renderBlockquote(builder, node, context, options);
       break;
     case "table":
-      renderTable(builder, node, options);
+      renderTable(builder, node, context, options);
       break;
     case "thematicBreak":
       builder.append("---");
       break;
     case "html":
-      renderHtml(builder, node.value);
+      renderHtml(builder, node.value, context);
       break;
     case "definition":
-      break;
       break;
     default:
       renderUnknownNode(builder, node, context, options);
@@ -153,7 +188,7 @@ function renderPhrasing(
 ): void {
   switch (node.type) {
     case "text":
-      builder.append(node.value);
+      renderTextWithSpoilers(builder, node.value);
       break;
     case "emphasis":
       renderFormatting(builder, "italic", node, context, options);
@@ -177,21 +212,78 @@ function renderPhrasing(
       renderLinkReference(builder, node, context, options);
       break;
     case "image":
-      renderImage(builder, node);
+      renderImage(builder, node, context);
       break;
     case "imageReference":
-      renderImageReference(builder, node);
+      renderImageReference(builder, node, context);
       break;
     case "html":
-      renderHtml(builder, node.value);
+      renderHtml(builder, node.value, context);
       break;
     default:
-      if (hasChildren(node)) {
-        renderPhrasingChildren(builder, node as Parent, context, options);
-      } else if ("value" in node && typeof node.value === "string") {
-        builder.append(node.value);
-      }
+      renderUnknownPhrasingNode(builder, node, context, options);
       break;
+  }
+}
+
+function pushUnsupportedNodeWarning(
+  context: RenderContext,
+  node: Nodes,
+): void {
+  pushRendererWarning(context, {
+    code: "unsupported-node-degraded",
+    message: `Degraded unsupported Markdown node "${node.type}" to safe plain text.`,
+    source: "renderer",
+    nodeType: node.type,
+  });
+}
+
+function renderUnknownPhrasingNode(
+  builder: TelegramTextBuilder,
+  node: Content,
+  context: RenderContext,
+  options: Required<TelegramMarkdownRenderOptions>,
+): void {
+  pushUnsupportedNodeWarning(context, node);
+  if (hasChildren(node)) {
+    renderPhrasingChildren(builder, node as Parent, context, options);
+    return;
+  }
+  if ("value" in node && typeof node.value === "string") {
+    builder.append(node.value);
+    return;
+  }
+
+  const fallbackLabel = (node as { label?: unknown; identifier?: unknown }).label
+    ?? (node as { label?: unknown; identifier?: unknown }).identifier;
+  if (typeof fallbackLabel === "string" && fallbackLabel.trim()) {
+    builder.append(`[${fallbackLabel.trim()}]`);
+  }
+}
+
+function renderTextWithSpoilers(builder: TelegramTextBuilder, value: string): void {
+  let cursor = 0;
+  while (cursor < value.length) {
+    const open = value.indexOf(SPOILER_DELIMITER, cursor);
+    if (open < 0) {
+      builder.append(value.slice(cursor));
+      return;
+    }
+
+    const close = value.indexOf(SPOILER_DELIMITER, open + SPOILER_DELIMITER.length);
+    if (close < 0) {
+      builder.append(value.slice(cursor));
+      return;
+    }
+
+    builder.append(value.slice(cursor, open));
+    const spoilerText = value.slice(open + SPOILER_DELIMITER.length, close);
+    if (spoilerText.length > 0) {
+      builder.withEntity("spoiler", () => {
+        builder.append(spoilerText);
+      });
+    }
+    cursor = close + SPOILER_DELIMITER.length;
   }
 }
 
@@ -237,14 +329,26 @@ function renderCodeBlock(builder: TelegramTextBuilder, node: Code): void {
 function addSafeTextLinkEntity(
   builder: TelegramTextBuilder,
   start: number,
-  url: string | undefined,
-): boolean {
-  if (!isSafeTelegramLinkUrl(url)) {
-    return false;
+  url: string,
+): void {
+  builder.addEntity("text_link", start, builder.length - start, { url });
+}
+
+function pushDroppedLinkWarning(
+  context: RenderContext,
+  linkSafety: TelegramLinkSafetyResult,
+): void {
+  if (linkSafety.safe) {
+    return;
   }
 
-  builder.addEntity("text_link", start, builder.length - start, { url });
-  return true;
+  pushRendererWarning(context, {
+    code: linkSafety.warningCode ?? "unsafe-url-dropped",
+    message: "Dropped unsafe Telegram link URL.",
+    source: "renderer",
+    reason: linkSafety.reason,
+    value: linkSafety.redactedValue,
+  });
 }
 
 function renderLink(
@@ -253,20 +357,22 @@ function renderLink(
   context: RenderContext,
   options: Required<TelegramMarkdownRenderOptions>,
 ): void {
+  const linkSafety = classifyTelegramLinkUrl(node.url);
   const start = builder.length;
   if (node.children.length > 0) {
     renderPhrasingChildren(builder, node, context, options);
-  } else {
+  } else if (linkSafety.safe) {
     builder.append(node.url);
+  } else {
+    builder.append("link");
   }
 
-  if (addSafeTextLinkEntity(builder, start, node.url)) {
+  if (linkSafety.safe) {
+    addSafeTextLinkEntity(builder, start, node.url);
     return;
   }
 
-  if (node.url) {
-    builder.append(` (${node.url})`);
-  }
+  pushDroppedLinkWarning(context, linkSafety);
 }
 
 function renderLinkReference(
@@ -289,16 +395,29 @@ function renderLinkReference(
     return;
   }
 
-  if (addSafeTextLinkEntity(builder, start, definition.url)) {
+  const linkSafety = classifyTelegramLinkUrl(definition.url);
+  if (linkSafety.safe) {
+    addSafeTextLinkEntity(builder, start, definition.url);
     return;
   }
 
+  pushDroppedLinkWarning(context, linkSafety);
   // Reference definitions are metadata, not visible Markdown content. If the
   // referenced URL is unsafe for a hidden Telegram text_link, keep only the
   // visible link label instead of surfacing hidden definition data.
 }
 
-function renderImage(builder: TelegramTextBuilder, node: Image): void {
+function renderImage(
+  builder: TelegramTextBuilder,
+  node: Image,
+  context: RenderContext,
+): void {
+  pushRendererWarning(context, {
+    code: "image-degraded",
+    message: "Degraded image Markdown to safe plain text.",
+    source: "renderer",
+    nodeType: "image",
+  });
   const label = node.alt?.trim() || "image";
   builder.append(label);
 }
@@ -306,7 +425,14 @@ function renderImage(builder: TelegramTextBuilder, node: Image): void {
 function renderImageReference(
   builder: TelegramTextBuilder,
   node: ImageReference,
+  context: RenderContext,
 ): void {
+  pushRendererWarning(context, {
+    code: "image-degraded",
+    message: "Degraded image reference Markdown to safe plain text.",
+    source: "renderer",
+    nodeType: "imageReference",
+  });
   builder.append(node.alt?.trim() || node.label || node.identifier || "image");
 }
 
@@ -334,7 +460,12 @@ function renderList(
     const indent = "  ".repeat(context.listDepth);
     builder.append(indent);
     builder.append(listMarker(node, item, index));
-    renderListItem(builder, item, { ...context, listDepth: context.listDepth + 1 }, options);
+    renderListItem(
+      builder,
+      item,
+      childContext(context, { listDepth: context.listDepth + 1 }),
+      options,
+    );
   });
 }
 
@@ -369,44 +500,118 @@ function renderBlockquote(
   options: Required<TelegramMarkdownRenderOptions>,
 ): void {
   if (context.inBlockquote) {
+    pushRendererWarning(context, {
+      code: "nested-blockquote-dropped",
+      message: "Dropped nested Telegram blockquote entity.",
+      source: "renderer",
+      nodeType: "blockquote",
+    });
     renderChildren(builder, node.children, context, options);
     return;
   }
 
-  builder.withEntity("blockquote", () => {
+  const { entityType, children } = extractExpandableBlockquote(node);
+  builder.withEntity(entityType, () => {
     renderChildren(
       builder,
-      node.children,
-      { ...context, inBlockquote: true },
+      children,
+      childContext(context, { inBlockquote: true }),
       options,
     );
   });
 }
 
-function plainTextFromNode(node: Nodes): string {
+function extractExpandableBlockquote(node: Blockquote): {
+  entityType: Extract<TelegramMessageEntityType, "blockquote" | "expandable_blockquote">;
+  children: Content[];
+} {
+  const [first, ...rest] = node.children;
+  if (!first || first.type !== "paragraph" || first.children.length === 0) {
+    return { entityType: "blockquote", children: [...node.children] };
+  }
+
+  const [firstChild, ...remainingParagraphChildren] = first.children as PhrasingContent[];
+  if (
+    !firstChild
+    || firstChild.type !== "text"
+    || !firstChild.value.trimStart().startsWith(EXPANDABLE_BLOCKQUOTE_MARKER)
+  ) {
+    return { entityType: "blockquote", children: [...node.children] };
+  }
+
+  const leadingTrimmed = firstChild.value.trimStart();
+  const markerStart = firstChild.value.length - leadingTrimmed.length;
+  const afterMarker = firstChild.value
+    .slice(markerStart + EXPANDABLE_BLOCKQUOTE_MARKER.length)
+    .replace(/^[ \t]*\n?/u, "");
+  const paragraphChildren: PhrasingContent[] = [
+    ...(afterMarker ? [{ ...firstChild, value: afterMarker }] : []),
+    ...remainingParagraphChildren,
+  ];
+  const children = paragraphChildren.length > 0
+    ? [{ ...first, children: paragraphChildren }]
+    : [...rest];
+  if (paragraphChildren.length > 0) {
+    children.push(...rest);
+  }
+
+  return {
+    entityType: "expandable_blockquote",
+    children,
+  };
+}
+
+function plainTextFromNode(node: Nodes, context?: RenderContext): string {
   switch (node.type) {
     case "text":
     case "inlineCode":
     case "code":
-    case "html":
       return node.value;
+    case "html":
+      if (context) {
+        pushRendererWarning(context, {
+          code: "raw-html-degraded",
+          message: "Degraded raw HTML Markdown to safe plain text.",
+          source: "renderer",
+          nodeType: "html",
+        });
+      }
+      return stripHtmlToPlainText(node.value);
     case "break":
       return "\n";
     case "image":
-      return node.alt || node.url;
-    case "link":
-      return node.children.map(plainTextFromNode).join("") || node.url;
+      if (context) {
+        pushRendererWarning(context, {
+          code: "image-degraded",
+          message: "Degraded image Markdown to safe plain text.",
+          source: "renderer",
+          nodeType: "image",
+        });
+      }
+      return node.alt || "image";
+    case "link": {
+      const linkSafety = classifyTelegramLinkUrl(node.url);
+      if (!linkSafety.safe && context) {
+        pushDroppedLinkWarning(context, linkSafety);
+      }
+      return node.children.map((child) => plainTextFromNode(child, context)).join("")
+        || (linkSafety.safe ? node.url : "link");
+    }
     default:
-      return nodeChildren(node).map(plainTextFromNode).join("");
+      return nodeChildren(node).map((child) => plainTextFromNode(child, context)).join("");
   }
 }
 
 function renderTable(
   builder: TelegramTextBuilder,
   node: Table,
+  context: RenderContext,
   options: Required<TelegramMarkdownRenderOptions>,
 ): void {
-  const rows = node.children.map((row) => row.children.map((cell) => plainTextFromCell(cell)));
+  const rows = node.children.map((row) => row.children.map((cell) => plainTextFromCell(
+    cell,
+    context,
+  )));
   if (rows.length === 0) {
     return;
   }
@@ -421,19 +626,38 @@ function renderTable(
     .map((width, columnIndex) => (row[columnIndex] ?? "").padEnd(width, " "))
     .join(" | ")
     .trimEnd());
-  const tooWide = alignedRows.some((row) => row.length > options.tableMaxWidth);
-  const tableText = tooWide ? renderNarrowTable(rows) : alignedRows.join("\n");
+  const tableText = alignedRows.join("\n");
+  const shouldRenderCards =
+    columnCount > TELEGRAM_TABLE_CARD_COLUMN_THRESHOLD
+    || alignedRows.some((row) => row.length > options.tableMaxWidth)
+    || tableText.length > TELEGRAM_TABLE_CARD_TEXT_LENGTH_THRESHOLD;
+
+  if (shouldRenderCards) {
+    pushRendererWarning(context, {
+      code: "table-rendered-as-cards",
+      message: "Rendered wide Markdown table as mobile-friendly cards.",
+      source: "renderer",
+      nodeType: "table",
+      reason: `columns=${columnCount}; length=${tableText.length}; maxWidth=${options.tableMaxWidth}`,
+    });
+    builder.append(renderTableCards(rows));
+    return;
+  }
 
   builder.withEntity("pre", () => {
     builder.append(tableText);
   });
 }
 
-function plainTextFromCell(cell: TableCell): string {
-  return cell.children.map(plainTextFromNode).join("").replace(/\s+/gu, " ").trim();
+function plainTextFromCell(cell: TableCell, context: RenderContext): string {
+  return cell.children
+    .map((child) => plainTextFromNode(child, context))
+    .join("")
+    .replace(/\s+/gu, " ")
+    .trim();
 }
 
-function renderNarrowTable(rows: string[][]): string {
+function renderTableCards(rows: string[][]): string {
   const [header, ...bodyRows] = rows;
   if (!header || bodyRows.length === 0) {
     return rows.map((row) => row.join(" | ")).join("\n");
@@ -441,16 +665,34 @@ function renderNarrowTable(rows: string[][]): string {
 
   return bodyRows
     .map((row) => header
-      .map((heading, index) => `${heading || `Column ${index + 1}`}: ${row[index] ?? ""}`)
+      .map((heading, index) => {
+        const key = heading || `Column ${index + 1}`;
+        const value = row[index]?.trim() || "—";
+        return `${key}: ${value}`;
+      })
       .join("\n"))
-    .join("\n\n");
+    .join(TELEGRAM_TABLE_CARD_ROW_SEPARATOR);
 }
 
-function renderHtml(builder: TelegramTextBuilder, html: string): void {
-  const stripped = html.replace(/<[^>]*>/gu, "").trim();
+function renderHtml(
+  builder: TelegramTextBuilder,
+  html: string,
+  context: RenderContext,
+): void {
+  pushRendererWarning(context, {
+    code: "raw-html-degraded",
+    message: "Degraded raw HTML Markdown to safe plain text.",
+    source: "renderer",
+    nodeType: "html",
+  });
+  const stripped = stripHtmlToPlainText(html);
   if (stripped) {
     builder.append(stripped);
   }
+}
+
+function stripHtmlToPlainText(html: string): string {
+  return html.replace(/<[^>]*>/gu, "").trim();
 }
 
 function renderUnknownNode(
@@ -459,6 +701,7 @@ function renderUnknownNode(
   context: RenderContext,
   options: Required<TelegramMarkdownRenderOptions>,
 ): void {
+  pushUnsupportedNodeWarning(context, node);
   if (hasChildren(node)) {
     renderChildren(builder, nodeChildren(node), context, options);
     return;
@@ -479,20 +722,28 @@ export function renderMarkdownToTelegramEntities(
   try {
     const ast = parseMarkdown(markdown);
     const builder = new TelegramTextBuilder();
+    const context = baseContext(collectDefinitions(ast));
     renderChildren(
       builder,
       ast.children,
-      baseContext(collectDefinitions(ast)),
+      context,
       normalizedOptions,
     );
-    return builder.toRenderedMessage();
+    return builder.toRenderedMessage(context.warnings, context.structuredWarnings);
   } catch (error) {
+    const message = `Telegram Markdown renderer fallback: ${
+      error instanceof Error ? error.message : String(error)
+    }`;
     return {
       text: markdown,
       entities: [],
-      warnings: [
-        `Telegram Markdown renderer fallback: ${error instanceof Error ? error.message : String(error)}`,
-      ],
+      warnings: [message],
+      structuredWarnings: [{
+        code: "markdown-render-fallback",
+        message,
+        source: "renderer",
+        reason: error instanceof Error ? error.name : typeof error,
+      }],
     };
   }
 }

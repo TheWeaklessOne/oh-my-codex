@@ -231,6 +231,93 @@ describe('completed-turn rendering', () => {
     assert.equal(overrides?.telegram?.parseMode, null);
   });
 
+  it('does not append renderer warnings to Telegram message text or log by default', () => {
+    const originalWarn = console.warn;
+    const originalDebug = process.env.OMX_TELEGRAM_RENDER_DEBUG;
+    const warnCalls: unknown[][] = [];
+    console.warn = (...args: unknown[]) => {
+      warnCalls.push(args);
+    };
+    delete process.env.OMX_TELEGRAM_RENDER_DEBUG;
+
+    try {
+      const decision = planCompletedTurnNotification({
+        semanticOutcome: {
+          kind: 'result-ready',
+          summary: 'All tests passed.',
+          notificationEvent: 'result-ready',
+        },
+      });
+      assert.ok(decision);
+      const payload: FullNotificationPayload = {
+        ...basePayload,
+        message: renderCompletedTurnMessage(
+          decision.transportPolicy.default,
+          basePayload,
+          '[signed](https://example.com/file?token=secret)',
+        ),
+      };
+      const overrides = buildCompletedTurnTransportOverrides(
+        decision,
+        payload,
+        '[signed](https://example.com/file?token=secret)',
+      );
+
+      assert.equal(overrides?.telegram?.message, 'signed');
+      assert.doesNotMatch(overrides?.telegram?.message ?? '', /warning|secret/i);
+      assert.equal(warnCalls.length, 0);
+    } finally {
+      console.warn = originalWarn;
+      if (originalDebug === undefined) delete process.env.OMX_TELEGRAM_RENDER_DEBUG;
+      else process.env.OMX_TELEGRAM_RENDER_DEBUG = originalDebug;
+    }
+  });
+
+  it('logs redacted renderer warning telemetry when Telegram render debug is enabled', () => {
+    const originalWarn = console.warn;
+    const originalDebug = process.env.OMX_TELEGRAM_RENDER_DEBUG;
+    const warnCalls: unknown[][] = [];
+    console.warn = (...args: unknown[]) => {
+      warnCalls.push(args);
+    };
+    process.env.OMX_TELEGRAM_RENDER_DEBUG = '1';
+
+    try {
+      const decision = planCompletedTurnNotification({
+        semanticOutcome: {
+          kind: 'result-ready',
+          summary: 'All tests passed.',
+          notificationEvent: 'result-ready',
+        },
+      });
+      assert.ok(decision);
+      const payload: FullNotificationPayload = {
+        ...basePayload,
+        message: renderCompletedTurnMessage(
+          decision.transportPolicy.default,
+          basePayload,
+          '[signed](https://example.com/file?token=secret)',
+        ),
+      };
+      const overrides = buildCompletedTurnTransportOverrides(
+        decision,
+        payload,
+        '[signed](https://example.com/file?token=secret)',
+      );
+
+      assert.equal(overrides?.telegram?.message, 'signed');
+      assert.equal(warnCalls.length, 1);
+      const telemetry = JSON.stringify(warnCalls[0]);
+      assert.match(telemetry, /sensitive-url-dropped/);
+      assert.doesNotMatch(telemetry, /secret/);
+      assert.doesNotMatch(telemetry, /file\\?token=secret/);
+    } finally {
+      console.warn = originalWarn;
+      if (originalDebug === undefined) delete process.env.OMX_TELEGRAM_RENDER_DEBUG;
+      else process.env.OMX_TELEGRAM_RENDER_DEBUG = originalDebug;
+    }
+  });
+
   it('builds Telegram entity overrides for ask-user-question raw markdown by default', () => {
     const decision = planCompletedTurnNotification({
       semanticOutcome: {

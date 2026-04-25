@@ -2,6 +2,10 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { renderMarkdownToTelegramEntities } from '../telegram-markdown-renderer.js';
+import {
+  splitTelegramRenderedMessage,
+  TELEGRAM_MESSAGE_MAX_LENGTH,
+} from '../telegram-entities.js';
 
 describe('renderMarkdownToTelegramEntities', () => {
   it('renders inline commands as code entities without backticks', () => {
@@ -20,6 +24,16 @@ describe('renderMarkdownToTelegramEntities', () => {
     assert.deepEqual(rendered.entities, [
       { type: 'pre', offset: 0, length: 'npm test'.length, language: 'sh' },
     ]);
+  });
+
+  it('sanitizes unsafe fenced code language tokens with structured warnings', () => {
+    const rendered = renderMarkdownToTelegramEntities('```../bad\nnpm test\n```');
+
+    assert.equal(rendered.text, 'npm test');
+    assert.deepEqual(rendered.entities, [
+      { type: 'pre', offset: 0, length: 'npm test'.length },
+    ]);
+    assert.equal(rendered.structuredWarnings?.[0]?.code, 'pre-language-sanitized');
   });
 
   it('renders headings as bold text without literal heading markers', () => {
@@ -61,7 +75,7 @@ describe('renderMarkdownToTelegramEntities', () => {
   it('renders safe links as text_link and unsafe links as plain text', () => {
     const rendered = renderMarkdownToTelegramEntities('[docs](https://example.com/docs) [bad](javascript:alert(1))');
 
-    assert.equal(rendered.text, 'docs bad (javascript:alert(1))');
+    assert.equal(rendered.text, 'docs bad');
     assert.deepEqual(rendered.entities, [
       {
         type: 'text_link',
@@ -70,6 +84,7 @@ describe('renderMarkdownToTelegramEntities', () => {
         url: 'https://example.com/docs',
       },
     ]);
+    assert.equal(rendered.structuredWarnings?.[0]?.code, 'unsafe-url-dropped');
   });
 
   it('rejects hidden text links to local or token-bearing URLs', () => {
@@ -80,9 +95,23 @@ describe('renderMarkdownToTelegramEntities', () => {
 
     assert.equal(
       rendered.text,
-      'local (https://127.0.0.1:8443/) signed (https://example.com/file?X-Amz-Signature=secret)',
+      'local signed',
     );
     assert.deepEqual(rendered.entities, []);
+    assert.deepEqual(
+      rendered.structuredWarnings?.map((warning) => warning.code),
+      ['local-url-dropped', 'sensitive-url-dropped'],
+    );
+    assert.doesNotMatch(JSON.stringify(rendered.structuredWarnings), /secret/);
+  });
+
+  it('does not leak unsafe URLs from empty link labels', () => {
+    const rendered = renderMarkdownToTelegramEntities('[](https://127.0.0.1:8443/?token=secret)');
+
+    assert.equal(rendered.text, 'link');
+    assert.deepEqual(rendered.entities, []);
+    assert.equal(rendered.structuredWarnings?.[0]?.code, 'local-url-dropped');
+    assert.doesNotMatch(JSON.stringify(rendered.structuredWarnings), /secret/);
   });
 
   it('resolves reference-style links and hides definition metadata', () => {
@@ -114,6 +143,7 @@ describe('renderMarkdownToTelegramEntities', () => {
 
     assert.equal(rendered.text, 'diagram\nlogo\nimage\nhidden');
     assert.deepEqual(rendered.entities, []);
+    assert.ok(rendered.structuredWarnings?.every((warning) => warning.code === 'image-degraded'));
   });
 
   it('renders blockquotes with legal nested inline formatting', () => {
@@ -136,6 +166,149 @@ describe('renderMarkdownToTelegramEntities', () => {
     ]);
   });
 
+  it('renders wide GFM tables as mobile-friendly cards instead of pre text', () => {
+    const rendered = renderMarkdownToTelegramEntities([
+      '| Feature | Result | Owner | Notes | Extra |',
+      '| --- | --- | --- | --- | --- |',
+      '| entities | pass | bot | handles **bold** | 🚀 |',
+      '| fallback | pass | bot | strips unsafe links | 🛡️ |',
+    ].join('\n'));
+
+    assert.match(rendered.text, /^Feature: entities\nResult: pass\nOwner: bot/m);
+    assert.match(rendered.text, /\n---\nFeature: fallback\nResult: pass/m);
+    assert.deepEqual(rendered.entities, []);
+    assert.equal(rendered.structuredWarnings?.[0]?.code, 'table-rendered-as-cards');
+  });
+
+  it('renders tables with empty Cyrillic and emoji cells readably', () => {
+    const rendered = renderMarkdownToTelegramEntities([
+      '| Фича | Итог | Emoji | Notes | Extra |',
+      '| --- | --- | --- | --- | --- |',
+      '| сущности | пройдены | 😀 |  | 🚀 |',
+    ].join('\n'));
+
+    assert.match(rendered.text, /Фича: сущности/);
+    assert.match(rendered.text, /Notes: —/);
+    assert.match(rendered.text, /Emoji: 😀/);
+  });
+
+  it('does not break neighboring entities around a wide table', () => {
+    const rendered = renderMarkdownToTelegramEntities([
+      '**Before**',
+      '',
+      '| Feature | Result | Owner | Notes | Extra |',
+      '| --- | --- | --- | --- | --- |',
+      '| entities | pass | bot | handles cards | 🚀 |',
+      '',
+      '`After`',
+    ].join('\n'));
+
+    assert.match(rendered.text, /^Before\n\nFeature: entities/m);
+    assert.match(rendered.text, /🚀\n\nAfter$/m);
+    assert.deepEqual(rendered.entities, [
+      { type: 'bold', offset: 0, length: 'Before'.length },
+      {
+        type: 'code',
+        offset: rendered.text.length - 'After'.length,
+        length: 'After'.length,
+      },
+    ]);
+  });
+
+  it('allows long card table output to chunk safely downstream', () => {
+    const rows = Array.from({ length: 180 }, (_unused, index) => (
+      `| feature-${index} | pass | bot | ${'note '.repeat(8)} | 🚀 |`
+    ));
+    const rendered = renderMarkdownToTelegramEntities([
+      '| Feature | Result | Owner | Notes | Extra |',
+      '| --- | --- | --- | --- | --- |',
+      ...rows,
+    ].join('\n'));
+    const chunks = splitTelegramRenderedMessage(rendered);
+
+    assert.equal(rendered.structuredWarnings?.[0]?.code, 'table-rendered-as-cards');
+    assert.ok(chunks.length > 1);
+    assert.ok(chunks.every((chunk) => chunk.text.length <= TELEGRAM_MESSAGE_MAX_LENGTH));
+  });
+
+  it('degrades table cell images and raw HTML without leaking unsafe URLs or tags', () => {
+    const rendered = renderMarkdownToTelegramEntities([
+      '| A | B | C | D | E |',
+      '| --- | --- | --- | --- | --- |',
+      '| [safe](https://example.com) | [bad](https://127.0.0.1:8443/?token=secret) | ![](https://127.0.0.1/p.png) | <script>alert(1)</script> | text |',
+    ].join('\n'));
+
+    assert.equal(
+      rendered.text,
+      [
+        'A: safe',
+        'B: bad',
+        'C: image',
+        'D: alert(1)',
+        'E: text',
+      ].join('\n'),
+    );
+    assert.doesNotMatch(rendered.text, /127\.0\.0\.1|token=secret|<script>/);
+    assert.deepEqual(rendered.entities, []);
+    assert.deepEqual(
+      rendered.structuredWarnings?.map((warning) => warning.code),
+      [
+        'local-url-dropped',
+        'image-degraded',
+        'raw-html-degraded',
+        'raw-html-degraded',
+        'table-rendered-as-cards',
+      ],
+    );
+  });
+
+  it('renders explicit spoiler delimiters as Telegram spoiler entities', () => {
+    const rendered = renderMarkdownToTelegramEntities('Visible ||secret 😀|| done');
+
+    assert.equal(rendered.text, 'Visible secret 😀 done');
+    assert.deepEqual(rendered.entities, [
+      { type: 'spoiler', offset: 'Visible '.length, length: 'secret 😀'.length },
+    ]);
+  });
+
+  it('keeps underline unsupported via raw HTML graceful degradation', () => {
+    const rendered = renderMarkdownToTelegramEntities('<u>under</u>');
+
+    assert.equal(rendered.text, 'under');
+    assert.deepEqual(rendered.entities, []);
+    assert.ok(rendered.structuredWarnings?.some((warning) => warning.code === 'raw-html-degraded'));
+  });
+
+  it('renders explicit expandable blockquote marker as Telegram expandable blockquote', () => {
+    const rendered = renderMarkdownToTelegramEntities('> [!EXPANDABLE]\n> hidden **quote**');
+
+    assert.equal(rendered.text, 'hidden quote');
+    assert.deepEqual(rendered.entities, [
+      { type: 'expandable_blockquote', offset: 0, length: 'hidden quote'.length },
+      { type: 'bold', offset: 'hidden '.length, length: 'quote'.length },
+    ]);
+  });
+
+  it('denies tg links by default', () => {
+    const rendered = renderMarkdownToTelegramEntities('[user](tg://user?id=123)');
+
+    assert.equal(rendered.text, 'user');
+    assert.deepEqual(rendered.entities, []);
+    assert.equal(rendered.structuredWarnings?.[0]?.code, 'unsafe-url-dropped');
+  });
+
+  it('degrades unsupported GFM footnote nodes to visible safe text with warnings', () => {
+    const rendered = renderMarkdownToTelegramEntities('text [^1]\n\n[^1]: footnote');
+
+    assert.equal(rendered.text, 'text [1]\n\nfootnote');
+    assert.deepEqual(rendered.entities, []);
+    assert.deepEqual(
+      rendered.structuredWarnings?.map((warning) => warning.code),
+      ['unsupported-node-degraded', 'unsupported-node-degraded'],
+    );
+    assert.doesNotMatch(rendered.text, /\[\^1\]/u);
+  });
+
   it('handles malformed Markdown without throwing', () => {
     const rendered = renderMarkdownToTelegramEntities('**unterminated [link](https://example.com');
 
@@ -148,6 +321,7 @@ describe('renderMarkdownToTelegramEntities', () => {
 
     assert.equal(rendered.text, 'boldalert(1)');
     assert.deepEqual(rendered.entities, []);
+    assert.ok(rendered.structuredWarnings?.some((warning) => warning.code === 'raw-html-degraded'));
   });
 
   it('keeps UTF-16 offsets correct for mixed Cyrillic and emoji text', () => {

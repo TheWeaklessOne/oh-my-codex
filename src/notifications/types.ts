@@ -220,10 +220,40 @@ export interface TelegramMessageEntity {
   language?: string;
 }
 
+export type TelegramRenderWarningCode =
+  | "unsafe-url-dropped"
+  | "sensitive-url-dropped"
+  | "local-url-dropped"
+  | "entity-invalid-range-dropped"
+  | "entity-trimmed"
+  | "entity-empty-after-trim-dropped"
+  | "partial-overlap-dropped"
+  | "nested-blockquote-dropped"
+  | "code-formatting-dropped"
+  | "pre-language-sanitized"
+  | "unsupported-node-degraded"
+  | "raw-html-degraded"
+  | "image-degraded"
+  | "markdown-render-fallback"
+  | "table-rendered-as-cards"
+  | "message-truncated";
+
+export interface TelegramRenderWarning {
+  code: TelegramRenderWarningCode;
+  message: string;
+  source: "renderer" | "normalizer" | "chunker";
+  entityType?: TelegramMessageEntityType;
+  nodeType?: string;
+  reason?: string;
+  /** Redacted diagnostic value safe for debug logging. */
+  value?: string;
+}
+
 export interface TelegramRenderedMessage {
   text: string;
   entities: TelegramMessageEntity[];
   warnings: string[];
+  structuredWarnings?: TelegramRenderWarning[];
 }
 
 export interface NotificationTransportOverride {

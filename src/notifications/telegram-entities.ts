@@ -2,12 +2,16 @@ import { isIP } from "node:net";
 import type {
   TelegramMessageEntity,
   TelegramMessageEntityType,
+  TelegramRenderWarning,
+  TelegramRenderWarningCode,
   TelegramRenderedMessage,
 } from "./types.js";
 
 export const TELEGRAM_MESSAGE_MAX_LENGTH = 4096;
 export const TELEGRAM_MESSAGE_MAX_CHUNKS = 20;
 const TELEGRAM_TRUNCATION_NOTICE = "\n\n… [Telegram notification truncated]";
+export const TELEGRAM_CONTINUATION_SUFFIX = "\n…continued";
+export const TELEGRAM_CONTINUATION_PREFIX = "continued…\n";
 
 const NON_SPLITTABLE_ENTITY_TYPES = new Set<TelegramMessageEntityType>([
   "code",
@@ -45,6 +49,13 @@ export interface TelegramEntityValidationResult {
   text: string;
   entities: TelegramMessageEntity[];
   warnings: string[];
+  structuredWarnings: TelegramRenderWarning[];
+}
+
+export interface TelegramChunkingOptions {
+  continuationMarkers?: boolean;
+  continuationPrefix?: string;
+  continuationSuffix?: string;
 }
 
 interface IndexedEntity extends TelegramMessageEntity {
@@ -53,6 +64,15 @@ interface IndexedEntity extends TelegramMessageEntity {
 
 export function utf16Length(text: string): number {
   return text.length;
+}
+
+function pushTelegramRenderWarning(
+  warnings: string[],
+  structuredWarnings: TelegramRenderWarning[],
+  warning: TelegramRenderWarning,
+): void {
+  warnings.push(warning.message);
+  structuredWarnings.push(warning);
 }
 
 function isPrivateOrReservedIpv4(hostname: string): boolean {
@@ -103,6 +123,27 @@ function isPrivateOrReservedIpv6(hostname: string): boolean {
   return false;
 }
 
+const LOCAL_ADDRESS_ALIAS_DOMAINS = new Set([
+  "localtest.me",
+  "lvh.me",
+  "nip.io",
+  "sslip.io",
+  "xip.io",
+]);
+
+function hostnameIsOrEndsWith(hostname: string, suffix: string): boolean {
+  return hostname === suffix || hostname.endsWith(`.${suffix}`);
+}
+
+function isKnownLocalAddressAliasHostname(hostname: string): boolean {
+  for (const suffix of LOCAL_ADDRESS_ALIAS_DOMAINS) {
+    if (hostnameIsOrEndsWith(hostname, suffix)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function isLocalOrPrivateHostname(hostname: string): boolean {
   const withoutIpv6Brackets =
     hostname.startsWith("[") && hostname.endsWith("]")
@@ -113,6 +154,7 @@ function isLocalOrPrivateHostname(hostname: string): boolean {
     normalized === "localhost"
     || normalized.endsWith(".localhost")
     || normalized.endsWith(".local")
+    || isKnownLocalAddressAliasHostname(normalized)
   ) {
     return true;
   }
@@ -137,22 +179,115 @@ function hasSensitiveQueryParams(url: URL): boolean {
   return false;
 }
 
-export function isSafeTelegramLinkUrl(url: string | undefined): url is string {
-  if (!url) {
-    return false;
+export type TelegramLinkSafetyReason =
+  | "missing"
+  | "invalid"
+  | "unsupported-protocol"
+  | "credentials"
+  | "local-or-private"
+  | "sensitive-query";
+
+export interface TelegramLinkSafetyResult {
+  safe: boolean;
+  reason?: TelegramLinkSafetyReason;
+  warningCode?: Extract<
+    TelegramRenderWarningCode,
+    "unsafe-url-dropped" | "sensitive-url-dropped" | "local-url-dropped"
+  >;
+  redactedValue?: string;
+}
+
+function redactSearchParams(parsed: URL): string {
+  const clone = new URL(parsed.toString());
+  for (const key of [...clone.searchParams.keys()]) {
+    clone.searchParams.set(
+      key,
+      SENSITIVE_QUERY_PARAM_NAMES.has(key.toLowerCase()) ? "[redacted]" : "[value]",
+    );
   }
+  clone.hash = clone.hash ? "#[fragment]" : "";
+  return clone.toString();
+}
+
+export function redactTelegramDiagnosticValue(value: string | undefined): string | undefined {
+  if (!value) {
+    return value;
+  }
+
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return `${parsed.protocol}//[redacted]`;
+    }
+
+    if (parsed.username || parsed.password) {
+      parsed.username = "[redacted]";
+      parsed.password = "";
+    }
+
+    return redactSearchParams(parsed);
+  } catch {
+    return value.length > 80 ? `${value.slice(0, 32)}…[redacted]` : "[invalid-url]";
+  }
+}
+
+export function classifyTelegramLinkUrl(url: string | undefined): TelegramLinkSafetyResult {
+  if (!url) {
+    return {
+      safe: false,
+      reason: "missing",
+      warningCode: "unsafe-url-dropped",
+    };
+  }
+
   try {
     const parsed = new URL(url);
-    return (
-      (parsed.protocol === "http:" || parsed.protocol === "https:")
-      && !parsed.username
-      && !parsed.password
-      && !isLocalOrPrivateHostname(parsed.hostname)
-      && !hasSensitiveQueryParams(parsed)
-    );
+    const redactedValue = redactTelegramDiagnosticValue(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return {
+        safe: false,
+        reason: "unsupported-protocol",
+        warningCode: "unsafe-url-dropped",
+        redactedValue,
+      };
+    }
+    if (parsed.username || parsed.password) {
+      return {
+        safe: false,
+        reason: "credentials",
+        warningCode: "sensitive-url-dropped",
+        redactedValue,
+      };
+    }
+    if (isLocalOrPrivateHostname(parsed.hostname)) {
+      return {
+        safe: false,
+        reason: "local-or-private",
+        warningCode: "local-url-dropped",
+        redactedValue,
+      };
+    }
+    if (hasSensitiveQueryParams(parsed)) {
+      return {
+        safe: false,
+        reason: "sensitive-query",
+        warningCode: "sensitive-url-dropped",
+        redactedValue,
+      };
+    }
+    return { safe: true };
   } catch {
-    return false;
+    return {
+      safe: false,
+      reason: "invalid",
+      warningCode: "unsafe-url-dropped",
+      redactedValue: redactTelegramDiagnosticValue(url),
+    };
   }
+}
+
+export function isSafeTelegramLinkUrl(url: string | undefined): url is string {
+  return classifyTelegramLinkUrl(url).safe;
 }
 
 export function sanitizeTelegramPreLanguage(
@@ -221,10 +356,19 @@ function trimEntityRange(
 function normalizeEntityMetadata(
   entity: TelegramMessageEntity,
   warnings: string[],
+  structuredWarnings: TelegramRenderWarning[],
 ): TelegramMessageEntity | null {
   if (entity.type === "text_link") {
-    if (!isSafeTelegramLinkUrl(entity.url)) {
-      warnings.push("Dropped text_link entity with unsafe or invalid URL.");
+    const linkSafety = classifyTelegramLinkUrl(entity.url);
+    if (!linkSafety.safe) {
+      pushTelegramRenderWarning(warnings, structuredWarnings, {
+        code: linkSafety.warningCode ?? "unsafe-url-dropped",
+        message: "Dropped text_link entity with unsafe or invalid URL.",
+        source: "normalizer",
+        entityType: entity.type,
+        reason: linkSafety.reason,
+        value: linkSafety.redactedValue,
+      });
       return null;
     }
     return { ...entity, url: entity.url };
@@ -233,7 +377,13 @@ function normalizeEntityMetadata(
   if (entity.type === "pre") {
     const language = sanitizeTelegramPreLanguage(entity.language);
     if (entity.language && !language) {
-      warnings.push("Dropped unsafe Telegram pre language token.");
+      pushTelegramRenderWarning(warnings, structuredWarnings, {
+        code: "pre-language-sanitized",
+        message: "Dropped unsafe Telegram pre language token.",
+        source: "normalizer",
+        entityType: entity.type,
+        value: "[removed]",
+      });
     }
     return {
       type: entity.type,
@@ -265,6 +415,7 @@ function sortEntities<T extends IndexedEntity>(entities: T[]): T[] {
 function removeCodeAndPreFormattingConflicts(
   entities: IndexedEntity[],
   warnings: string[],
+  structuredWarnings: TelegramRenderWarning[],
 ): IndexedEntity[] {
   const codeRanges = entities.filter((entity) => CODE_ENTITY_TYPES.has(entity.type));
   if (codeRanges.length === 0) {
@@ -277,7 +428,12 @@ function removeCodeAndPreFormattingConflicts(
     }
     const conflictsWithCode = codeRanges.some((codeEntity) => rangesOverlap(entity, codeEntity));
     if (conflictsWithCode) {
-      warnings.push(`Dropped ${entity.type} entity overlapping code/pre text.`);
+      pushTelegramRenderWarning(warnings, structuredWarnings, {
+        code: "code-formatting-dropped",
+        message: `Dropped ${entity.type} entity overlapping code/pre text.`,
+        source: "normalizer",
+        entityType: entity.type,
+      });
       return false;
     }
     return true;
@@ -287,6 +443,7 @@ function removeCodeAndPreFormattingConflicts(
 function removeNestedBlockquotes(
   entities: IndexedEntity[],
   warnings: string[],
+  structuredWarnings: TelegramRenderWarning[],
 ): IndexedEntity[] {
   const acceptedBlockquotes: IndexedEntity[] = [];
   return entities.filter((entity) => {
@@ -298,7 +455,12 @@ function removeNestedBlockquotes(
       (accepted) => rangeContains(accepted, entity) || rangeContains(entity, accepted),
     );
     if (nested) {
-      warnings.push("Dropped nested Telegram blockquote entity.");
+      pushTelegramRenderWarning(warnings, structuredWarnings, {
+        code: "nested-blockquote-dropped",
+        message: "Dropped nested Telegram blockquote entity.",
+        source: "normalizer",
+        entityType: entity.type,
+      });
       return false;
     }
 
@@ -310,12 +472,18 @@ function removeNestedBlockquotes(
 function removePartialOverlaps(
   entities: IndexedEntity[],
   warnings: string[],
+  structuredWarnings: TelegramRenderWarning[],
 ): IndexedEntity[] {
   const accepted: IndexedEntity[] = [];
   for (const entity of entities) {
     const partialOverlap = accepted.some((existing) => rangesPartiallyOverlap(existing, entity));
     if (partialOverlap) {
-      warnings.push(`Dropped ${entity.type} entity with partial overlap.`);
+      pushTelegramRenderWarning(warnings, structuredWarnings, {
+        code: "partial-overlap-dropped",
+        message: `Dropped ${entity.type} entity with partial overlap.`,
+        source: "normalizer",
+        entityType: entity.type,
+      });
       continue;
     }
     accepted.push(entity);
@@ -328,6 +496,7 @@ export function normalizeTelegramEntities(
   entities: readonly TelegramMessageEntity[],
 ): TelegramEntityValidationResult {
   const warnings: string[] = [];
+  const structuredWarnings: TelegramRenderWarning[] = [];
   const normalized = entities.reduce<IndexedEntity[]>((acc, entity, originalIndex) => {
     const rangeIsValid =
       Number.isInteger(entity.offset)
@@ -336,19 +505,37 @@ export function normalizeTelegramEntities(
       && entity.length > 0
       && entityEnd(entity) <= text.length;
     if (!rangeIsValid) {
-      warnings.push(`Dropped ${entity.type} entity with invalid range.`);
+      pushTelegramRenderWarning(warnings, structuredWarnings, {
+        code: "entity-invalid-range-dropped",
+        message: `Dropped ${entity.type} entity with invalid range.`,
+        source: "normalizer",
+        entityType: entity.type,
+      });
       return acc;
     }
 
-    const metadataNormalized = normalizeEntityMetadata(entity, warnings);
+    const metadataNormalized = normalizeEntityMetadata(entity, warnings, structuredWarnings);
     if (!metadataNormalized) {
       return acc;
     }
 
     const rangeTrimmed = trimEntityRange(text, metadataNormalized);
     if (!rangeTrimmed) {
-      warnings.push(`Dropped ${entity.type} entity after trailing whitespace trim.`);
+      pushTelegramRenderWarning(warnings, structuredWarnings, {
+        code: "entity-empty-after-trim-dropped",
+        message: `Dropped ${entity.type} entity after trailing whitespace trim.`,
+        source: "normalizer",
+        entityType: entity.type,
+      });
       return acc;
+    }
+    if (rangeTrimmed.length !== metadataNormalized.length) {
+      pushTelegramRenderWarning(warnings, structuredWarnings, {
+        code: "entity-trimmed",
+        message: `Trimmed trailing whitespace from ${entity.type} entity.`,
+        source: "normalizer",
+        entityType: entity.type,
+      });
     }
 
     acc.push({ ...rangeTrimmed, originalIndex });
@@ -356,15 +543,28 @@ export function normalizeTelegramEntities(
   }, []);
 
   const sorted = sortEntities(normalized);
-  const withoutCodeConflicts = removeCodeAndPreFormattingConflicts(sorted, warnings);
-  const withoutNestedBlockquotes = removeNestedBlockquotes(withoutCodeConflicts, warnings);
-  const withoutPartialOverlaps = removePartialOverlaps(withoutNestedBlockquotes, warnings);
+  const withoutCodeConflicts = removeCodeAndPreFormattingConflicts(
+    sorted,
+    warnings,
+    structuredWarnings,
+  );
+  const withoutNestedBlockquotes = removeNestedBlockquotes(
+    withoutCodeConflicts,
+    warnings,
+    structuredWarnings,
+  );
+  const withoutPartialOverlaps = removePartialOverlaps(
+    withoutNestedBlockquotes,
+    warnings,
+    structuredWarnings,
+  );
   const finalEntities = sortEntities(withoutPartialOverlaps).map(({ originalIndex: _originalIndex, ...entity }) => entity);
 
   return {
     text,
     entities: finalEntities,
     warnings,
+    structuredWarnings,
   };
 }
 
@@ -410,12 +610,19 @@ export class TelegramTextBuilder {
     this.addEntity(type, offset, this.length - offset, metadata);
   }
 
-  toRenderedMessage(warnings: readonly string[] = []): TelegramRenderedMessage {
+  toRenderedMessage(
+    warnings: readonly string[] = [],
+    structuredWarnings: readonly TelegramRenderWarning[] = [],
+  ): TelegramRenderedMessage {
     const normalized = normalizeTelegramEntities(this.textValue, this.entityValue);
     return {
       text: normalized.text,
       entities: normalized.entities,
       warnings: [...warnings, ...normalized.warnings],
+      structuredWarnings: [
+        ...structuredWarnings,
+        ...normalized.structuredWarnings,
+      ],
     };
   }
 }
@@ -449,8 +656,12 @@ export function clampToUtf16Boundary(text: string, index: number): number {
 function truncateRenderedMessageForTelegram(
   rendered: TelegramRenderedMessage,
   maxLength: number,
+  markerOverheadPerFullMessage = 0,
 ): TelegramRenderedMessage {
-  const maxTotalLength = maxLength * TELEGRAM_MESSAGE_MAX_CHUNKS;
+  const maxTotalLength = Math.max(
+    maxLength,
+    maxLength * TELEGRAM_MESSAGE_MAX_CHUNKS - markerOverheadPerFullMessage,
+  );
   if (rendered.text.length <= maxTotalLength) {
     return rendered;
   }
@@ -464,7 +675,31 @@ function truncateRenderedMessageForTelegram(
       ...rendered.warnings,
       `Telegram message truncated to ${TELEGRAM_MESSAGE_MAX_CHUNKS} chunks.`,
     ],
+    structuredWarnings: [
+      ...(rendered.structuredWarnings ?? []),
+      {
+        code: "message-truncated",
+        message: `Telegram message truncated to ${TELEGRAM_MESSAGE_MAX_CHUNKS} chunks.`,
+        source: "chunker",
+      },
+    ],
   };
+}
+
+function normalizeChunkingOptions(options: TelegramChunkingOptions): Required<TelegramChunkingOptions> {
+  return {
+    continuationMarkers: options.continuationMarkers !== false,
+    continuationPrefix: options.continuationPrefix ?? TELEGRAM_CONTINUATION_PREFIX,
+    continuationSuffix: options.continuationSuffix ?? TELEGRAM_CONTINUATION_SUFFIX,
+  };
+}
+
+function markerOverheadForMaxChunks(options: Required<TelegramChunkingOptions>): number {
+  if (!options.continuationMarkers) {
+    return 0;
+  }
+  return (TELEGRAM_MESSAGE_MAX_CHUNKS - 1)
+    * (options.continuationPrefix.length + options.continuationSuffix.length);
 }
 
 function lastIndexAtOrBefore(text: string, search: string, start: number, end: number): number {
@@ -511,6 +746,7 @@ function remapEntitiesForChunk(
   entities: readonly TelegramMessageEntity[],
   start: number,
   end: number,
+  offsetDelta = 0,
 ): TelegramMessageEntity[] {
   return entities.reduce<TelegramMessageEntity[]>((acc, entity) => {
     const overlapStart = Math.max(start, entity.offset);
@@ -521,7 +757,7 @@ function remapEntitiesForChunk(
 
     acc.push({
       ...entity,
-      offset: overlapStart - start,
+      offset: overlapStart - start + offsetDelta,
       length: overlapEnd - overlapStart,
     });
     return acc;
@@ -531,43 +767,75 @@ function remapEntitiesForChunk(
 export function splitTelegramRenderedMessage(
   rendered: TelegramRenderedMessage,
   maxLength = TELEGRAM_MESSAGE_MAX_LENGTH,
+  options: TelegramChunkingOptions = {},
 ): TelegramRenderedMessage[] {
   if (!Number.isInteger(maxLength) || maxLength <= 0) {
     throw new Error("maxLength must be a positive integer");
   }
 
-  const bounded = truncateRenderedMessageForTelegram(rendered, maxLength);
+  const markerOptions = normalizeChunkingOptions(options);
+  const markersFit =
+    markerOptions.continuationPrefix.length + markerOptions.continuationSuffix.length < maxLength;
+  const markersEnabled = markerOptions.continuationMarkers && markersFit;
+  const bounded = truncateRenderedMessageForTelegram(
+    rendered,
+    maxLength,
+    markersEnabled ? markerOverheadForMaxChunks(markerOptions) : 0,
+  );
   const normalized = normalizeTelegramEntities(bounded.text, bounded.entities);
   const warnings = [...bounded.warnings, ...normalized.warnings];
+  const structuredWarnings = [
+    ...(bounded.structuredWarnings ?? []),
+    ...normalized.structuredWarnings,
+  ];
   if (normalized.text.length <= maxLength) {
-    return [{ text: normalized.text, entities: normalized.entities, warnings }];
+    return [{
+      text: normalized.text,
+      entities: normalized.entities,
+      warnings,
+      structuredWarnings,
+    }];
   }
 
   const chunks: TelegramRenderedMessage[] = [];
   let start = 0;
 
   while (start < normalized.text.length) {
+    const prefix = markersEnabled && chunks.length > 0
+      ? markerOptions.continuationPrefix
+      : "";
+    const lastChunkBudget = maxLength - prefix.length;
     const remaining = normalized.text.length - start;
-    let end = remaining <= maxLength
+    const willFitLastChunk = remaining <= lastChunkBudget;
+    const suffix = markersEnabled && !willFitLastChunk
+      ? markerOptions.continuationSuffix
+      : "";
+    const contentBudget = Math.max(1, maxLength - prefix.length - suffix.length);
+    let end = willFitLastChunk
       ? normalized.text.length
       : findNaturalSplit(
         normalized.text,
         start,
-        clampToUtf16Boundary(normalized.text, start + maxLength),
+        clampToUtf16Boundary(normalized.text, start + contentBudget),
       );
 
     end = avoidNonSplittableEntityBoundary(normalized.entities, start, end);
     end = clampToUtf16Boundary(normalized.text, end);
 
     if (end <= start) {
-      end = clampToUtf16Boundary(normalized.text, start + maxLength);
+      end = clampToUtf16Boundary(normalized.text, start + contentBudget);
     }
     if (end <= start) {
-      end = Math.min(normalized.text.length, start + maxLength);
+      end = Math.min(normalized.text.length, start + contentBudget);
     }
 
-    const chunkText = normalized.text.slice(start, end);
-    const chunkEntities = remapEntitiesForChunk(normalized.entities, start, end);
+    const chunkText = `${prefix}${normalized.text.slice(start, end)}${suffix}`;
+    const chunkEntities = remapEntitiesForChunk(
+      normalized.entities,
+      start,
+      end,
+      prefix.length,
+    );
     const chunkNormalized = normalizeTelegramEntities(chunkText, chunkEntities);
     chunks.push({
       text: chunkNormalized.text,
@@ -575,6 +843,9 @@ export function splitTelegramRenderedMessage(
       warnings: chunks.length === 0
         ? [...warnings, ...chunkNormalized.warnings]
         : chunkNormalized.warnings,
+      structuredWarnings: chunks.length === 0
+        ? [...structuredWarnings, ...chunkNormalized.structuredWarnings]
+        : chunkNormalized.structuredWarnings,
     });
     start = end;
   }

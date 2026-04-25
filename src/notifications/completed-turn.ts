@@ -66,6 +66,7 @@ type CompletedTurnEffectiveEvent = Extract<
 
 const DEFAULT_TELEGRAM_COMPLETED_TURN_FORMAT: TelegramCompletedTurnFormat =
   "entities";
+const TELEGRAM_RENDER_DEBUG_ENV = "OMX_TELEGRAM_RENDER_DEBUG";
 
 function shouldFallbackToFormattedNotification(
   policy: CompletedTurnTransportRenderPolicy,
@@ -101,6 +102,7 @@ function resolveCompletedTurnRenderedMessage(
       && (policy.telegramFormat ?? DEFAULT_TELEGRAM_COMPLETED_TURN_FORMAT) === "entities"
     ) {
       const rendered = renderMarkdownToTelegramEntities(assistantText);
+      logTelegramRenderWarningsIfEnabled(rendered);
       return {
         message: rendered.text,
         parseMode: null,
@@ -119,6 +121,22 @@ function resolveCompletedTurnRenderedMessage(
   return {
     message: formatNotification(payload),
   };
+}
+
+function logTelegramRenderWarningsIfEnabled(
+  rendered: ReturnType<typeof renderMarkdownToTelegramEntities>,
+): void {
+  const debugValue = process.env[TELEGRAM_RENDER_DEBUG_ENV]?.trim().toLowerCase();
+  const debugEnabled = debugValue === "1" || debugValue === "true" || debugValue === "yes";
+  const structuredWarnings = rendered.structuredWarnings ?? [];
+  if (!debugEnabled || structuredWarnings.length === 0) {
+    return;
+  }
+
+  console.warn("[notifications] telegram rich renderer warnings", {
+    warningCount: structuredWarnings.length,
+    warnings: structuredWarnings,
+  });
 }
 
 function resolveCompletedTurnRenderMode(

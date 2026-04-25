@@ -5,6 +5,8 @@ import {
   isSafeTelegramLinkUrl,
   normalizeTelegramEntities,
   splitTelegramRenderedMessage,
+  TELEGRAM_CONTINUATION_PREFIX,
+  TELEGRAM_CONTINUATION_SUFFIX,
   TELEGRAM_MESSAGE_MAX_CHUNKS,
   TELEGRAM_MESSAGE_MAX_LENGTH,
   TelegramTextBuilder,
@@ -44,6 +46,7 @@ describe('normalizeTelegramEntities', () => {
       { type: 'bold', offset: 0, length: 4 },
       { type: 'italic', offset: 6, length: 5 },
     ]);
+    assert.equal(normalized.structuredWarnings?.[0]?.code, 'entity-trimmed');
   });
 
   it('drops empty entities after trimming', () => {
@@ -53,6 +56,7 @@ describe('normalizeTelegramEntities', () => {
 
     assert.deepEqual(normalized.entities, []);
     assert.match(normalized.warnings.join('\n'), /after trailing whitespace trim/);
+    assert.equal(normalized.structuredWarnings?.[0]?.code, 'entity-empty-after-trim-dropped');
   });
 
   it('sorts entities by offset and descending length for stable nesting', () => {
@@ -77,6 +81,7 @@ describe('normalizeTelegramEntities', () => {
       { type: 'bold', offset: 0, length: 4 },
     ]);
     assert.match(normalized.warnings.join('\n'), /partial overlap/);
+    assert.equal(normalized.structuredWarnings?.[0]?.code, 'partial-overlap-dropped');
   });
 
   it('keeps code/pre ranges and drops overlapping formatting', () => {
@@ -89,6 +94,7 @@ describe('normalizeTelegramEntities', () => {
       { type: 'code', offset: 2, length: 2 },
     ]);
     assert.match(normalized.warnings.join('\n'), /overlapping code\/pre/);
+    assert.equal(normalized.structuredWarnings?.[0]?.code, 'code-formatting-dropped');
   });
 
   it('drops nested blockquotes', () => {
@@ -101,6 +107,7 @@ describe('normalizeTelegramEntities', () => {
       { type: 'blockquote', offset: 0, length: 6 },
     ]);
     assert.match(normalized.warnings.join('\n'), /nested Telegram blockquote/);
+    assert.equal(normalized.structuredWarnings?.[0]?.code, 'nested-blockquote-dropped');
   });
 
   it('sanitizes text links and pre languages', () => {
@@ -119,6 +126,10 @@ describe('normalizeTelegramEntities', () => {
     ]);
     assert.match(normalized.warnings.join('\n'), /unsafe or invalid URL/);
     assert.match(normalized.warnings.join('\n'), /unsafe Telegram pre language/);
+    assert.deepEqual(
+      normalized.structuredWarnings.map((warning) => warning.code),
+      ['unsafe-url-dropped', 'pre-language-sanitized'],
+    );
   });
 
   it('rejects private, credentialed, and token-bearing text links', () => {
@@ -129,6 +140,11 @@ describe('normalizeTelegramEntities', () => {
       'https://[::1]/build',
       'https://[fc00::1]/build',
       'https://[::ffff:127.0.0.1]/build',
+      'https://127.0.0.1.nip.io/build',
+      'https://127-0-0-1.sslip.io/build',
+      'https://example.xip.io/build',
+      'https://foo.lvh.me/build',
+      'https://foo.localtest.me/build',
       'https://user:pass@example.com/build',
       'https://example.com/download?X-Amz-Signature=secret',
       'https://example.com/callback?access_token=secret',
@@ -188,5 +204,69 @@ describe('splitTelegramRenderedMessage', () => {
     assert.equal(chunks.length, TELEGRAM_MESSAGE_MAX_CHUNKS);
     assert.match(chunks[chunks.length - 1].text, /Telegram notification truncated/);
     assert.ok(chunks.every((chunk) => chunk.text.length <= TELEGRAM_MESSAGE_MAX_LENGTH));
+    assert.match(chunks[0].text, /…continued$/);
+    assert.ok(chunks[0].structuredWarnings?.some((warning) => warning.code === 'message-truncated'));
+    assert.equal(
+      chunks
+        .slice(1)
+        .some((chunk) => chunk.structuredWarnings?.some((warning) => warning.code === 'message-truncated')),
+      false,
+    );
+  });
+
+  it('adds continuation markers to multi-chunk messages without exceeding Telegram limits', () => {
+    const chunks = splitTelegramRenderedMessage({
+      text: `${'a'.repeat(TELEGRAM_MESSAGE_MAX_LENGTH)}tail`,
+      entities: [],
+      warnings: [],
+    });
+
+    assert.equal(chunks.length, 2);
+    assert.equal(chunks[0].text.endsWith(TELEGRAM_CONTINUATION_SUFFIX), true);
+    assert.equal(chunks[1].text.startsWith(TELEGRAM_CONTINUATION_PREFIX), true);
+    assert.ok(chunks.every((chunk) => chunk.text.length <= TELEGRAM_MESSAGE_MAX_LENGTH));
+  });
+
+  it('does not add continuation markers to single-chunk messages', () => {
+    const chunks = splitTelegramRenderedMessage({
+      text: 'short message',
+      entities: [],
+      warnings: [],
+    });
+
+    assert.deepEqual(chunks.map((chunk) => chunk.text), ['short message']);
+  });
+
+  it('remaps entity offsets after a continuation prefix', () => {
+    const chunks = splitTelegramRenderedMessage({
+      text: `${'a'.repeat(TELEGRAM_MESSAGE_MAX_LENGTH)}code`,
+      entities: [{ type: 'code', offset: TELEGRAM_MESSAGE_MAX_LENGTH, length: 4 }],
+      warnings: [],
+    });
+
+    assert.equal(chunks.length, 2);
+    assert.equal(chunks[1].text.startsWith(TELEGRAM_CONTINUATION_PREFIX), true);
+    assert.deepEqual(chunks[1].entities, [
+      {
+        type: 'code',
+        offset: TELEGRAM_CONTINUATION_PREFIX.length
+          + TELEGRAM_CONTINUATION_SUFFIX.length,
+        length: 4,
+      },
+    ]);
+  });
+
+  it('keeps marker splits UTF-16 safe for surrogate pairs', () => {
+    const contentBudget = TELEGRAM_MESSAGE_MAX_LENGTH - TELEGRAM_CONTINUATION_SUFFIX.length;
+    const chunks = splitTelegramRenderedMessage({
+      text: `${'a'.repeat(contentBudget - 1)}😀${'tail'.repeat(8)}`,
+      entities: [],
+      warnings: [],
+    });
+
+    assert.equal(chunks.length, 2);
+    assert.equal(chunks[0].text.endsWith(TELEGRAM_CONTINUATION_SUFFIX), true);
+    assert.doesNotMatch(chunks[0].text, /\ud83d$/u);
+    assert.doesNotMatch(chunks[1].text, /^\ude00/u);
   });
 });

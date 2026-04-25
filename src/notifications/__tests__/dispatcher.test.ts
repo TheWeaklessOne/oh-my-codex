@@ -24,6 +24,10 @@ import {
   sendWebhook,
   dispatchNotifications,
 } from '../dispatcher.js';
+import {
+  TELEGRAM_CONTINUATION_PREFIX,
+  TELEGRAM_CONTINUATION_SUFFIX,
+} from '../telegram-entities.js';
 import { getTelegramTopicRegistryRecord } from '../telegram-topic-registry.js';
 import { normalizeTelegramProjectIdentity } from '../telegram-topics.js';
 import { markMockTelegramTransportForTests } from '../../utils/test-env.js';
@@ -36,6 +40,21 @@ const basePayload: FullNotificationPayload = {
   projectPath: '/home/user/project',
   projectName: 'project',
 };
+
+function joinTelegramChunkTexts(texts: readonly string[]): string {
+  return texts
+    .map((text, index) => {
+      let logicalText = text;
+      if (index > 0 && logicalText.startsWith(TELEGRAM_CONTINUATION_PREFIX)) {
+        logicalText = logicalText.slice(TELEGRAM_CONTINUATION_PREFIX.length);
+      }
+      if (index < texts.length - 1 && logicalText.endsWith(TELEGRAM_CONTINUATION_SUFFIX)) {
+        logicalText = logicalText.slice(0, -TELEGRAM_CONTINUATION_SUFFIX.length);
+      }
+      return logicalText;
+    })
+    .join('');
+}
 
 type HttpsRouteHandler = (body: string, options: ClientRequestArgs) => {
   statusCode: number;
@@ -509,13 +528,19 @@ describe('sendTelegram', () => {
     assert.deepEqual(result.messageIds, ['301', '302']);
     assert.equal(requestBodies.length, 2);
     assert.equal(requestBodies[0].text.length, 4096);
-    assert.equal(requestBodies[1].text, 'code');
+    assert.equal(requestBodies[0].text.endsWith(TELEGRAM_CONTINUATION_SUFFIX), true);
+    assert.equal(requestBodies[1].text.startsWith(TELEGRAM_CONTINUATION_PREFIX), true);
+    assert.equal(joinTelegramChunkTexts(requestBodies.map((body) => body.text)), `${'a'.repeat(4096)}code`);
     assert.equal(requestBodies[0].message_thread_id, 9001);
     assert.equal(requestBodies[1].message_thread_id, 9001);
     assert.equal('parse_mode' in requestBodies[0], false);
     assert.equal('parse_mode' in requestBodies[1], false);
     assert.deepEqual(requestBodies[1].entities, [
-      { type: 'code', offset: 0, length: 4 },
+      {
+        type: 'code',
+        offset: TELEGRAM_CONTINUATION_PREFIX.length + TELEGRAM_CONTINUATION_SUFFIX.length,
+        length: 4,
+      },
     ]);
   });
 
@@ -563,6 +588,126 @@ describe('sendTelegram', () => {
     assert.equal(requestBodies[0].parse_mode, 'Markdown');
   });
 
+  it('retries classified parse-mode rich payload failures as raw text without parse_mode', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      parseMode: 'Markdown',
+    };
+    const requestBodies: Array<{ text: string; parse_mode?: string; entities?: unknown[] }> = [];
+    const markdownMessage = '*unterminated';
+
+    const result = await sendTelegram(
+      config,
+      {
+        ...basePayload,
+        message: markdownMessage,
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+            requestBodies.push(JSON.parse(body));
+            if (requestBodies.length === 1) {
+              return {
+                statusCode: 400,
+                body: {
+                  ok: false,
+                  error_code: 400,
+                  description: "Bad Request: can't parse entities: can't find end of the entity",
+                },
+              };
+            }
+            if (requestBodies.length > 2) {
+              throw new Error('parse-mode raw fallback should be attempted once');
+            }
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: 304,
+                },
+              },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(result.messageId, '304');
+    assert.equal(requestBodies.length, 2);
+    assert.equal(requestBodies[0].parse_mode, 'Markdown');
+    assert.equal('parse_mode' in requestBodies[1], false);
+    assert.equal('entities' in requestBodies[1], false);
+    assert.equal(requestBodies[1].text, markdownMessage);
+  });
+
+  it('retries Telegram HTML parse-mode failures as raw text without parse_mode', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      parseMode: 'HTML',
+    };
+    const requestBodies: Array<{ text: string; parse_mode?: string; entities?: unknown[] }> = [];
+    const htmlMessage = '<span>unsupported</span>';
+
+    const result = await sendTelegram(
+      config,
+      {
+        ...basePayload,
+        message: htmlMessage,
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+            requestBodies.push(JSON.parse(body));
+            if (requestBodies.length === 1) {
+              return {
+                statusCode: 400,
+                body: {
+                  ok: false,
+                  error_code: 400,
+                  description: 'Bad Request: can\'t parse message text: Unsupported start tag "span" at byte offset 0',
+                },
+              };
+            }
+            if (requestBodies.length > 2) {
+              throw new Error('HTML parse-mode raw fallback should be attempted once');
+            }
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: 305,
+                },
+              },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(result.messageId, '305');
+    assert.equal(requestBodies.length, 2);
+    assert.equal(requestBodies[0].parse_mode, 'HTML');
+    assert.equal('parse_mode' in requestBodies[1], false);
+    assert.equal('entities' in requestBodies[1], false);
+    assert.equal(requestBodies[1].text, htmlMessage);
+  });
+
   it('sends oversized non-entity parse-mode Telegram payloads as raw chunks', async () => {
     const config: TelegramNotificationConfig = {
       enabled: true,
@@ -603,7 +748,7 @@ describe('sendTelegram', () => {
 
     assert.equal(result.success, true);
     assert.equal(requestBodies.length, 2);
-    assert.equal(requestBodies.map((body) => body.text).join(''), markdownMessage);
+    assert.equal(joinTelegramChunkTexts(requestBodies.map((body) => body.text)), markdownMessage);
     assert.equal(requestBodies.every((body) => !('parse_mode' in body)), true);
   });
 
@@ -749,6 +894,118 @@ describe('sendTelegram', () => {
     assert.equal(requestBodies[1].text, 'Run npm run build');
   });
 
+  it('retries classified Telegram entity wording variants as raw text once', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+    };
+    const requestBodies: Array<{
+      text: string;
+      entities?: unknown[];
+      parse_mode?: string;
+    }> = [];
+
+    const result = await sendTelegram(
+      config,
+      {
+        ...basePayload,
+        transportOverrides: {
+          telegram: {
+            message: 'Run npm run build',
+            parseMode: null,
+            entities: [
+              { type: 'code', offset: 0, length: 3 },
+            ],
+          },
+        },
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+            requestBodies.push(JSON.parse(body));
+            if (requestBodies.length === 1) {
+              return {
+                statusCode: 400,
+                body: {
+                  ok: false,
+                  error_code: 400,
+                  description: 'Bad Request: entity start is out of range',
+                },
+              };
+            }
+            if (requestBodies.length > 2) {
+              throw new Error('raw fallback should be attempted once');
+            }
+            return {
+              statusCode: 200,
+              body: { ok: true, result: { message_id: 334 } },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(requestBodies.length, 2);
+    assert.ok(requestBodies[0].entities);
+    assert.equal('entities' in requestBodies[1], false);
+    assert.equal('parse_mode' in requestBodies[1], false);
+  });
+
+  it('does not raw-fallback generic 400 failures as entity success', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+    };
+    const requestBodies: Array<{ entities?: unknown[] }> = [];
+
+    const result = await sendTelegram(
+      config,
+      {
+        ...basePayload,
+        transportOverrides: {
+          telegram: {
+            message: 'Run npm run build',
+            parseMode: null,
+            entities: [
+              { type: 'code', offset: 0, length: 3 },
+            ],
+          },
+        },
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+            requestBodies.push(JSON.parse(body));
+            return {
+              statusCode: 400,
+              body: {
+                ok: false,
+                error_code: 400,
+                description: 'Bad Request: chat not found',
+              },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, false);
+    assert.match(result.error || '', /chat not found/);
+    assert.equal(requestBodies.length, 1);
+    assert.ok(requestBodies[0].entities);
+  });
+
   it('retries a split entity message as a fully raw logical message after entity failure', async () => {
     const config: TelegramNotificationConfig = {
       enabled: true,
@@ -843,7 +1100,10 @@ describe('sendTelegram', () => {
     assert.equal('parse_mode' in sendBodies[2], false);
     assert.equal('entities' in sendBodies[3], false);
     assert.equal('parse_mode' in sendBodies[3], false);
-    assert.equal(sendBodies.slice(2).map((body) => body.text).join(''), `${'a'.repeat(4096)}code`);
+    assert.equal(
+      joinTelegramChunkTexts(sendBodies.slice(2).map((body) => body.text)),
+      `${'a'.repeat(4096)}code`,
+    );
     assert.equal(sendBodies[2].message_thread_id, 9001);
     assert.equal(sendBodies[3].message_thread_id, 9001);
   });
@@ -1039,6 +1299,117 @@ describe('sendTelegram', () => {
       );
       assert.equal(record?.messageThreadId, '9002');
       assert.equal(record?.lastCreateFailureCode, undefined);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  it('refreshes topic-mismatch errors for rich entity sends without raw fallback', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true },
+    };
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-dispatcher-telegram-mismatch-error-'));
+    const identity = normalizeTelegramProjectIdentity(basePayload);
+    assert.ok(identity);
+    let resolveCalls = 0;
+    const requestBodies: Array<{
+      message_thread_id?: number;
+      entities?: Array<{ type: string; offset: number; length: number }>;
+      parse_mode?: string;
+    }> = [];
+
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+
+    try {
+      const result = await sendTelegram(
+        config,
+        {
+          ...basePayload,
+          transportOverrides: {
+            telegram: {
+              message: 'Topic code',
+              parseMode: null,
+              entities: [{ type: 'code', offset: 'Topic '.length, length: 'code'.length }],
+            },
+          },
+        },
+        {
+          resolveTelegramDestinationImpl: async () => {
+            resolveCalls += 1;
+            return {
+              chatId: '777',
+              sourceChatKey: 'telegram:123456:777',
+              messageThreadId: resolveCalls === 1 ? '9001' : '9002',
+              projectKey: identity.projectKey,
+              canonicalProjectPath: identity.canonicalProjectPath,
+              topicName: 'project',
+            };
+          },
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+              const parsed = JSON.parse(body) as {
+                message_thread_id?: number;
+                entities?: Array<{ type: string; offset: number; length: number }>;
+                parse_mode?: string;
+              };
+              requestBodies.push(parsed);
+              if (requestBodies.length === 1) {
+                return {
+                  statusCode: 400,
+                  body: {
+                    ok: false,
+                    error_code: 400,
+                    description: 'Bad Request: message is not a forum topic message',
+                  },
+                };
+              }
+
+              assert.equal(parsed.message_thread_id, 9002);
+              assert.deepEqual(parsed.entities, [
+                { type: 'code', offset: 'Topic '.length, length: 'code'.length },
+              ]);
+              assert.equal('parse_mode' in parsed, false);
+              return {
+                statusCode: 200,
+                body: {
+                  ok: true,
+                  result: {
+                    message_id: 436,
+                    message_thread_id: 9002,
+                    is_topic_message: true,
+                  },
+                },
+              };
+            },
+          }),
+        },
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.messageId, '436');
+      assert.equal(result.messageThreadId, '9002');
+      assert.equal(resolveCalls, 2);
+      assert.deepEqual(
+        requestBodies.map((body) => body.message_thread_id),
+        [9001, 9002],
+      );
+      assert.deepEqual(
+        requestBodies.map((body) => body.entities),
+        [
+          [{ type: 'code', offset: 'Topic '.length, length: 'code'.length }],
+          [{ type: 'code', offset: 'Topic '.length, length: 'code'.length }],
+        ],
+      );
     } finally {
       await rm(tempHome, { recursive: true, force: true });
       if (originalHome === undefined) delete process.env.HOME;
