@@ -25,6 +25,10 @@ const TELEGRAM_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_CREATE_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 const TOPIC_NAME_LIMIT = 128;
 const DEFAULT_TOPIC_NAMING: TelegramProjectTopicNaming = 'projectName';
+const STALE_TOPIC_FAILURE_CODES = new Set([
+  'topic-stale',
+  'topic-delivery-mismatch',
+]);
 
 type LoggerLike = Pick<Console, 'warn'>;
 
@@ -715,12 +719,14 @@ export async function ensureProjectTopic(
         };
       }
 
-      const recoveredRecord = await recoverTopicRecordFromSessionRegistry(
-        sourceChatKey,
-        identity,
-        nowIso,
-        deps.logger,
-      );
+      const recoveredRecord = STALE_TOPIC_FAILURE_CODES.has(currentRecord?.lastCreateFailureCode || '')
+        ? null
+        : await recoverTopicRecordFromSessionRegistry(
+            sourceChatKey,
+            identity,
+            nowIso,
+            deps.logger,
+          );
       if (recoveredRecord?.messageThreadId) {
         return {
           chatId: config.chatId,

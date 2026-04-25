@@ -121,6 +121,7 @@ https.request = (options, callback) => {
           result: {
             message_id: 321,
             message_thread_id: 9001,
+            is_topic_message: true,
           },
         }));
       });

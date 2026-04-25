@@ -27,6 +27,7 @@ import {
   normalizeTelegramProjectIdentity,
   performTelegramBotApiRequest,
   resolveTelegramDestination,
+  TelegramBotApiError,
   type TelegramResolvedDestination,
   type TelegramTopicResolutionDeps,
 } from "./telegram-topics.js";
@@ -305,89 +306,349 @@ export async function sendTelegram(
   }
 
   let destination: TelegramResolvedDestination | null = null;
+  let refreshedStaleTopic = false;
 
-  try {
-    const resolveTelegramDestinationImpl =
-      deps.resolveTelegramDestinationImpl ?? resolveTelegramDestination;
-    destination = await resolveTelegramDestinationImpl(config, payload, deps);
-    if (destination.skipSend) {
+  while (true) {
+    try {
+      const resolveTelegramDestinationImpl =
+        deps.resolveTelegramDestinationImpl ?? resolveTelegramDestination;
+      destination = await resolveTelegramDestinationImpl(config, payload, deps);
+      if (destination.skipSend) {
+        return {
+          platform: "telegram",
+          success: false,
+          error:
+            destination.warningMessage
+            || "Telegram topic routing is unavailable and fallbackToGeneral is disabled",
+          projectKey: destination.projectKey,
+          topicName: destination.topicName,
+        };
+      }
+      if (refreshedStaleTopic && isUnsafeStaleTopicRetryDestination(destination)) {
+        return {
+          platform: "telegram",
+          success: false,
+          error:
+            destination.warningMessage
+            || "Telegram topic refresh did not produce a topic destination",
+          projectKey: destination.projectKey,
+          topicName: destination.topicName,
+        };
+      }
+
+      const result = await sendTelegramMessageToDestination(
+        config,
+        payload,
+        destination,
+        deps,
+      );
+
+      if (isTelegramTopicDeliveryMismatch(destination, result)) {
+        const cleanupSucceeded = await deleteTelegramMessageBestEffort(
+          config,
+          destination,
+          result.message_id,
+          deps,
+        );
+        if (
+          !refreshedStaleTopic
+          && shouldMarkStaleTelegramTopic(config, destination)
+        ) {
+          refreshedStaleTopic = true;
+          await markTelegramTopicDestinationStaleBestEffort(
+            payload,
+            destination,
+            "topic-delivery-mismatch",
+            "Telegram accepted the cached topic id but returned a non-topic or different-topic message; refreshing the topic mapping.",
+          );
+          if (!cleanupSucceeded) {
+            return {
+              platform: "telegram",
+              success: false,
+              error: "Telegram topic delivery mismatch cleanup failed",
+              projectKey: destination.projectKey,
+              topicName: destination.topicName,
+            };
+          }
+          if (!canRetryStaleTelegramTopic(config, destination)) {
+            return {
+              platform: "telegram",
+              success: false,
+              error: "Telegram topic delivery mismatch",
+              projectKey: destination.projectKey,
+              topicName: destination.topicName,
+            };
+          }
+          continue;
+        }
+        return {
+          platform: "telegram",
+          success: false,
+          error: "Telegram topic delivery mismatch",
+          projectKey: destination.projectKey,
+          topicName: destination.topicName,
+        };
+      }
+
+      const messageId =
+        result?.message_id !== undefined ? String(result.message_id) : undefined;
+      const messageThreadId =
+        destination.messageThreadId
+        ?? (result?.message_thread_id !== undefined
+          ? String(result.message_thread_id)
+          : undefined);
+
+      await persistTelegramDestinationMappingBestEffort(
+        config,
+        payload,
+        destination,
+        messageThreadId,
+      );
+
       return {
         platform: "telegram",
-        success: false,
-        error:
-          destination.warningMessage
-          || "Telegram topic routing is unavailable and fallbackToGeneral is disabled",
+        success: true,
+        messageId,
+        messageThreadId,
         projectKey: destination.projectKey,
         topicName: destination.topicName,
       };
-    }
+    } catch (error) {
+      const staleTopicError = isRecoverableTelegramTopicError(error);
+      if (
+        staleTopicError
+        && destination
+        && !refreshedStaleTopic
+        && shouldMarkStaleTelegramTopic(config, destination)
+      ) {
+        refreshedStaleTopic = true;
+        await markTelegramTopicDestinationStaleBestEffort(
+          payload,
+          destination,
+          "topic-stale",
+          error instanceof Error ? error.message : String(error),
+        );
+        if (!canRetryStaleTelegramTopic(config, destination)) {
+          return {
+            platform: "telegram",
+            success: false,
+            error: error instanceof Error ? error.message : "Unknown error",
+            projectKey: destination.projectKey,
+            topicName: destination.topicName,
+          };
+        }
+        continue;
+      }
 
-    const result = await performTelegramBotApiRequest<{
-      message_id?: number | string;
-      message_thread_id?: number | string;
-    }>(
+      if (!staleTopicError) {
+        await persistTelegramDestinationMappingBestEffort(
+          config,
+          payload,
+          destination,
+          destination?.messageThreadId,
+        );
+      }
+
+      return {
+        platform: "telegram",
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown error",
+      };
+    }
+  }
+}
+
+async function sendTelegramMessageToDestination(
+  config: TelegramNotificationConfig,
+  payload: FullNotificationPayload,
+  destination: TelegramResolvedDestination,
+  deps: TelegramTopicResolutionDeps,
+): Promise<{
+  message_id?: number | string;
+  message_thread_id?: number | string;
+  is_topic_message?: true;
+}> {
+  return (await performTelegramBotApiRequest<{
+    message_id?: number | string;
+    message_thread_id?: number | string;
+    is_topic_message?: true;
+  }>(
+    config.botToken,
+    "sendMessage",
+    {
+      ...(() => {
+        const transportOverride = getTransportOverride(payload, "telegram");
+        const effectiveParseMode =
+          Object.prototype.hasOwnProperty.call(transportOverride ?? {}, "parseMode")
+            ? transportOverride?.parseMode
+            : (config.parseMode ?? "Markdown");
+        return effectiveParseMode ? { parse_mode: effectiveParseMode } : {};
+      })(),
+      chat_id: destination.chatId,
+      text: getTransportOverride(payload, "telegram")?.message ?? payload.message,
+      ...(destination.messageThreadId
+          ? {
+              message_thread_id: coerceTelegramMessageThreadId(
+                destination.messageThreadId,
+              ),
+            }
+          : {}),
+    },
+    {
+      ...(deps.httpsRequestImpl ? { httpsRequestImpl: deps.httpsRequestImpl } : {}),
+      timeoutMs: deps.timeoutMs ?? SEND_TIMEOUT_MS,
+    },
+  )) ?? {};
+}
+
+async function deleteTelegramMessageBestEffort(
+  config: TelegramNotificationConfig,
+  destination: TelegramResolvedDestination,
+  messageId: number | string | undefined,
+  deps: TelegramTopicResolutionDeps,
+): Promise<boolean> {
+  if (messageId === undefined || messageId === null) {
+    return false;
+  }
+
+  try {
+    await performTelegramBotApiRequest<true>(
       config.botToken,
-      "sendMessage",
+      "deleteMessage",
       {
-        ...(() => {
-          const transportOverride = getTransportOverride(payload, "telegram");
-          const effectiveParseMode =
-            Object.prototype.hasOwnProperty.call(transportOverride ?? {}, "parseMode")
-              ? transportOverride?.parseMode
-              : (config.parseMode ?? "Markdown");
-          return effectiveParseMode ? { parse_mode: effectiveParseMode } : {};
-        })(),
         chat_id: destination.chatId,
-        text: getTransportOverride(payload, "telegram")?.message ?? payload.message,
-        ...(destination.messageThreadId
-            ? {
-                message_thread_id: coerceTelegramMessageThreadId(
-                  destination.messageThreadId,
-                ),
-              }
-            : {}),
+        message_id: messageId,
       },
       {
         ...(deps.httpsRequestImpl ? { httpsRequestImpl: deps.httpsRequestImpl } : {}),
         timeoutMs: deps.timeoutMs ?? SEND_TIMEOUT_MS,
       },
     );
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-    const messageId =
-      result?.message_id !== undefined ? String(result.message_id) : undefined;
-    const messageThreadId =
-      destination.messageThreadId
-      ?? (result?.message_thread_id !== undefined
-        ? String(result.message_thread_id)
-        : undefined);
+function normalizeTelegramThreadId(value: number | string | undefined): string {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(Math.floor(value));
+  }
+  return typeof value === "string" ? value.trim() : "";
+}
 
-    await persistTelegramDestinationMappingBestEffort(
-      config,
-      payload,
-      destination,
-      messageThreadId,
+function isTelegramTopicDeliveryMismatch(
+  destination: TelegramResolvedDestination,
+  result: {
+    message_thread_id?: number | string;
+    is_topic_message?: true;
+  },
+): boolean {
+  if (!destination.messageThreadId) {
+    return false;
+  }
+
+  const expectedThreadId = normalizeTelegramThreadId(destination.messageThreadId);
+  const actualThreadId = normalizeTelegramThreadId(result?.message_thread_id);
+  return (
+    !actualThreadId
+    || actualThreadId !== expectedThreadId
+    || result?.is_topic_message !== true
+  );
+}
+
+function isRecoverableTelegramTopicError(error: unknown): boolean {
+  if (!(error instanceof TelegramBotApiError)) {
+    return false;
+  }
+
+  if (error.methodName !== "sendMessage") {
+    return false;
+  }
+
+  const description = `${error.description || ""} ${error.message}`.toLowerCase();
+  return (
+    description.includes("message thread not found")
+    || (description.includes("topic") && description.includes("not found"))
+  );
+}
+
+function shouldMarkStaleTelegramTopic(
+  config: TelegramNotificationConfig,
+  destination: TelegramResolvedDestination,
+): boolean {
+  return Boolean(
+    config.projectTopics?.enabled === true
+    && destination.sourceChatKey
+    && destination.projectKey
+    && destination.messageThreadId
+    && !destination.usedFallback,
+  );
+}
+
+function canRetryStaleTelegramTopic(
+  config: TelegramNotificationConfig,
+  destination: TelegramResolvedDestination,
+): boolean {
+  return Boolean(
+    shouldMarkStaleTelegramTopic(config, destination)
+    && config.projectTopics?.autoCreate !== false,
+  );
+}
+
+function isUnsafeStaleTopicRetryDestination(
+  destination: TelegramResolvedDestination,
+): boolean {
+  return Boolean(destination.usedFallback || !destination.messageThreadId);
+}
+
+async function markTelegramTopicDestinationStaleBestEffort(
+  payload: FullNotificationPayload,
+  destination: TelegramResolvedDestination,
+  failureCode: "topic-stale" | "topic-delivery-mismatch",
+  failureMessage: string,
+): Promise<void> {
+  if (!destination.sourceChatKey || !destination.projectKey) {
+    return;
+  }
+
+  const identity = normalizeTelegramProjectIdentity(payload);
+  if (!identity || identity.projectKey !== destination.projectKey) {
+    return;
+  }
+
+  const nowIso = new Date().toISOString();
+
+  try {
+    await updateTelegramTopicRegistryRecord(
+      destination.sourceChatKey,
+      destination.projectKey,
+      (record) => ({
+        ...record,
+        sourceChatKey: destination.sourceChatKey,
+        projectKey: destination.projectKey!,
+        canonicalProjectPath: identity.canonicalProjectPath,
+        displayName: identity.displayName,
+        topicName: destination.topicName || record?.topicName || identity.displayName,
+        createdAt: record?.createdAt,
+        lastUsedAt: record?.lastUsedAt,
+        lastCreateAttemptAt: record?.lastCreateAttemptAt,
+        lastCreateFailureAt: nowIso,
+        lastCreateFailureCode: failureCode,
+        lastCreateFailureMessage: failureMessage,
+        createFailureCooldownUntil: undefined,
+        messageThreadId: undefined,
+      }),
     );
-
-    return {
-      platform: "telegram",
-      success: true,
-      messageId,
-      messageThreadId,
-      projectKey: destination.projectKey,
-      topicName: destination.topicName,
-    };
   } catch (error) {
-    await persistTelegramDestinationMappingBestEffort(
-      config,
-      payload,
-      destination,
-      destination?.messageThreadId,
-    );
-    return {
-      platform: "telegram",
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error",
-    };
+    console.warn("[notifications] telegram topic registry persistence warning", {
+      warningCode: "topic-registry-stale-mark-failed",
+      sourceChatKey: destination.sourceChatKey,
+      projectKey: destination.projectKey,
+      canonicalProjectPath: identity.canonicalProjectPath,
+      messageThreadId: destination.messageThreadId,
+      error: error instanceof Error ? error.message : String(error),
+    });
   }
 }
 

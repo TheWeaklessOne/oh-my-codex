@@ -302,6 +302,7 @@ describe('sendTelegram', () => {
                 result: {
                   message_id: 321,
                   message_thread_id: 9001,
+                  is_topic_message: true,
                 },
               },
             };
@@ -473,6 +474,476 @@ describe('sendTelegram', () => {
     assert.equal(httpsCalled, false);
   });
 
+  it('refreshes a stale cached topic and retries once when Telegram reports the thread is missing', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true },
+    };
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-dispatcher-telegram-stale-'));
+    const identity = normalizeTelegramProjectIdentity(basePayload);
+    assert.ok(identity);
+    let resolveCalls = 0;
+    const requestBodies: Array<{ message_thread_id?: number }> = [];
+
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+
+    try {
+      const result = await sendTelegram(
+        config,
+        basePayload,
+        {
+          resolveTelegramDestinationImpl: async () => {
+            resolveCalls += 1;
+            return {
+              chatId: '777',
+              sourceChatKey: 'telegram:123456:777',
+              messageThreadId: resolveCalls === 1 ? '9001' : '9002',
+              projectKey: identity.projectKey,
+              canonicalProjectPath: identity.canonicalProjectPath,
+              topicName: 'project',
+            };
+          },
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+              requestBodies.push(JSON.parse(body) as { message_thread_id?: number });
+              if (requestBodies.length === 1) {
+                return {
+                  statusCode: 400,
+                  body: {
+                    ok: false,
+                    error_code: 400,
+                    description: 'Bad Request: message thread not found',
+                  },
+                };
+              }
+
+              return {
+                statusCode: 200,
+                body: {
+                  ok: true,
+                  result: {
+                    message_id: 433,
+                    message_thread_id: 9002,
+                    is_topic_message: true,
+                  },
+                },
+              };
+            },
+          }),
+        },
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.messageId, '433');
+      assert.equal(result.messageThreadId, '9002');
+      assert.equal(resolveCalls, 2);
+      assert.deepEqual(
+        requestBodies.map((body) => body.message_thread_id),
+        [9001, 9002],
+      );
+
+      const record = await getTelegramTopicRegistryRecord(
+        'telegram:123456:777',
+        identity.projectKey,
+      );
+      assert.equal(record?.messageThreadId, '9002');
+      assert.equal(record?.lastCreateFailureCode, undefined);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  it('deletes a topic-mismatched Telegram send and retries with a refreshed topic', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true },
+    };
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-dispatcher-telegram-mismatch-'));
+    const identity = normalizeTelegramProjectIdentity(basePayload);
+    assert.ok(identity);
+    let resolveCalls = 0;
+    let deleteCalled = false;
+    let sendCalls = 0;
+
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+
+    try {
+      const result = await sendTelegram(
+        config,
+        basePayload,
+        {
+          resolveTelegramDestinationImpl: async () => {
+            resolveCalls += 1;
+            return {
+              chatId: '777',
+              sourceChatKey: 'telegram:123456:777',
+              messageThreadId: resolveCalls === 1 ? '9001' : '9002',
+              projectKey: identity.projectKey,
+              canonicalProjectPath: identity.canonicalProjectPath,
+              topicName: 'project',
+            };
+          },
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendMessage`]: () => {
+              sendCalls += 1;
+              if (sendCalls === 1) {
+                return {
+                  statusCode: 200,
+                  body: {
+                    ok: true,
+                    result: {
+                      message_id: 434,
+                      message_thread_id: 9001,
+                      is_topic_message: false,
+                    },
+                  },
+                };
+              }
+
+              return {
+                statusCode: 200,
+                body: {
+                  ok: true,
+                  result: {
+                    message_id: 435,
+                    message_thread_id: 9002,
+                    is_topic_message: true,
+                  },
+                },
+              };
+            },
+            [`POST /bot${config.botToken}/deleteMessage`]: () => {
+              deleteCalled = true;
+              return {
+                statusCode: 200,
+                body: { ok: true, result: true },
+              };
+            },
+          }),
+        },
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.messageId, '435');
+      assert.equal(result.messageThreadId, '9002');
+      assert.equal(deleteCalled, true);
+      assert.equal(resolveCalls, 2);
+      assert.equal(sendCalls, 2);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  it('does not retry stale topic sends into the root chat when refresh falls back', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true, fallbackToGeneral: true },
+    };
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-dispatcher-telegram-fallback-'));
+    const identity = normalizeTelegramProjectIdentity(basePayload);
+    assert.ok(identity);
+    let resolveCalls = 0;
+    let sendCalls = 0;
+
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+
+    try {
+      const result = await sendTelegram(
+        config,
+        basePayload,
+        {
+          resolveTelegramDestinationImpl: async () => {
+            resolveCalls += 1;
+            return resolveCalls === 1
+              ? {
+                  chatId: '777',
+                  sourceChatKey: 'telegram:123456:777',
+                  messageThreadId: '9001',
+                  projectKey: identity.projectKey,
+                  canonicalProjectPath: identity.canonicalProjectPath,
+                  topicName: 'project',
+                }
+              : {
+                  chatId: '777',
+                  sourceChatKey: 'telegram:123456:777',
+                  projectKey: identity.projectKey,
+                  canonicalProjectPath: identity.canonicalProjectPath,
+                  topicName: 'project',
+                  usedFallback: true,
+                  warningMessage: 'Topic creation is cooling down.',
+                };
+          },
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendMessage`]: () => {
+              sendCalls += 1;
+              return {
+                statusCode: 400,
+                body: {
+                  ok: false,
+                  error_code: 400,
+                  description: 'Bad Request: message thread not found',
+                },
+              };
+            },
+          }),
+        },
+      );
+
+      assert.equal(result.success, false);
+      assert.equal(result.error, 'Topic creation is cooling down.');
+      assert.equal(resolveCalls, 2);
+      assert.equal(sendCalls, 1);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  it('tombstones stale cached topics even when autoCreate is disabled', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true, autoCreate: false, fallbackToGeneral: true },
+    };
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-dispatcher-telegram-autocreate-off-'));
+    const identity = normalizeTelegramProjectIdentity(basePayload);
+    assert.ok(identity);
+    let resolveCalls = 0;
+    let sendCalls = 0;
+
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+
+    try {
+      const result = await sendTelegram(
+        config,
+        basePayload,
+        {
+          resolveTelegramDestinationImpl: async () => {
+            resolveCalls += 1;
+            return {
+              chatId: '777',
+              sourceChatKey: 'telegram:123456:777',
+              messageThreadId: '9001',
+              projectKey: identity.projectKey,
+              canonicalProjectPath: identity.canonicalProjectPath,
+              topicName: 'project',
+            };
+          },
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendMessage`]: () => {
+              sendCalls += 1;
+              return {
+                statusCode: 400,
+                body: {
+                  ok: false,
+                  error_code: 400,
+                  description: 'Bad Request: message thread not found',
+                },
+              };
+            },
+          }),
+        },
+      );
+
+      assert.equal(result.success, false);
+      assert.match(result.error || '', /message thread not found/);
+      assert.equal(resolveCalls, 1);
+      assert.equal(sendCalls, 1);
+
+      const record = await getTelegramTopicRegistryRecord(
+        'telegram:123456:777',
+        identity.projectKey,
+      );
+      assert.equal(record?.messageThreadId, undefined);
+      assert.equal(record?.lastCreateFailureCode, 'topic-stale');
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  it('does not retry a topic mismatch when cleanup fails', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true },
+    };
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-dispatcher-telegram-delete-failed-'));
+    const identity = normalizeTelegramProjectIdentity(basePayload);
+    assert.ok(identity);
+    let resolveCalls = 0;
+    let sendCalls = 0;
+    let deleteCalls = 0;
+
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+
+    try {
+      const result = await sendTelegram(
+        config,
+        basePayload,
+        {
+          resolveTelegramDestinationImpl: async () => {
+            resolveCalls += 1;
+            return {
+              chatId: '777',
+              sourceChatKey: 'telegram:123456:777',
+              messageThreadId: '9001',
+              projectKey: identity.projectKey,
+              canonicalProjectPath: identity.canonicalProjectPath,
+              topicName: 'project',
+            };
+          },
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendMessage`]: () => {
+              sendCalls += 1;
+              return {
+                statusCode: 200,
+                body: {
+                  ok: true,
+                  result: {
+                    message_id: 436,
+                    message_thread_id: 9001,
+                    is_topic_message: false,
+                  },
+                },
+              };
+            },
+            [`POST /bot${config.botToken}/deleteMessage`]: () => {
+              deleteCalls += 1;
+              return {
+                statusCode: 400,
+                body: {
+                  ok: false,
+                  error_code: 400,
+                  description: 'Bad Request: message to delete not found',
+                },
+              };
+            },
+          }),
+        },
+      );
+
+      assert.equal(result.success, false);
+      assert.equal(result.error, 'Telegram topic delivery mismatch cleanup failed');
+      assert.equal(resolveCalls, 1);
+      assert.equal(sendCalls, 1);
+      assert.equal(deleteCalls, 1);
+
+      const record = await getTelegramTopicRegistryRecord(
+        'telegram:123456:777',
+        identity.projectKey,
+      );
+      assert.equal(record?.messageThreadId, undefined);
+      assert.equal(record?.lastCreateFailureCode, 'topic-delivery-mismatch');
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  it('stops stale topic retry after one refresh attempt', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true },
+    };
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-dispatcher-telegram-stale-bounded-'));
+    const identity = normalizeTelegramProjectIdentity(basePayload);
+    assert.ok(identity);
+    let resolveCalls = 0;
+    let sendCalls = 0;
+
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+
+    try {
+      const result = await sendTelegram(
+        config,
+        basePayload,
+        {
+          resolveTelegramDestinationImpl: async () => {
+            resolveCalls += 1;
+            return {
+              chatId: '777',
+              sourceChatKey: 'telegram:123456:777',
+              messageThreadId: resolveCalls === 1 ? '9001' : '9002',
+              projectKey: identity.projectKey,
+              canonicalProjectPath: identity.canonicalProjectPath,
+              topicName: 'project',
+            };
+          },
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendMessage`]: () => {
+              sendCalls += 1;
+              return {
+                statusCode: 400,
+                body: {
+                  ok: false,
+                  error_code: 400,
+                  description: 'Bad Request: message thread not found',
+                },
+              };
+            },
+          }),
+        },
+      );
+
+      assert.equal(result.success, false);
+      assert.match(result.error || '', /message thread not found/);
+      assert.equal(resolveCalls, 2);
+      assert.equal(sendCalls, 2);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
   it('persists topic metadata after a successful send when an existing topic destination is reused', async () => {
     const config: TelegramNotificationConfig = {
       enabled: true,
@@ -509,6 +980,7 @@ describe('sendTelegram', () => {
                 result: {
                   message_id: 432,
                   message_thread_id: 9001,
+                  is_topic_message: true,
                 },
               },
             }),

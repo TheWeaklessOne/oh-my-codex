@@ -490,6 +490,94 @@ describe('telegram-topics', () => {
     assert.equal(persisted?.topicName, 'project-a');
   });
 
+  it('does not recover stale failed topic ids from session correlation metadata before recreating', async () => {
+    const topics = await importTopicsFresh();
+    const registry = await importRegistryFresh();
+    const config = createConfig();
+    const sourceChatKey = 'telegram:123456:777';
+
+    for (const [index, failureCode] of (['topic-stale', 'topic-delivery-mismatch'] as const).entries()) {
+      const projectName = `project-${index}`;
+      const projectPath = `/repos/${projectName}`;
+      const recreatedThreadId = String(9006 + index);
+      const identity = topics.normalizeTelegramProjectIdentity({
+        projectPath,
+        projectName,
+      });
+      assert.ok(identity);
+
+      await mkdir(join(tempHome, '.omx', 'state'), { recursive: true });
+      await writeFile(
+        join(tempHome, '.omx', 'state', 'reply-session-registry.jsonl'),
+        `${JSON.stringify({
+          platform: 'telegram',
+          messageId: '321',
+          source: {
+            platform: 'telegram',
+            key: sourceChatKey,
+            label: 'telegram:777',
+            chatId: '777',
+            botId: '123456',
+          },
+          sessionId: 'sess-1',
+          tmuxPaneId: '%1',
+          tmuxSessionName: 'omx',
+          event: 'result-ready',
+          createdAt: '2026-04-21T16:05:00.000Z',
+          projectPath,
+          projectKey: identity!.projectKey,
+          messageThreadId: '9004',
+          topicName: projectName,
+        })}\n`,
+      );
+      await registry.updateTelegramTopicRegistryRecord(
+        sourceChatKey,
+        identity!.projectKey,
+        () => ({
+          sourceChatKey,
+          projectKey: identity!.projectKey,
+          canonicalProjectPath: identity!.canonicalProjectPath,
+          displayName: identity!.displayName,
+          topicName: projectName,
+          lastCreateFailureAt: '2026-04-21T16:06:00.000Z',
+          lastCreateFailureCode: failureCode,
+          lastCreateFailureMessage: 'Bad Request: message thread not found',
+        }),
+      );
+
+      const destination = await topics.resolveTelegramDestination(
+        config,
+        {
+          projectPath,
+          projectName,
+        },
+        {
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/createForumTopic`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_thread_id: recreatedThreadId,
+                  name: projectName,
+                },
+              },
+            }),
+          }),
+          logger: { warn() {} },
+        },
+      );
+
+      assert.equal(destination.messageThreadId, recreatedThreadId);
+      const persisted = await registry.getTelegramTopicRegistryRecord(
+        sourceChatKey,
+        identity!.projectKey,
+      );
+      assert.equal(persisted?.messageThreadId, recreatedThreadId);
+      assert.equal(persisted?.lastCreateFailureCode, undefined);
+    }
+  });
+
   it('warns when a topic record exists but the effective config disables projectTopics', async () => {
     const topics = await importTopicsFresh();
     const registry = await importRegistryFresh();
