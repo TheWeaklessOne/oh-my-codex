@@ -10,6 +10,7 @@ import {
   buildConfigFromEnv,
   getNotificationConfig,
   getReplyListenerPlatformConfig,
+  normalizeCompletedTurnPresentationConfig,
 } from '../config.js';
 
 const ENV_KEYS = [
@@ -294,6 +295,56 @@ describe('buildConfigFromEnv', () => {
   });
 });
 
+describe('normalizeCompletedTurnPresentationConfig', () => {
+  it('normalizes Telegram completed-turn entity format overrides', () => {
+    const config = normalizeCompletedTurnPresentationConfig({
+      platformOverrides: {
+        telegram: {
+          telegramFormat: 'entities',
+        },
+      },
+    });
+
+    assert.equal(config.platformOverrides?.telegram?.telegramFormat, 'entities');
+  });
+
+  it('normalizes Telegram literal opt-out overrides', () => {
+    const config = normalizeCompletedTurnPresentationConfig({
+      platformOverrides: {
+        telegram: {
+          telegramFormat: 'literal',
+        },
+      },
+    });
+
+    assert.equal(config.platformOverrides?.telegram?.telegramFormat, 'literal');
+  });
+
+  it('falls invalid Telegram completed-turn formats back to entities', () => {
+    const config = normalizeCompletedTurnPresentationConfig({
+      platformOverrides: {
+        telegram: {
+          telegramFormat: 'MarkdownV2',
+        },
+      },
+    } as unknown as Parameters<typeof normalizeCompletedTurnPresentationConfig>[0]);
+
+    assert.equal(config.platformOverrides?.telegram?.telegramFormat, 'entities');
+  });
+
+  it('ignores telegramFormat on non-Telegram platform overrides', () => {
+    const config = normalizeCompletedTurnPresentationConfig({
+      platformOverrides: {
+        discord: {
+          telegramFormat: 'literal',
+        },
+      },
+    } as unknown as Parameters<typeof normalizeCompletedTurnPresentationConfig>[0]);
+
+    assert.equal(config.platformOverrides, undefined);
+  });
+});
+
 describe('getNotificationConfig', () => {
   beforeEach(() => {
     clearEnvVars();
@@ -337,6 +388,42 @@ describe('getNotificationConfig', () => {
       assert.equal(config.telegram?.projectTopics?.enabled, true);
       assert.equal(config.completedTurn?.resultReadyMode, 'raw-assistant-text');
       assert.equal(config.completedTurn?.askUserQuestionMode, 'raw-assistant-text');
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('loads Telegram completed-turn format overrides from .omx-config.json', async () => {
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-notification-config-'));
+    const codexHome = join(tempHome, '.codex');
+
+    try {
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          webhook: {
+            enabled: true,
+            url: 'https://example.com/webhook',
+          },
+          completedTurn: {
+            platformOverrides: {
+              telegram: {
+                telegramFormat: 'literal',
+              },
+            },
+          },
+        },
+      }, null, 2));
+      process.env.HOME = tempHome;
+      process.env.CODEX_HOME = codexHome;
+
+      const config = getNotificationConfig();
+      assert.ok(config);
+      assert.equal(
+        config.completedTurn?.platformOverrides?.telegram?.telegramFormat,
+        'literal',
+      );
     } finally {
       await rm(tempHome, { recursive: true, force: true });
     }

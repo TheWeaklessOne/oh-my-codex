@@ -251,7 +251,9 @@ Completed-turn presentation is now configurable separately from lifecycle delive
       "askUserQuestionMode": "raw-assistant-text",
       "platformOverrides": {
         "telegram": {
-          "resultReadyMode": "raw-assistant-text"
+          "resultReadyMode": "raw-assistant-text",
+          "askUserQuestionMode": "raw-assistant-text",
+          "telegramFormat": "entities"
         }
       }
     }
@@ -263,6 +265,11 @@ Completed-turn presentation is now configurable separately from lifecycle delive
 - Every non-empty leader final turn is eligible for `result-ready` delivery as raw assistant text; the semantic classifier only upgrades explicit input requests to `ask-user-question`.
 - `result-ready` defaults to `raw-assistant-text`, so the visible notification body is the full assistant answer.
 - `ask-user-question` also defaults to `raw-assistant-text`.
+- Telegram completed-turn raw text defaults to `telegramFormat: "entities"`: Codex/LLM Markdown is parsed with a Markdown AST parser and sent to Telegram as plain `text` plus Bot API `entities`, never as MarkdownV2.
+- Set `notifications.completedTurn.platformOverrides.telegram.telegramFormat` to `"literal"` to opt out and send the raw assistant Markdown literally. Literal Telegram raw delivery still disables `parse_mode`.
+- In entity mode, Telegram `parseMode`/`parse_mode` is ignored for those completed-turn messages because the request uses `entities`; non-Telegram transports keep their existing raw/formatted text behavior.
+- Supported Telegram entity rendering covers paragraphs, headings as bold, strong/emphasis/strikethrough, inline code, fenced/indented code blocks with safe languages, public non-sensitive HTTP(S) links, reference-style links, lists/task lists, blockquotes, and readable table degradation. Images, raw HTML, unsafe links, and unsupported Markdown nodes degrade to safe plain text.
+- Rendered Telegram messages are validated locally, capped to a bounded number of 4096 UTF-16-code-unit chunks, split after rendering, and delivered sequentially with remapped entity offsets. Markdown parse/render failures are converted to safe plain text before sending; Telegram Bot API entity delivery failures retry the whole logical message once as raw text without `entities` and without `parse_mode`. Oversized legacy `parseMode` messages are also chunked as raw text instead of being sent as one oversized request.
 - Lifecycle events (`session-start`, `session-stop`, `session-idle`, `session-end`) keep the existing formatter-based rendering.
 - You can switch either completed-turn event back to `formatted-notification` globally or per platform without changing code.
 - When OMX runs with a project-scoped `CODEX_HOME`, it reads `.codex/.omx-config.json` first and falls back to `~/.codex/.omx-config.json` if the project file is absent.

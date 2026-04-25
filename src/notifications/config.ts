@@ -11,6 +11,7 @@ import { codexHome, defaultCodexHome } from "../utils/paths.js";
 import type {
   CompletedTurnPlatformPresentationConfig,
   CompletedTurnPresentationConfig,
+  TelegramCompletedTurnFormat,
   CompletedTurnRenderMode,
   FullNotificationConfig,
   NotificationsBlock,
@@ -50,9 +51,15 @@ const COMPLETED_TURN_RENDER_MODES = new Set<CompletedTurnRenderMode>([
   "formatted-notification",
   "raw-assistant-text",
 ]);
+const TELEGRAM_COMPLETED_TURN_FORMATS = new Set<TelegramCompletedTurnFormat>([
+  "literal",
+  "entities",
+]);
 const DEFAULT_RESULT_READY_MODE: CompletedTurnRenderMode = "raw-assistant-text";
 const DEFAULT_ASK_USER_QUESTION_MODE: CompletedTurnRenderMode =
   "raw-assistant-text";
+const DEFAULT_TELEGRAM_COMPLETED_TURN_FORMAT: TelegramCompletedTurnFormat =
+  "entities";
 
 export interface NotificationConfigLoadOptions {
   codexHomeOverride?: string;
@@ -104,6 +111,16 @@ function normalizeCompletedTurnRenderMode(
     : fallback;
 }
 
+function normalizeTelegramCompletedTurnFormat(
+  value: unknown,
+  fallback: TelegramCompletedTurnFormat = DEFAULT_TELEGRAM_COMPLETED_TURN_FORMAT,
+): TelegramCompletedTurnFormat {
+  return typeof value === "string"
+    && TELEGRAM_COMPLETED_TURN_FORMATS.has(value as TelegramCompletedTurnFormat)
+    ? value as TelegramCompletedTurnFormat
+    : fallback;
+}
+
 function normalizeCompletedTurnPlatformOverrides(
   value: unknown,
 ): CompletedTurnPresentationConfig["platformOverrides"] | undefined {
@@ -135,6 +152,14 @@ function normalizeCompletedTurnPlatformOverrides(
       normalizedOverride.askUserQuestionMode = normalizeCompletedTurnRenderMode(
         overrideConfig.askUserQuestionMode,
         DEFAULT_ASK_USER_QUESTION_MODE,
+      );
+    }
+    if (
+      platform === "telegram"
+      && overrideConfig.telegramFormat !== undefined
+    ) {
+      normalizedOverride.telegramFormat = normalizeTelegramCompletedTurnFormat(
+        overrideConfig.telegramFormat,
       );
     }
 

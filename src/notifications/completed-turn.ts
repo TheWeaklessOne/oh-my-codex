@@ -1,4 +1,5 @@
 import { formatNotification } from "./formatter.js";
+import { renderMarkdownToTelegramEntities } from "./telegram-markdown-renderer.js";
 import type {
   CompletedTurnPresentationConfig,
   CompletedTurnRenderMode,
@@ -7,6 +8,8 @@ import type {
   NotificationEvent,
   NotificationPlatform,
   NotificationTransportOverrides,
+  TelegramCompletedTurnFormat,
+  TelegramMessageEntity,
 } from "./types.js";
 import type {
   CompletedTurnSemanticKind,
@@ -24,6 +27,7 @@ export interface CompletedTurnReplyOrigin {
 export interface CompletedTurnTransportRenderPolicy {
   mode: CompletedTurnRenderMode;
   parseMode?: "Markdown" | "HTML" | null;
+  telegramFormat?: TelegramCompletedTurnFormat;
 }
 
 export interface CompletedTurnHookMetadata {
@@ -60,12 +64,12 @@ type CompletedTurnEffectiveEvent = Extract<
   "result-ready" | "ask-user-question"
 >;
 
-const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
+const DEFAULT_TELEGRAM_COMPLETED_TURN_FORMAT: TelegramCompletedTurnFormat =
+  "entities";
 
 function shouldFallbackToFormattedNotification(
   policy: CompletedTurnTransportRenderPolicy,
   assistantText: string,
-  platform?: NotificationPlatform,
 ): boolean {
   if (policy.mode !== "raw-assistant-text") {
     return false;
@@ -75,10 +79,7 @@ function shouldFallbackToFormattedNotification(
     return true;
   }
 
-  return (
-    platform === "telegram"
-    && Array.from(assistantText).length > TELEGRAM_MAX_MESSAGE_LENGTH
-  );
+  return false;
 }
 
 function resolveCompletedTurnRenderedMessage(
@@ -86,11 +87,27 @@ function resolveCompletedTurnRenderedMessage(
   payload: FullNotificationPayload,
   assistantText: string,
   platform?: NotificationPlatform,
-): { message: string; parseMode?: "Markdown" | "HTML" | null } {
+): {
+  message: string;
+  parseMode?: "Markdown" | "HTML" | null;
+  entities?: TelegramMessageEntity[];
+} {
   if (
     policy.mode === "raw-assistant-text"
-    && !shouldFallbackToFormattedNotification(policy, assistantText, platform)
+    && !shouldFallbackToFormattedNotification(policy, assistantText)
   ) {
+    if (
+      platform === "telegram"
+      && (policy.telegramFormat ?? DEFAULT_TELEGRAM_COMPLETED_TURN_FORMAT) === "entities"
+    ) {
+      const rendered = renderMarkdownToTelegramEntities(assistantText);
+      return {
+        message: rendered.text,
+        parseMode: null,
+        ...(rendered.entities.length > 0 ? { entities: rendered.entities } : {}),
+      };
+    }
+
     return {
       message: assistantText,
       ...(Object.prototype.hasOwnProperty.call(policy, "parseMode")
@@ -122,14 +139,27 @@ function resolveCompletedTurnRenderMode(
   );
 }
 
+function resolveTelegramCompletedTurnFormat(
+  config?: CompletedTurnPresentationConfig | null,
+): TelegramCompletedTurnFormat {
+  return (
+    config?.platformOverrides?.telegram?.telegramFormat
+    ?? DEFAULT_TELEGRAM_COMPLETED_TURN_FORMAT
+  );
+}
+
 function buildTransportRenderPolicy(
   mode: CompletedTurnRenderMode,
   platform?: NotificationPlatform,
+  telegramFormat?: TelegramCompletedTurnFormat,
 ): CompletedTurnTransportRenderPolicy {
   return {
     mode,
     ...(platform === "telegram" && mode === "raw-assistant-text"
-      ? { parseMode: null }
+      ? {
+          parseMode: null,
+          telegramFormat: telegramFormat ?? DEFAULT_TELEGRAM_COMPLETED_TURN_FORMAT,
+        }
       : {}),
   };
 }
@@ -156,10 +186,14 @@ function buildCompletedTurnTransportPolicy(
       const platformPolicy = buildTransportRenderPolicy(
         resolveCompletedTurnRenderMode(event, completedTurnConfig, platform),
         platform,
+        platform === "telegram"
+          ? resolveTelegramCompletedTurnFormat(completedTurnConfig)
+          : undefined,
       );
       if (
         platformPolicy.mode !== defaultPolicy.mode
         || Object.prototype.hasOwnProperty.call(platformPolicy, "parseMode")
+        || platformPolicy.telegramFormat !== undefined
       ) {
         acc[platform] = platformPolicy;
       }
@@ -306,15 +340,20 @@ export function buildCompletedTurnTransportOverrides(
   decision: CompletedTurnNotificationDecision,
   payload: FullNotificationPayload,
   assistantText: string,
+  enabledPlatforms?: readonly NotificationPlatform[],
 ): NotificationTransportOverrides | undefined {
   if (!decision.transportPolicy.overrides) {
     return undefined;
   }
 
+  const enabledPlatformSet = enabledPlatforms
+    ? new Set<NotificationPlatform>(enabledPlatforms)
+    : null;
   const overrides = Object.entries(decision.transportPolicy.overrides).reduce<
     NotificationTransportOverrides
   >((acc, [platform, policy]) => {
-    if (!policy) {
+    const notificationPlatform = platform as NotificationPlatform;
+    if (!policy || (enabledPlatformSet && !enabledPlatformSet.has(notificationPlatform))) {
       return acc;
     }
 
@@ -322,13 +361,14 @@ export function buildCompletedTurnTransportOverrides(
       policy,
       payload,
       assistantText,
-      platform as NotificationPlatform,
+      notificationPlatform,
     );
-    acc[platform as NotificationPlatform] = {
+    acc[notificationPlatform] = {
       message: rendered.message,
       ...(Object.prototype.hasOwnProperty.call(rendered, "parseMode")
         ? { parseMode: rendered.parseMode }
         : {}),
+      ...(rendered.entities ? { entities: rendered.entities } : {}),
     };
     return acc;
   }, {});

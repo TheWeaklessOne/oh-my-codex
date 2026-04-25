@@ -381,6 +381,473 @@ describe('sendTelegram', () => {
     assert.equal('parse_mode' in parsedBody, false);
   });
 
+  it('sends Telegram entities and omits parse_mode even when config parseMode is set', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      parseMode: 'HTML',
+      projectTopics: { enabled: true },
+    };
+    let requestBody = '';
+
+    const result = await sendTelegram(
+      config,
+      {
+        ...basePayload,
+        message: 'fallback message',
+        transportOverrides: {
+          telegram: {
+            message: 'Run npm run build',
+            parseMode: null,
+            entities: [
+              { type: 'code', offset: 'Run '.length, length: 'npm run build'.length },
+            ],
+          },
+        },
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+          messageThreadId: '9001',
+          projectKey: 'project-key-1',
+          topicName: 'project-a',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+            requestBody = body;
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: 222,
+                  message_thread_id: 9001,
+                  is_topic_message: true,
+                },
+              },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(result.messageId, '222');
+    const parsedBody = JSON.parse(requestBody) as {
+      text: string;
+      entities?: unknown[];
+      parse_mode?: string;
+      message_thread_id?: number;
+    };
+    assert.equal(parsedBody.text, 'Run npm run build');
+    assert.deepEqual(parsedBody.entities, [
+      { type: 'code', offset: 'Run '.length, length: 'npm run build'.length },
+    ]);
+    assert.equal('parse_mode' in parsedBody, false);
+    assert.equal(parsedBody.message_thread_id, 9001);
+  });
+
+  it('sends long Telegram entity overrides as multiple chunks with remapped entities', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true },
+    };
+    const requestBodies: Array<{
+      text: string;
+      entities?: Array<{ type: string; offset: number; length: number }>;
+      message_thread_id?: number;
+      parse_mode?: string;
+    }> = [];
+
+    const result = await sendTelegram(
+      config,
+      {
+        ...basePayload,
+        transportOverrides: {
+          telegram: {
+            message: `${'a'.repeat(4096)}code`,
+            parseMode: null,
+            entities: [
+              { type: 'code', offset: 4096, length: 4 },
+            ],
+          },
+        },
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+          messageThreadId: '9001',
+          projectKey: 'project-key-1',
+          topicName: 'project-a',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+            requestBodies.push(JSON.parse(body));
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: requestBodies.length === 1 ? 301 : 302,
+                  message_thread_id: 9001,
+                  is_topic_message: true,
+                },
+              },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(result.messageId, '301');
+    assert.deepEqual(result.messageIds, ['301', '302']);
+    assert.equal(requestBodies.length, 2);
+    assert.equal(requestBodies[0].text.length, 4096);
+    assert.equal(requestBodies[1].text, 'code');
+    assert.equal(requestBodies[0].message_thread_id, 9001);
+    assert.equal(requestBodies[1].message_thread_id, 9001);
+    assert.equal('parse_mode' in requestBodies[0], false);
+    assert.equal('parse_mode' in requestBodies[1], false);
+    assert.deepEqual(requestBodies[1].entities, [
+      { type: 'code', offset: 0, length: 4 },
+    ]);
+  });
+
+  it('keeps short non-entity parse-mode Telegram payloads in parse mode', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      parseMode: 'Markdown',
+    };
+    const requestBodies: Array<{ text: string; parse_mode?: string }> = [];
+    const markdownMessage = '*short*';
+
+    const result = await sendTelegram(
+      config,
+      {
+        ...basePayload,
+        message: markdownMessage,
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+            requestBodies.push(JSON.parse(body));
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: 303,
+                },
+              },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(requestBodies.length, 1);
+    assert.equal(requestBodies[0].text, markdownMessage);
+    assert.equal(requestBodies[0].parse_mode, 'Markdown');
+  });
+
+  it('sends oversized non-entity parse-mode Telegram payloads as raw chunks', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      parseMode: 'Markdown',
+    };
+    const requestBodies: Array<{ text: string; parse_mode?: string }> = [];
+    const markdownMessage = `*${'a'.repeat(5000)}*`;
+
+    const result = await sendTelegram(
+      config,
+      {
+        ...basePayload,
+        message: markdownMessage,
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+            requestBodies.push(JSON.parse(body));
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: 303 + requestBodies.length,
+                },
+              },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(requestBodies.length, 2);
+    assert.equal(requestBodies.map((body) => body.text).join(''), markdownMessage);
+    assert.equal(requestBodies.every((body) => !('parse_mode' in body)), true);
+  });
+
+  it('deletes accepted Telegram chunks when a later chunk send fails', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true },
+    };
+    const sendBodies: Array<{ text: string; parse_mode?: string }> = [];
+    const deleteBodies: Array<{ chat_id: string; message_id: number }> = [];
+
+    const result = await sendTelegram(
+      config,
+      {
+        ...basePayload,
+        transportOverrides: {
+          telegram: {
+            message: `${'a'.repeat(4096)}tail`,
+            parseMode: null,
+            entities: [],
+          },
+        },
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+          messageThreadId: '9001',
+          projectKey: 'project-key-1',
+          topicName: 'project-a',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+            sendBodies.push(JSON.parse(body));
+            if (sendBodies.length === 1) {
+              return {
+                statusCode: 200,
+                body: {
+                  ok: true,
+                  result: {
+                    message_id: 401,
+                    message_thread_id: 9001,
+                    is_topic_message: true,
+                  },
+                },
+              };
+            }
+            return {
+              statusCode: 500,
+              body: {
+                ok: false,
+                error_code: 500,
+                description: 'Internal server error',
+              },
+            };
+          },
+          [`POST /bot${config.botToken}/deleteMessage`]: (body) => {
+            deleteBodies.push(JSON.parse(body));
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: true,
+              },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(sendBodies.length, 2);
+    assert.deepEqual(deleteBodies, [{ chat_id: '777', message_id: 401 }]);
+    assert.equal('parse_mode' in sendBodies[0], false);
+  });
+
+  it('retries Telegram entity send failures as raw text without entities or parse_mode', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+    };
+    const requestBodies: Array<{
+      text: string;
+      entities?: unknown[];
+      parse_mode?: string;
+    }> = [];
+
+    const result = await sendTelegram(
+      config,
+      {
+        ...basePayload,
+        transportOverrides: {
+          telegram: {
+            message: 'Run npm run build',
+            parseMode: null,
+            entities: [
+              { type: 'code', offset: 0, length: 3 },
+            ],
+          },
+        },
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+            requestBodies.push(JSON.parse(body));
+            if (requestBodies.length === 1) {
+              return {
+                statusCode: 400,
+                body: {
+                  ok: false,
+                  error_code: 400,
+                  description: "Bad Request: can't parse entities: invalid entity range",
+                },
+              };
+            }
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: 333,
+                },
+              },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(result.messageId, '333');
+    assert.equal(requestBodies.length, 2);
+    assert.ok(requestBodies[0].entities);
+    assert.equal('entities' in requestBodies[1], false);
+    assert.equal('parse_mode' in requestBodies[1], false);
+    assert.equal(requestBodies[1].text, 'Run npm run build');
+  });
+
+  it('retries a split entity message as a fully raw logical message after entity failure', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true },
+    };
+    const sendBodies: Array<{
+      text: string;
+      entities?: unknown[];
+      parse_mode?: string;
+      message_thread_id?: number;
+    }> = [];
+    const deleteBodies: Array<{ chat_id: string; message_id: number }> = [];
+
+    const result = await sendTelegram(
+      config,
+      {
+        ...basePayload,
+        transportOverrides: {
+          telegram: {
+            message: `${'a'.repeat(4096)}code`,
+            parseMode: null,
+            entities: [
+              { type: 'code', offset: 4096, length: 4 },
+            ],
+          },
+        },
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+          messageThreadId: '9001',
+          projectKey: 'project-key-1',
+          topicName: 'project-a',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+            sendBodies.push(JSON.parse(body));
+            if (sendBodies.length === 1) {
+              return {
+                statusCode: 200,
+                body: {
+                  ok: true,
+                  result: {
+                    message_id: 701,
+                    message_thread_id: 9001,
+                    is_topic_message: true,
+                  },
+                },
+              };
+            }
+            if (sendBodies.length === 2) {
+              return {
+                statusCode: 400,
+                body: {
+                  ok: false,
+                  error_code: 400,
+                  description: "Bad Request: can't parse entities: invalid entity range",
+                },
+              };
+            }
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: 700 + sendBodies.length,
+                  message_thread_id: 9001,
+                  is_topic_message: true,
+                },
+              },
+            };
+          },
+          [`POST /bot${config.botToken}/deleteMessage`]: (body) => {
+            deleteBodies.push(JSON.parse(body));
+            return {
+              statusCode: 200,
+              body: { ok: true, result: true },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, true);
+    assert.deepEqual(deleteBodies, [{ chat_id: '777', message_id: 701 }]);
+    assert.equal(sendBodies.length, 4);
+    assert.ok(sendBodies[1].entities);
+    assert.equal('entities' in sendBodies[2], false);
+    assert.equal('parse_mode' in sendBodies[2], false);
+    assert.equal('entities' in sendBodies[3], false);
+    assert.equal('parse_mode' in sendBodies[3], false);
+    assert.equal(sendBodies.slice(2).map((body) => body.text).join(''), `${'a'.repeat(4096)}code`);
+    assert.equal(sendBodies[2].message_thread_id, 9001);
+    assert.equal(sendBodies[3].message_thread_id, 9001);
+  });
+
   it('sends to the root chat without a thread id when topic routing falls back', async () => {
     const config: TelegramNotificationConfig = {
       enabled: true,
@@ -487,7 +954,10 @@ describe('sendTelegram', () => {
     const identity = normalizeTelegramProjectIdentity(basePayload);
     assert.ok(identity);
     let resolveCalls = 0;
-    const requestBodies: Array<{ message_thread_id?: number }> = [];
+    const requestBodies: Array<{
+      message_thread_id?: number;
+      entities?: Array<{ type: string; offset: number; length: number }>;
+    }> = [];
 
     process.env.HOME = tempHome;
     process.env.USERPROFILE = tempHome;
@@ -495,7 +965,16 @@ describe('sendTelegram', () => {
     try {
       const result = await sendTelegram(
         config,
-        basePayload,
+        {
+          ...basePayload,
+          transportOverrides: {
+            telegram: {
+              message: 'Topic code',
+              parseMode: null,
+              entities: [{ type: 'code', offset: 'Topic '.length, length: 'code'.length }],
+            },
+          },
+        },
         {
           resolveTelegramDestinationImpl: async () => {
             resolveCalls += 1;
@@ -545,6 +1024,13 @@ describe('sendTelegram', () => {
       assert.deepEqual(
         requestBodies.map((body) => body.message_thread_id),
         [9001, 9002],
+      );
+      assert.deepEqual(
+        requestBodies.map((body) => body.entities),
+        [
+          [{ type: 'code', offset: 'Topic '.length, length: 'code'.length }],
+          [{ type: 'code', offset: 'Topic '.length, length: 'code'.length }],
+        ],
       );
 
       const record = await getTelegramTopicRegistryRecord(
@@ -643,6 +1129,188 @@ describe('sendTelegram', () => {
       assert.equal(deleteCalled, true);
       assert.equal(resolveCalls, 2);
       assert.equal(sendCalls, 2);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  it('accepts topic chunk responses when Telegram omits optional is_topic_message', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true },
+    };
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-dispatcher-telegram-optional-topic-'));
+    const identity = normalizeTelegramProjectIdentity(basePayload);
+    assert.ok(identity);
+    let resolveCalls = 0;
+    let deleteCalled = false;
+    const sendBodies: Array<{ message_thread_id?: number }> = [];
+
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+
+    try {
+      const result = await sendTelegram(
+        config,
+        {
+          ...basePayload,
+          transportOverrides: {
+            telegram: {
+              message: `${'a'.repeat(4096)}tail`,
+              parseMode: null,
+              entities: [],
+            },
+          },
+        },
+        {
+          resolveTelegramDestinationImpl: async () => {
+            resolveCalls += 1;
+            return {
+              chatId: '777',
+              sourceChatKey: 'telegram:123456:777',
+              messageThreadId: '9001',
+              projectKey: identity.projectKey,
+              canonicalProjectPath: identity.canonicalProjectPath,
+              topicName: 'project',
+            };
+          },
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+              sendBodies.push(JSON.parse(body));
+              return {
+                statusCode: 200,
+                body: {
+                  ok: true,
+                  result: {
+                    message_id: 800 + sendBodies.length,
+                    message_thread_id: 9001,
+                  },
+                },
+              };
+            },
+            [`POST /bot${config.botToken}/deleteMessage`]: () => {
+              deleteCalled = true;
+              return {
+                statusCode: 200,
+                body: { ok: true, result: true },
+              };
+            },
+          }),
+        },
+      );
+
+      assert.equal(result.success, true);
+      assert.deepEqual(result.messageIds, ['801', '802']);
+      assert.equal(resolveCalls, 1);
+      assert.equal(sendBodies.length, 2);
+      assert.equal(deleteCalled, false);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  it('deletes all accepted chunks for a topic-mismatched chunked send before retrying', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true },
+    };
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-dispatcher-telegram-chunk-mismatch-'));
+    const identity = normalizeTelegramProjectIdentity(basePayload);
+    assert.ok(identity);
+    let resolveCalls = 0;
+    const sendBodies: Array<{ message_thread_id?: number }> = [];
+    const deleteBodies: Array<{ chat_id: string; message_id: number }> = [];
+
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+
+    try {
+      const result = await sendTelegram(
+        config,
+        {
+          ...basePayload,
+          transportOverrides: {
+            telegram: {
+              message: `${'a'.repeat(4096)}tail`,
+              parseMode: null,
+              entities: [],
+            },
+          },
+        },
+        {
+          resolveTelegramDestinationImpl: async () => {
+            resolveCalls += 1;
+            return {
+              chatId: '777',
+              sourceChatKey: 'telegram:123456:777',
+              messageThreadId: resolveCalls === 1 ? '9001' : '9002',
+              projectKey: identity.projectKey,
+              canonicalProjectPath: identity.canonicalProjectPath,
+              topicName: 'project',
+            };
+          },
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+              sendBodies.push(JSON.parse(body));
+              const firstAttempt = sendBodies.length <= 2;
+              const secondAttemptMessageId = sendBodies.length === 3 ? 803 : 804;
+              return {
+                statusCode: 200,
+                body: {
+                  ok: true,
+                  result: firstAttempt
+                    ? {
+                        message_id: 800 + sendBodies.length,
+                        message_thread_id: sendBodies.length === 1 ? 9001 : 9999,
+                        is_topic_message: true,
+                      }
+                    : {
+                        message_id: secondAttemptMessageId,
+                        message_thread_id: 9002,
+                        is_topic_message: true,
+                      },
+                },
+              };
+            },
+            [`POST /bot${config.botToken}/deleteMessage`]: (body) => {
+              deleteBodies.push(JSON.parse(body));
+              return {
+                statusCode: 200,
+                body: { ok: true, result: true },
+              };
+            },
+          }),
+        },
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.messageId, '803');
+      assert.deepEqual(result.messageIds, ['803', '804']);
+      assert.equal(resolveCalls, 2);
+      assert.deepEqual(deleteBodies, [
+        { chat_id: '777', message_id: 801 },
+        { chat_id: '777', message_id: 802 },
+      ]);
+      assert.deepEqual(
+        sendBodies.map((body) => body.message_thread_id),
+        [9001, 9001, 9002, 9002],
+      );
     } finally {
       await rm(tempHome, { recursive: true, force: true });
       if (originalHome === undefined) delete process.env.HOME;

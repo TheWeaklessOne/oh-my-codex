@@ -41,6 +41,7 @@ describe('planCompletedTurnNotification', () => {
     assert.equal(decision.transportPolicy.default.mode, 'raw-assistant-text');
     assert.equal(decision.transportPolicy.overrides?.telegram?.mode, 'raw-assistant-text');
     assert.equal(decision.transportPolicy.overrides?.telegram?.parseMode, null);
+    assert.equal(decision.transportPolicy.overrides?.telegram?.telegramFormat, 'entities');
   });
 
   it('uses per-turn fingerprints for reply-origin follow-ups', () => {
@@ -199,6 +200,110 @@ describe('completed-turn rendering', () => {
     assert.equal(message, 'raw assistant text');
   });
 
+  it('builds Telegram entity overrides for raw completed-turn result markdown by default', () => {
+    const decision = planCompletedTurnNotification({
+      semanticOutcome: {
+        kind: 'result-ready',
+        summary: 'All tests passed.',
+        notificationEvent: 'result-ready',
+      },
+    });
+    assert.ok(decision);
+
+    const payload: FullNotificationPayload = {
+      ...basePayload,
+      message: renderCompletedTurnMessage(
+        decision.transportPolicy.default,
+        basePayload,
+        'Run `npm run build`',
+      ),
+    };
+    const overrides = buildCompletedTurnTransportOverrides(
+      decision,
+      payload,
+      'Run `npm run build`',
+    );
+
+    assert.equal(overrides?.telegram?.message, 'Run npm run build');
+    assert.deepEqual(overrides?.telegram?.entities, [
+      { type: 'code', offset: 'Run '.length, length: 'npm run build'.length },
+    ]);
+    assert.equal(overrides?.telegram?.parseMode, null);
+  });
+
+  it('builds Telegram entity overrides for ask-user-question raw markdown by default', () => {
+    const decision = planCompletedTurnNotification({
+      semanticOutcome: {
+        kind: 'input-needed',
+        summary: 'Need a command.',
+        question: 'Run `npm test`?',
+        notificationEvent: 'ask-user-question',
+      },
+    });
+    assert.ok(decision);
+
+    const payload: FullNotificationPayload = {
+      ...basePayload,
+      event: 'ask-user-question',
+      message: renderCompletedTurnMessage(
+        decision.transportPolicy.default,
+        { ...basePayload, event: 'ask-user-question' },
+        'Run `npm test`?',
+      ),
+    };
+    const overrides = buildCompletedTurnTransportOverrides(
+      decision,
+      payload,
+      'Run `npm test`?',
+    );
+
+    assert.equal(overrides?.telegram?.message, 'Run npm test?');
+    assert.deepEqual(overrides?.telegram?.entities, [
+      { type: 'code', offset: 'Run '.length, length: 'npm test'.length },
+    ]);
+    assert.equal(overrides?.telegram?.parseMode, null);
+  });
+
+  it('keeps literal raw Telegram markdown when telegramFormat opts out', () => {
+    const decision = planCompletedTurnNotification({
+      semanticOutcome: {
+        kind: 'result-ready',
+        summary: 'All tests passed.',
+        notificationEvent: 'result-ready',
+      },
+      notificationConfig: {
+        completedTurn: {
+          resultReadyMode: 'raw-assistant-text',
+          askUserQuestionMode: 'raw-assistant-text',
+          platformOverrides: {
+            telegram: {
+              telegramFormat: 'literal',
+            },
+          },
+        },
+      },
+    });
+    assert.ok(decision);
+
+    const payload: FullNotificationPayload = {
+      ...basePayload,
+      message: renderCompletedTurnMessage(
+        decision.transportPolicy.default,
+        basePayload,
+        'Run `npm run build`',
+      ),
+    };
+    const overrides = buildCompletedTurnTransportOverrides(
+      decision,
+      payload,
+      'Run `npm run build`',
+    );
+
+    assert.equal(overrides?.telegram?.message, 'Run `npm run build`');
+    assert.equal(overrides?.telegram?.entities, undefined);
+    assert.equal(overrides?.telegram?.parseMode, null);
+  });
+
   it('falls back to formatted output when raw assistant text is empty', () => {
     const message = renderCompletedTurnMessage(
       { mode: 'raw-assistant-text' },
@@ -287,7 +392,7 @@ describe('completed-turn rendering', () => {
     assert.equal(overrides?.telegram?.parseMode, undefined);
   });
 
-  it('falls back to formatted telegram delivery when raw assistant text exceeds Telegram limits', () => {
+  it('keeps long raw Telegram completed-turn text for dispatcher chunking', () => {
     const decision = planCompletedTurnNotification({
       semanticOutcome: {
         kind: 'result-ready',
@@ -312,9 +417,9 @@ describe('completed-turn rendering', () => {
     );
 
     assert.equal(payload.message, 'x'.repeat(5000));
-    assert.ok(overrides?.telegram?.message);
-    assert.match(overrides?.telegram?.message || '', /# Result Ready/);
-    assert.equal(overrides?.telegram?.parseMode, undefined);
+    assert.equal(overrides?.telegram?.message, 'x'.repeat(5000));
+    assert.equal(overrides?.telegram?.entities, undefined);
+    assert.equal(overrides?.telegram?.parseMode, null);
   });
 
   it('supports opting ask-user-question back into formatter mode via config', () => {

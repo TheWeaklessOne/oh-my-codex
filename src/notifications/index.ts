@@ -176,6 +176,7 @@ import type {
 } from "./types.js";
 import {
   getNotificationConfig,
+  getEnabledPlatforms,
   getReplyConfig,
   getReplyListenerPlatformConfig,
   isEventEnabled,
@@ -616,6 +617,7 @@ export async function notifyCompletedTurn(
       decision,
       payload,
       data.assistantText,
+      getEnabledPlatforms(config, decision.effectiveEvent),
     );
 
     const openClawEvent = toOpenClawEvent(decision.effectiveEvent);

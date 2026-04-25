@@ -563,3 +563,54 @@ describe('notifyLifecycle reply listener sync', () => {
     }
   });
 });
+
+describe('notifyCompletedTurn transport override filtering', () => {
+  it('does not render Telegram entity overrides when Telegram is disabled', async () => {
+    const { notifyCompletedTurn, planCompletedTurnNotification } = await import(`../index.js?completed-turn-filter=${Date.now()}`);
+    const decision = planCompletedTurnNotification({
+      semanticOutcome: {
+        kind: 'result-ready',
+        summary: 'Done.',
+        notificationEvent: 'result-ready',
+      },
+      assistantText: 'Run `npm test`',
+      turnId: 'turn-filter-disabled-telegram',
+    });
+    assert.ok(decision);
+
+    const config: FullNotificationConfig = {
+      enabled: true,
+      webhook: {
+        enabled: true,
+        url: 'https://example.com/webhook',
+      },
+    };
+    let capturedPayload: { transportOverrides?: unknown } | undefined;
+
+    const result = await notifyCompletedTurn(
+      decision,
+      {
+        sessionId: 'sess-filter-disabled-telegram',
+        assistantText: 'Run `npm test`',
+        timestamp: new Date('2026-04-25T12:00:00Z').toISOString(),
+      },
+      undefined,
+      {
+        getNotificationConfigImpl: () => config,
+        isEventEnabledImpl: () => true,
+        ensureReplyListenerForConfigImpl: () => {},
+        dispatchNotificationsImpl: async (_config: FullNotificationConfig, event: string, payload: unknown) => {
+          capturedPayload = payload as { transportOverrides?: unknown };
+          return {
+            event: event as never,
+            anySuccess: true,
+            results: [],
+          };
+        },
+      },
+    );
+
+    assert.ok(result);
+    assert.equal(capturedPayload?.transportOverrides, undefined);
+  });
+});

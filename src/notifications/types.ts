@@ -37,9 +37,13 @@ export type CompletedTurnRenderMode =
   | "formatted-notification"
   | "raw-assistant-text";
 
+export type TelegramCompletedTurnFormat = "literal" | "entities";
+
 export interface CompletedTurnPlatformPresentationConfig {
   resultReadyMode?: CompletedTurnRenderMode;
   askUserQuestionMode?: CompletedTurnRenderMode;
+  /** Telegram-only rendering for raw assistant completed-turn text. */
+  telegramFormat?: TelegramCompletedTurnFormat;
 }
 
 export interface CompletedTurnPresentationConfig {
@@ -192,11 +196,43 @@ export interface FullNotificationConfig {
   events?: Partial<Record<NotificationEvent, EventNotificationConfig>>;
 }
 
+export type TelegramMessageEntityType =
+  | "bold"
+  | "italic"
+  | "underline"
+  | "strikethrough"
+  | "spoiler"
+  | "blockquote"
+  | "expandable_blockquote"
+  | "code"
+  | "pre"
+  | "text_link";
+
+export interface TelegramMessageEntity {
+  type: TelegramMessageEntityType;
+  /** UTF-16 code-unit offset, as required by Telegram Bot API. */
+  offset: number;
+  /** UTF-16 code-unit length, as required by Telegram Bot API. */
+  length: number;
+  /** Required only for text_link entities. */
+  url?: string;
+  /** Optional, sanitized language token for pre entities. */
+  language?: string;
+}
+
+export interface TelegramRenderedMessage {
+  text: string;
+  entities: TelegramMessageEntity[];
+  warnings: string[];
+}
+
 export interface NotificationTransportOverride {
   /** Per-platform message override when a planner wants custom rendering */
   message?: string;
   /** Transport-specific parse mode override; null disables parse_mode entirely */
   parseMode?: "Markdown" | "HTML" | null;
+  /** Telegram Bot API message entities; when present Telegram sends omit parse_mode. */
+  entities?: TelegramMessageEntity[];
 }
 
 export type NotificationTransportOverrides = Partial<
@@ -261,6 +297,8 @@ export interface NotificationResult {
   success: boolean;
   error?: string;
   messageId?: string;
+  /** All message IDs produced by transports that split one notification. */
+  messageIds?: string[];
   messageThreadId?: string;
   projectKey?: string;
   topicName?: string;
