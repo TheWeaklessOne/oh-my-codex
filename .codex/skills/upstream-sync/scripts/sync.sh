@@ -539,7 +539,14 @@ if not selected:
     print("none")
     raise SystemExit(0)
 
-print("; ".join(f"{tag} {summary}" for tag, summary in selected))
+shown = selected[-2:]
+omitted = len(selected) - len(shown)
+text = "; ".join(f"{tag} {summary}" for tag, summary in shown)
+if omitted > 0:
+    text = f"{text}; +{omitted} earlier release{'s' if omitted != 1 else ''}"
+if len(text) > 240:
+    text = (text[:237].rsplit(" ", 1)[0] or text[:237]).rstrip(" ,;:") + "…"
+print(text)
 PY
 )
 

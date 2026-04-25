@@ -52,6 +52,26 @@ describe('loadNotificationConfig', () => {
       rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('does not implicitly load repo-local live config while running tests', async () => {
+    const tmpDir = join(tmpdir(), `omx-test-${randomUUID()}`);
+    const omxDir = join(tmpDir, '.omx');
+    const originalCwd = process.cwd();
+    mkdirSync(omxDir, { recursive: true });
+    writeFileSync(join(omxDir, 'notifications.json'), JSON.stringify({
+      discord: { webhookUrl: 'https://discord.com/api/webhooks/live' },
+      telegram: { botToken: '123456:live', chatId: '777' },
+    }));
+
+    try {
+      process.chdir(tmpDir);
+      const config = await loadNotificationConfig();
+      assert.equal(config, null);
+    } finally {
+      process.chdir(originalCwd);
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('notify', () => {
@@ -78,6 +98,27 @@ describe('notify', () => {
     for (const type of types) {
       // Should not throw
       await notify({ ...basePayload, type }, {});
+    }
+  });
+
+
+  it('does not call legacy webhook transports while running tests', async () => {
+    const httpsModule = await import('https');
+    const originalRequest = httpsModule.default.request;
+    let requestCalls = 0;
+    (httpsModule.default as { request: typeof originalRequest }).request = ((() => {
+      requestCalls += 1;
+      throw new Error('network should be blocked in tests');
+    }) as unknown) as typeof originalRequest;
+
+    try {
+      await notify(basePayload, {
+        discord: { webhookUrl: 'https://discord.com/api/webhooks/live' },
+        telegram: { botToken: '123456:live', chatId: '777' },
+      });
+      assert.equal(requestCalls, 0);
+    } finally {
+      (httpsModule.default as { request: typeof originalRequest }).request = originalRequest;
     }
   });
 });

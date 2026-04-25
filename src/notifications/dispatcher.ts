@@ -6,7 +6,6 @@
  * blocking hooks.
  */
 
-import { request as httpsRequest } from "https";
 import type {
   DiscordNotificationConfig,
   DiscordBotNotificationConfig,
@@ -32,6 +31,7 @@ import {
   type TelegramTopicResolutionDeps,
 } from "./telegram-topics.js";
 import { updateTelegramTopicRegistryRecord } from "./telegram-topic-registry.js";
+import { shouldBlockLiveNotificationNetworkInTests } from "../utils/test-env.js";
 
 const SEND_TIMEOUT_MS = 10_000;
 const DISPATCH_TIMEOUT_MS = 15_000;
@@ -294,6 +294,16 @@ export async function sendTelegram(
     };
   }
 
+  if (
+    shouldBlockLiveNotificationNetworkInTests(process.env, deps.httpsRequestImpl)
+  ) {
+    return {
+      platform: "telegram",
+      success: false,
+      error: "Live Telegram sends are disabled while running tests",
+    };
+  }
+
   let destination: TelegramResolvedDestination | null = null;
 
   try {
@@ -338,7 +348,7 @@ export async function sendTelegram(
             : {}),
       },
       {
-        httpsRequestImpl: deps.httpsRequestImpl ?? httpsRequest,
+        ...(deps.httpsRequestImpl ? { httpsRequestImpl: deps.httpsRequestImpl } : {}),
         timeoutMs: deps.timeoutMs ?? SEND_TIMEOUT_MS,
       },
     );

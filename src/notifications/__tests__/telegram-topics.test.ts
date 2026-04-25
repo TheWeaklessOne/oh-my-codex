@@ -1,11 +1,13 @@
 import { after, before, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ClientRequestArgs, IncomingMessage } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import { PassThrough } from 'node:stream';
 import { mkdtemp, mkdir, readdir, readlink, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { TelegramNotificationConfig } from '../types.js';
+import { markMockTelegramTransportForTests } from '../../utils/test-env.js';
 
 let tempHome = '';
 let originalHome: string | undefined;
@@ -32,7 +34,7 @@ type HttpsRouteHandler = (body: string, options: ClientRequestArgs) => {
 function createHttpsRequestMock(
   routes: Record<string, HttpsRouteHandler>,
 ): typeof import('node:https').request {
-  return ((options: ClientRequestArgs, callback?: (res: IncomingMessage) => void) => {
+  return markMockTelegramTransportForTests(((options: ClientRequestArgs, callback?: (res: IncomingMessage) => void) => {
     const listeners = new Map<string, Array<(value?: unknown) => void>>();
     let requestBody = '';
 
@@ -83,7 +85,7 @@ function createHttpsRequestMock(
     };
 
     return request;
-  }) as typeof import('node:https').request;
+  }) as typeof import('node:https').request);
 }
 
 function createConfig(overrides: Partial<TelegramNotificationConfig> = {}): TelegramNotificationConfig {
@@ -129,6 +131,24 @@ describe('telegram-topics', () => {
     }
 
     await rm(tempHome, { recursive: true, force: true });
+  });
+
+  it('blocks live Telegram Bot API requests in tests without a marked mock transport', async () => {
+    const topics = await importTopicsFresh();
+    const config = createConfig();
+    const wrapperTransport = ((...args: Parameters<typeof httpsRequest>) => {
+      return httpsRequest(...args);
+    }) as typeof httpsRequest;
+
+    await assert.rejects(
+      topics.performTelegramBotApiRequest(
+        config.botToken,
+        'createForumTopic',
+        { chat_id: config.chatId, name: 'project-a' },
+        { httpsRequestImpl: wrapperTransport },
+      ),
+      /Live Telegram Bot API requests are disabled while running tests/,
+    );
   });
 
   it('creates a project topic on first send and reuses it on later sends', async () => {

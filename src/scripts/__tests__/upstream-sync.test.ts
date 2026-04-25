@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 const testDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(testDir, '..', '..', '..');
 const syncScript = join(repoRoot, '.codex', 'skills', 'upstream-sync', 'scripts', 'sync.sh');
+const watchScript = join(repoRoot, '.codex', 'skills', 'upstream-sync', 'scripts', 'watch-release.sh');
 
 function git(cwd: string, args: string[]): string {
 	return execFileSync('git', args, { cwd, encoding: 'utf-8' }).trim();
@@ -43,6 +44,27 @@ function runSync(
 	envOverrides: Record<string, string> = {},
 ): { status: number | null; stdout: string; stderr: string } {
 	const result = spawnSync('bash', [syncScript, ...args], {
+		cwd,
+		encoding: 'utf-8',
+		env: {
+			...process.env,
+			...envOverrides,
+		},
+	});
+	return {
+		status: result.status,
+		stdout: result.stdout || '',
+		stderr: result.stderr || '',
+	};
+}
+
+
+function runWatcher(
+	cwd: string,
+	args: string[],
+	envOverrides: Record<string, string> = {},
+): { status: number | null; stdout: string; stderr: string } {
+	const result = spawnSync('bash', [watchScript, ...args], {
 		cwd,
 		encoding: 'utf-8',
 		env: {
@@ -553,4 +575,61 @@ describe('upstream-sync skill script', () => {
 			await rm(fixture.cleanupRoot, { recursive: true, force: true });
 		}
 	});
+
+	it('release watcher refuses spoofed automatic remotes', async () => {
+		const rawRoot = await mkdtemp(join(tmpdir(), 'omx-release-watch-spoof-'));
+		const cleanupRoot = realpathSync(rawRoot);
+		const repo = join(cleanupRoot, 'repo');
+
+		try {
+			execFileSync('git', ['init', repo], { stdio: 'ignore' });
+			execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo, stdio: 'ignore' });
+			execFileSync('git', ['config', 'user.name', 'Test User'], { cwd: repo, stdio: 'ignore' });
+			execFileSync('git', ['checkout', '-b', 'main'], { cwd: repo, stdio: 'ignore' });
+			await writeFile(join(repo, 'README.md'), 'base\n', 'utf-8');
+			execFileSync('git', ['add', 'README.md'], { cwd: repo, stdio: 'ignore' });
+			execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo, stdio: 'ignore' });
+			execFileSync('git', ['remote', 'add', 'upstream', 'https://evil.example/Yeachan-Heo/oh-my-codex.git'], { cwd: repo, stdio: 'ignore' });
+
+			const result = runWatcher(repo, ['--repo', repo]);
+			assert.notEqual(result.status, 0);
+			assert.match(result.stderr, /no canonical Yeachan-Heo\/oh-my-codex remote configured/);
+		} finally {
+			await rm(cleanupRoot, { recursive: true, force: true });
+		}
+	});
+
+	it('release watcher recovers stale locks and fails on fetch errors instead of stale refs', async () => {
+		const rawRoot = await mkdtemp(join(tmpdir(), 'omx-release-watch-fetch-'));
+		const cleanupRoot = realpathSync(rawRoot);
+		const repo = join(cleanupRoot, 'repo');
+		const remote = join(cleanupRoot, 'origin.git');
+
+		try {
+			execFileSync('git', ['init', '--bare', remote], { stdio: 'ignore' });
+			execFileSync('git', ['init', repo], { stdio: 'ignore' });
+			execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo, stdio: 'ignore' });
+			execFileSync('git', ['config', 'user.name', 'Test User'], { cwd: repo, stdio: 'ignore' });
+			execFileSync('git', ['checkout', '-b', 'main'], { cwd: repo, stdio: 'ignore' });
+			await writeFile(join(repo, 'README.md'), 'base\n', 'utf-8');
+			execFileSync('git', ['add', 'README.md'], { cwd: repo, stdio: 'ignore' });
+			execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo, stdio: 'ignore' });
+			execFileSync('git', ['tag', 'v0.1.0'], { cwd: repo, stdio: 'ignore' });
+			execFileSync('git', ['remote', 'add', 'origin', remote], { cwd: repo, stdio: 'ignore' });
+			execFileSync('git', ['push', '-u', 'origin', 'main', '--tags'], { cwd: repo, stdio: 'ignore' });
+
+			const lockDir = join(repo, '.omx', 'state', 'upstream-sync', 'release-watch.lock');
+			await mkdir(lockDir, { recursive: true });
+			await writeFile(join(lockDir, 'pid'), '999999', 'utf-8');
+			execFileSync('git', ['remote', 'set-url', 'origin', join(cleanupRoot, 'missing.git')], { cwd: repo, stdio: 'ignore' });
+
+			const result = runWatcher(repo, ['--repo', repo, '--remote', 'origin', '--mark-current']);
+			assert.notEqual(result.status, 0);
+			assert.match(result.stderr + result.stdout, /recover: removing stale watcher lock/);
+			assert.match(result.stderr + result.stdout, /failed to fetch origin\/main/);
+		} finally {
+			await rm(cleanupRoot, { recursive: true, force: true });
+		}
+	});
+
 });

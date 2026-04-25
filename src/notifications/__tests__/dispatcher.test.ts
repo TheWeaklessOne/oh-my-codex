@@ -1,6 +1,7 @@
 import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ClientRequestArgs, IncomingMessage } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -25,6 +26,7 @@ import {
 } from '../dispatcher.js';
 import { getTelegramTopicRegistryRecord } from '../telegram-topic-registry.js';
 import { normalizeTelegramProjectIdentity } from '../telegram-topics.js';
+import { markMockTelegramTransportForTests } from '../../utils/test-env.js';
 
 const basePayload: FullNotificationPayload = {
   event: 'session-idle',
@@ -43,7 +45,7 @@ type HttpsRouteHandler = (body: string, options: ClientRequestArgs) => {
 function createHttpsRequestMock(
   routes: Record<string, HttpsRouteHandler>,
 ): typeof import('node:https').request {
-  return ((options: ClientRequestArgs, callback?: (res: IncomingMessage) => void) => {
+  return markMockTelegramTransportForTests(((options: ClientRequestArgs, callback?: (res: IncomingMessage) => void) => {
     const listeners = new Map<string, Array<(value?: unknown) => void>>();
     let requestBody = '';
 
@@ -92,7 +94,7 @@ function createHttpsRequestMock(
     };
 
     return request;
-  }) as typeof import('node:https').request;
+  }) as typeof import('node:https').request);
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +186,92 @@ describe('sendDiscordBot', () => {
 // ---------------------------------------------------------------------------
 
 describe('sendTelegram', () => {
+  it('blocks live Telegram sends in tests unless the request transport is mocked', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+    };
+    let resolverCalled = false;
+
+    const result = await sendTelegram(
+      config,
+      basePayload,
+      {
+        resolveTelegramDestinationImpl: async () => {
+          resolverCalled = true;
+          return {
+            chatId: '777',
+            sourceChatKey: 'telegram:123456:777',
+          };
+        },
+      },
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(result.error, 'Live Telegram sends are disabled while running tests');
+    assert.equal(resolverCalled, false);
+  });
+
+  it('also blocks tests that accidentally pass the real Telegram transport explicitly', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+    };
+    let resolverCalled = false;
+
+    const result = await sendTelegram(
+      config,
+      basePayload,
+      {
+        resolveTelegramDestinationImpl: async () => {
+          resolverCalled = true;
+          return {
+            chatId: '777',
+            sourceChatKey: 'telegram:123456:777',
+          };
+        },
+        httpsRequestImpl: httpsRequest,
+      },
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(result.error, 'Live Telegram sends are disabled while running tests');
+    assert.equal(resolverCalled, false);
+  });
+
+  it('also blocks unmarked wrapper transports in tests', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+    };
+    let resolverCalled = false;
+    const wrapperTransport = ((...args: Parameters<typeof httpsRequest>) => {
+      return httpsRequest(...args);
+    }) as typeof httpsRequest;
+
+    const result = await sendTelegram(
+      config,
+      basePayload,
+      {
+        resolveTelegramDestinationImpl: async () => {
+          resolverCalled = true;
+          return {
+            chatId: '777',
+            sourceChatKey: 'telegram:123456:777',
+          };
+        },
+        httpsRequestImpl: wrapperTransport,
+      },
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(result.error, 'Live Telegram sends are disabled while running tests');
+    assert.equal(resolverCalled, false);
+  });
+
   it('passes message_thread_id and returns topic metadata when the resolver selects a project topic', async () => {
     const config: TelegramNotificationConfig = {
       enabled: true,

@@ -1,6 +1,8 @@
 import { spawnSync } from 'node:child_process';
-import { readdirSync, statSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { sanitizeLiveNotificationEnv } from '../utils/test-env.js';
 
 function collectTests(path: string, out: string[]): void {
   let stats;
@@ -36,13 +38,27 @@ if (files.length === 0) {
   process.exit(1);
 }
 
-const result = spawnSync(process.execPath, ['--test', ...files], {
-  stdio: 'inherit',
-  env: process.env,
-});
-
-if (typeof result.status === 'number') {
-  process.exit(result.status);
+const testHome = mkdtempSync(join(tmpdir(), 'omx-test-home-'));
+const testEnv = sanitizeLiveNotificationEnv(process.env);
+const originalHome = process.env.HOME || process.env.USERPROFILE;
+testEnv.HOME = testHome;
+testEnv.USERPROFILE = testHome;
+if (originalHome) {
+  testEnv.CARGO_HOME ??= join(originalHome, '.cargo');
+  testEnv.RUSTUP_HOME ??= join(originalHome, '.rustup');
 }
 
-process.exit(1);
+try {
+  const result = spawnSync(process.execPath, ['--test', ...files], {
+    stdio: 'inherit',
+    env: testEnv,
+  });
+
+  if (typeof result.status === 'number') {
+    process.exitCode = result.status;
+  } else {
+    process.exitCode = 1;
+  }
+} finally {
+  rmSync(testHome, { recursive: true, force: true });
+}

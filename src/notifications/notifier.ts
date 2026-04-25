@@ -8,6 +8,7 @@ import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { existsSync } from 'fs';
 import { promisify } from 'util';
+import { shouldBlockLiveNotificationNetworkInTests } from '../utils/test-env.js';
 
 const execFileAsync = promisify(execFile);
 const HTTP_REQUEST_TIMEOUT_MS = 10_000;
@@ -43,6 +44,9 @@ interface JsonHttpsRequestOptions {
  * Load notification config from .omx/notifications.json
  */
 export async function loadNotificationConfig(projectRoot?: string): Promise<NotificationConfig | null> {
+  if (!projectRoot && shouldBlockLiveNotificationNetworkInTests()) {
+    return null;
+  }
   const configPath = join(projectRoot || process.cwd(), '.omx', 'notifications.json');
   if (!existsSync(configPath)) return null;
   try {
@@ -149,6 +153,10 @@ export async function _sendJsonHttpsRequest(options: JsonHttpsRequestOptions): P
 }
 
 async function sendDiscordNotification(payload: NotificationPayload, webhookUrl: string): Promise<void> {
+  if (shouldBlockLiveNotificationNetworkInTests()) {
+    return;
+  }
+
   const colorMap = { info: 3447003, success: 3066993, warning: 15105570, error: 15158332 };
   const body = JSON.stringify({
     embeds: [{
@@ -178,6 +186,10 @@ async function sendTelegramNotification(
   botToken: string,
   chatId: string
 ): Promise<void> {
+  if (shouldBlockLiveNotificationNetworkInTests()) {
+    return;
+  }
+
   const text = `*[OMX] ${payload.title}*\n${payload.message}`;
 
   try {

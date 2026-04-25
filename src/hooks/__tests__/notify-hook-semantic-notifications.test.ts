@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { buildInjectedReplyInput } from '../../notifications/reply-listener.js';
 import { recordPendingReplyOrigin } from '../../notifications/reply-origin-state.js';
+import { sanitizeLiveNotificationEnv } from '../../utils/test-env.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, '..', '..', '..');
@@ -81,6 +82,7 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { PassThrough } from 'node:stream';
 
 const capturePath = process.env.OMX_TELEGRAM_CAPTURE_PATH;
+globalThis.__OMX_TEST_MOCK_TELEGRAM_TRANSPORT__ = 'https-request-capture';
 const require = createRequire(import.meta.url);
 const https = require('node:https');
 
@@ -267,7 +269,7 @@ function runNotifyHook(
     cwd: repoRoot,
     encoding: 'utf-8',
     env: {
-      ...process.env,
+      ...sanitizeLiveNotificationEnv(process.env),
       ...env,
       OMX_TEAM_WORKER: '',
       TMUX: '',
@@ -688,6 +690,7 @@ describe('notify-hook semantic notifications', () => {
         HOME: tempRoot,
         USERPROFILE: tempRoot,
         OMX_TELEGRAM_CAPTURE_PATH: capturePath,
+        OMX_TEST_MOCK_TELEGRAM_TRANSPORT: '1',
         NODE_OPTIONS: `--import=${preloadPath}`,
       });
       assert.equal(result.status, 0, result.stderr || result.stdout);

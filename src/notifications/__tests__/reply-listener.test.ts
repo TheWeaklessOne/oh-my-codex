@@ -1,6 +1,7 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, type spawnSync } from 'node:child_process';
+import { request as httpsRequest } from 'node:https';
 import type { ClientRequestArgs, IncomingMessage } from 'node:http';
 import { PassThrough } from 'node:stream';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
@@ -27,6 +28,7 @@ import type { ReplyListenerDaemonConfig, ReplyListenerState } from '../reply-lis
 import type { SessionMapping } from '../session-registry.js';
 import { NO_TRACKED_SESSION_MESSAGE } from '../session-status.js';
 import { buildDiscordReplySource, buildTelegramReplySource } from '../reply-source.js';
+import { markMockTelegramTransportForTests } from '../../utils/test-env.js';
 
 function createBaseConfig(overrides: Partial<ReplyListenerDaemonConfig> = {}): ReplyListenerDaemonConfig {
   return {
@@ -109,7 +111,7 @@ type HttpsRouteHandler = (body: string, options: ClientRequestArgs) => {
 };
 
 function createHttpsRequestMock(routes: Record<string, HttpsRouteHandler>): typeof import('node:https').request {
-  return ((options: ClientRequestArgs, callback?: (res: IncomingMessage) => void) => {
+  return markMockTelegramTransportForTests(((options: ClientRequestArgs, callback?: (res: IncomingMessage) => void) => {
     const listeners = new Map<string, Array<(value?: unknown) => void>>();
     let requestBody = '';
 
@@ -158,7 +160,7 @@ function createHttpsRequestMock(routes: Record<string, HttpsRouteHandler>): type
     };
 
     return request;
-  }) as typeof import('node:https').request;
+  }) as typeof import('node:https').request);
 }
 
 describe('sanitizeReplyInput', () => {
@@ -1141,6 +1143,41 @@ describe('captureReplyAcknowledgementSummary redaction', () => {
 });
 
 describe('pollDiscordOnce', () => {
+  it('does not clear stale Discord poll-error diagnostics for malformed successful responses', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    assert.ok(config.discordBotToken);
+    assert.ok(config.discordChannelId);
+    const source = buildDiscordReplySource(config.discordBotToken, config.discordChannelId);
+    state.sourceStates[source.key] = {
+      sourceKey: source.key,
+      platform: 'discord-bot',
+      label: source.label,
+      discordLastMessageId: null,
+      lastPollAt: '2026-03-20T00:00:00.000Z',
+      lastIngestAt: null,
+      lastFailureAt: '2026-03-20T00:00:01.000Z',
+      lastFailureCategory: 'poll-error',
+      lastFailureMessage: 'previous malformed response',
+      failureCounts: { 'poll-error': 1 },
+    };
+
+    await pollDiscordOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        fetchImpl: async () => jsonResponse({ malformed: true }),
+      },
+    );
+
+    const sourceState = state.sourceStates[source.key];
+    assert.equal(sourceState?.lastFailureCategory, 'poll-error');
+    assert.match(sourceState?.lastFailureMessage ?? '', /Expected Discord messages array/);
+    assert.equal(sourceState?.failureCounts?.['poll-error'], 2);
+  });
+
   it('treats exact-match status replies as read-only Discord session lookups', async () => {
     resetReplyListenerTransientState();
     const config = createBaseConfig();
@@ -1492,6 +1529,29 @@ describe('pollDiscordOnce', () => {
 });
 
 describe('pollTelegramOnce', () => {
+  it('blocks live Telegram polling in tests without a marked mock transport', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const wrapperTransport = ((...args: Parameters<typeof httpsRequest>) => {
+      return httpsRequest(...args);
+    }) as typeof httpsRequest;
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      { httpsRequestImpl: wrapperTransport },
+    );
+
+    assert.equal(state.errors, 0);
+    assert.equal(state.lastPollAt, null);
+    assert.ok(config.telegramBotToken);
+    assert.ok(config.telegramChatId);
+    const source = buildTelegramReplySource(config.telegramBotToken, config.telegramChatId);
+    assert.equal(state.sourceStates[source.key]?.lastPollAt, null);
+  });
+
   it('uses long polling parameters and default allowed_updates', async () => {
     resetReplyListenerTransientState();
     const config = createBaseConfig();
@@ -1521,6 +1581,52 @@ describe('pollTelegramOnce', () => {
       observedPath,
       `/bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`,
     );
+  });
+
+  it('clears stale Telegram poll-error diagnostics after a successful poll', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    assert.ok(config.telegramBotToken);
+    assert.ok(config.telegramChatId);
+    const source = buildTelegramReplySource(config.telegramBotToken, config.telegramChatId);
+    state.sourceStates[source.key] = {
+      sourceKey: source.key,
+      platform: 'telegram',
+      label: source.label,
+      telegramLastUpdateId: null,
+      telegramStartupPolicyApplied: true,
+      lastPollAt: '2026-03-20T00:00:00.000Z',
+      lastIngestAt: null,
+      lastFailureAt: '2026-03-20T00:00:01.000Z',
+      lastFailureCategory: 'poll-error',
+      lastFailureMessage: 'Request timeout',
+      failureCounts: { 'poll-error': 1 },
+    };
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [],
+            },
+          }),
+        }),
+      },
+    );
+
+    const sourceState = state.sourceStates[source.key];
+    assert.ok(sourceState?.lastPollAt);
+    assert.equal(sourceState?.lastFailureAt, null);
+    assert.equal(sourceState?.lastFailureCategory, null);
+    assert.equal(sourceState?.lastFailureMessage, null);
+    assert.equal(sourceState?.failureCounts?.['poll-error'], 1);
   });
 
   it('injects Telegram replies and sends a reply acknowledgement', async () => {

@@ -64,6 +64,7 @@ import {
   waitForCodexPaneReady,
 } from '../tmux/prompt-submit.js';
 import { spawnPlatformCommandSync } from '../utils/platform-command.js';
+import { shouldBlockLiveNotificationNetworkInTests } from '../utils/test-env.js';
 import type {
   ReplyAcknowledgementMode,
   ReplyConfig,
@@ -657,6 +658,20 @@ function recordSourceFailure(
     ...(sourceState.failureCounts ?? {}),
     [category]: (sourceState.failureCounts?.[category] ?? 0) + 1,
   };
+}
+
+function clearSourceFailure(
+  state: ReplyListenerState,
+  source: ReplySourceDescriptor,
+  category?: string,
+): void {
+  const sourceState = ensureSourceState(state, source);
+  if (category && sourceState.lastFailureCategory !== category) {
+    return;
+  }
+  sourceState.lastFailureAt = null;
+  sourceState.lastFailureCategory = null;
+  sourceState.lastFailureMessage = null;
 }
 
 function logSourceEvent(
@@ -1306,12 +1321,17 @@ export async function pollDiscordOnce(
       return;
     }
 
-    const messages = await response.json() as DiscordMessage[];
-
-    if (!Array.isArray(messages) || messages.length === 0) return;
+    const messages = await response.json() as unknown;
+    if (!Array.isArray(messages)) {
+      throw new Error('Expected Discord messages array in polling response');
+    }
 
     sourceState.lastPollAt = new Date().toISOString();
-    const sorted = [...messages].reverse();
+    clearSourceFailure(state, source, 'poll-error');
+
+    if (messages.length === 0) return;
+
+    const sorted = [...messages].reverse() as DiscordMessage[];
 
     for (const msg of sorted) {
       const isStatusCommand = isDiscordStatusCommand(msg.content ?? '');
@@ -1934,6 +1954,12 @@ export async function pollTelegramOnce(
   if (!source) return;
   const sourceState = ensureSourceState(state, source);
 
+  if (
+    shouldBlockLiveNotificationNetworkInTests(process.env, deps.httpsRequestImpl)
+  ) {
+    return;
+  }
+
   const httpsRequestImpl = deps.httpsRequestImpl ?? httpsRequest;
   const getNotificationConfigImpl = deps.getNotificationConfigImpl ?? getNotificationConfig;
   const injectReplyImpl = deps.injectReplyImpl ?? injectReply;
@@ -1968,6 +1994,7 @@ export async function pollTelegramOnce(
     const updates = startupPolicy.startupUpdates
       ?? await requestTelegramUpdates(config, sourceState, httpsRequestImpl);
     sourceState.lastPollAt = new Date().toISOString();
+    clearSourceFailure(state, source, 'poll-error');
 
     for (const update of updates) {
       const updateId = typeof update.update_id === 'number' ? update.update_id : null;

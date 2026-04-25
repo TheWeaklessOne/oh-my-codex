@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { request as httpsRequest } from 'node:https';
 import { basename } from 'node:path';
 import { canonicalizeComparablePath } from '../utils/paths.js';
+import { shouldBlockLiveNotificationNetworkInTests } from '../utils/test-env.js';
 import { buildTelegramReplySource } from './reply-source.js';
 import { loadAllMappings, type SessionMapping } from './session-registry.js';
 import {
@@ -188,6 +189,12 @@ export async function performTelegramBotApiRequest<T>(
   body: Record<string, unknown>,
   deps: TelegramBotApiRequestDeps = {},
 ): Promise<T | undefined> {
+  if (
+    shouldBlockLiveNotificationNetworkInTests(process.env, deps.httpsRequestImpl)
+  ) {
+    throw new Error('Live Telegram Bot API requests are disabled while running tests');
+  }
+
   const httpsRequestImpl = deps.httpsRequestImpl ?? httpsRequest;
   const timeoutMs = deps.timeoutMs ?? TELEGRAM_REQUEST_TIMEOUT_MS;
   const requestBody = JSON.stringify(body);
