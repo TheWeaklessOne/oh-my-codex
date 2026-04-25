@@ -105,6 +105,39 @@ describe('planCompletedTurnNotification', () => {
     assert.equal(decision, null);
   });
 
+  it('treats non-empty assistant text as result-ready unless input is explicitly needed', () => {
+    const decision = planCompletedTurnNotification({
+      semanticOutcome: {
+        kind: 'progress',
+        summary: 'Готово — составил план исправления...',
+      },
+      assistantText: 'Готово — составил план исправления...',
+      turnId: 'turn-russian-plan',
+    });
+
+    assert.ok(decision);
+    assert.equal(decision.effectiveEvent, 'result-ready');
+    assert.equal(decision.hookMetadata.semanticPhase, 'progress');
+    assert.equal(decision.hookMetadata.semanticClassifierEvent, null);
+    assert.match(decision.effectiveFingerprint, /"policy":"per-turn"/);
+  });
+
+  it('keeps explicit input-needed turns as ask-user-question even with non-empty assistant text', () => {
+    const decision = planCompletedTurnNotification({
+      semanticOutcome: {
+        kind: 'input-needed',
+        summary: 'Need approval to continue.',
+        question: 'Should I continue?',
+        notificationEvent: 'ask-user-question',
+      },
+      assistantText: 'Should I continue?',
+      turnId: 'turn-question',
+    });
+
+    assert.ok(decision);
+    assert.equal(decision.effectiveEvent, 'ask-user-question');
+  });
+
   it('keeps hook fingerprints stable across repeated identical reply-origin turns', () => {
     const first = planCompletedTurnNotification({
       semanticOutcome: {

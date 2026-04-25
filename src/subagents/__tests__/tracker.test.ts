@@ -50,4 +50,42 @@ describe('subagents/tracker', () => {
     });
     assert.deepEqual(drained?.activeSubagentThreadIds, []);
   });
+
+  it('uses native subagent parent thread metadata instead of treating the first completed thread as leader', () => {
+    let state = createSubagentTrackingState();
+    state = recordSubagentTurn(state, {
+      sessionId: 'sess-subagent-first',
+      threadId: 'sub-thread-first',
+      turnId: 'turn-subagent',
+      timestamp: '2026-04-25T10:00:00.000Z',
+      kind: 'subagent',
+      parentThreadId: 'leader-thread-parent',
+    });
+
+    let summary = summarizeSubagentSession(state, 'sess-subagent-first', {
+      now: '2026-04-25T10:00:10.000Z',
+      activeWindowMs: 60_000,
+    });
+    assert.equal(summary?.leaderThreadId, 'leader-thread-parent');
+    assert.deepEqual(summary?.allThreadIds, ['leader-thread-parent', 'sub-thread-first']);
+    assert.deepEqual(summary?.allSubagentThreadIds, ['sub-thread-first']);
+    assert.equal(state.sessions['sess-subagent-first']?.threads['leader-thread-parent']?.turn_count, 0);
+
+    state = recordSubagentTurn(state, {
+      sessionId: 'sess-subagent-first',
+      threadId: 'leader-thread-parent',
+      turnId: 'turn-leader',
+      timestamp: '2026-04-25T10:00:30.000Z',
+      kind: 'leader',
+    });
+
+    summary = summarizeSubagentSession(state, 'sess-subagent-first', {
+      now: '2026-04-25T10:00:45.000Z',
+      activeWindowMs: 60_000,
+    });
+    assert.equal(summary?.leaderThreadId, 'leader-thread-parent');
+    assert.equal(state.sessions['sess-subagent-first']?.threads['leader-thread-parent']?.kind, 'leader');
+    assert.equal(state.sessions['sess-subagent-first']?.threads['leader-thread-parent']?.turn_count, 1);
+    assert.deepEqual(summary?.allSubagentThreadIds, ['sub-thread-first']);
+  });
 });

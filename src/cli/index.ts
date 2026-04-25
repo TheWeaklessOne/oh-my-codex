@@ -1122,9 +1122,11 @@ export async function execWithOverlay(args: string[]): Promise<void> {
       process.env,
       sessionModelInstructionsPath(cwd, sessionId),
     );
-    const codexEnvBase = codexHomeOverride
-      ? { ...process.env, CODEX_HOME: codexHomeOverride }
-      : process.env;
+    const codexEnvBase = {
+      ...process.env,
+      ...(codexHomeOverride ? { CODEX_HOME: codexHomeOverride } : {}),
+      OMX_SESSION_ID: sessionId,
+    };
     const codexEnv = notifyTempContractRaw
       ? {
           ...codexEnvBase,

@@ -36,7 +36,7 @@ function runOmx(
 }
 
 describe('omx exec', () => {
-  it('runs codex exec with session-scoped instructions that preserve AGENTS and overlay content', async () => {
+  it('runs codex exec --telegram with canonical session id and session-scoped instructions', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-exec-cli-'));
     try {
       const home = join(wd, 'home');
@@ -52,6 +52,7 @@ describe('omx exec', () => {
         fakeCodexPath,
         [
           '#!/bin/sh',
+          'printf \'env-session:%s\\n\' "$OMX_SESSION_ID"',
           'printf \'fake-codex:%s\\n\' "$*"',
           'for arg in "$@"; do',
           '  case "$arg" in',
@@ -70,7 +71,7 @@ describe('omx exec', () => {
       await writeFile(fakePsPath, '#!/bin/sh\nexit 0\n');
       await chmod(fakePsPath, 0o755);
 
-      const result = runOmx(wd, ['exec', '--model', 'gpt-5', 'say hi'], {
+      const result = runOmx(wd, ['exec', '--telegram', '--model', 'gpt-5', 'say hi'], {
         HOME: home,
         NODE_OPTIONS: '',
         PATH: `${fakeBin}:/usr/bin:/bin`,
@@ -80,6 +81,7 @@ describe('omx exec', () => {
       });
 
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
+      assert.match(result.stdout, /env-session:omx-[A-Za-z0-9-]+/);
       assert.match(result.stdout, /fake-codex:exec --model gpt-5 say hi /);
       assert.match(result.stdout, /instructions-path:.*\/\.omx\/state\/sessions\/omx-.*\/AGENTS\.md/);
       assert.match(result.stdout, /# User Instructions/);

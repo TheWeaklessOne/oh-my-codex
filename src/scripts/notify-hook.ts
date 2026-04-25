@@ -64,6 +64,10 @@ import {
   buildCompletedTurnHookFingerprint,
   planCompletedTurnNotification,
 } from '../notifications/completed-turn.js';
+import {
+  isExternalCompletedTurnSuppressedOrigin,
+  resolveTurnOrigin,
+} from '../notifications/turn-origin.js';
 import { consumePendingReplyOrigin } from '../notifications/reply-origin-state.js';
 import {
   parseTeamWorkerEnv,
@@ -131,6 +135,28 @@ async function main() {
   await mkdir(stateDir, { recursive: true }).catch(() => {});
   currentOmxSessionId = await readCurrentSessionId(stateDir).catch(() => '') || '';
 
+  let turnOrigin = resolveTurnOrigin(payload, process.env);
+  if (!isTeamWorker && getEffectiveSessionId() && payloadThreadId) {
+    try {
+      const { readSubagentTrackingState } = await import('../subagents/tracker.js');
+      const trackingState = await readSubagentTrackingState(cwd);
+      const trackedThread = trackingState.sessions[getEffectiveSessionId()]?.threads[payloadThreadId];
+      if (trackedThread?.kind === 'subagent') {
+        turnOrigin = {
+          ...turnOrigin,
+          kind: 'native-subagent',
+        };
+      } else if (trackedThread?.kind === 'leader') {
+        turnOrigin = {
+          ...turnOrigin,
+          kind: 'leader',
+        };
+      }
+    } catch {
+      // Non-critical: payload/session-meta origins retain the existing behavior.
+    }
+  }
+
   // Turn-level dedupe prevents double-processing when native notify and fallback
   // watcher both emit the same completed turn.
   try {
@@ -165,12 +191,19 @@ async function main() {
       const turnId = safeString(payload['turn-id'] || payload.turn_id || '');
       if (getEffectiveSessionId() && threadId) {
         const { recordSubagentTurnForSession } = await import('../subagents/tracker.js');
+        const trackingKind = turnOrigin.kind === 'leader'
+          ? 'leader'
+          : turnOrigin.kind === 'native-subagent'
+            ? 'subagent'
+            : undefined;
         await recordSubagentTurnForSession(cwd, {
           sessionId: getEffectiveSessionId(),
           threadId,
           ...(turnId ? { turnId } : {}),
           timestamp: new Date().toISOString(),
           mode: safeString(payload.mode || ''),
+          ...(trackingKind ? { kind: trackingKind } : {}),
+          ...(turnOrigin.parentThreadId ? { parentThreadId: turnOrigin.parentThreadId } : {}),
         });
       }
     } catch {
@@ -190,6 +223,8 @@ async function main() {
     type: payload.type || 'agent-turn-complete',
     thread_id: payload['thread-id'] || payload.thread_id,
     turn_id: payload['turn-id'] || payload.turn_id,
+    origin_kind: turnOrigin.kind,
+    origin_parent_thread_id: turnOrigin.parentThreadId,
     input_preview: latestInputPreview,
     input_message_count: normalizedInputMessages.length,
     output_preview: (payload['last-assistant-message'] || payload.last_assistant_message || '')
@@ -543,8 +578,26 @@ async function main() {
       } = await import('../notifications/idle-cooldown.js');
       const notifySessionId = getEffectiveSessionId();
       const lastAssistantMessage = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '');
+      const hasAssistantText = lastAssistantMessage.trim().length > 0;
+      const suppressExternalCompletedTurn = isExternalCompletedTurnSuppressedOrigin(turnOrigin);
+      if (suppressExternalCompletedTurn && hasAssistantText) {
+        await logNotifyHookEvent(logsDir, {
+          timestamp: new Date().toISOString(),
+          type: 'completed_turn_suppressed_non_leader',
+          origin_kind: turnOrigin.kind,
+          thread_id: safeString(payload['thread-id'] || payload.thread_id || ''),
+          parent_thread_id: turnOrigin.parentThreadId || null,
+          agent_nickname: turnOrigin.agentNickname || null,
+          agent_role: turnOrigin.agentRole || null,
+        });
+      }
       const semanticOutcome = classifyCompletedTurn(lastAssistantMessage);
-      const replyOrigin = notifySessionId
+      const canNotifyExternalCompletedTurn = Boolean(
+        notifySessionId
+        && hasAssistantText
+        && !suppressExternalCompletedTurn,
+      );
+      const replyOrigin = canNotifyExternalCompletedTurn && notifySessionId
         ? await consumePendingReplyOrigin(cwd, notifySessionId, latestUserInput)
         : null;
       const notificationConfig = getNotificationConfig();
@@ -552,6 +605,7 @@ async function main() {
         semanticOutcome,
         replyOrigin,
         turnId: safeString(payload['turn-id'] || payload.turn_id || ''),
+        assistantText: lastAssistantMessage,
         notificationConfig,
       });
       const completedTurnHookFingerprint = buildCompletedTurnHookFingerprint(
@@ -559,14 +613,16 @@ async function main() {
         semanticOutcome,
       );
 
-      const shouldNotifyCompletedTurn = notifySessionId
+      const shouldNotifyCompletedTurn = canNotifyExternalCompletedTurn
+        && notifySessionId
         && decision
         && shouldSendCompletedTurnNotification(
           stateDir,
           notifySessionId,
           decision.effectiveFingerprint,
         );
-      const shouldDispatchSessionIdleHookEvent = notifySessionId
+      const shouldDispatchSessionIdleHookEvent = canNotifyExternalCompletedTurn
+        && notifySessionId
         && shouldSendSessionIdleHookEvent(
           stateDir,
           notifySessionId,

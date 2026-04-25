@@ -33,6 +33,8 @@ export interface RecordSubagentTurnInput {
   turnId?: string;
   timestamp?: string;
   mode?: string;
+  kind?: 'leader' | 'subagent';
+  parentThreadId?: string;
 }
 
 export interface SubagentSessionSummary {
@@ -88,7 +90,7 @@ export function normalizeSubagentTrackingState(input: unknown): SubagentTracking
         ...(typeof candidate.last_turn_id === 'string' && candidate.last_turn_id.trim().length > 0
           ? { last_turn_id: candidate.last_turn_id }
           : {}),
-        turn_count: typeof candidate.turn_count === 'number' && Number.isFinite(candidate.turn_count) && candidate.turn_count > 0
+        turn_count: typeof candidate.turn_count === 'number' && Number.isFinite(candidate.turn_count) && candidate.turn_count >= 0
           ? candidate.turn_count
           : 1,
         ...(typeof candidate.mode === 'string' && candidate.mode.trim().length > 0 ? { mode: candidate.mode } : {}),
@@ -144,6 +146,10 @@ export function recordSubagentTurn(
   if (!sessionId || !threadId) return normalizeSubagentTrackingState(state);
 
   const timestamp = input.timestamp ?? new Date().toISOString();
+  const inputKind = input.kind === 'leader' || input.kind === 'subagent'
+    ? input.kind
+    : undefined;
+  const parentThreadId = input.parentThreadId?.trim() || '';
   const normalized = normalizeSubagentTrackingState(state);
   const existingSession = normalized.sessions[sessionId] ?? {
     session_id: sessionId,
@@ -151,11 +157,17 @@ export function recordSubagentTurn(
     threads: {},
   };
 
-  const leaderThreadId = existingSession.leader_thread_id || threadId;
+  const leaderThreadId = inputKind === 'leader'
+    ? threadId
+    : inputKind === 'subagent'
+      ? (parentThreadId || existingSession.leader_thread_id || undefined)
+      : (existingSession.leader_thread_id || threadId);
+  const nextKind: TrackedSubagentThread['kind'] = inputKind
+    ?? (leaderThreadId && threadId === leaderThreadId ? 'leader' : 'subagent');
   const existingThread = existingSession.threads[threadId];
   const nextThread: TrackedSubagentThread = {
     thread_id: threadId,
-    kind: threadId === leaderThreadId ? 'leader' : 'subagent',
+    kind: nextKind,
     first_seen_at: existingThread?.first_seen_at ?? timestamp,
     last_seen_at: timestamp,
     turn_count: (existingThread?.turn_count ?? 0) + 1,
@@ -167,11 +179,29 @@ export function recordSubagentTurn(
     ...existingSession.threads,
     [threadId]: nextThread,
   };
-  if (leaderThreadId && threadId !== leaderThreadId && threads[leaderThreadId]) {
-    threads[leaderThreadId] = {
-      ...threads[leaderThreadId],
-      kind: 'leader',
-    };
+  if (leaderThreadId) {
+    if (threads[leaderThreadId]) {
+      threads[leaderThreadId] = {
+        ...threads[leaderThreadId],
+        kind: 'leader',
+      };
+    } else {
+      threads[leaderThreadId] = {
+        thread_id: leaderThreadId,
+        kind: 'leader',
+        first_seen_at: timestamp,
+        last_seen_at: timestamp,
+        turn_count: 0,
+      };
+    }
+    for (const candidateThreadId of Object.keys(threads)) {
+      if (candidateThreadId === leaderThreadId) continue;
+      if (threads[candidateThreadId]?.kind !== 'leader') continue;
+      threads[candidateThreadId] = {
+        ...threads[candidateThreadId],
+        kind: 'subagent',
+      };
+    }
   }
 
   normalized.sessions[sessionId] = {

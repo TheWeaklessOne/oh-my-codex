@@ -182,12 +182,12 @@ function buildCompletedTurnFingerprint(
     turnId?: string;
   },
 ): string {
-  if (decision.replyOrigin && decision.turnId) {
+  if (decision.turnId) {
     return JSON.stringify({
       scope: "completed-turn",
-      policy: "reply-origin-per-turn",
+      policy: decision.replyOrigin ? "reply-origin-per-turn" : "per-turn",
       effectiveEvent: decision.effectiveEvent,
-      replyOriginPlatform: decision.replyOrigin.platform,
+      replyOriginPlatform: decision.replyOrigin?.platform || "",
       turnId: decision.turnId,
     });
   }
@@ -232,20 +232,30 @@ export function planCompletedTurnNotification(input: {
   semanticOutcome: CompletedTurnSemanticOutcome;
   replyOrigin?: CompletedTurnReplyOrigin | null;
   turnId?: string;
+  assistantText?: string;
   notificationConfig?: Pick<FullNotificationConfig, "completedTurn"> | null;
 }): CompletedTurnNotificationDecision | null {
   const { semanticOutcome } = input;
   const replyOrigin = input.replyOrigin ?? null;
-  const semanticEvent =
-    semanticOutcome.notificationEvent === "result-ready"
+  const hasAssistantText =
+    typeof input.assistantText === "string"
+    && input.assistantText.trim().length > 0;
+  const semanticEvent = semanticOutcome.notificationEvent === "result-ready"
     || semanticOutcome.notificationEvent === "ask-user-question"
-      ? semanticOutcome.notificationEvent
-      : undefined;
+    ? semanticOutcome.notificationEvent
+    : undefined;
+  const explicitInputNeeded =
+    semanticOutcome.kind === "input-needed"
+    && semanticOutcome.notificationEvent === "ask-user-question";
   const canPromoteReplyOriginTurn = replyOrigin
     && (semanticOutcome.kind === "noise" || semanticOutcome.kind === "progress");
   const effectiveEvent: CompletedTurnEffectiveEvent | undefined =
-    semanticEvent
-    ?? (canPromoteReplyOriginTurn ? "result-ready" : undefined);
+    explicitInputNeeded
+      ? "ask-user-question"
+      : hasAssistantText
+        ? "result-ready"
+        : semanticEvent
+          ?? (canPromoteReplyOriginTurn ? "result-ready" : undefined);
 
   if (!effectiveEvent) {
     return null;

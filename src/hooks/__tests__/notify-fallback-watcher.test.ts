@@ -451,10 +451,90 @@ describe('notify-fallback watcher', () => {
       assert.equal(turnLines.length, 1);
       assert.match(turnLines[0], new RegExp(freshTurn));
       assert.doesNotMatch(turnLines[0], new RegExp(staleTurn));
+      const turnEntries = await readJsonLines(turnLog);
+      assert.equal(turnEntries[0]?.origin_kind, 'unknown');
 
       const fallbackLog = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
       const fallbackEntries = await readJsonLines(fallbackLog);
       assert.deepEqual(fallbackEntries.map((entry) => entry.type), ['fallback_notify']);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(tempHome, { recursive: true, force: true });
+      await rm(rolloutPath, { force: true });
+    }
+  });
+
+  it('preserves rollout native-subagent parent origin when synthesizing notify payloads', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-subagent-origin-'));
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-home-'));
+    const sid = randomUUID();
+    const sessionId = 'omx-fallback-subagent-origin';
+    const sessionDir = todaySessionDir(tempHome);
+    const rolloutPath = join(sessionDir, `rollout-test-fallback-subagent-origin-${sid}.jsonl`);
+
+    try {
+      await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
+      await mkdir(join(wd, '.omx', 'state', 'sessions', sessionId), { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+
+      const nowIso = new Date(Date.now() + 2_000).toISOString();
+      const leaderThreadId = `leader-${sid}`;
+      const subagentThreadId = `subagent-${sid}`;
+      const subagentTurnId = `turn-subagent-${sid}`;
+
+      const lines = [
+        {
+          timestamp: nowIso,
+          type: 'session_meta',
+          payload: {
+            id: subagentThreadId,
+            cwd: wd,
+            agent_nickname: 'executor',
+            agent_role: 'executor',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: leaderThreadId,
+                },
+                agent_nickname: 'executor',
+                agent_role: 'executor',
+              },
+            },
+          },
+        },
+        {
+          timestamp: nowIso,
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: subagentTurnId,
+            last_agent_message: 'Implemented notification gate. Ready for review.',
+          },
+        },
+      ];
+      await writeFile(rolloutPath, `${lines.map(v => JSON.stringify(v)).join('\n')}\n`);
+
+      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const result = spawnSync(
+        process.execPath,
+        [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
+        { encoding: 'utf-8', env: buildCleanNotifyEnv({ HOME: tempHome, OMX_SESSION_ID: sessionId }) }
+      );
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const tracking = JSON.parse(await readFile(join(wd, '.omx', 'state', 'subagent-tracking.json'), 'utf-8'));
+      const session = tracking.sessions[sessionId];
+      assert.equal(session.leader_thread_id, leaderThreadId);
+      assert.equal(session.threads[leaderThreadId].kind, 'leader');
+      assert.equal(session.threads[leaderThreadId].turn_count, 0);
+      assert.equal(session.threads[subagentThreadId].kind, 'subagent');
+      assert.equal(session.threads[subagentThreadId].last_turn_id, subagentTurnId);
+
+      const turnLog = join(wd, '.omx', 'logs', `turns-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const turnEntries = await readJsonLines(turnLog);
+      assert.equal(turnEntries[0]?.origin_kind, 'native-subagent');
+      assert.equal(turnEntries[0]?.origin_parent_thread_id, leaderThreadId);
     } finally {
       await rm(wd, { recursive: true, force: true });
       await rm(tempHome, { recursive: true, force: true });

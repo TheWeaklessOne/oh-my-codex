@@ -33,6 +33,10 @@ import {
   DEFAULT_SUBAGENT_ACTIVE_WINDOW_MS,
   readSubagentSessionSummary,
 } from '../subagents/tracker.js';
+import {
+  resolveTurnOrigin,
+  type TurnOrigin,
+} from '../notifications/turn-origin.js';
 import { listNotifyCanonicalActiveTeams } from './notify-hook/active-team.js';
 import { sameFilePath } from '../utils/paths.js';
 import { validateSessionId } from '../mcp/state-paths.js';
@@ -153,9 +157,17 @@ const QUIET_ONCE_EVENT_TYPES = new Set(['watcher_start', 'watcher_once_complete'
 
 interface WatcherFileMeta {
   threadId: string;
+  sessionMeta?: Record<string, unknown>;
+  origin: TurnOrigin;
   offset: number;
   size: number;
   partial: string;
+}
+
+interface WatcherSessionMeta {
+  threadId: string;
+  sessionMeta: Record<string, unknown>;
+  origin: TurnOrigin;
 }
 
 interface RalphContinueSteerState {
@@ -1581,7 +1593,7 @@ async function readFirstLine(path: string): Promise<string> {
   return idx >= 0 ? content.slice(0, idx) : content;
 }
 
-function shouldTrackSessionMeta(line: string): string | null {
+function parseSessionMetaLine(line: string): WatcherSessionMeta | null {
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(line) as Record<string, unknown>;
@@ -1592,7 +1604,20 @@ function shouldTrackSessionMeta(line: string): string | null {
   const payload = parsed.payload as Record<string, unknown>;
   if (safeString(payload.cwd) !== cwd) return null;
   const threadId = safeString(payload.id);
-  return threadId || null;
+  if (!threadId) return null;
+  const parsedOrigin = resolveTurnOrigin({
+    session_meta: payload,
+    thread_id: threadId,
+  }, process.env);
+  const origin: TurnOrigin = {
+    ...parsedOrigin,
+    threadId: parsedOrigin.threadId || threadId,
+  };
+  return {
+    threadId,
+    sessionMeta: payload,
+    origin,
+  };
 }
 
 async function discoverRolloutFiles(): Promise<string[]> {
@@ -1617,15 +1642,17 @@ function turnKey(threadId: string, turnId: string): string {
   return `${threadId || 'no-thread'}|${turnId || 'no-turn'}`;
 }
 
-function buildNotifyPayload(threadId: string, turnId: string, lastMessage: string): Record<string, unknown> {
+function buildNotifyPayload(meta: WatcherFileMeta, turnId: string, lastMessage: string): Record<string, unknown> {
   return {
     type: 'agent-turn-complete',
     cwd,
-    'thread-id': threadId,
+    'thread-id': meta.threadId,
     'turn-id': turnId,
     'input-messages': ['[notify-fallback] synthesized from rollout task_complete'],
     'last-assistant-message': lastMessage || '',
     source: 'notify-fallback-watcher',
+    session_meta: meta.sessionMeta,
+    origin: meta.origin,
   };
 }
 
@@ -1669,7 +1696,7 @@ async function processLine(meta: WatcherFileMeta, line: string, filePath: string
   seenTurnKeys.add(key);
 
   const payload = buildNotifyPayload(
-    meta.threadId,
+    meta,
     turnId,
     safeString((parsed.payload as Record<string, unknown>).last_agent_message)
   );
@@ -1681,11 +1708,18 @@ async function ensureTrackedFiles(): Promise<void> {
   for (const path of files) {
     if (fileState.has(path)) continue;
     const line = await readFirstLine(path).catch(() => '');
-    const threadId = shouldTrackSessionMeta(line);
-    if (!threadId) continue;
+    const sessionMeta = parseSessionMetaLine(line);
+    if (!sessionMeta) continue;
     const size = (await stat(path).catch(() => ({ size: 0 }))).size || 0;
     const offset = runOnce ? 0 : size;
-    fileState.set(path, { threadId, offset, size, partial: '' });
+    fileState.set(path, {
+      threadId: sessionMeta.threadId,
+      sessionMeta: sessionMeta.sessionMeta,
+      origin: sessionMeta.origin,
+      offset,
+      size,
+      partial: '',
+    });
   }
 }
 

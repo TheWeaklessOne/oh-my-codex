@@ -217,7 +217,7 @@ See [Codex native hook mapping](./docs/codex-native-hooks.md) for the current na
 
 ### Meaningful Telegram notifications
 
-If you want Telegram to receive only meaningful turn results and real input requests, keep a session-level verbosity profile and explicitly enable only the semantic events you care about:
+If you want Telegram to receive leader final answers and real input requests while suppressing lifecycle chatter, keep a session-level verbosity profile and explicitly enable only the completed-turn events you care about:
 
 ```json
 {
@@ -259,6 +259,8 @@ Completed-turn presentation is now configurable separately from lifecycle delive
 }
 ```
 
+- Completed-turn notifications are leader-only: native Codex subagent and OMX team worker final reports stay internal and should be summarized by the leader.
+- Every non-empty leader final turn is eligible for `result-ready` delivery as raw assistant text; the semantic classifier only upgrades explicit input requests to `ask-user-question`.
 - `result-ready` defaults to `raw-assistant-text`, so the visible notification body is the full assistant answer.
 - `ask-user-question` also defaults to `raw-assistant-text`.
 - Lifecycle events (`session-start`, `session-stop`, `session-idle`, `session-end`) keep the existing formatter-based rendering.
