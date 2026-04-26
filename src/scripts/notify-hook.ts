@@ -18,7 +18,7 @@
  *   team-worker.js     – worker heartbeat and idle notification
  */
 
-import { writeFile, appendFile, mkdir, readFile, open, rm, stat } from 'fs/promises';
+import { writeFile, appendFile, mkdir, readFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 
@@ -30,12 +30,15 @@ import {
 } from './notify-hook/payload-parser.js';
 import {
   getScopedStatePath,
-  readCurrentSessionId,
   readScopedJsonIfExists,
+  readCurrentSessionId,
   getScopedStateDirsForCurrentSession,
+  resolveScopedStateDir,
   normalizeNotifyState,
   pruneRecentTurns,
   readdir,
+  LockedJsonStateWriteError,
+  updateLockedJsonState,
 } from './notify-hook/state-io.js';
 import { isLeaderStale, resolveLeaderStalenessThresholdMs, maybeNudgeTeamLeader } from './notify-hook/team-leader-nudge.js';
 import { drainPendingTeamDispatch } from './notify-hook/team-dispatch.js';
@@ -79,8 +82,8 @@ import { DEFAULT_MARKER } from './tmux-hook-engine.js';
 const NOTIFY_HOOK_STATE_FILE = 'notify-hook-state.json';
 const NOTIFY_HOOK_TURN_DEDUPE_FILE = 'notify-hook-turn-dedupe.json';
 const NOTIFY_HOOK_TURN_DEDUPE_LOCK_FILE = 'notify-hook-turn-dedupe.lock';
-const NOTIFY_HOOK_TURN_DEDUPE_LOCK_TIMEOUT_MS = 1500;
-const NOTIFY_HOOK_TURN_DEDUPE_LOCK_STALE_MS = 10_000;
+const PROJECT_TURN_PENDING_RECOVERY_TTL_MS = 5 * 60_000;
+const PROJECT_TURN_DISPATCHING_RECOVERY_TTL_MS = 60_000;
 
 const RALPH_ACTIVE_PROGRESS_PHASES = new Set([
   'start',
@@ -103,15 +106,28 @@ function isTurnCompletePayload(payload: Record<string, unknown>): boolean {
 
 type ProjectTurnDelivery = 'allow' | 'suppress';
 type ProjectTurnSourceKind = 'native' | 'fallback';
+type ProjectTurnDeliveryStatus = 'pending' | 'dispatching' | 'sent' | 'committed';
 
 interface ProjectTurnClaim {
   timestamp: number;
   delivery: ProjectTurnDelivery;
+  delivery_status?: ProjectTurnDeliveryStatus;
+  delivery_status_at?: number;
   source_kind: ProjectTurnSourceKind;
   source: string;
   session_id: string;
   audience: string;
   reason: string;
+}
+
+interface ProjectTurnDedupeKeyDetails {
+  key: string;
+  threadId: string;
+  turnId: string;
+  eventType: string;
+  sessionId: string;
+  source: string;
+  expectedClaim?: ProjectTurnClaim;
 }
 
 interface ProjectTurnDedupeState {
@@ -124,18 +140,30 @@ interface ProjectTurnDedupeDecision {
   shouldContinue: boolean;
   suppressExternalDelivery: boolean;
   reason: string;
+  persistenceFailed?: boolean;
   existingClaim?: ProjectTurnClaim;
   currentClaim: ProjectTurnClaim;
+}
+
+interface PendingProjectFallbackOwnerUpgrade {
+  key: string;
+  expectedClaim: ProjectTurnClaim;
+  nextClaim: ProjectTurnClaim;
+  primaryRollback?: {
+    expectedClaim: ProjectTurnClaim;
+    replacementClaim?: ProjectTurnClaim;
+  };
+  threadId: string;
+  turnId: string;
+  eventType: string;
+  sessionId: string;
+  source: string;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function normalizeTurnDedupeEventType(rawType: unknown): string {
@@ -156,6 +184,16 @@ function normalizeProjectTurnDelivery(value: string): ProjectTurnDelivery {
   return value === 'allow' ? 'allow' : 'suppress';
 }
 
+function normalizeProjectTurnDeliveryStatus(
+  value: unknown,
+): ProjectTurnDeliveryStatus | undefined {
+  const status = safeString(value).trim().toLowerCase();
+  if (status === 'pending' || status === 'dispatching' || status === 'sent' || status === 'committed') {
+    return status;
+  }
+  return undefined;
+}
+
 function normalizeProjectTurnClaim(
   value: unknown,
   fallbackTimestamp: number | null,
@@ -166,9 +204,16 @@ function normalizeProjectTurnClaim(
   if (timestamp === null) return null;
   const source = safeString(raw.source);
   const sourceKind = safeString(raw.source_kind) === 'fallback' ? 'fallback' : 'native';
+  const delivery = normalizeProjectTurnDelivery(safeString(raw.delivery));
   return {
     timestamp,
-    delivery: normalizeProjectTurnDelivery(safeString(raw.delivery)),
+    delivery,
+    ...(delivery === 'allow'
+      ? {
+        delivery_status: normalizeProjectTurnDeliveryStatus(raw.delivery_status),
+        delivery_status_at: asNumber(raw.delivery_status_at) ?? timestamp,
+      }
+      : { delivery_status: 'committed' as const }),
     source_kind: sourceKind,
     source,
     session_id: safeString(raw.session_id),
@@ -196,62 +241,6 @@ function normalizeProjectTurnDedupeState(raw: unknown, now: number): ProjectTurn
   };
 }
 
-async function acquireProjectTurnDedupeLock(stateDir: string): Promise<() => Promise<void>> {
-  const lockPath = join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_LOCK_FILE);
-  const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
-  const deadline = Date.now() + NOTIFY_HOOK_TURN_DEDUPE_LOCK_TIMEOUT_MS;
-
-  while (true) {
-    try {
-      await mkdir(dirname(lockPath), { recursive: true }).catch(() => {});
-      const handle = await open(lockPath, 'wx');
-      try {
-        await handle.writeFile(token);
-      } catch (error) {
-        await handle.close().catch(() => {});
-        await rm(lockPath, { force: true }).catch(() => {});
-        throw error;
-      } finally {
-        await handle.close().catch(() => {});
-      }
-      return async () => {
-        const currentToken = await readFile(lockPath, 'utf-8').catch(() => '');
-        if (currentToken === token) {
-          await rm(lockPath, { force: true }).catch(() => {});
-        }
-      };
-    } catch (error) {
-      const code = error && typeof error === 'object'
-        ? (error as NodeJS.ErrnoException).code
-        : '';
-      if (code !== 'EEXIST') {
-        throw error;
-      }
-      const lockStat = await stat(lockPath).catch(() => null);
-      if (lockStat && Date.now() - lockStat.mtimeMs > NOTIFY_HOOK_TURN_DEDUPE_LOCK_STALE_MS) {
-        await rm(lockPath, { force: true }).catch(() => {});
-        continue;
-      }
-      if (Date.now() >= deadline) {
-        throw new Error('project turn dedupe lock timeout');
-      }
-      await sleep(25);
-    }
-  }
-}
-
-async function withProjectTurnDedupeLock<T>(
-  stateDir: string,
-  action: () => Promise<T>,
-): Promise<T> {
-  const release = await acquireProjectTurnDedupeLock(stateDir);
-  try {
-    return await action();
-  } finally {
-    await release();
-  }
-}
-
 function createProjectTurnClaim(
   now: number,
   details: {
@@ -265,6 +254,8 @@ function createProjectTurnClaim(
   return {
     timestamp: now,
     delivery: details.delivery,
+    delivery_status: details.delivery === 'allow' ? 'pending' : 'committed',
+    delivery_status_at: now,
     source_kind: normalizeProjectTurnSourceKind(details.source),
     source: details.source,
     session_id: details.sessionId,
@@ -277,6 +268,8 @@ function legacyProjectTurnClaim(timestamp: number): ProjectTurnClaim {
   return {
     timestamp,
     delivery: 'allow',
+    delivery_status: undefined,
+    delivery_status_at: timestamp,
     source_kind: 'native',
     source: 'legacy',
     session_id: '',
@@ -289,12 +282,324 @@ function shouldUpgradeProjectTurnClaim(
   existingClaim: ProjectTurnClaim,
   currentClaim: ProjectTurnClaim,
 ): boolean {
+  if (existingClaim.delivery === 'allow' && isProjectAllowClaimDeliveryClosed(existingClaim)) {
+    return false;
+  }
   if (currentClaim.delivery === 'allow' && existingClaim.delivery === 'suppress') {
     return true;
   }
   return currentClaim.delivery === 'allow'
     && currentClaim.source_kind === 'native'
     && existingClaim.source_kind === 'fallback';
+}
+
+function isProjectTurnDedupeDecision(value: unknown): value is ProjectTurnDedupeDecision {
+  const raw = asRecord(value);
+  return Boolean(
+    raw
+    && typeof raw.shouldContinue === 'boolean'
+    && typeof raw.suppressExternalDelivery === 'boolean'
+    && typeof raw.reason === 'string',
+  );
+}
+
+function projectPrimaryRollbackForPreDelivery(
+  decision: ProjectTurnDedupeDecision | null,
+): PendingProjectFallbackOwnerUpgrade['primaryRollback'] | undefined {
+  if (!decision?.shouldContinue) return undefined;
+  if (decision.reason === 'first') {
+    return { expectedClaim: decision.currentClaim };
+  }
+  if (
+    decision.reason === 'owner_upgrade'
+    && decision.existingClaim
+    && !decision.suppressExternalDelivery
+  ) {
+    return {
+      expectedClaim: decision.currentClaim,
+      replacementClaim: decision.existingClaim,
+    };
+  }
+  return undefined;
+}
+
+function isStateFileLockTimeout(error: unknown): boolean {
+  return error instanceof Error && error.message.includes('state file lock timeout');
+}
+
+function fallbackDedupeStateExists(stateDir: string): boolean {
+  return existsSync(join(stateDir, NOTIFY_HOOK_STATE_FILE))
+    || existsSync(join(stateDir, `${NOTIFY_HOOK_STATE_FILE}.lock`));
+}
+
+
+interface CompletedTurnLogEvidence {
+  deliveryAllowed: boolean;
+  deliverySent: boolean;
+  preDeliveryRecoveryFailure: boolean;
+  latestPreDeliveryRecoveryFailureAt: number | null;
+}
+
+function isSameTurnLogEntry(
+  entry: Record<string, unknown>,
+  details: { threadId: string; turnId: string },
+): boolean {
+  if (safeString(entry.turn_id) !== details.turnId) return false;
+  const entryThreadId = safeString(entry.thread_id);
+  return !details.threadId || !entryThreadId || entryThreadId === details.threadId;
+}
+
+function isPreDeliveryRecoveryFailureLogEntry(entry: Record<string, unknown>): boolean {
+  const type = safeString(entry.type);
+  if (
+    type === 'project_turn_dedupe_delivery_status_failed'
+    && safeString(entry.delivery_status) === 'dispatching'
+  ) {
+    return true;
+  }
+  if (type === 'project_fallback_turn_dedupe_upgrade_failed') return true;
+  if (type === 'project_fallback_turn_dedupe_upgraded') return entry.upgraded === false;
+  if (type === 'project_turn_dedupe_rollback_failed') return true;
+  if (type === 'session_turn_dedupe_rollback_failed') return true;
+  if (type === 'project_turn_dedupe_rolled_back') return entry.rolled_back === false;
+  if (type === 'project_fallback_turn_dedupe_rolled_back') return entry.rolled_back === false;
+  if (type === 'completed_turn_delivery_failed') return true;
+  return false;
+}
+
+async function readCompletedTurnLogEvidence(
+  logsDir: string,
+  details: { threadId: string; turnId: string },
+): Promise<CompletedTurnLogEvidence> {
+  if (!details.turnId) {
+    return {
+      deliveryAllowed: false,
+      deliverySent: false,
+      preDeliveryRecoveryFailure: false,
+      latestPreDeliveryRecoveryFailureAt: null,
+    };
+  }
+  const evidence: CompletedTurnLogEvidence = {
+    deliveryAllowed: false,
+    deliverySent: false,
+    preDeliveryRecoveryFailure: false,
+    latestPreDeliveryRecoveryFailureAt: null,
+  };
+  const names = (await readdir(logsDir).catch(() => []))
+    .filter((name) => name.startsWith('notify-hook-') && name.endsWith('.jsonl'))
+    .sort();
+
+  for (const name of names) {
+    const content = await readFile(join(logsDir, name), 'utf-8').catch(() => '');
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let entry: Record<string, unknown> | null = null;
+      try {
+        const parsed = JSON.parse(trimmed);
+        entry = asRecord(parsed);
+      } catch {
+        entry = null;
+      }
+      if (!entry || !isSameTurnLogEntry(entry, details)) continue;
+      if (safeString(entry.type) === 'completed_turn_delivery_allowed') {
+        evidence.deliveryAllowed = true;
+      }
+      if (safeString(entry.type) === 'completed_turn_delivery_sent') {
+        evidence.deliverySent = true;
+      }
+      if (isPreDeliveryRecoveryFailureLogEntry(entry)) {
+        evidence.preDeliveryRecoveryFailure = true;
+        const failureAt = Date.parse(safeString(entry.timestamp));
+        if (Number.isFinite(failureAt)) {
+          evidence.latestPreDeliveryRecoveryFailureAt = Math.max(
+            evidence.latestPreDeliveryRecoveryFailureAt ?? failureAt,
+            failureAt,
+          );
+        }
+      }
+      if (evidence.deliveryAllowed && evidence.deliverySent && evidence.preDeliveryRecoveryFailure) {
+        return evidence;
+      }
+    }
+  }
+  return evidence;
+}
+
+function isProjectAllowClaimDeliveryClosed(claim: ProjectTurnClaim): boolean {
+  return claim.delivery === 'allow'
+    && (claim.delivery_status === 'sent' || claim.delivery_status === 'committed');
+}
+
+function projectTurnClaimStatusTimestamp(claim: ProjectTurnClaim): number {
+  return claim.delivery_status_at ?? claim.timestamp;
+}
+
+function isProjectAllowClaimPendingExpired(claim: ProjectTurnClaim, now: number): boolean {
+  return claim.delivery === 'allow'
+    && claim.delivery_status === 'pending'
+    && projectTurnClaimStatusTimestamp(claim) + PROJECT_TURN_PENDING_RECOVERY_TTL_MS <= now;
+}
+
+function isProjectAllowClaimDispatchingExpired(claim: ProjectTurnClaim, now: number): boolean {
+  return claim.delivery === 'allow'
+    && claim.delivery_status === 'dispatching'
+    && projectTurnClaimStatusTimestamp(claim) + PROJECT_TURN_DISPATCHING_RECOVERY_TTL_MS <= now;
+}
+
+function closeLegacyAllowClaimForFallbackRepair(claim: ProjectTurnClaim): ProjectTurnClaim {
+  if (claim.delivery !== 'allow' || claim.delivery_status) return claim;
+  // Suppressed-helper repair copies an already-authoritative primary claim into
+  // fallback state; do not later reinterpret that repair copy as a fresh
+  // crash-before-delivery legacy claim.
+  return {
+    ...claim,
+    delivery_status: 'committed',
+  };
+}
+
+async function shouldRecoverUndeliveredAllowClaim(
+  logsDir: string,
+  details: { threadId: string; turnId: string },
+  existingClaim: ProjectTurnClaim | undefined,
+): Promise<boolean> {
+  if (!existingClaim || existingClaim.delivery !== 'allow') return false;
+  if (isProjectAllowClaimDeliveryClosed(existingClaim)) return false;
+
+  const evidence = await readCompletedTurnLogEvidence(logsDir, details);
+  if (evidence.deliverySent) return false;
+
+  // Older state did not carry delivery_status, so an allow claim without a
+  // sent marker is treated as recoverable. New claims start as "pending",
+  // which lets concurrent writers fail closed while the original owner may
+  // still be between the dedupe write and the notifier result.
+  if (!existingClaim.delivery_status) {
+    return true;
+  }
+  if (
+    evidence.preDeliveryRecoveryFailure
+    && evidence.latestPreDeliveryRecoveryFailureAt !== null
+    && evidence.latestPreDeliveryRecoveryFailureAt >= projectTurnClaimStatusTimestamp(existingClaim)
+  ) {
+    return true;
+  }
+  const now = Date.now();
+  if (isProjectAllowClaimPendingExpired(existingClaim, now)) {
+    return true;
+  }
+  if (isProjectAllowClaimDispatchingExpired(existingClaim, now)) {
+    return true;
+  }
+  return false;
+}
+
+function decideProjectTurnAgainstExistingClaim(
+  existingClaim: ProjectTurnClaim,
+  currentClaim: ProjectTurnClaim,
+): ProjectTurnDedupeDecision {
+  return shouldUpgradeProjectTurnClaim(existingClaim, currentClaim)
+    ? {
+      shouldContinue: true,
+      suppressExternalDelivery: existingClaim.delivery === 'allow',
+      reason: 'owner_upgrade',
+      existingClaim,
+      currentClaim,
+    }
+    : {
+      shouldContinue: false,
+      suppressExternalDelivery: false,
+      reason: 'duplicate',
+      existingClaim,
+      currentClaim,
+    };
+}
+
+async function readProjectTurnDedupeClaim(
+  dedupePath: string,
+  lockPath: string,
+  key: string,
+  now: number,
+): Promise<ProjectTurnClaim | null> {
+  return updateLockedJsonState<ProjectTurnClaim | null>(dedupePath, async (rawState) => {
+    const dedupeState = normalizeProjectTurnDedupeState(rawState, now);
+    const existingTimestamp = asNumber(dedupeState.recent_turns[key]);
+    return {
+      result: dedupeState.turn_claims[key]
+        || (existingTimestamp !== null ? legacyProjectTurnClaim(existingTimestamp) : null),
+      write: false,
+    };
+  }, { lockPath });
+}
+
+async function updateProjectTurnDedupeState(
+  dedupePath: string,
+  lockPath: string,
+  key: string,
+  currentClaim: ProjectTurnClaim,
+  now: number,
+  options: { deferOwnerUpgrade?: boolean } = {},
+): Promise<ProjectTurnDedupeDecision> {
+  return updateLockedJsonState<ProjectTurnDedupeDecision>(dedupePath, async (rawState) => {
+    const dedupeState = normalizeProjectTurnDedupeState(
+      rawState,
+      now,
+    );
+    const existingTimestamp = asNumber(dedupeState.recent_turns[key]);
+    const existingClaim = dedupeState.turn_claims[key]
+      || (existingTimestamp !== null ? legacyProjectTurnClaim(existingTimestamp) : null);
+
+    if (existingClaim && !shouldUpgradeProjectTurnClaim(existingClaim, currentClaim)) {
+      return {
+        result: {
+          shouldContinue: false,
+          suppressExternalDelivery: false,
+          reason: 'duplicate',
+          existingClaim,
+          currentClaim,
+        },
+        write: false,
+      };
+    }
+
+    if (existingClaim) {
+      const result = {
+        shouldContinue: true,
+        suppressExternalDelivery: existingClaim.delivery === 'allow',
+        reason: 'owner_upgrade',
+        existingClaim,
+        currentClaim,
+      };
+      if (options.deferOwnerUpgrade) {
+        return {
+          result,
+          write: false,
+        };
+      }
+      dedupeState.recent_turns[key] = now;
+      dedupeState.turn_claims[key] = currentClaim;
+      dedupeState.last_event_at = new Date().toISOString();
+      return {
+        result,
+        nextState: dedupeState,
+        write: true,
+      };
+    }
+
+    dedupeState.recent_turns[key] = now;
+    dedupeState.turn_claims[key] = currentClaim;
+    dedupeState.last_event_at = new Date().toISOString();
+
+    return {
+      result: {
+        shouldContinue: true,
+        suppressExternalDelivery: false,
+        reason: 'first',
+        currentClaim,
+      },
+      nextState: dedupeState,
+      write: true,
+    };
+  }, { lockPath });
 }
 
 async function recordProjectTurnDedupe(
@@ -314,51 +619,38 @@ async function recordProjectTurnDedupe(
 ): Promise<ProjectTurnDedupeDecision> {
   const now = Date.now();
   const dedupePath = join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_FILE);
+  const dedupeLockPath = join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_LOCK_FILE);
   const currentClaim = createProjectTurnClaim(now, details);
-  const decision = await withProjectTurnDedupeLock(stateDir, async () => {
-    const dedupeState = normalizeProjectTurnDedupeState(
-      await readFile(dedupePath, 'utf-8')
-        .then((content) => JSON.parse(content))
-        .catch(() => null),
-      now,
-    );
-    const existingTimestamp = asNumber(dedupeState.recent_turns[key]);
-    const existingClaim = dedupeState.turn_claims[key]
-      || (existingTimestamp !== null ? legacyProjectTurnClaim(existingTimestamp) : null);
-
-    if (existingClaim && !shouldUpgradeProjectTurnClaim(existingClaim, currentClaim)) {
-      return {
-        shouldContinue: false,
-        suppressExternalDelivery: false,
-        reason: 'duplicate',
-        existingClaim,
-        currentClaim,
-      };
+  let writeFailed = false;
+  let decision: ProjectTurnDedupeDecision;
+  try {
+    decision = await updateProjectTurnDedupeState(dedupePath, dedupeLockPath, key, currentClaim, now);
+  } catch (error) {
+    if (
+      error instanceof LockedJsonStateWriteError
+      && isProjectTurnDedupeDecision(error.result)
+    ) {
+      writeFailed = true;
+      decision = { ...error.result, persistenceFailed: true };
+      await logNotifyHookEvent(logsDir, {
+        timestamp: new Date().toISOString(),
+        level: 'warn',
+        type: 'project_turn_dedupe_write_failed',
+        thread_id: details.threadId || null,
+        turn_id: details.turnId || null,
+        event_type: details.eventType,
+        omx_session_id: details.sessionId || null,
+        source: details.source || null,
+        decision_reason: decision.reason,
+        suppress_external_delivery: decision.suppressExternalDelivery,
+        error: error.originalError instanceof Error
+          ? error.originalError.message
+          : String(error.originalError),
+      });
+    } else {
+      throw error;
     }
-
-    dedupeState.recent_turns[key] = now;
-    dedupeState.turn_claims[key] = currentClaim;
-    dedupeState.last_event_at = new Date().toISOString();
-    await mkdir(dirname(dedupePath), { recursive: true }).catch(() => {});
-    await writeFile(dedupePath, JSON.stringify(dedupeState, null, 2)).catch(() => {});
-
-    if (existingClaim) {
-      return {
-        shouldContinue: true,
-        suppressExternalDelivery: existingClaim.delivery === 'allow',
-        reason: 'owner_upgrade',
-        existingClaim,
-        currentClaim,
-      };
-    }
-
-    return {
-      shouldContinue: true,
-      suppressExternalDelivery: false,
-      reason: 'first',
-      currentClaim,
-    };
-  });
+  }
 
   if (!decision.shouldContinue) {
     await logNotifyHookEvent(logsDir, {
@@ -391,10 +683,718 @@ async function recordProjectTurnDedupe(
       previous_source_kind: decision.existingClaim?.source_kind || null,
       previous_delivery: decision.existingClaim?.delivery || null,
       suppress_external_delivery: decision.suppressExternalDelivery,
+      write_failed: writeFailed,
     });
   }
 
   return decision;
+}
+
+async function recordProjectFallbackTurnDedupe(
+  stateDir: string,
+  logsDir: string,
+  key: string,
+  details: {
+    threadId: string;
+    turnId: string;
+    eventType: string;
+    sessionId: string;
+    source: string;
+    audience: string;
+    delivery: ProjectTurnDelivery;
+    reason: string;
+  },
+): Promise<ProjectTurnDedupeDecision> {
+  const now = Date.now();
+  const dedupePath = join(stateDir, NOTIFY_HOOK_STATE_FILE);
+  const dedupeLockPath = `${dedupePath}.lock`;
+  const currentClaim = createProjectTurnClaim(now, details);
+  let writeFailed = false;
+  let decision: ProjectTurnDedupeDecision;
+  try {
+    decision = await updateProjectTurnDedupeState(
+      dedupePath,
+      dedupeLockPath,
+      key,
+      currentClaim,
+      now,
+      { deferOwnerUpgrade: true },
+    );
+  } catch (error) {
+    if (
+      error instanceof LockedJsonStateWriteError
+      && isProjectTurnDedupeDecision(error.result)
+    ) {
+      writeFailed = true;
+      decision = { ...error.result, persistenceFailed: true };
+      await logNotifyHookEvent(logsDir, {
+        timestamp: new Date().toISOString(),
+        level: 'warn',
+        type: 'project_fallback_turn_dedupe_write_failed',
+        thread_id: details.threadId || null,
+        turn_id: details.turnId || null,
+        event_type: details.eventType,
+        omx_session_id: details.sessionId || null,
+        source: details.source || null,
+        decision_reason: decision.reason,
+        suppress_external_delivery: decision.suppressExternalDelivery,
+        error: error.originalError instanceof Error
+          ? error.originalError.message
+          : String(error.originalError),
+      });
+    } else {
+      throw error;
+    }
+  }
+
+  if (!decision.shouldContinue) {
+    await logNotifyHookEvent(logsDir, {
+      timestamp: new Date().toISOString(),
+      type: 'turn_duplicate_suppressed',
+      scope: 'project_fallback',
+      thread_id: details.threadId || null,
+      turn_id: details.turnId || null,
+      event_type: details.eventType,
+      omx_session_id: details.sessionId || null,
+      source: details.source || null,
+      existing_source: decision.existingClaim?.source || null,
+      existing_source_kind: decision.existingClaim?.source_kind || null,
+      existing_delivery: decision.existingClaim?.delivery || null,
+    });
+    return decision;
+  }
+
+  if (decision.reason === 'owner_upgrade') {
+    await logNotifyHookEvent(logsDir, {
+      timestamp: new Date().toISOString(),
+      type: 'turn_duplicate_owner_upgraded',
+      scope: 'project_fallback',
+      thread_id: details.threadId || null,
+      turn_id: details.turnId || null,
+      event_type: details.eventType,
+      omx_session_id: details.sessionId || null,
+      source: details.source || null,
+      previous_source: decision.existingClaim?.source || null,
+      previous_source_kind: decision.existingClaim?.source_kind || null,
+      previous_delivery: decision.existingClaim?.delivery || null,
+      suppress_external_delivery: decision.suppressExternalDelivery,
+      write_failed: writeFailed,
+    });
+  }
+
+  return decision;
+}
+
+async function seedProjectTurnDedupeFromFallback(
+  stateDir: string,
+  key: string,
+  fallbackClaim: ProjectTurnClaim,
+): Promise<void> {
+  const now = Date.now();
+  const dedupePath = join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_FILE);
+  const dedupeLockPath = join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_LOCK_FILE);
+  await updateLockedJsonState<boolean>(dedupePath, async (rawState) => {
+    const dedupeState = normalizeProjectTurnDedupeState(rawState, now);
+    const existingTimestamp = asNumber(dedupeState.recent_turns[key]);
+    const existingClaim = dedupeState.turn_claims[key]
+      || (existingTimestamp !== null ? legacyProjectTurnClaim(existingTimestamp) : null);
+    if (existingClaim) {
+      return { result: false, write: false };
+    }
+
+    dedupeState.recent_turns[key] = fallbackClaim.timestamp;
+    dedupeState.turn_claims[key] = fallbackClaim;
+    dedupeState.last_event_at = new Date().toISOString();
+    return {
+      result: true,
+      nextState: dedupeState,
+      write: true,
+    };
+  }, { lockPath: dedupeLockPath });
+}
+
+function sameProjectTurnClaim(left: ProjectTurnClaim, right: ProjectTurnClaim): boolean {
+  return left.timestamp === right.timestamp
+    && left.delivery === right.delivery
+    && left.delivery_status === right.delivery_status
+    && projectTurnClaimStatusTimestamp(left) === projectTurnClaimStatusTimestamp(right)
+    && left.source_kind === right.source_kind
+    && left.source === right.source
+    && left.session_id === right.session_id
+    && left.audience === right.audience
+    && left.reason === right.reason;
+}
+
+function sameProjectTurnClaimIdentity(left: ProjectTurnClaim, right: ProjectTurnClaim): boolean {
+  return left.timestamp === right.timestamp
+    && left.delivery === right.delivery
+    && left.source_kind === right.source_kind
+    && left.source === right.source
+    && left.session_id === right.session_id
+    && left.audience === right.audience
+    && left.reason === right.reason;
+}
+
+async function removeProjectTurnDedupeClaimIfCurrent(
+  stateDir: string,
+  key: string,
+  expectedClaim: ProjectTurnClaim,
+): Promise<boolean> {
+  const now = Date.now();
+  const dedupePath = join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_FILE);
+  const dedupeLockPath = join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_LOCK_FILE);
+  return updateLockedJsonState<boolean>(dedupePath, async (rawState) => {
+    const dedupeState = normalizeProjectTurnDedupeState(rawState, now);
+    const existingClaim = dedupeState.turn_claims[key];
+    if (!existingClaim || !sameProjectTurnClaim(existingClaim, expectedClaim)) {
+      return { result: false, write: false };
+    }
+    delete dedupeState.recent_turns[key];
+    delete dedupeState.turn_claims[key];
+    dedupeState.last_event_at = new Date().toISOString();
+    return {
+      result: true,
+      nextState: dedupeState,
+      write: true,
+    };
+  }, { lockPath: dedupeLockPath });
+}
+
+async function replaceProjectTurnDedupeClaimIfCurrent(
+  stateDir: string,
+  key: string,
+  expectedClaim: ProjectTurnClaim,
+  replacementClaim: ProjectTurnClaim,
+): Promise<boolean> {
+  const now = Date.now();
+  const dedupePath = join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_FILE);
+  const dedupeLockPath = join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_LOCK_FILE);
+  return updateLockedJsonState<boolean>(dedupePath, async (rawState) => {
+    const dedupeState = normalizeProjectTurnDedupeState(rawState, now);
+    const existingClaim = dedupeState.turn_claims[key];
+    if (!existingClaim || !sameProjectTurnClaim(existingClaim, expectedClaim)) {
+      return { result: false, write: false };
+    }
+    dedupeState.recent_turns[key] = replacementClaim.timestamp;
+    dedupeState.turn_claims[key] = replacementClaim;
+    dedupeState.last_event_at = new Date().toISOString();
+    return {
+      result: true,
+      nextState: dedupeState,
+      write: true,
+    };
+  }, { lockPath: dedupeLockPath });
+}
+
+async function claimProjectTurnRecoveryIfCurrent(
+  stateDir: string,
+  key: string,
+  expectedClaim: ProjectTurnClaim,
+  recoveryClaim: ProjectTurnClaim,
+): Promise<boolean> {
+  const now = Date.now();
+  const dedupePath = join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_FILE);
+  const dedupeLockPath = join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_LOCK_FILE);
+  return updateLockedJsonState<boolean>(dedupePath, async (rawState) => {
+    const dedupeState = normalizeProjectTurnDedupeState(rawState, now);
+    const existingTimestamp = asNumber(dedupeState.recent_turns[key]);
+    const existingClaim = dedupeState.turn_claims[key]
+      || (existingTimestamp !== null ? legacyProjectTurnClaim(existingTimestamp) : null);
+    if (!existingClaim || !sameProjectTurnClaim(existingClaim, expectedClaim)) {
+      return { result: false, write: false };
+    }
+    dedupeState.recent_turns[key] = recoveryClaim.timestamp;
+    dedupeState.turn_claims[key] = recoveryClaim;
+    dedupeState.last_event_at = new Date().toISOString();
+    return {
+      result: true,
+      nextState: dedupeState,
+      write: true,
+    };
+  }, { lockPath: dedupeLockPath });
+}
+
+async function markProjectTurnDedupeClaimDeliveryStatus(
+  dedupePath: string,
+  lockPath: string,
+  key: string,
+  status: ProjectTurnDeliveryStatus,
+  expectedClaim?: ProjectTurnClaim,
+): Promise<boolean> {
+  const now = Date.now();
+  return updateLockedJsonState<boolean>(dedupePath, async (rawState) => {
+    const dedupeState = normalizeProjectTurnDedupeState(rawState, now);
+    const existingTimestamp = asNumber(dedupeState.recent_turns[key]);
+    const existingClaim = dedupeState.turn_claims[key]
+      || (existingTimestamp !== null ? legacyProjectTurnClaim(existingTimestamp) : null);
+    if (!existingClaim || existingClaim.delivery !== 'allow') {
+      return { result: false, write: false };
+    }
+    if (expectedClaim && !sameProjectTurnClaimIdentity(existingClaim, expectedClaim)) {
+      return { result: false, write: false };
+    }
+    if (existingClaim.delivery_status === status) {
+      return { result: true, write: false };
+    }
+    dedupeState.recent_turns[key] = existingClaim.timestamp;
+    dedupeState.turn_claims[key] = {
+      ...existingClaim,
+      delivery_status: status,
+      delivery_status_at: now,
+    };
+    dedupeState.last_event_at = new Date().toISOString();
+    return {
+      result: true,
+      nextState: dedupeState,
+      write: true,
+    };
+  }, { lockPath });
+}
+
+async function markProjectTurnDeliveryStatus(
+  stateDir: string,
+  logsDir: string,
+  details: ProjectTurnDedupeKeyDetails,
+  status: ProjectTurnDeliveryStatus,
+): Promise<{ project: boolean; project_fallback: boolean }> {
+  const stores = [
+    {
+      scope: 'project',
+      path: join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_FILE),
+      lockPath: join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_LOCK_FILE),
+    },
+    {
+      scope: 'project_fallback',
+      path: join(stateDir, NOTIFY_HOOK_STATE_FILE),
+      lockPath: join(stateDir, `${NOTIFY_HOOK_STATE_FILE}.lock`),
+    },
+  ] as const;
+  const results = {
+    project: false,
+    project_fallback: false,
+  };
+
+  for (const store of stores) {
+    const updated = await markProjectTurnDedupeClaimDeliveryStatus(
+      store.path,
+      store.lockPath,
+      details.key,
+      status,
+      details.expectedClaim,
+    ).catch(async (error) => {
+      await logNotifyHookEvent(logsDir, {
+        timestamp: new Date().toISOString(),
+        level: 'warn',
+        type: 'project_turn_dedupe_delivery_status_failed',
+        scope: store.scope,
+        delivery_status: status,
+        thread_id: details.threadId || null,
+        turn_id: details.turnId || null,
+        event_type: details.eventType,
+        omx_session_id: details.sessionId || null,
+        source: details.source || null,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    });
+    results[store.scope] = updated;
+  }
+  return results;
+}
+
+async function updateProjectFallbackTurnDedupeClaimIfCurrent(
+  stateDir: string,
+  key: string,
+  expectedClaim: ProjectTurnClaim,
+  nextClaim: ProjectTurnClaim,
+): Promise<boolean> {
+  const now = Date.now();
+  const dedupePath = join(stateDir, NOTIFY_HOOK_STATE_FILE);
+  const dedupeLockPath = `${dedupePath}.lock`;
+  return updateLockedJsonState<boolean>(dedupePath, async (rawState) => {
+    const dedupeState = normalizeProjectTurnDedupeState(rawState, now);
+    const existingClaim = dedupeState.turn_claims[key];
+    if (!existingClaim || !sameProjectTurnClaim(existingClaim, expectedClaim)) {
+      return { result: false, write: false };
+    }
+    dedupeState.recent_turns[key] = nextClaim.timestamp;
+    dedupeState.turn_claims[key] = nextClaim;
+    dedupeState.last_event_at = new Date().toISOString();
+    return {
+      result: true,
+      nextState: dedupeState,
+      write: true,
+    };
+  }, { lockPath: dedupeLockPath });
+}
+
+async function removeProjectFallbackTurnDedupeClaimIfCurrent(
+  stateDir: string,
+  key: string,
+  expectedClaim: ProjectTurnClaim,
+): Promise<boolean> {
+  const now = Date.now();
+  const dedupePath = join(stateDir, NOTIFY_HOOK_STATE_FILE);
+  const dedupeLockPath = `${dedupePath}.lock`;
+  return updateLockedJsonState<boolean>(dedupePath, async (rawState) => {
+    const dedupeState = normalizeProjectTurnDedupeState(rawState, now);
+    const existingClaim = dedupeState.turn_claims[key];
+    if (!existingClaim || !sameProjectTurnClaim(existingClaim, expectedClaim)) {
+      return { result: false, write: false };
+    }
+    delete dedupeState.recent_turns[key];
+    delete dedupeState.turn_claims[key];
+    dedupeState.last_event_at = new Date().toISOString();
+    return {
+      result: true,
+      nextState: dedupeState,
+      write: true,
+    };
+  }, { lockPath: dedupeLockPath });
+}
+
+async function finalizeProjectFallbackOwnerUpgrade(
+  stateDir: string,
+  logsDir: string,
+  upgrade: PendingProjectFallbackOwnerUpgrade,
+): Promise<boolean> {
+  let fallbackUpgradeSucceeded = await updateProjectFallbackTurnDedupeClaimIfCurrent(
+    stateDir,
+    upgrade.key,
+    upgrade.expectedClaim,
+    upgrade.nextClaim,
+  ).catch(async (error) => {
+    await logNotifyHookEvent(logsDir, {
+      timestamp: new Date().toISOString(),
+      level: 'warn',
+      type: 'project_fallback_turn_dedupe_upgrade_failed',
+      thread_id: upgrade.threadId || null,
+      turn_id: upgrade.turnId || null,
+      event_type: upgrade.eventType,
+      omx_session_id: upgrade.sessionId || null,
+      source: upgrade.source || null,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  });
+  let alreadyCurrent = false;
+  if (!fallbackUpgradeSucceeded) {
+    const dedupePath = join(stateDir, NOTIFY_HOOK_STATE_FILE);
+    const currentClaim = await readProjectTurnDedupeClaim(
+      dedupePath,
+      `${dedupePath}.lock`,
+      upgrade.key,
+      Date.now(),
+    ).catch(async (error) => {
+      await logNotifyHookEvent(logsDir, {
+        timestamp: new Date().toISOString(),
+        level: 'warn',
+        type: 'project_fallback_turn_dedupe_upgrade_recheck_failed',
+        thread_id: upgrade.threadId || null,
+        turn_id: upgrade.turnId || null,
+        event_type: upgrade.eventType,
+        omx_session_id: upgrade.sessionId || null,
+        source: upgrade.source || null,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    });
+    alreadyCurrent = Boolean(currentClaim && sameProjectTurnClaim(currentClaim, upgrade.nextClaim));
+    fallbackUpgradeSucceeded = alreadyCurrent;
+  }
+  await logNotifyHookEvent(logsDir, {
+    timestamp: new Date().toISOString(),
+    type: 'project_fallback_turn_dedupe_upgraded',
+    thread_id: upgrade.threadId || null,
+    turn_id: upgrade.turnId || null,
+    event_type: upgrade.eventType,
+    omx_session_id: upgrade.sessionId || null,
+    source: upgrade.source || null,
+    upgraded: fallbackUpgradeSucceeded,
+    already_current: alreadyCurrent,
+  });
+  return fallbackUpgradeSucceeded;
+}
+
+async function rollbackPendingPrimaryClaim(
+  stateDir: string,
+  logsDir: string,
+  upgrade: PendingProjectFallbackOwnerUpgrade,
+  reason: string,
+): Promise<boolean> {
+  if (!upgrade.primaryRollback) return false;
+  const rollback = upgrade.primaryRollback;
+  const rolledBack = rollback.replacementClaim
+    ? await replaceProjectTurnDedupeClaimIfCurrent(
+      stateDir,
+      upgrade.key,
+      rollback.expectedClaim,
+      rollback.replacementClaim,
+    ).catch(async (error) => {
+      await logNotifyHookEvent(logsDir, {
+        timestamp: new Date().toISOString(),
+        level: 'warn',
+        type: 'project_turn_dedupe_rollback_failed',
+        thread_id: upgrade.threadId || null,
+        turn_id: upgrade.turnId || null,
+        event_type: upgrade.eventType,
+        omx_session_id: upgrade.sessionId || null,
+        reason,
+        rollback_mode: 'restore_previous_claim',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    })
+    : await removeProjectTurnDedupeClaimIfCurrent(
+      stateDir,
+      upgrade.key,
+      rollback.expectedClaim,
+    ).catch(async (error) => {
+      await logNotifyHookEvent(logsDir, {
+        timestamp: new Date().toISOString(),
+        level: 'warn',
+        type: 'project_turn_dedupe_rollback_failed',
+        thread_id: upgrade.threadId || null,
+        turn_id: upgrade.turnId || null,
+        event_type: upgrade.eventType,
+        omx_session_id: upgrade.sessionId || null,
+        reason,
+        rollback_mode: 'remove_first_claim',
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    });
+  await logNotifyHookEvent(logsDir, {
+    timestamp: new Date().toISOString(),
+    level: 'warn',
+    type: 'project_turn_dedupe_rolled_back',
+    thread_id: upgrade.threadId || null,
+    turn_id: upgrade.turnId || null,
+    event_type: upgrade.eventType,
+    omx_session_id: upgrade.sessionId || null,
+    reason,
+    rollback_mode: rollback.replacementClaim
+      ? 'restore_previous_claim'
+      : 'remove_first_claim',
+    rolled_back: rolledBack,
+  });
+  return rolledBack;
+}
+
+async function removeSessionTurnDedupeKeyIfCurrent(
+  statePath: string,
+  key: string,
+): Promise<boolean> {
+  return updateLockedJsonState<boolean>(statePath, async (rawState) => {
+    const dedupeState = normalizeNotifyState(rawState);
+    if (!dedupeState.recent_turns[key]) {
+      return { result: false, write: false };
+    }
+    delete dedupeState.recent_turns[key];
+    dedupeState.last_event_at = new Date().toISOString();
+    return {
+      result: true,
+      nextState: dedupeState,
+      write: true,
+    };
+  });
+}
+
+async function replayProjectFallbackTurnDedupe(
+  stateDir: string,
+  logsDir: string,
+  key: string,
+  details: {
+    threadId: string;
+    turnId: string;
+    eventType: string;
+    sessionId: string;
+    source: string;
+    audience: string;
+    delivery: ProjectTurnDelivery;
+    reason: string;
+  },
+): Promise<ProjectTurnDedupeDecision | null> {
+  const now = Date.now();
+  const dedupePath = join(stateDir, NOTIFY_HOOK_STATE_FILE);
+  const dedupeLockPath = `${dedupePath}.lock`;
+  const currentClaim = createProjectTurnClaim(now, details);
+  const existingClaim = await readProjectTurnDedupeClaim(dedupePath, dedupeLockPath, key, now);
+
+  if (!existingClaim) return null;
+
+  let persistenceFailed = false;
+  await seedProjectTurnDedupeFromFallback(stateDir, key, existingClaim).catch(async (error) => {
+    persistenceFailed = true;
+    await logNotifyHookEvent(logsDir, {
+      timestamp: new Date().toISOString(),
+      level: 'warn',
+      type: 'project_fallback_turn_dedupe_seed_failed',
+      thread_id: details.threadId || null,
+      turn_id: details.turnId || null,
+      event_type: details.eventType,
+      omx_session_id: details.sessionId || null,
+      source: details.source || null,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });
+
+  const decision = {
+    ...decideProjectTurnAgainstExistingClaim(existingClaim, currentClaim),
+    persistenceFailed,
+  };
+
+  if (!decision.shouldContinue) {
+    await logNotifyHookEvent(logsDir, {
+      timestamp: new Date().toISOString(),
+      type: 'turn_duplicate_suppressed',
+      scope: 'project_fallback',
+      thread_id: details.threadId || null,
+      turn_id: details.turnId || null,
+      event_type: details.eventType,
+      omx_session_id: details.sessionId || null,
+      source: details.source || null,
+      existing_source: decision.existingClaim?.source || null,
+      existing_source_kind: decision.existingClaim?.source_kind || null,
+      existing_delivery: decision.existingClaim?.delivery || null,
+    });
+    return decision;
+  }
+
+  if (decision.reason === 'owner_upgrade') {
+    await logNotifyHookEvent(logsDir, {
+      timestamp: new Date().toISOString(),
+      type: 'turn_duplicate_owner_upgraded',
+      scope: 'project_fallback',
+      thread_id: details.threadId || null,
+      turn_id: details.turnId || null,
+      event_type: details.eventType,
+      omx_session_id: details.sessionId || null,
+      source: details.source || null,
+      previous_source: decision.existingClaim?.source || null,
+      previous_source_kind: decision.existingClaim?.source_kind || null,
+      previous_delivery: decision.existingClaim?.delivery || null,
+      suppress_external_delivery: decision.suppressExternalDelivery,
+      write_failed: false,
+    });
+  }
+
+  return decision;
+}
+
+async function replayPrimaryProjectTurnDedupe(
+  stateDir: string,
+  logsDir: string,
+  key: string,
+  details: {
+    threadId: string;
+    turnId: string;
+    eventType: string;
+    sessionId: string;
+    source: string;
+    audience: string;
+    delivery: ProjectTurnDelivery;
+    reason: string;
+  },
+): Promise<ProjectTurnDedupeDecision | null> {
+  const now = Date.now();
+  const dedupePath = join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_FILE);
+  const dedupeLockPath = join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_LOCK_FILE);
+  const currentClaim = createProjectTurnClaim(now, details);
+  const existingClaim = await readProjectTurnDedupeClaim(dedupePath, dedupeLockPath, key, now);
+
+  if (!existingClaim) return null;
+
+  const decision = decideProjectTurnAgainstExistingClaim(existingClaim, currentClaim);
+  if (!decision.shouldContinue) {
+    await logNotifyHookEvent(logsDir, {
+      timestamp: new Date().toISOString(),
+      type: 'turn_duplicate_suppressed',
+      scope: 'project',
+      thread_id: details.threadId || null,
+      turn_id: details.turnId || null,
+      event_type: details.eventType,
+      omx_session_id: details.sessionId || null,
+      source: details.source || null,
+      existing_source: decision.existingClaim?.source || null,
+      existing_source_kind: decision.existingClaim?.source_kind || null,
+      existing_delivery: decision.existingClaim?.delivery || null,
+    });
+    return decision;
+  }
+
+  if (decision.reason === 'owner_upgrade') {
+    await logNotifyHookEvent(logsDir, {
+      timestamp: new Date().toISOString(),
+      type: 'turn_duplicate_owner_upgraded',
+      scope: 'project',
+      thread_id: details.threadId || null,
+      turn_id: details.turnId || null,
+      event_type: details.eventType,
+      omx_session_id: details.sessionId || null,
+      source: details.source || null,
+      previous_source: decision.existingClaim?.source || null,
+      previous_source_kind: decision.existingClaim?.source_kind || null,
+      previous_delivery: decision.existingClaim?.delivery || null,
+      suppress_external_delivery: decision.suppressExternalDelivery,
+      write_failed: false,
+    });
+  }
+
+  return decision;
+}
+
+interface ProjectFallbackReplayAttempt {
+  decision: ProjectTurnDedupeDecision | null;
+  failed: boolean;
+  lockTimedOut: boolean;
+}
+
+async function attemptProjectFallbackTurnDedupeReplay(
+  stateDir: string,
+  logsDir: string,
+  key: string,
+  details: {
+    threadId: string;
+    turnId: string;
+    eventType: string;
+    sessionId: string;
+    source: string;
+    audience: string;
+    delivery: ProjectTurnDelivery;
+    reason: string;
+  },
+  phase: 'before_project' | 'after_project',
+): Promise<ProjectFallbackReplayAttempt> {
+  if (phase === 'before_project' && !fallbackDedupeStateExists(stateDir)) {
+    return { decision: null, failed: false, lockTimedOut: false };
+  }
+
+  try {
+    return {
+      decision: await replayProjectFallbackTurnDedupe(stateDir, logsDir, key, details),
+      failed: false,
+      lockTimedOut: false,
+    };
+  } catch (error) {
+    await logNotifyHookEvent(logsDir, {
+      timestamp: new Date().toISOString(),
+      level: 'warn',
+      type: 'project_fallback_turn_dedupe_replay_failed',
+      phase,
+      thread_id: details.threadId || null,
+      turn_id: details.turnId || null,
+      event_type: details.eventType,
+      omx_session_id: details.sessionId || null,
+      fallback_state_exists: true,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      decision: null,
+      failed: true,
+      lockTimedOut: isStateFileLockTimeout(error),
+    };
+  }
 }
 
 async function main() {
@@ -466,6 +1466,8 @@ async function main() {
   let turnOrigin = originResolution.origin;
   const suppressExternalCompletedTurn = originResolution.delivery === 'suppress';
   let suppressProjectCompletedTurnDelivery = false;
+  let pendingProjectFallbackOwnerUpgrade: PendingProjectFallbackOwnerUpgrade | null = null;
+  let completedTurnDedupeForDeliveryStatus: ProjectTurnDedupeKeyDetails | null = null;
   await logNotifyHookEvent(logsDir, {
     timestamp: new Date().toISOString(),
     type: 'turn_origin_resolved',
@@ -491,38 +1493,844 @@ async function main() {
       const eventType = normalizeTurnDedupeEventType(payload.type);
       const key = `${threadId || 'no-thread'}|${turnId}|${eventType}`;
       const dedupeSessionId = getEffectiveSessionId();
-      const projectDedupe = await recordProjectTurnDedupe(
-        stateDir,
-        logsDir,
-        key,
-        {
+      const projectDedupeDetails = {
+        threadId,
+        turnId,
+        eventType,
+        sessionId: dedupeSessionId,
+        source: safeString(payload.source || ''),
+        audience: originResolution.audience,
+        delivery: normalizeProjectTurnDelivery(originResolution.delivery),
+        reason: originResolution.reason,
+      };
+      if (projectDedupeDetails.delivery === 'allow') {
+        completedTurnDedupeForDeliveryStatus = {
+          key,
           threadId,
           turnId,
           eventType,
           sessionId: dedupeSessionId,
-          source: safeString(payload.source || ''),
-          audience: originResolution.audience,
-          delivery: normalizeProjectTurnDelivery(originResolution.delivery),
-          reason: originResolution.reason,
-        },
+          source: projectDedupeDetails.source,
+        };
+      }
+      const beforeProjectFallbackReplay = await attemptProjectFallbackTurnDedupeReplay(
+        stateDir,
+        logsDir,
+        key,
+        projectDedupeDetails,
+        'before_project',
       );
-      if (!projectDedupe.shouldContinue) {
+      let recoveredBeforeProjectFallbackAllowClaim = false;
+      if (beforeProjectFallbackReplay.decision && !beforeProjectFallbackReplay.decision.shouldContinue) {
+        const shouldRecoverFallbackAllowClaim = beforeProjectFallbackReplay.decision.currentClaim.delivery === 'allow'
+          && beforeProjectFallbackReplay.decision.existingClaim?.delivery === 'allow'
+          && await shouldRecoverUndeliveredAllowClaim(
+            logsDir,
+            { threadId, turnId },
+            beforeProjectFallbackReplay.decision.existingClaim,
+          );
+        if (beforeProjectFallbackReplay.decision.existingClaim) {
+          const primaryClaim = await readProjectTurnDedupeClaim(
+            join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_FILE),
+            join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_LOCK_FILE),
+            key,
+            Date.now(),
+          ).catch(async (error) => {
+            await logNotifyHookEvent(logsDir, {
+              timestamp: new Date().toISOString(),
+              level: 'warn',
+              type: 'project_turn_dedupe_repair_read_failed',
+              thread_id: threadId || null,
+              turn_id: turnId || null,
+              event_type: eventType,
+              omx_session_id: dedupeSessionId || null,
+              reason: 'fallback_duplicate_before_project',
+              error: error instanceof Error ? error.message : String(error),
+            });
+            return null;
+          });
+          const primaryRepairClaim = primaryClaim?.delivery === 'allow'
+            ? closeLegacyAllowClaimForFallbackRepair(primaryClaim)
+            : null;
+          if (
+            primaryRepairClaim
+            && isProjectAllowClaimDeliveryClosed(primaryRepairClaim)
+            && !sameProjectTurnClaim(primaryRepairClaim, beforeProjectFallbackReplay.decision.existingClaim)
+          ) {
+            await finalizeProjectFallbackOwnerUpgrade(stateDir, logsDir, {
+              key,
+              expectedClaim: beforeProjectFallbackReplay.decision.existingClaim,
+              nextClaim: primaryRepairClaim,
+              threadId,
+              turnId,
+              eventType,
+              sessionId: dedupeSessionId,
+              source: projectDedupeDetails.source,
+            });
+          }
+        }
+        if (!shouldRecoverFallbackAllowClaim) {
+          process.exit(0);
+        }
+        recoveredBeforeProjectFallbackAllowClaim = true;
+        await logNotifyHookEvent(logsDir, {
+          timestamp: new Date().toISOString(),
+          level: 'warn',
+          type: 'project_fallback_turn_dedupe_allow_claim_recovered_before_delivery',
+          thread_id: threadId || null,
+          turn_id: turnId || null,
+          event_type: eventType,
+          omx_session_id: dedupeSessionId || null,
+          source: projectDedupeDetails.source || null,
+          existing_source: beforeProjectFallbackReplay.decision.existingClaim?.source || null,
+          existing_source_kind: beforeProjectFallbackReplay.decision.existingClaim?.source_kind || null,
+        });
+      }
+      if (beforeProjectFallbackReplay.decision?.persistenceFailed) {
         process.exit(0);
       }
-      suppressProjectCompletedTurnDelivery = projectDedupe.suppressExternalDelivery;
+      if (beforeProjectFallbackReplay.decision) {
+        if (
+          beforeProjectFallbackReplay.decision.shouldContinue
+          && beforeProjectFallbackReplay.decision.suppressExternalDelivery
+          && beforeProjectFallbackReplay.decision.existingClaim?.delivery === 'allow'
+        ) {
+          recoveredBeforeProjectFallbackAllowClaim = await shouldRecoverUndeliveredAllowClaim(
+            logsDir,
+            { threadId, turnId },
+            beforeProjectFallbackReplay.decision.existingClaim,
+          );
+          if (recoveredBeforeProjectFallbackAllowClaim) {
+            await logNotifyHookEvent(logsDir, {
+              timestamp: new Date().toISOString(),
+              level: 'warn',
+              type: 'project_fallback_turn_dedupe_allow_claim_recovered_before_delivery',
+              phase: 'before_project_owner_upgrade',
+              thread_id: threadId || null,
+              turn_id: turnId || null,
+              event_type: eventType,
+              omx_session_id: dedupeSessionId || null,
+              source: projectDedupeDetails.source || null,
+              existing_source: beforeProjectFallbackReplay.decision.existingClaim.source || null,
+              existing_source_kind: beforeProjectFallbackReplay.decision.existingClaim.source_kind || null,
+            });
+          }
+          if (!recoveredBeforeProjectFallbackAllowClaim) {
+            await logNotifyHookEvent(logsDir, {
+              timestamp: new Date().toISOString(),
+              type: 'completed_turn_duplicate_suppressed',
+              origin_kind: turnOrigin.kind,
+              audience: originResolution.audience,
+              delivery: 'suppress',
+              reason: 'project_duplicate_previous_delivery',
+              thread_id: threadId || null,
+              turn_id: turnId || null,
+              native_session_id: payloadSessionId || turnOrigin.nativeSessionId || null,
+              omx_session_id: dedupeSessionId || null,
+              parent_thread_id: turnOrigin.parentThreadId || null,
+              agent_nickname: turnOrigin.agentNickname || null,
+              agent_role: turnOrigin.agentRole || null,
+              origin_evidence: originResolution.evidence,
+              evidence_sources: originResolution.evidence.map((entry) => entry.source),
+              existing_source: beforeProjectFallbackReplay.decision.existingClaim.source || null,
+              existing_source_kind: beforeProjectFallbackReplay.decision.existingClaim.source_kind || null,
+              existing_delivery_status: beforeProjectFallbackReplay.decision.existingClaim.delivery_status || null,
+            });
+            process.exit(0);
+          }
+        }
+        if (!recoveredBeforeProjectFallbackAllowClaim) {
+          suppressProjectCompletedTurnDelivery ||= beforeProjectFallbackReplay.decision.suppressExternalDelivery;
+        }
+        if (
+          beforeProjectFallbackReplay.decision.reason === 'owner_upgrade'
+          && beforeProjectFallbackReplay.decision.existingClaim
+        ) {
+          pendingProjectFallbackOwnerUpgrade = {
+            key,
+            expectedClaim: beforeProjectFallbackReplay.decision.existingClaim,
+            nextClaim: beforeProjectFallbackReplay.decision.currentClaim,
+            threadId,
+            turnId,
+            eventType,
+            sessionId: dedupeSessionId,
+            source: projectDedupeDetails.source,
+          };
+        }
+      }
+      let projectDedupeFailed = false;
+      let projectDedupe: ProjectTurnDedupeDecision | null = null;
+      let recoveringUndeliveredProjectAllowClaim = false;
+      let pendingProjectPrimaryRollback: PendingProjectFallbackOwnerUpgrade['primaryRollback'] | undefined;
+      try {
+        projectDedupe = await recordProjectTurnDedupe(
+          stateDir,
+          logsDir,
+          key,
+          projectDedupeDetails,
+        );
+        if (
+          recoveredBeforeProjectFallbackAllowClaim
+          && projectDedupe.shouldContinue
+          && projectDedupe.reason === 'owner_upgrade'
+          && projectDedupe.existingClaim?.delivery === 'allow'
+          && projectDedupe.suppressExternalDelivery
+        ) {
+          recoveringUndeliveredProjectAllowClaim = true;
+          projectDedupe = {
+            ...projectDedupe,
+            suppressExternalDelivery: false,
+          };
+        }
+        if (!projectDedupe.shouldContinue) {
+          const shouldRecoverAllowClaim = projectDedupe.currentClaim.delivery === 'allow'
+            && projectDedupe.existingClaim?.delivery === 'allow'
+            && await shouldRecoverUndeliveredAllowClaim(
+              logsDir,
+              { threadId, turnId },
+              projectDedupe.existingClaim,
+          );
+          if (!shouldRecoverAllowClaim) {
+            if (pendingProjectFallbackOwnerUpgrade) {
+              const closedRepairClaim = projectDedupe.existingClaim?.delivery === 'allow'
+                ? closeLegacyAllowClaimForFallbackRepair(projectDedupe.existingClaim)
+                : null;
+              if (closedRepairClaim && isProjectAllowClaimDeliveryClosed(closedRepairClaim)) {
+                await finalizeProjectFallbackOwnerUpgrade(
+                  stateDir,
+                  logsDir,
+                  {
+                    ...pendingProjectFallbackOwnerUpgrade,
+                    nextClaim: closedRepairClaim,
+                  },
+                );
+              }
+              pendingProjectFallbackOwnerUpgrade = null;
+            }
+            process.exit(0);
+          }
+          const recoveryClaimed = projectDedupe.existingClaim
+            ? await claimProjectTurnRecoveryIfCurrent(
+              stateDir,
+              key,
+              projectDedupe.existingClaim,
+              projectDedupe.currentClaim,
+            ).catch(async (error) => {
+              await logNotifyHookEvent(logsDir, {
+                timestamp: new Date().toISOString(),
+                level: 'warn',
+                type: 'project_turn_dedupe_recovery_claim_failed',
+                thread_id: threadId || null,
+                turn_id: turnId || null,
+                event_type: eventType,
+                omx_session_id: dedupeSessionId || null,
+                source: projectDedupeDetails.source || null,
+                error: error instanceof Error ? error.message : String(error),
+              });
+              return false;
+            })
+            : false;
+          if (!recoveryClaimed) {
+            await logNotifyHookEvent(logsDir, {
+              timestamp: new Date().toISOString(),
+              level: 'warn',
+              type: 'project_turn_dedupe_recovery_claim_failed',
+              thread_id: threadId || null,
+              turn_id: turnId || null,
+              event_type: eventType,
+              omx_session_id: dedupeSessionId || null,
+              source: projectDedupeDetails.source || null,
+              existing_source: projectDedupe.existingClaim?.source || null,
+              existing_source_kind: projectDedupe.existingClaim?.source_kind || null,
+              reason: 'claim_changed_before_recovery',
+            });
+            process.exit(0);
+          }
+          recoveringUndeliveredProjectAllowClaim = true;
+          suppressProjectCompletedTurnDelivery = false;
+          await logNotifyHookEvent(logsDir, {
+            timestamp: new Date().toISOString(),
+            level: 'warn',
+            type: 'project_turn_dedupe_allow_claim_recovered_before_delivery',
+            thread_id: threadId || null,
+            turn_id: turnId || null,
+            event_type: eventType,
+            omx_session_id: dedupeSessionId || null,
+            source: projectDedupeDetails.source || null,
+            existing_source: projectDedupe.existingClaim?.source || null,
+            existing_source_kind: projectDedupe.existingClaim?.source_kind || null,
+            fallback_inconsistent: Boolean(pendingProjectFallbackOwnerUpgrade),
+          });
+          projectDedupe = {
+            ...projectDedupe,
+            shouldContinue: true,
+            suppressExternalDelivery: false,
+            reason: 'allow_claim_recovered_before_delivery',
+          };
+        }
+        projectDedupeFailed = projectDedupe.persistenceFailed === true;
+        suppressProjectCompletedTurnDelivery ||= projectDedupe.suppressExternalDelivery;
+        pendingProjectPrimaryRollback = projectPrimaryRollbackForPreDelivery(projectDedupe);
+        if (pendingProjectFallbackOwnerUpgrade && projectDedupe.shouldContinue) {
+          pendingProjectFallbackOwnerUpgrade = {
+            ...pendingProjectFallbackOwnerUpgrade,
+            nextClaim: projectDedupe.currentClaim,
+            ...(pendingProjectPrimaryRollback
+              ? { primaryRollback: pendingProjectPrimaryRollback }
+              : {}),
+          };
+        }
+        if (
+          completedTurnDedupeForDeliveryStatus
+          && projectDedupe.shouldContinue
+          && projectDedupe.currentClaim.delivery === 'allow'
+          && !projectDedupe.suppressExternalDelivery
+        ) {
+          completedTurnDedupeForDeliveryStatus = {
+            ...completedTurnDedupeForDeliveryStatus,
+            expectedClaim: projectDedupe.currentClaim,
+          };
+        }
+      } catch (error) {
+        projectDedupeFailed = true;
+        await logNotifyHookEvent(logsDir, {
+          timestamp: new Date().toISOString(),
+          level: 'warn',
+          type: 'project_turn_dedupe_failed',
+          thread_id: threadId || null,
+          turn_id: turnId || null,
+          event_type: eventType,
+          omx_session_id: dedupeSessionId || null,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        if (isStateFileLockTimeout(error)) {
+          process.exit(0);
+        }
+      }
 
-      const dedupeStatePath = await getScopedStatePath(stateDir, NOTIFY_HOOK_STATE_FILE, dedupeSessionId);
-      const dedupeState = normalizeNotifyState(
-        await readScopedJsonIfExists(stateDir, NOTIFY_HOOK_STATE_FILE, dedupeSessionId, null),
-      );
-      dedupeState.recent_turns = pruneRecentTurns(dedupeState.recent_turns, now);
-      if (dedupeState.recent_turns[key]) {
+      let projectFallbackDedupeFailed = false;
+      let pendingProjectFallbackRollback: ProjectTurnClaim | null = null;
+      if (!projectDedupeFailed && projectDedupe?.shouldContinue && !beforeProjectFallbackReplay.decision) {
+        // Lock and read the fallback store even when it does not exist yet.
+        // This orders normal primary writers against degraded fallback writers:
+        // whichever store writes first is visible to the other's post-write check.
+        const afterProjectFallbackReplay = await attemptProjectFallbackTurnDedupeReplay(
+          stateDir,
+          logsDir,
+          key,
+          projectDedupeDetails,
+          'after_project',
+        );
+        if (afterProjectFallbackReplay.decision) {
+          const afterProjectFallbackClosedAllow = Boolean(
+            afterProjectFallbackReplay.decision.existingClaim
+            && isProjectAllowClaimDeliveryClosed(afterProjectFallbackReplay.decision.existingClaim),
+          );
+          await logNotifyHookEvent(logsDir, {
+            timestamp: new Date().toISOString(),
+            type: 'project_fallback_turn_dedupe_primary_won_race',
+            thread_id: threadId || null,
+            turn_id: turnId || null,
+            event_type: eventType,
+            omx_session_id: dedupeSessionId || null,
+            decision_reason: afterProjectFallbackReplay.decision.reason,
+            fallback_delivery: afterProjectFallbackReplay.decision.existingClaim?.delivery || null,
+            fallback_source: afterProjectFallbackReplay.decision.existingClaim?.source || null,
+            fallback_source_kind: afterProjectFallbackReplay.decision.existingClaim?.source_kind || null,
+            suppress_external_delivery: afterProjectFallbackReplay.decision.suppressExternalDelivery,
+            fallback_delivery_closed: afterProjectFallbackClosedAllow,
+          });
+          const recoverFallbackAllowClaim = afterProjectFallbackReplay.decision.suppressExternalDelivery
+            && await shouldRecoverUndeliveredAllowClaim(
+              logsDir,
+              { threadId, turnId },
+              afterProjectFallbackReplay.decision.existingClaim,
+            );
+          if (recoverFallbackAllowClaim) {
+            await logNotifyHookEvent(logsDir, {
+              timestamp: new Date().toISOString(),
+              level: 'warn',
+              type: 'project_fallback_turn_dedupe_allow_claim_recovered_before_delivery',
+              phase: 'after_project',
+              thread_id: threadId || null,
+              turn_id: turnId || null,
+              event_type: eventType,
+              omx_session_id: dedupeSessionId || null,
+              source: projectDedupeDetails.source || null,
+              existing_source: afterProjectFallbackReplay.decision.existingClaim?.source || null,
+              existing_source_kind: afterProjectFallbackReplay.decision.existingClaim?.source_kind || null,
+            });
+          } else {
+            suppressProjectCompletedTurnDelivery ||=
+              afterProjectFallbackReplay.decision.suppressExternalDelivery
+              || afterProjectFallbackClosedAllow;
+          }
+        }
+        if (afterProjectFallbackReplay.decision?.persistenceFailed) {
+          const rolledBack = pendingProjectPrimaryRollback
+            ? await rollbackPendingPrimaryClaim(
+              stateDir,
+              logsDir,
+              {
+                key,
+                expectedClaim: projectDedupe.currentClaim,
+                nextClaim: projectDedupe.currentClaim,
+                primaryRollback: pendingProjectPrimaryRollback,
+                threadId,
+                turnId,
+                eventType,
+                sessionId: dedupeSessionId,
+                source: projectDedupeDetails.source,
+              },
+              'fallback_replay_persistence_failed',
+            )
+            : false;
+          if (rolledBack || suppressExternalCompletedTurn || suppressProjectCompletedTurnDelivery) {
+            process.exit(0);
+          }
+        }
+        if (afterProjectFallbackReplay.lockTimedOut) {
+          const shouldFailClosedAfterPrimaryLockTimeout = projectDedupe.reason === 'first'
+            || (
+              projectDedupe.reason === 'owner_upgrade'
+              && !projectDedupe.suppressExternalDelivery
+              && projectDedupe.existingClaim
+            );
+          if (shouldFailClosedAfterPrimaryLockTimeout) {
+            const rollbackSucceeded = projectDedupe.reason === 'owner_upgrade' && projectDedupe.existingClaim
+              ? await replaceProjectTurnDedupeClaimIfCurrent(
+                stateDir,
+                key,
+                projectDedupe.currentClaim,
+                projectDedupe.existingClaim,
+              ).catch(async (error) => {
+                await logNotifyHookEvent(logsDir, {
+                  timestamp: new Date().toISOString(),
+                  level: 'warn',
+                  type: 'project_turn_dedupe_rollback_failed',
+                  thread_id: threadId || null,
+                  turn_id: turnId || null,
+                  event_type: eventType,
+                  omx_session_id: dedupeSessionId || null,
+                  reason: 'fallback_replay_lock_timeout',
+                  rollback_mode: 'restore_previous_claim',
+                  error: error instanceof Error ? error.message : String(error),
+                });
+                return false;
+              })
+              : await removeProjectTurnDedupeClaimIfCurrent(
+                stateDir,
+                key,
+                projectDedupe.currentClaim,
+              ).catch(async (error) => {
+                await logNotifyHookEvent(logsDir, {
+                  timestamp: new Date().toISOString(),
+                  level: 'warn',
+                  type: 'project_turn_dedupe_rollback_failed',
+                  thread_id: threadId || null,
+                  turn_id: turnId || null,
+                  event_type: eventType,
+                  omx_session_id: dedupeSessionId || null,
+                  reason: 'fallback_replay_lock_timeout',
+                  rollback_mode: 'remove_first_claim',
+                  error: error instanceof Error ? error.message : String(error),
+                });
+                return false;
+              });
+            await logNotifyHookEvent(logsDir, {
+              timestamp: new Date().toISOString(),
+              level: 'warn',
+              type: 'project_turn_dedupe_rolled_back',
+              thread_id: threadId || null,
+              turn_id: turnId || null,
+              event_type: eventType,
+              omx_session_id: dedupeSessionId || null,
+              reason: 'fallback_replay_lock_timeout',
+              rollback_mode: projectDedupe.reason === 'owner_upgrade'
+                ? 'restore_previous_claim'
+                : 'remove_first_claim',
+              rolled_back: rollbackSucceeded,
+            });
+            process.exit(0);
+          }
+        }
+        if (
+          afterProjectFallbackReplay.decision?.reason === 'owner_upgrade'
+          && afterProjectFallbackReplay.decision.existingClaim
+        ) {
+          pendingProjectFallbackOwnerUpgrade = {
+            key,
+            expectedClaim: afterProjectFallbackReplay.decision.existingClaim,
+            nextClaim: afterProjectFallbackReplay.decision.currentClaim,
+            primaryRollback: pendingProjectPrimaryRollback,
+            threadId,
+            turnId,
+            eventType,
+            sessionId: dedupeSessionId,
+            source: projectDedupeDetails.source,
+          };
+        }
+      } else if (projectDedupeFailed) {
+        if (beforeProjectFallbackReplay.failed && beforeProjectFallbackReplay.lockTimedOut) {
+          process.exit(0);
+        }
+        try {
+          const fallbackProjectDedupe = await recordProjectFallbackTurnDedupe(
+            stateDir,
+            logsDir,
+            key,
+            projectDedupeDetails,
+          );
+          if (!fallbackProjectDedupe.shouldContinue) {
+            process.exit(0);
+          }
+          if (fallbackProjectDedupe.persistenceFailed) {
+            process.exit(0);
+          }
+          if (fallbackProjectDedupe.reason === 'first') {
+            pendingProjectFallbackRollback = fallbackProjectDedupe.currentClaim;
+          }
+          if (
+            completedTurnDedupeForDeliveryStatus
+            && fallbackProjectDedupe.shouldContinue
+            && fallbackProjectDedupe.currentClaim.delivery === 'allow'
+            && !fallbackProjectDedupe.suppressExternalDelivery
+          ) {
+            completedTurnDedupeForDeliveryStatus = {
+              ...completedTurnDedupeForDeliveryStatus,
+              expectedClaim: fallbackProjectDedupe.currentClaim,
+            };
+          }
+          // Mirror the post-primary fallback check in the degraded direction so
+          // a fallback writer suppresses itself if a healthy primary writer won.
+          const primaryReplay = await replayPrimaryProjectTurnDedupe(
+            stateDir,
+            logsDir,
+            key,
+            projectDedupeDetails,
+          ).catch(async (error) => {
+            await logNotifyHookEvent(logsDir, {
+              timestamp: new Date().toISOString(),
+              level: 'warn',
+              type: 'project_turn_dedupe_replay_failed',
+              thread_id: threadId || null,
+              turn_id: turnId || null,
+              event_type: eventType,
+              omx_session_id: dedupeSessionId || null,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            if (isStateFileLockTimeout(error)) {
+              if (fallbackProjectDedupe.reason === 'first') {
+                const rollbackSucceeded = await removeProjectFallbackTurnDedupeClaimIfCurrent(
+                  stateDir,
+                  key,
+                  fallbackProjectDedupe.currentClaim,
+                ).catch(async (rollbackError) => {
+                  await logNotifyHookEvent(logsDir, {
+                    timestamp: new Date().toISOString(),
+                    level: 'warn',
+                    type: 'project_fallback_turn_dedupe_rollback_failed',
+                    thread_id: threadId || null,
+                    turn_id: turnId || null,
+                    event_type: eventType,
+                    omx_session_id: dedupeSessionId || null,
+                    reason: 'primary_replay_lock_timeout',
+                    error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+                  });
+                  return false;
+                });
+                await logNotifyHookEvent(logsDir, {
+                  timestamp: new Date().toISOString(),
+                  level: 'warn',
+                  type: 'project_fallback_turn_dedupe_rolled_back',
+                  thread_id: threadId || null,
+                  turn_id: turnId || null,
+                  event_type: eventType,
+                  omx_session_id: dedupeSessionId || null,
+                  reason: 'primary_replay_lock_timeout',
+                  rolled_back: rollbackSucceeded,
+                });
+              }
+              projectFallbackDedupeFailed = true;
+            }
+            return null;
+          });
+          if (primaryReplay && !primaryReplay.shouldContinue) {
+            if (primaryReplay.existingClaim?.delivery === 'allow') {
+              await finalizeProjectFallbackOwnerUpgrade(stateDir, logsDir, {
+                key,
+                expectedClaim: fallbackProjectDedupe.reason === 'owner_upgrade' && fallbackProjectDedupe.existingClaim
+                  ? fallbackProjectDedupe.existingClaim
+                  : fallbackProjectDedupe.currentClaim,
+                nextClaim: closeLegacyAllowClaimForFallbackRepair(primaryReplay.existingClaim),
+                threadId,
+                turnId,
+                eventType,
+                sessionId: dedupeSessionId,
+                source: projectDedupeDetails.source,
+              });
+            }
+            process.exit(0);
+          }
+          if (primaryReplay?.persistenceFailed) {
+            process.exit(0);
+          }
+          if (primaryReplay) {
+            suppressProjectCompletedTurnDelivery ||= primaryReplay.suppressExternalDelivery;
+          }
+          if (fallbackProjectDedupe.reason === 'owner_upgrade' && fallbackProjectDedupe.existingClaim) {
+            pendingProjectFallbackOwnerUpgrade = {
+              key,
+              expectedClaim: fallbackProjectDedupe.existingClaim,
+              nextClaim: fallbackProjectDedupe.currentClaim,
+              threadId,
+              turnId,
+              eventType,
+              sessionId: dedupeSessionId,
+              source: projectDedupeDetails.source,
+            };
+          }
+          suppressProjectCompletedTurnDelivery ||= fallbackProjectDedupe.suppressExternalDelivery;
+        } catch (error) {
+          projectFallbackDedupeFailed = true;
+          await logNotifyHookEvent(logsDir, {
+            timestamp: new Date().toISOString(),
+            level: 'warn',
+            type: 'project_fallback_turn_dedupe_failed',
+            thread_id: threadId || null,
+            turn_id: turnId || null,
+            event_type: eventType,
+            omx_session_id: dedupeSessionId || null,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      if (projectDedupeFailed && projectFallbackDedupeFailed) {
         process.exit(0);
       }
-      dedupeState.recent_turns[key] = now;
-      dedupeState.last_event_at = new Date().toISOString();
-      await mkdir(dirname(dedupeStatePath), { recursive: true }).catch(() => {});
-      await writeFile(dedupeStatePath, JSON.stringify(dedupeState, null, 2)).catch(() => {});
+
+      const scopedDedupeDir = await resolveScopedStateDir(stateDir, dedupeSessionId);
+      const sessionDedupeStatePath = scopedDedupeDir === stateDir
+        ? null
+        : join(scopedDedupeDir, NOTIFY_HOOK_STATE_FILE);
+      let fallbackFirst = true;
+      try {
+        if (!sessionDedupeStatePath) {
+          fallbackFirst = true;
+        } else {
+          fallbackFirst = await updateLockedJsonState<boolean>(sessionDedupeStatePath, async (rawState) => {
+            const dedupeState = normalizeNotifyState(rawState);
+            dedupeState.recent_turns = pruneRecentTurns(dedupeState.recent_turns, now);
+            if (dedupeState.recent_turns[key]) {
+              return { result: false, write: false };
+            }
+            dedupeState.recent_turns[key] = now;
+            dedupeState.last_event_at = new Date().toISOString();
+            return {
+              result: true,
+              nextState: dedupeState,
+              write: true,
+            };
+          });
+        }
+      } catch (error) {
+        await logNotifyHookEvent(logsDir, {
+          timestamp: new Date().toISOString(),
+          level: 'warn',
+          type: 'session_turn_dedupe_failed',
+          scope: 'session',
+          thread_id: threadId || null,
+          turn_id: turnId || null,
+          event_type: eventType,
+          omx_session_id: dedupeSessionId || null,
+          project_dedupe_failed: projectDedupeFailed,
+          project_fallback_dedupe_failed: projectFallbackDedupeFailed,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        if (pendingProjectFallbackRollback) {
+          const fallbackRolledBack = await removeProjectFallbackTurnDedupeClaimIfCurrent(
+            stateDir,
+            key,
+            pendingProjectFallbackRollback,
+          ).catch(async (rollbackError) => {
+            await logNotifyHookEvent(logsDir, {
+              timestamp: new Date().toISOString(),
+              level: 'warn',
+              type: 'project_fallback_turn_dedupe_rollback_failed',
+              thread_id: threadId || null,
+              turn_id: turnId || null,
+              event_type: eventType,
+              omx_session_id: dedupeSessionId || null,
+              reason: 'session_turn_dedupe_failed',
+              error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+            });
+            return false;
+          });
+          await logNotifyHookEvent(logsDir, {
+            timestamp: new Date().toISOString(),
+            level: 'warn',
+            type: 'project_fallback_turn_dedupe_rolled_back',
+            thread_id: threadId || null,
+            turn_id: turnId || null,
+            event_type: eventType,
+            omx_session_id: dedupeSessionId || null,
+            reason: 'session_turn_dedupe_failed',
+            rolled_back: fallbackRolledBack,
+          });
+          process.exit(0);
+        }
+        if (projectDedupeFailed) {
+          process.exit(0);
+        }
+        if (projectDedupeFailed && projectFallbackDedupeFailed) {
+          process.exit(0);
+        }
+      }
+      if (!fallbackFirst) {
+        const shouldRecoverSessionDuplicate = recoveringUndeliveredProjectAllowClaim
+          || (
+            projectDedupe?.reason === 'owner_upgrade'
+            && projectDedupe.currentClaim.delivery === 'allow'
+            && projectDedupe.existingClaim?.delivery === 'suppress'
+            && !projectDedupe.suppressExternalDelivery
+          );
+        let recoveredSessionDuplicate = false;
+        if (shouldRecoverSessionDuplicate) {
+          recoveredSessionDuplicate = true;
+          await logNotifyHookEvent(logsDir, {
+            timestamp: new Date().toISOString(),
+            level: 'warn',
+            type: 'session_turn_dedupe_recovered_before_delivery',
+            scope: 'session',
+            thread_id: threadId || null,
+            turn_id: turnId || null,
+            event_type: eventType,
+            omx_session_id: dedupeSessionId || null,
+            recovered: true,
+          });
+        }
+        const rolledBack = !recoveredSessionDuplicate && pendingProjectPrimaryRollback
+          ? await rollbackPendingPrimaryClaim(
+            stateDir,
+            logsDir,
+            {
+              key,
+              expectedClaim: pendingProjectPrimaryRollback.expectedClaim,
+              nextClaim: pendingProjectPrimaryRollback.expectedClaim,
+              primaryRollback: pendingProjectPrimaryRollback,
+              threadId,
+              turnId,
+              eventType,
+              sessionId: dedupeSessionId,
+              source: projectDedupeDetails.source,
+            },
+            'session_turn_dedupe_duplicate_before_delivery',
+          )
+          : false;
+        if (pendingProjectFallbackRollback) {
+          const fallbackRolledBack = await removeProjectFallbackTurnDedupeClaimIfCurrent(
+            stateDir,
+            key,
+            pendingProjectFallbackRollback,
+          ).catch(async (error) => {
+            await logNotifyHookEvent(logsDir, {
+              timestamp: new Date().toISOString(),
+              level: 'warn',
+              type: 'project_fallback_turn_dedupe_rollback_failed',
+              thread_id: threadId || null,
+              turn_id: turnId || null,
+              event_type: eventType,
+              omx_session_id: dedupeSessionId || null,
+              reason: 'session_turn_dedupe_duplicate_before_delivery',
+              error: error instanceof Error ? error.message : String(error),
+            });
+            return false;
+          });
+          await logNotifyHookEvent(logsDir, {
+            timestamp: new Date().toISOString(),
+            level: 'warn',
+            type: 'project_fallback_turn_dedupe_rolled_back',
+            thread_id: threadId || null,
+            turn_id: turnId || null,
+            event_type: eventType,
+            omx_session_id: dedupeSessionId || null,
+            reason: 'session_turn_dedupe_duplicate_before_delivery',
+            rolled_back: fallbackRolledBack,
+          });
+        }
+        if (rolledBack && pendingProjectPrimaryRollback?.replacementClaim && sessionDedupeStatePath) {
+          await removeSessionTurnDedupeKeyIfCurrent(
+            sessionDedupeStatePath,
+            key,
+          ).catch(async (error) => {
+            await logNotifyHookEvent(logsDir, {
+              timestamp: new Date().toISOString(),
+              level: 'warn',
+              type: 'session_turn_dedupe_rollback_failed',
+              scope: 'session',
+              thread_id: threadId || null,
+              turn_id: turnId || null,
+              event_type: eventType,
+              omx_session_id: dedupeSessionId || null,
+              reason: 'session_turn_dedupe_duplicate_before_delivery',
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+        }
+        if (
+          !recoveredSessionDuplicate
+          && (
+            rolledBack
+            || pendingProjectFallbackRollback
+            || !pendingProjectPrimaryRollback?.replacementClaim
+            || suppressExternalCompletedTurn
+            || suppressProjectCompletedTurnDelivery
+          )
+        ) {
+          process.exit(0);
+        }
+      }
+      if (
+        pendingProjectFallbackOwnerUpgrade
+        && !suppressExternalCompletedTurn
+        && !suppressProjectCompletedTurnDelivery
+      ) {
+        const fallbackUpgradeSucceeded = await finalizeProjectFallbackOwnerUpgrade(
+          stateDir,
+          logsDir,
+          pendingProjectFallbackOwnerUpgrade,
+        );
+        const failedUpgrade = pendingProjectFallbackOwnerUpgrade;
+        pendingProjectFallbackOwnerUpgrade = null;
+        if (!fallbackUpgradeSucceeded) {
+          const rolledBack = await rollbackPendingPrimaryClaim(
+            stateDir,
+            logsDir,
+            failedUpgrade,
+            'fallback_owner_upgrade_finalize_failed',
+          );
+          if ((rolledBack || !failedUpgrade.primaryRollback) && sessionDedupeStatePath) {
+            await removeSessionTurnDedupeKeyIfCurrent(
+              sessionDedupeStatePath,
+              key,
+            ).catch(async (error) => {
+              await logNotifyHookEvent(logsDir, {
+                timestamp: new Date().toISOString(),
+                level: 'warn',
+                type: 'session_turn_dedupe_rollback_failed',
+                scope: 'session',
+                thread_id: threadId || null,
+                turn_id: turnId || null,
+                event_type: eventType,
+                omx_session_id: dedupeSessionId || null,
+                reason: 'fallback_owner_upgrade_finalize_failed',
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+          }
+          process.exit(0);
+        }
+      }
     }
   } catch {
     // Non-critical
@@ -960,7 +2768,7 @@ async function main() {
   if (!isTeamWorker) {
     try {
       const { notifyCompletedTurn } = await import('../notifications/index.js');
-      const { getNotificationConfig } = await import('../notifications/config.js');
+      const { getNotificationConfig, getEnabledPlatforms, isEventEnabled } = await import('../notifications/config.js');
       const {
         shouldSendCompletedTurnNotification,
         recordCompletedTurnNotificationSent,
@@ -1005,11 +2813,46 @@ async function main() {
         });
       }
       const semanticOutcome = classifyCompletedTurn(lastAssistantMessage);
-      const canNotifyExternalCompletedTurn = Boolean(
+      let canNotifyExternalCompletedTurn = Boolean(
         notifySessionId
         && hasAssistantText
         && !suppressCompletedTurnDelivery,
       );
+      if (
+        canNotifyExternalCompletedTurn
+        && completedTurnDedupeForDeliveryStatus?.expectedClaim
+      ) {
+        const dispatchingResults = await markProjectTurnDeliveryStatus(
+          stateDir,
+          logsDir,
+          completedTurnDedupeForDeliveryStatus,
+          'dispatching',
+        );
+        if (dispatchingResults.project || dispatchingResults.project_fallback) {
+          completedTurnDedupeForDeliveryStatus = {
+            ...completedTurnDedupeForDeliveryStatus,
+            expectedClaim: {
+              ...completedTurnDedupeForDeliveryStatus.expectedClaim,
+              delivery_status: 'dispatching',
+            },
+          };
+        } else {
+          const deliveryStatusSource = completedTurnDedupeForDeliveryStatus.source;
+          canNotifyExternalCompletedTurn = false;
+          completedTurnDedupeForDeliveryStatus = null;
+          await logNotifyHookEvent(logsDir, {
+            timestamp: new Date().toISOString(),
+            level: 'warn',
+            type: 'project_turn_dedupe_delivery_status_failed',
+            delivery_status: 'dispatching',
+            thread_id: safeString(payload['thread-id'] || payload.thread_id || ''),
+            turn_id: safeString(payload['turn-id'] || payload.turn_id || ''),
+            omx_session_id: notifySessionId || null,
+            source: deliveryStatusSource || null,
+            reason: 'claim_changed_before_dispatch',
+          });
+        }
+      }
       if (canNotifyExternalCompletedTurn) {
         await logNotifyHookEvent(logsDir, {
           timestamp: new Date().toISOString(),
@@ -1040,6 +2883,16 @@ async function main() {
         assistantText: lastAssistantMessage,
         notificationConfig,
       });
+      const notificationEventEnabled = Boolean(
+        notificationConfig
+        && decision
+        && isEventEnabled(notificationConfig, decision.effectiveEvent),
+      );
+      const standardNotificationPlatformsEnabled = Boolean(
+        notificationConfig
+        && decision
+        && getEnabledPlatforms(notificationConfig, decision.effectiveEvent).length > 0,
+      );
       const completedTurnHookFingerprint = buildCompletedTurnHookFingerprint(
         decision,
         semanticOutcome,
@@ -1060,27 +2913,99 @@ async function main() {
           notifySessionId,
           completedTurnHookFingerprint,
         );
+      let completedTurnDeliveryStatus: ProjectTurnDeliveryStatus | null = null;
+      let completedTurnNotificationFailed = false;
 
       if (shouldNotifyCompletedTurn || shouldDispatchSessionIdleHookEvent) {
         if (shouldNotifyCompletedTurn) {
           const completedTurnResult = await notifyCompletedTurn(decision!, {
-            sessionId: notifySessionId,
-            projectPath: cwd,
-            contextSummary: semanticOutcome.summary || undefined,
-            question:
-              semanticOutcome.kind === 'input-needed'
-                ? (semanticOutcome.question || semanticOutcome.summary || 'Input is needed to continue.')
-                : undefined,
-            assistantText: lastAssistantMessage,
-          }, undefined, {
-            getNotificationConfigImpl: () => notificationConfig,
-          });
+              sessionId: notifySessionId,
+              projectPath: cwd,
+              contextSummary: semanticOutcome.summary || undefined,
+              question:
+                semanticOutcome.kind === 'input-needed'
+                  ? (semanticOutcome.question || semanticOutcome.summary || 'Input is needed to continue.')
+                  : undefined,
+              assistantText: lastAssistantMessage,
+            }, undefined, {
+              getNotificationConfigImpl: () => notificationConfig,
+            })
+            .catch(async (error) => {
+              await logNotifyHookEvent(logsDir, {
+                timestamp: new Date().toISOString(),
+                level: 'warn',
+                type: 'completed_turn_delivery_failed',
+                origin_kind: turnOrigin.kind,
+                audience: originResolution.audience,
+                delivery: originResolution.delivery,
+                reason: originResolution.reason,
+                thread_id: safeString(payload['thread-id'] || payload.thread_id || ''),
+                turn_id: safeString(payload['turn-id'] || payload.turn_id || ''),
+                native_session_id: payloadSessionId || turnOrigin.nativeSessionId || null,
+                omx_session_id: notifySessionId || null,
+                parent_thread_id: turnOrigin.parentThreadId || null,
+                agent_nickname: turnOrigin.agentNickname || null,
+                agent_role: turnOrigin.agentRole || null,
+                origin_evidence: originResolution.evidence,
+                evidence_sources: originResolution.evidence.map((entry) => entry.source),
+                notification_event: decision!.effectiveEvent,
+                error: error instanceof Error ? error.message : String(error),
+              });
+              return null;
+            });
           if (completedTurnResult && completedTurnResult.anySuccess) {
             recordCompletedTurnNotificationSent(
               stateDir,
               notifySessionId,
               decision!.effectiveFingerprint,
             );
+            completedTurnDeliveryStatus = 'sent';
+            await logNotifyHookEvent(logsDir, {
+              timestamp: new Date().toISOString(),
+              type: 'completed_turn_delivery_sent',
+              origin_kind: turnOrigin.kind,
+              audience: originResolution.audience,
+              delivery: originResolution.delivery,
+              reason: originResolution.reason,
+              thread_id: safeString(payload['thread-id'] || payload.thread_id || ''),
+              turn_id: safeString(payload['turn-id'] || payload.turn_id || ''),
+              native_session_id: payloadSessionId || turnOrigin.nativeSessionId || null,
+              omx_session_id: notifySessionId || null,
+              parent_thread_id: turnOrigin.parentThreadId || null,
+              agent_nickname: turnOrigin.agentNickname || null,
+              agent_role: turnOrigin.agentRole || null,
+              origin_evidence: originResolution.evidence,
+              evidence_sources: originResolution.evidence.map((entry) => entry.source),
+              notification_event: decision!.effectiveEvent,
+            });
+          } else if (
+            notificationEventEnabled
+            && !standardNotificationPlatformsEnabled
+            && completedTurnResult
+          ) {
+            completedTurnDeliveryStatus = 'committed';
+          } else if (notificationEventEnabled) {
+            completedTurnNotificationFailed = true;
+            await logNotifyHookEvent(logsDir, {
+              timestamp: new Date().toISOString(),
+              level: 'warn',
+              type: 'completed_turn_delivery_failed',
+              origin_kind: turnOrigin.kind,
+              audience: originResolution.audience,
+              delivery: originResolution.delivery,
+              reason: originResolution.reason,
+              thread_id: safeString(payload['thread-id'] || payload.thread_id || ''),
+              turn_id: safeString(payload['turn-id'] || payload.turn_id || ''),
+              native_session_id: payloadSessionId || turnOrigin.nativeSessionId || null,
+              omx_session_id: notifySessionId || null,
+              parent_thread_id: turnOrigin.parentThreadId || null,
+              agent_nickname: turnOrigin.agentNickname || null,
+              agent_role: turnOrigin.agentRole || null,
+              origin_evidence: originResolution.evidence,
+              evidence_sources: originResolution.evidence.map((entry) => entry.source),
+              notification_event: decision!.effectiveEvent,
+              any_success: completedTurnResult?.anySuccess ?? false,
+            });
           }
         }
 
@@ -1123,6 +3048,28 @@ async function main() {
             // Non-fatal
           }
         }
+      }
+      if (
+        !completedTurnDeliveryStatus
+        && completedTurnDedupeForDeliveryStatus
+        && !suppressCompletedTurnDelivery
+        && !completedTurnNotificationFailed
+        && (
+          !canNotifyExternalCompletedTurn
+          || !decision
+          || !notificationEventEnabled
+          || !shouldNotifyCompletedTurn
+        )
+      ) {
+        completedTurnDeliveryStatus = 'committed';
+      }
+      if (completedTurnDeliveryStatus && completedTurnDedupeForDeliveryStatus) {
+        await markProjectTurnDeliveryStatus(
+          stateDir,
+          logsDir,
+          completedTurnDedupeForDeliveryStatus,
+          completedTurnDeliveryStatus,
+        );
       }
     } catch {
       // Non-fatal: notification module may not be built or config may not exist
