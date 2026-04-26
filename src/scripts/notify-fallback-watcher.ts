@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 
 import { existsSync } from 'fs';
-import { appendFile, mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'fs/promises';
+import { appendFile, mkdir, open, readFile, rename, rm, stat, unlink, writeFile } from 'fs/promises';
 import { dirname, join, resolve } from 'path';
-import { homedir } from 'os';
 import { StringDecoder } from 'string_decoder';
 import { spawnPlatformCommandSync } from '../utils/platform-command.js';
 import { drainPendingTeamDispatch } from './notify-hook/team-dispatch.js';
@@ -33,10 +32,11 @@ import {
   DEFAULT_SUBAGENT_ACTIVE_WINDOW_MS,
   readSubagentSessionSummary,
 } from '../subagents/tracker.js';
+import type { TurnOrigin } from '../notifications/turn-origin.js';
 import {
-  resolveTurnOrigin,
-  type TurnOrigin,
-} from '../notifications/turn-origin.js';
+  discoverRecentCodexRolloutFiles,
+  parseRolloutSessionMetaLine,
+} from '../runtime/codex-session-origin.js';
 import { listNotifyCanonicalActiveTeams } from './notify-hook/active-team.js';
 import { sameFilePath } from '../utils/paths.js';
 import { validateSessionId } from '../mcp/state-paths.js';
@@ -1583,109 +1583,34 @@ async function enforceLifecycleGuards(): Promise<boolean> {
   return false;
 }
 
-function codexSessionRoots(): string[] {
-  const roots = [
-    safeString(process.env.CODEX_HOME),
-    join(safeString(process.env.HOME) || homedir(), '.codex'),
-    join(homedir(), '.codex'),
-  ].filter(Boolean);
-  return Array.from(new Set(roots));
-}
-
-function sessionDirs(): string[] {
-  const now = new Date();
-  const yesterdayDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-  const days = [now, yesterdayDate];
-  return Array.from(new Set(codexSessionRoots().flatMap((root) => days.map((day) => join(
-    root,
-    'sessions',
-    String(day.getUTCFullYear()),
-    String(day.getUTCMonth() + 1).padStart(2, '0'),
-    String(day.getUTCDate()).padStart(2, '0'),
-  )))));
-}
-
 async function readFirstLine(path: string): Promise<string> {
   const content = await readFile(path, 'utf-8');
   const idx = content.indexOf('\n');
   return idx >= 0 ? content.slice(0, idx) : content;
 }
 
-function recordValue(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {};
-}
-
-function isOmxExploreSessionMetaPayload(payload: Record<string, unknown>): boolean {
-  const originator = safeString(payload.originator).toLowerCase();
-  const source = safeString(payload.source).toLowerCase();
-  const baseInstructions = recordValue(payload.base_instructions);
-  const baseInstructionsText = safeString(baseInstructions.text || payload.base_instructions);
-  return originator === 'codex_exec'
-    && source === 'exec'
-    && (
-      baseInstructionsText.includes('OMX Explore Lightweight Instructions')
-      || baseInstructionsText.includes('executing the `omx explore` command path')
-    );
-}
-
 function parseSessionMetaLine(line: string): WatcherSessionMeta | null {
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(line) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-  if (!parsed || parsed.type !== 'session_meta' || !parsed.payload) return null;
-  const payload = parsed.payload as Record<string, unknown>;
-  if (safeString(payload.cwd) !== cwd) return null;
-  const threadId = safeString(payload.id);
-  if (!threadId) return null;
-  const parsedOrigin = resolveTurnOrigin({
-    session_meta: payload,
-    thread_id: threadId,
-  }, process.env);
-  const origin: TurnOrigin = {
-    ...parsedOrigin,
-    threadId: parsedOrigin.threadId || threadId,
-  };
-  const exploreHelper = isOmxExploreSessionMetaPayload(payload);
-  const effectiveOrigin: TurnOrigin = exploreHelper
-    ? {
-        ...origin,
-        kind: 'internal-helper',
-        source: 'omx-explore',
-      }
-    : origin;
-  const suppressCompletedTurn = effectiveOrigin.kind === 'internal-helper';
+  const parsed = parseRolloutSessionMetaLine(line, { cwd, env: process.env });
+  if (!parsed) return null;
+  const suppressCompletedTurn = parsed.origin.kind === 'internal-helper';
   return {
-    threadId,
-    sessionMeta: payload,
-    origin: effectiveOrigin,
+    threadId: parsed.threadId,
+    sessionMeta: parsed.sessionMeta,
+    origin: parsed.origin,
     suppressCompletedTurn,
     ...(suppressCompletedTurn
-      ? { suppressReason: exploreHelper ? 'omx_explore_helper' : effectiveOrigin.source || 'internal_helper' }
+      ? { suppressReason: parsed.origin.source === 'omx-explore' ? 'omx_explore_helper' : parsed.origin.source || 'internal_helper' }
       : {}),
   };
 }
 
 async function discoverRolloutFiles(): Promise<string[]> {
-  const discovered: string[] = [];
-  for (const dir of sessionDirs()) {
-    if (!existsSync(dir)) continue;
-    const names = await readdir(dir).catch(() => [] as string[]);
-    for (const name of names) {
-      if (!name.startsWith('rollout-') || !name.endsWith('.jsonl')) continue;
-      const path = join(dir, name);
-      const st = await stat(path).catch(() => null);
-      if (!st) continue;
-      if (st.mtimeMs < startedAt - fileWindowMs) continue;
-      discovered.push(path);
-    }
-  }
-  discovered.sort();
-  return discovered;
+  return await discoverRecentCodexRolloutFiles({
+    env: process.env,
+    now: new Date(),
+    startedAt,
+    fileWindowMs,
+  });
 }
 
 function turnKey(threadId: string, turnId: string): string {

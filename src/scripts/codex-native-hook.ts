@@ -57,6 +57,10 @@ import { reconcileHudForPromptSubmit } from "../hud/reconcile.js";
 import { onSessionStart as buildWikiSessionStartContext } from "../wiki/lifecycle.js";
 import { readAutoresearchCompletionStatus, readAutoresearchModeState } from "../autoresearch/skill-validation.js";
 import { shouldContinueRun } from "../runtime/run-loop.js";
+import {
+  recordCodexSessionOrigin,
+  resolveSessionStartOrigin,
+} from "../runtime/codex-session-origin.js";
 import { triagePrompt } from "../hooks/triage-heuristic.js";
 import { readTriageConfig } from "../hooks/triage-config.js";
 import {
@@ -1905,10 +1909,30 @@ export async function dispatchCodexNativeHook(
   let resolvedNativeSessionId = nativeSessionId;
 
   if (hookEventName === "SessionStart" && nativeSessionId) {
+    const sessionOrigin = resolveSessionStartOrigin({
+      ...payload,
+      thread_id: threadId || nativeSessionId,
+    });
+    const indexedOrigin = {
+      ...sessionOrigin.origin,
+      threadId: sessionOrigin.origin.threadId || threadId || nativeSessionId,
+      nativeSessionId: sessionOrigin.origin.nativeSessionId || nativeSessionId,
+    };
+    await recordCodexSessionOrigin({
+      cwd,
+      stateDir,
+      origin: indexedOrigin,
+      audience: sessionOrigin.audience,
+      evidence: sessionOrigin.evidence,
+    }).catch(() => null);
     const sessionState = await reconcileNativeSessionStart(cwd, nativeSessionId, {
       pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
+      ownerKind: sessionOrigin.ownerKind,
+      parentThreadId: sessionOrigin.origin.parentThreadId,
     });
-    canonicalSessionId = safeString(sessionState.session_id).trim();
+    canonicalSessionId = sessionOrigin.ownerKind === "external-owner" || currentSessionState
+      ? safeString(sessionState.session_id).trim()
+      : "";
     resolvedNativeSessionId = safeString(sessionState.native_session_id).trim() || nativeSessionId;
   } else if (!canonicalSessionId) {
     canonicalSessionId = safeString(currentSessionState?.session_id).trim();

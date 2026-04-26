@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import { once } from 'node:events';
 import assert from 'node:assert/strict';
-import { appendFile, chmod, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdtemp, mkdir, readFile, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -30,6 +30,28 @@ function todaySessionDir(baseHome: string): string {
   );
 }
 
+function localSessionDirForDate(baseHome: string, now: Date): string {
+  return join(
+    baseHome,
+    '.codex',
+    'sessions',
+    String(now.getFullYear()),
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'),
+  );
+}
+
+function utcSessionDirForDate(baseHome: string, now: Date): string {
+  return join(
+    baseHome,
+    '.codex',
+    'sessions',
+    String(now.getUTCFullYear()),
+    String(now.getUTCMonth() + 1).padStart(2, '0'),
+    String(now.getUTCDate()).padStart(2, '0'),
+  );
+}
+
 function todayCodexHomeSessionDir(codexHome: string): string {
   const now = new Date();
   return join(
@@ -39,6 +61,33 @@ function todayCodexHomeSessionDir(codexHome: string): string {
     String(now.getUTCMonth() + 1).padStart(2, '0'),
     String(now.getUTCDate()).padStart(2, '0')
   );
+}
+
+async function writeDateMockPreload(dir: string, fixedNowIso: string): Promise<string> {
+  const preloadPath = join(dir, 'mock-date.mjs');
+  await writeFile(preloadPath, `
+const fixedNowIso = ${JSON.stringify(fixedNowIso)};
+const RealDate = Date;
+globalThis.Date = class extends RealDate {
+  constructor(...args) {
+    if (args.length === 0) {
+      super(fixedNowIso);
+    } else {
+      super(...args);
+    }
+  }
+  static now() {
+    return RealDate.parse(fixedNowIso);
+  }
+  static parse(value) {
+    return RealDate.parse(value);
+  }
+  static UTC(...args) {
+    return RealDate.UTC(...args);
+  }
+};
+`, 'utf-8');
+  return preloadPath;
 }
 
 async function readLines(path: string): Promise<string[]> {
@@ -560,6 +609,180 @@ describe('notify-fallback watcher', () => {
       const turnEntries = await readJsonLines(turnLog);
       assert.equal(turnEntries[0]?.origin_kind, 'native-subagent');
       assert.equal(turnEntries[0]?.origin_parent_thread_id, leaderThreadId);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(tempHome, { recursive: true, force: true });
+      await rm(rolloutPath, { force: true });
+    }
+  });
+
+  it('discovers local-date native-subagent rollouts across a UTC boundary', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-local-boundary-subagent-'));
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-home-'));
+    const sid = randomUUID();
+    const fixedNowIso = '2026-04-26T21:30:00.000Z';
+    const preloadPath = await writeDateMockPreload(tempHome, fixedNowIso);
+    const sessionDir = localSessionDirForDate(tempHome, new Date(2026, 3, 27, 0, 30));
+    const rolloutPath = join(sessionDir, `rollout-test-fallback-local-boundary-${sid}.jsonl`);
+
+    try {
+      await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
+      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+
+      const leaderThreadId = `leader-local-boundary-${sid}`;
+      const subagentThreadId = `subagent-local-boundary-${sid}`;
+      const turnId = `turn-local-boundary-${sid}`;
+      const lines = [
+        {
+          timestamp: fixedNowIso,
+          type: 'session_meta',
+          payload: {
+            id: subagentThreadId,
+            cwd: wd,
+            agent_nickname: 'reviewer',
+            agent_role: 'code-reviewer',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: leaderThreadId,
+                },
+                agent_nickname: 'reviewer',
+                agent_role: 'code-reviewer',
+              },
+            },
+          },
+        },
+        {
+          timestamp: fixedNowIso,
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: turnId,
+            last_agent_message: '{"findings":[{"severity":"high","blocking":true}]}',
+          },
+        },
+      ];
+      await writeFile(rolloutPath, `${lines.map(v => JSON.stringify(v)).join('\n')}\n`);
+      await utimes(rolloutPath, new Date(fixedNowIso), new Date(fixedNowIso));
+
+      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const result = spawnSync(
+        process.execPath,
+        [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
+        {
+          encoding: 'utf-8',
+          env: buildCleanNotifyEnv({
+            HOME: tempHome,
+            TZ: 'Europe/Moscow',
+            NODE_OPTIONS: `--import=${preloadPath}`,
+          }),
+        }
+      );
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const turnLog = join(wd, '.omx', 'logs', 'turns-2026-04-26.jsonl');
+      const turnEntries = await readJsonLines(turnLog);
+      assert.equal(turnEntries.length, 1);
+      assert.equal(turnEntries[0]?.origin_kind, 'native-subagent');
+      assert.equal(turnEntries[0]?.origin_parent_thread_id, leaderThreadId);
+
+      const notifyLog = join(wd, '.omx', 'logs', 'notify-hook-2026-04-26.jsonl');
+      const notifyEntries = await readJsonLines(notifyLog);
+      assert.ok(notifyEntries.some((entry) =>
+        (entry.type === 'completed_turn_suppressed_non_leader'
+          || entry.type === 'completed_turn_delivery_suppressed')
+        && entry.origin_kind === 'native-subagent'
+      ));
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(tempHome, { recursive: true, force: true });
+      await rm(rolloutPath, { force: true });
+    }
+  });
+
+  it('discovers UTC-date native-subagent rollouts across a local-date boundary', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-utc-boundary-subagent-'));
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-home-'));
+    const sid = randomUUID();
+    const fixedNowIso = '2026-04-26T21:30:00.000Z';
+    const preloadPath = await writeDateMockPreload(tempHome, fixedNowIso);
+    const sessionDir = utcSessionDirForDate(tempHome, new Date(fixedNowIso));
+    const rolloutPath = join(sessionDir, `rollout-test-fallback-utc-boundary-${sid}.jsonl`);
+
+    try {
+      await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
+      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+
+      const leaderThreadId = `leader-utc-boundary-${sid}`;
+      const subagentThreadId = `subagent-utc-boundary-${sid}`;
+      const turnId = `turn-utc-boundary-${sid}`;
+      const lines = [
+        {
+          timestamp: fixedNowIso,
+          type: 'session_meta',
+          payload: {
+            id: subagentThreadId,
+            cwd: wd,
+            agent_nickname: 'reviewer',
+            agent_role: 'code-reviewer',
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: leaderThreadId,
+                },
+                agent_nickname: 'reviewer',
+                agent_role: 'code-reviewer',
+              },
+            },
+          },
+        },
+        {
+          timestamp: fixedNowIso,
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: turnId,
+            last_agent_message: '{"findings":[{"severity":"high","blocking":true}]}',
+          },
+        },
+      ];
+      await writeFile(rolloutPath, `${lines.map(v => JSON.stringify(v)).join('\n')}\n`);
+      await utimes(rolloutPath, new Date(fixedNowIso), new Date(fixedNowIso));
+
+      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const result = spawnSync(
+        process.execPath,
+        [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
+        {
+          encoding: 'utf-8',
+          env: buildCleanNotifyEnv({
+            HOME: tempHome,
+            TZ: 'Europe/Moscow',
+            NODE_OPTIONS: `--import=${preloadPath}`,
+          }),
+        }
+      );
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const turnLog = join(wd, '.omx', 'logs', 'turns-2026-04-26.jsonl');
+      const turnEntries = await readJsonLines(turnLog);
+      assert.equal(turnEntries.length, 1);
+      assert.equal(turnEntries[0]?.origin_kind, 'native-subagent');
+      assert.equal(turnEntries[0]?.origin_parent_thread_id, leaderThreadId);
+      assert.equal(turnEntries[0]?.output_preview, '');
+      assert.equal(turnEntries[0]?.output_redacted, true);
+
+      const notifyLog = join(wd, '.omx', 'logs', 'notify-hook-2026-04-26.jsonl');
+      const notifyEntries = await readJsonLines(notifyLog);
+      assert.ok(notifyEntries.some((entry) =>
+        (entry.type === 'completed_turn_suppressed_non_leader'
+          || entry.type === 'completed_turn_delivery_suppressed')
+        && entry.origin_kind === 'native-subagent'
+      ));
     } finally {
       await rm(wd, { recursive: true, force: true });
       await rm(tempHome, { recursive: true, force: true });

@@ -158,6 +158,8 @@ interface SessionStartOptions {
   pid?: number;
   platform?: NodeJS.Platform;
   nativeSessionId?: string;
+  ownerKind?: 'external-owner' | 'child' | 'internal-helper' | 'team-worker' | 'unknown-non-owner';
+  parentThreadId?: string;
 }
 
 function defaultIsPidAlive(pid: number): boolean {
@@ -320,6 +322,45 @@ export async function reconcileNativeSessionStart(
   const existing = await readUsableSessionState(cwd, {
     ...(options.platform ? { platform: options.platform } : {}),
   });
+  const ownerKind = options.ownerKind ?? 'external-owner';
+  if (ownerKind !== 'external-owner') {
+    const pid = Number.isInteger(options.pid) && options.pid && options.pid > 0
+      ? options.pid
+      : process.pid;
+    const nowIso = new Date().toISOString();
+    if (existing) {
+      await appendToLog(cwd, {
+        event: 'session_start_child_indexed',
+        session_id: existing.session_id,
+        ...(existing.native_session_id ? { owner_native_session_id: existing.native_session_id } : {}),
+        native_session_id: nativeSessionId,
+        owner_kind: ownerKind,
+        ...(options.parentThreadId ? { parent_thread_id: options.parentThreadId } : {}),
+        pid,
+        timestamp: nowIso,
+      });
+      return existing;
+    }
+
+    const platform = options.platform ?? process.platform;
+    const linuxIdentity = platform === 'linux'
+      ? readLinuxProcessIdentity(pid)
+      : null;
+    const synthetic = createSessionState(cwd, nativeSessionId, pid, platform, linuxIdentity, {
+      nowIso,
+      nativeSessionId,
+    });
+    await appendToLog(cwd, {
+      event: 'session_start_child_without_owner',
+      native_session_id: nativeSessionId,
+      owner_kind: ownerKind,
+      ...(options.parentThreadId ? { parent_thread_id: options.parentThreadId } : {}),
+      pid,
+      timestamp: nowIso,
+    });
+    return synthetic;
+  }
+
   if (!existing) {
     return await writeSessionStart(cwd, nativeSessionId, {
       ...options,

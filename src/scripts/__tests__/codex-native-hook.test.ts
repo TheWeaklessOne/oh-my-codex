@@ -440,6 +440,113 @@ describe("codex native hook dispatch", () => {
     }
   });
 
+  it("indexes child SessionStart payloads without replacing the current session owner", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-child-session-start-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const canonicalSessionId = "omx-root-owner";
+      const rootNativeSessionId = "codex-root-owner";
+      const childNativeSessionId = "codex-child-reviewer";
+      await mkdir(join(stateDir, "sessions", canonicalSessionId), { recursive: true });
+      await writeSessionStart(cwd, canonicalSessionId, {
+        nativeSessionId: rootNativeSessionId,
+      });
+
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: childNativeSessionId,
+          thread_id: childNativeSessionId,
+          source: {
+            subagent: {
+              thread_spawn: {
+                parent_thread_id: rootNativeSessionId,
+              },
+              agent_nickname: "reviewer",
+              agent_role: "code-reviewer",
+            },
+          },
+        },
+        {
+          cwd,
+          sessionOwnerPid: process.pid,
+        },
+      );
+
+      const sessionState = JSON.parse(
+        await readFile(join(stateDir, "session.json"), "utf-8"),
+      ) as { session_id?: string; native_session_id?: string };
+      assert.equal(sessionState.session_id, canonicalSessionId);
+      assert.equal(sessionState.native_session_id, rootNativeSessionId);
+
+      const index = JSON.parse(
+        await readFile(join(stateDir, "codex-session-origin-index.json"), "utf-8"),
+      ) as {
+        sessions?: Record<string, {
+          origin_kind?: string;
+          audience?: string;
+          parent_thread_id?: string;
+        }>;
+      };
+      assert.equal(index.sessions?.[childNativeSessionId]?.origin_kind, "native-subagent");
+      assert.equal(index.sessions?.[childNativeSessionId]?.audience, "child");
+      assert.equal(index.sessions?.[childNativeSessionId]?.parent_thread_id, rootNativeSessionId);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("indexes internal-helper SessionStart payloads without replacing the current session owner", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-helper-session-start-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const canonicalSessionId = "omx-root-owner-helper";
+      const rootNativeSessionId = "codex-root-owner-helper";
+      const helperNativeSessionId = "codex-internal-helper";
+      await mkdir(join(stateDir, "sessions", canonicalSessionId), { recursive: true });
+      await writeSessionStart(cwd, canonicalSessionId, {
+        nativeSessionId: rootNativeSessionId,
+      });
+
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: helperNativeSessionId,
+          thread_id: helperNativeSessionId,
+          origin: {
+            kind: "internal-helper",
+            source: "omx-explore",
+          },
+        },
+        {
+          cwd,
+          sessionOwnerPid: process.pid,
+        },
+      );
+
+      const sessionState = JSON.parse(
+        await readFile(join(stateDir, "session.json"), "utf-8"),
+      ) as { session_id?: string; native_session_id?: string };
+      assert.equal(sessionState.session_id, canonicalSessionId);
+      assert.equal(sessionState.native_session_id, rootNativeSessionId);
+
+      const index = JSON.parse(
+        await readFile(join(stateDir, "codex-session-origin-index.json"), "utf-8"),
+      ) as {
+        sessions?: Record<string, {
+          origin_kind?: string;
+          audience?: string;
+        }>;
+      };
+      assert.equal(index.sessions?.[helperNativeSessionId]?.origin_kind, "internal-helper");
+      assert.equal(index.sessions?.[helperNativeSessionId]?.audience, "internal-helper");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("describes attached tmux runtime in SessionStart context when TMUX is present", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-session-start-tmux-"));
     process.env.TMUX = "/tmp/tmux-attached";
