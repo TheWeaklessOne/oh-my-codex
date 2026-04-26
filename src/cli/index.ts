@@ -31,6 +31,7 @@ import { sparkshellCommand } from "./sparkshell.js";
 import { agentsInitCommand } from "./agents-init.js";
 import { agentsCommand } from "./agents.js";
 import { sessionCommand } from "./session-search.js";
+import { sessionsCommand } from "./sessions.js";
 import { autoresearchCommand } from "./autoresearch.js";
 import { mcpParityCommand } from "./mcp-parity.js";
 import { mcpServeCommand } from "./mcp-serve.js";
@@ -106,6 +107,7 @@ import {
   listCurrentWindowHudPaneIds,
   parsePaneIdFromTmuxOutput,
 } from "../hud/tmux.js";
+import { buildSetOmxTmuxSessionMarkerArgs } from "../tmux/omx-session-markers.js";
 
 export { parseTmuxPaneSnapshot, isHudWatchPane, findHudWatchPaneIds } from "../hud/tmux.js";
 
@@ -173,6 +175,7 @@ Usage:
   omx resume    Resume a previous interactive Codex session
   omx explore   Default read-only exploration entrypoint (may adaptively use sparkshell backend)
   omx session   Search prior local session transcripts and history artifacts
+  omx sessions  Browse and attach to live OMX tmux sessions
   omx agents-init [path]
                 Bootstrap lightweight AGENTS.md files for a repo/subtree
   omx agents    Manage Codex native agent TOML files
@@ -297,6 +300,7 @@ type CliCommand =
   | "team"
   | "mission"
   | "session"
+  | "sessions"
   | "resume"
   | "version"
   | "tmux-hook"
@@ -331,6 +335,7 @@ const NESTED_HELP_COMMANDS = new Set<CliCommand>([
   "ralph",
   "resume",
   "session",
+  "sessions",
   "sparkshell",
   "team",
   "mission",
@@ -725,6 +730,7 @@ export async function main(args: string[]): Promise<void> {
     "team",
     "ralph",
     "session",
+    "sessions",
     "resume",
     "version",
     "tmux-hook",
@@ -831,6 +837,9 @@ export async function main(args: string[]): Promise<void> {
         break;
       case "session":
         await sessionCommand(args.slice(1));
+        break;
+      case "sessions":
+        await sessionsCommand(args.slice(1));
         break;
       case "ralph":
         await ralphCommand(args.slice(1));
@@ -1995,8 +2004,17 @@ export function buildDetachedSessionBootstrapSteps(
     "#{pane_id}",
     hudCmd,
   ];
+  const markerSteps: DetachedSessionTmuxStep[] = buildSetOmxTmuxSessionMarkerArgs(sessionName, {
+    sessionId,
+    projectPath: cwd,
+    kind: "session",
+  }).map((args, index) => ({
+    name: `mark-omx-session-${index + 1}`,
+    args,
+  }));
   return [
     { name: "new-session", args: newSessionArgs },
+    ...markerSteps,
     { name: "split-and-capture-hud-pane", args: splitCaptureArgs },
   ];
 }

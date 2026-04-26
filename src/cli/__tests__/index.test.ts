@@ -906,6 +906,7 @@ describe("commandOwnsLocalHelp", () => {
       "ralph",
       "resume",
       "session",
+      "sessions",
       "sparkshell",
       "team",
       "tmux-hook",
@@ -1530,12 +1531,20 @@ describe("detached tmux new-session sequencing", () => {
     );
     assert.deepEqual(
       steps.map((step) => step.name),
-      ["new-session", "split-and-capture-hud-pane"],
+      [
+        "new-session",
+        "mark-omx-session-1",
+        "mark-omx-session-2",
+        "mark-omx-session-3",
+        "split-and-capture-hud-pane",
+      ],
     );
-    assert.equal(steps[1]?.args[3], String(HUD_TMUX_HEIGHT_LINES));
-    assert.equal(steps[1]?.args[6], "omx-demo");
-    assert.equal(steps[1]?.args.includes("-P"), true);
-    assert.equal(steps[1]?.args.includes("#{pane_id}"), true);
+    const splitCapture = steps.find((step) => step.name === "split-and-capture-hud-pane");
+    assert.ok(splitCapture);
+    assert.equal(splitCapture!.args[3], String(HUD_TMUX_HEIGHT_LINES));
+    assert.equal(splitCapture!.args[6], "omx-demo");
+    assert.equal(splitCapture!.args.includes("-P"), true);
+    assert.equal(splitCapture!.args.includes("#{pane_id}"), true);
     assert.equal(steps[0]?.args.includes("-e"), true);
     assert.equal(
       steps[0]?.args.includes('OMX_NOTIFY_TEMP_CONTRACT={\"active\":true}'),
@@ -1632,8 +1641,9 @@ describe("detached tmux new-session sequencing", () => {
     );
     assert.equal(steps[0]?.name, "new-session");
     assert.equal(steps[0]?.args.at(-1), "powershell.exe");
-    assert.equal(steps[1]?.name, "split-and-capture-hud-pane");
-    assert.equal(steps[1]?.args.at(-1), hudCmd);
+    const splitCapture = steps.find((step) => step.name === "split-and-capture-hud-pane");
+    assert.ok(splitCapture);
+    assert.equal(splitCapture!.args.at(-1), hudCmd);
   });
 
   it("buildDetachedWindowsBootstrapScript targets the resolved tmux-compatible command", () => {

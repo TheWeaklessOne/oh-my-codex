@@ -7,11 +7,11 @@ import {
 
 describe('launchDetachedManagedSession', () => {
   it('returns detached launch metadata with the captured leader pane id', async () => {
-    const observed: {
-      command?: string;
-      args?: string[];
+    const calls: Array<{
+      command: string;
+      args: string[];
       options?: { encoding?: string };
-    } = {};
+    }> = [];
 
     const result = await launchDetachedManagedSession(
       {
@@ -24,9 +24,7 @@ describe('launchDetachedManagedSession', () => {
         omxEntryPath: '/repo/dist/cli/omx.js',
         buildPlatformCommandSpecImpl: (command, args) => ({ command, args }),
         spawnPlatformCommandSyncImpl: (command, args, options) => {
-          observed.command = command;
-          observed.args = [...args];
-          observed.options = options;
+          calls.push({ command, args: [...args], options });
           return {
             spec: { command, args, resolvedPath: command },
             result: {
@@ -42,14 +40,18 @@ describe('launchDetachedManagedSession', () => {
       },
     );
 
-    assert.equal(observed.command, 'tmux');
+    const newSession = calls.find((call) => call.args[0] === 'new-session');
+    assert.equal(newSession?.command, 'tmux');
     assert.deepEqual(
-      observed.args?.slice(0, 8),
+      newSession?.args.slice(0, 8),
       ['new-session', '-d', '-P', '-F', '#{pane_id}', '-s', result.tmuxSessionName, '-c'],
     );
-    assert.ok(observed.args?.includes('OMX_SESSION_ID=omx-explicit-session-1'));
-    assert.ok(observed.args?.includes('CODEX_HOME=/tmp/codex-home'));
-    assert.ok(observed.args?.includes('OMX_NOTIFY_PROFILE=ops'));
+    assert.ok(newSession?.args.includes('OMX_SESSION_ID=omx-explicit-session-1'));
+    assert.ok(newSession?.args.includes('CODEX_HOME=/tmp/codex-home'));
+    assert.ok(newSession?.args.includes('OMX_NOTIFY_PROFILE=ops'));
+    assert.ok(calls.some((call) => call.args.join('\0') === ['set-option', '-t', result.tmuxSessionName, '@omx-owned', '1'].join('\0')));
+    assert.ok(calls.some((call) => call.args.join('\0') === ['set-option', '-t', result.tmuxSessionName, '@omx-session-id', 'omx-explicit-session-1'].join('\0')));
+    assert.ok(calls.some((call) => call.args.join('\0') === ['set-option', '-t', result.tmuxSessionName, '@omx-project-path', '/repo/project-a'].join('\0')));
     assert.equal(result.sessionId, 'omx-explicit-session-1');
     assert.equal(result.leaderPaneId, '%42');
     assert.equal(result.cwd, '/repo/project-a');
@@ -83,7 +85,7 @@ describe('launchDetachedManagedSession', () => {
   });
 
   it('uses the stable OMX CLI resolver when no explicit entry path is provided', async () => {
-    const observed: { args?: string[] } = {};
+    const calls: string[][] = [];
     let resolverCalled = false;
 
     const result = await launchDetachedManagedSession(
@@ -98,7 +100,7 @@ describe('launchDetachedManagedSession', () => {
         },
         buildPlatformCommandSpecImpl: (command, args) => ({ command, args }),
         spawnPlatformCommandSyncImpl: (command, args) => {
-          observed.args = [...args];
+          calls.push([...args]);
           return {
             spec: { command, args, resolvedPath: command },
             result: {
@@ -116,7 +118,8 @@ describe('launchDetachedManagedSession', () => {
 
     assert.equal(resolverCalled, true);
     assert.equal(result.leaderPaneId, '%43');
-    assert.match(observed.args?.at(-1) ?? '', /\/repo\/dist\/cli\/omx\.js/);
+    const newSession = calls.find((args) => args[0] === 'new-session');
+    assert.match(newSession?.at(-1) ?? '', /\/repo\/dist\/cli\/omx\.js/);
   });
 
   it('fails closed when the stable OMX CLI resolver has no launchable entry', async () => {

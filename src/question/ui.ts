@@ -1,47 +1,30 @@
-import { emitKeypressEvents } from 'node:readline';
 import { createInterface as createPromptInterface } from 'node:readline/promises';
 import { stdin as defaultInput, stdout as defaultOutput } from 'node:process';
+import {
+  applyInteractiveSelectionKey as applyGenericInteractiveSelectionKey,
+  promptForSelectionsWithArrows as promptForGenericSelectionsWithArrows,
+  renderInteractiveSelectFrame,
+  supportsInteractiveSelectUi,
+  type InteractiveSelectionState,
+  type KeyLike,
+  type SelectionUpdate,
+  type SelectUiInput,
+  type SelectUiOutput,
+} from '../ui/select.js';
 import { injectQuestionAnswerToPane } from './renderer.js';
 import { markQuestionAnswered, markQuestionTerminalError, readQuestionRecord } from './state.js';
 import { isMultiAnswerableQuestion } from './types.js';
 import type { QuestionAnswer, QuestionRecord } from './types.js';
 
-interface QuestionUiInput {
-  isTTY?: boolean;
-  on(event: 'keypress', listener: (str: string, key: KeyLike) => void): this;
-  off(event: 'keypress', listener: (str: string, key: KeyLike) => void): this;
-  resume?(): void;
-  pause?(): void;
-  setRawMode?(mode: boolean): void;
-}
+type QuestionUiInput = SelectUiInput;
 
-interface QuestionUiOutput {
-  isTTY?: boolean;
-  write(chunk: string): boolean;
-}
+type QuestionUiOutput = SelectUiOutput;
 
 interface QuestionUiDeps {
   input?: QuestionUiInput;
   output?: QuestionUiOutput;
   env?: NodeJS.ProcessEnv;
   injectAnswerToPane?: (paneId: string, answer: QuestionAnswer) => boolean;
-}
-
-interface InteractiveSelectionState {
-  cursorIndex: number;
-  selectedIndices: number[];
-  error?: string;
-}
-
-interface SelectionUpdate {
-  state: InteractiveSelectionState;
-  submit: boolean;
-}
-
-interface KeyLike {
-  name?: string;
-  ctrl?: boolean;
-  sequence?: string;
 }
 
 function getOptionLabels(record: QuestionRecord): string[] {
@@ -133,203 +116,57 @@ function maybeInjectAnswer(
   }
 }
 
-function supportsInteractiveArrowUi(input: QuestionUiInput, output: QuestionUiOutput): boolean {
-  return Boolean(input.isTTY && output.isTTY && typeof input.setRawMode === 'function');
-}
-
-function toggleSelection(selectedIndices: number[], index: number): number[] {
-  return selectedIndices.includes(index)
-    ? selectedIndices.filter((value) => value !== index)
-    : [...selectedIndices, index].sort((left, right) => left - right);
-}
-
-export function createInitialInteractiveSelectionState(): InteractiveSelectionState {
-  return {
-    cursorIndex: 0,
-    selectedIndices: [],
-  };
-}
+export { createInitialInteractiveSelectionState } from '../ui/select.js';
 
 export function applyInteractiveSelectionKey(
   record: QuestionRecord,
   state: InteractiveSelectionState,
   key: KeyLike,
 ): SelectionUpdate {
-  const optionCount = getOptionLabels(record).length;
-  if (optionCount === 0) throw new Error('Interactive question UI requires at least one selectable option.');
-
-  const moveCursor = (delta: number): SelectionUpdate => ({
-    submit: false,
-    state: {
-      ...state,
-      cursorIndex: (state.cursorIndex + delta + optionCount) % optionCount,
-      error: undefined,
+  return applyGenericInteractiveSelectionKey(
+    {
+      itemCount: getOptionLabels(record).length,
+      multiSelect: isMultiAnswerableQuestion(record),
+      emptySelectionError: 'Select one or more options with Space before pressing Enter.',
     },
-  });
-
-  if (key.name === 'up') return moveCursor(-1);
-  if (key.name === 'down') return moveCursor(1);
-
-  if (key.sequence && /^[1-9]$/.test(key.sequence)) {
-    const explicitIndex = Number.parseInt(key.sequence, 10) - 1;
-    if (explicitIndex < optionCount) {
-      return {
-        submit: !isMultiAnswerableQuestion(record),
-        state: {
-          ...state,
-          cursorIndex: explicitIndex,
-          selectedIndices: isMultiAnswerableQuestion(record) ? toggleSelection(state.selectedIndices, explicitIndex) : state.selectedIndices,
-          error: undefined,
-        },
-      };
-    }
-  }
-
-  if (key.name === 'space') {
-    if (!isMultiAnswerableQuestion(record)) {
-      return {
-        submit: true,
-        state: {
-          ...state,
-          error: undefined,
-        },
-      };
-    }
-    return {
-      submit: false,
-      state: {
-        ...state,
-        selectedIndices: toggleSelection(state.selectedIndices, state.cursorIndex),
-        error: undefined,
-      },
-    };
-  }
-
-  if (key.name === 'return' || key.name === 'enter') {
-    if (!isMultiAnswerableQuestion(record)) {
-      return {
-        submit: true,
-        state: {
-          ...state,
-          error: undefined,
-        },
-      };
-    }
-    if (state.selectedIndices.length > 0) {
-      return {
-        submit: true,
-        state: {
-          ...state,
-          error: undefined,
-        },
-      };
-    }
-    return {
-      submit: false,
-      state: {
-        ...state,
-        error: 'Select one or more options with Space before pressing Enter.',
-      },
-    };
-  }
-
-  return { submit: false, state };
+    state,
+    key,
+  );
 }
 
 export function renderInteractiveQuestionFrame(
   record: QuestionRecord,
   state: InteractiveSelectionState,
 ): string {
-  const optionLabels = getOptionLabels(record);
-  const lines: string[] = [];
-
-  if (record.header) lines.push(record.header);
-  lines.push(record.question, '');
-
-  optionLabels.forEach((label, index) => {
-    const isActive = state.cursorIndex === index;
-    const isChecked = isMultiAnswerableQuestion(record) ? state.selectedIndices.includes(index) : isActive;
-    lines.push(`${isActive ? '›' : ' '} [${isChecked ? 'x' : ' '}] ${label}`);
-  });
-
-  lines.push('');
-  lines.push(
-    isMultiAnswerableQuestion(record)
-      ? 'Use ↑/↓ to move, Space to toggle, Enter to submit.'
-      : 'Use ↑/↓ to move, Enter to select.',
+  return renderInteractiveSelectFrame(
+    {
+      header: record.header,
+      question: record.question,
+      labels: getOptionLabels(record),
+      multiSelect: isMultiAnswerableQuestion(record),
+    },
+    state,
   );
-
-  if (state.error) lines.push(state.error);
-  return `${lines.join('\n')}\n`;
 }
 
 export async function promptForSelectionsWithArrows(
   record: QuestionRecord,
   deps: QuestionUiDeps = {},
 ): Promise<number[]> {
-  const input = deps.input ?? defaultInput;
-  const output = deps.output ?? defaultOutput;
-  if (!supportsInteractiveArrowUi(input, output)) {
-    throw new Error('Interactive arrow UI requires TTY stdin/stdout with raw-mode support.');
-  }
-
-  return new Promise<number[]>((resolve, reject) => {
-    let state = createInitialInteractiveSelectionState();
-    let finished = false;
-
-    const cleanup = () => {
-      input.off('keypress', onKeypress);
-      input.setRawMode?.(false);
-      input.pause?.();
-      output.write('\u001b[?25h');
-    };
-
-    const finish = (selections: number[]) => {
-      if (finished) return;
-      finished = true;
-      cleanup();
-      output.write('\n');
-      resolve(selections);
-    };
-
-    const fail = (error: Error) => {
-      if (finished) return;
-      finished = true;
-      cleanup();
-      output.write('\n');
-      reject(error);
-    };
-
-    const render = () => {
-      output.write('\u001b[H\u001b[J');
-      output.write('\u001b[?25l');
-      output.write(renderInteractiveQuestionFrame(record, state));
-    };
-
-    const onKeypress = (_: string, key: KeyLike) => {
-      if (key.ctrl && key.name === 'c') {
-        fail(new Error('Question UI cancelled by user.'));
-        return;
-      }
-
-      const update = applyInteractiveSelectionKey(record, state, key);
-      state = update.state;
-      render();
-      if (!update.submit) return;
-
-      if (isMultiAnswerableQuestion(record)) {
-        finish(state.selectedIndices.map((index) => index + 1));
-        return;
-      }
-      finish([state.cursorIndex + 1]);
-    };
-
-    emitKeypressEvents(input as NodeJS.ReadableStream);
-    input.setRawMode?.(true);
-    input.resume?.();
-    input.on('keypress', onKeypress);
-    render();
-  });
+  const selections = await promptForGenericSelectionsWithArrows(
+    {
+      header: record.header,
+      question: record.question,
+      labels: getOptionLabels(record),
+      multiSelect: isMultiAnswerableQuestion(record),
+      renderFrame: (state) => renderInteractiveQuestionFrame(record, state),
+      cancelMessage: 'Question UI cancelled by user.',
+      emptySelectionError: 'Select one or more options with Space before pressing Enter.',
+    },
+    deps,
+  );
+  if (!selections) throw new Error('Question UI cancelled by user.');
+  return selections;
 }
 
 async function promptForSelectionsWithNumbers(
@@ -387,7 +224,7 @@ export async function runQuestionUi(recordPath: string, deps: QuestionUiDeps = {
   const output = deps.output ?? defaultOutput;
 
   try {
-    const selections = supportsInteractiveArrowUi(input, output)
+    const selections = supportsInteractiveSelectUi(input, output)
       ? await promptForSelectionsWithArrows(record, { input, output })
       : await promptForSelectionsWithNumbers(record, { input, output });
 

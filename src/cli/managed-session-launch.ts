@@ -1,5 +1,6 @@
 import type { SpawnSyncOptionsWithStringEncoding, SpawnSyncReturns } from 'node:child_process';
 import { parsePaneIdFromTmuxOutput } from '../hud/tmux.js';
+import { buildSetOmxTmuxSessionMarkerArgs } from '../tmux/omx-session-markers.js';
 import { resolveOmxCliEntryPath } from '../utils/paths.js';
 import { buildPlatformCommandSpec, spawnPlatformCommandSync } from '../utils/platform-command.js';
 import {
@@ -36,6 +37,14 @@ interface ManagedSessionLaunchDeps {
     spec: { command: string; args: string[]; resolvedPath?: string };
     result: SpawnSyncReturns<string>;
   };
+}
+
+function summarizeTmuxFailure(prefix: string, result: SpawnSyncReturns<string>): Error {
+  const details = [
+    result.error?.message,
+    (result.stderr || '').trim(),
+  ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+  return new Error(details.length > 0 ? `${prefix}: ${details.join(' | ')}` : prefix);
 }
 
 function buildManagedSessionCommand(
@@ -87,29 +96,36 @@ export async function launchDetachedManagedSession(
 
   const buildPlatformCommandSpecImpl = deps.buildPlatformCommandSpecImpl ?? buildPlatformCommandSpec;
   const spawnPlatformCommandSyncImpl = deps.spawnPlatformCommandSyncImpl ?? spawnPlatformCommandSync;
-  const tmuxSpec = buildPlatformCommandSpecImpl('tmux', newSessionArgs);
-  const execution = spawnPlatformCommandSyncImpl(tmuxSpec.command, tmuxSpec.args, {
-    encoding: 'utf-8',
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
+  const runTmux = (args: string[]) => {
+    const tmuxSpec = buildPlatformCommandSpecImpl('tmux', args);
+    return spawnPlatformCommandSyncImpl(tmuxSpec.command, tmuxSpec.args, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  };
+
+  const execution = runTmux(newSessionArgs);
   const stdout = execution.result.stdout ?? '';
-  const stderr = execution.result.stderr ?? '';
 
   if (execution.result.error || execution.result.status !== 0) {
-    const details = [
-      execution.result.error?.message,
-      stderr.trim(),
-    ].filter((value): value is string => typeof value === 'string' && value.length > 0);
-    throw new Error(
-      details.length > 0
-        ? `Failed to launch detached OMX session: ${details.join(' | ')}`
-        : 'Failed to launch detached OMX session',
-    );
+    throw summarizeTmuxFailure('Failed to launch detached OMX session', execution.result);
   }
 
   const leaderPaneId = parsePaneIdFromTmuxOutput(stdout);
   if (!leaderPaneId) {
     throw new Error('Detached OMX session launch did not return a leader pane id');
+  }
+
+  for (const args of buildSetOmxTmuxSessionMarkerArgs(tmuxSessionName, {
+    sessionId,
+    projectPath: options.cwd,
+    kind: 'session',
+  })) {
+    const mark = runTmux(args);
+    if (mark.result.error || mark.result.status !== 0) {
+      runTmux(['kill-session', '-t', tmuxSessionName]);
+      throw summarizeTmuxFailure('Failed to mark detached OMX tmux session', mark.result);
+    }
   }
 
   return {

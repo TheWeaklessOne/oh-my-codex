@@ -21,6 +21,7 @@ import {
 } from '../scripts/tmux-hook-engine.js';
 import { readActiveProviderEnvOverrides } from '../config/models.js';
 import { waitForCodexPaneReady } from '../tmux/prompt-submit.js';
+import { buildSetOmxTmuxSessionMarkerArgs } from '../tmux/omx-session-markers.js';
 import { sleep, sleepSync } from '../utils/sleep.js';
 import {
   buildPlatformCommandSpec,
@@ -1052,6 +1053,14 @@ export function createTeamSession(
       throw new Error(`failed to parse current tmux target: ${context.stdout}`);
     }
     const teamTarget = `${sessionName}:${windowIndex}`;
+    for (const markerArgs of buildSetOmxTmuxSessionMarkerArgs(sessionName, {
+      projectPath: cwd,
+      kind: 'team',
+      teamName: safeTeamName,
+    })) {
+      const marker = runTmux(markerArgs);
+      if (!marker.ok) throw new Error(`failed to mark OMX tmux session ${sessionName}: ${marker.stderr}`);
+    }
     const panes = listPanes(teamTarget);
     const leaderPaneId = chooseTeamLeaderPaneId(panes, detectedLeaderPaneId);
     const initialHudPaneIds = findHudPaneIds(teamTarget, leaderPaneId);

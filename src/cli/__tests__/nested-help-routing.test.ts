@@ -35,6 +35,7 @@ describe('nested help routing', () => {
     [['mcp-serve', '--help'], /Usage:\s*omx mcp-serve <target>/i],
     [['tmux-hook', '--help'], /Usage:\s*\n\s*omx tmux-hook init/i],
     [['ralph', '--help'], /omx ralph - Launch Codex with ralph persistence mode active/i],
+    [['sessions', '--help'], /omx sessions - Browse and attach to live OMX tmux sessions/i],
   ] satisfies Array<[string[], RegExp]>) {
     it(`routes ${argv.join(' ')} to command-local help`, async () => {
       const cwd = await mkdtemp(join(tmpdir(), 'omx-nested-help-'));
