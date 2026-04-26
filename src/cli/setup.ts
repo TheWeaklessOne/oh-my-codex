@@ -71,7 +71,6 @@ import {
   resolveAgentsModelTableContext,
   upsertAgentsModelTable,
 } from "../utils/agents-model-table.js";
-import { spawnPlatformCommandSync } from "../utils/platform-command.js";
 
 interface SetupOptions {
   codexVersionProbe?: () => string | null;
@@ -224,7 +223,6 @@ const DEFAULT_SETUP_INSTALL_MODE: SetupInstallMode = "legacy";
 const LEGACY_SETUP_MODEL = "gpt-5.3-codex";
 const DEFAULT_SETUP_MODEL = DEFAULT_FRONTIER_MODEL;
 const OBSOLETE_NATIVE_AGENT_FIELD = ["skill", "ref"].join("_");
-const TUI_OWNED_BY_CODEX_VERSION = [0, 107, 0] as const;
 
 function createEmptyCategorySummary(): SetupCategorySummary {
   return {
@@ -628,40 +626,6 @@ async function promptForModelUpgrade(
   } finally {
     rl.close();
   }
-}
-
-function parseSemverTriplet(version: string): [number, number, number] | null {
-  const match = version.match(/(\d+)\.(\d+)\.(\d+)/);
-  if (!match) return null;
-  return [Number(match[1]), Number(match[2]), Number(match[3])];
-}
-
-function semverGte(
-  version: [number, number, number],
-  minimum: readonly [number, number, number],
-): boolean {
-  if (version[0] !== minimum[0]) return version[0] > minimum[0];
-  if (version[1] !== minimum[1]) return version[1] > minimum[1];
-  return version[2] >= minimum[2];
-}
-
-function probeInstalledCodexVersion(): string | null {
-  const { result } = spawnPlatformCommandSync("codex", ["--version"], {
-    encoding: "utf-8",
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  if (result.error || result.status !== 0) return null;
-  const stdout = (result.stdout || "").trim();
-  return stdout === "" ? null : stdout;
-}
-
-function shouldOmxManageTuiFromCodexVersion(
-  versionOutput: string | null,
-): boolean {
-  if (!versionOutput) return true;
-  const parsed = parseSemverTriplet(versionOutput);
-  if (!parsed) return true;
-  return !semverGte(parsed, TUI_OWNED_BY_CODEX_VERSION);
 }
 
 async function promptForAgentsOverwrite(
@@ -1714,7 +1678,6 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
       summary.config,
       backupContext,
       {
-        codexVersionProbe: options.codexVersionProbe,
         dryRun,
         modelUpgradePrompt,
         verbose,
@@ -1980,10 +1943,6 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
   }
   if (omxManagesTui) {
     console.log("  StatusLine configured in config.toml via [tui] section.");
-  } else {
-    console.log(
-      "  Codex CLI >= 0.107.0 manages [tui]; OMX left that section untouched.",
-    );
   }
   console.log();
 
@@ -2680,7 +2639,7 @@ async function updateManagedConfig(
   backupContext: SetupBackupContext,
   options: Pick<
     SetupOptions,
-    "codexVersionProbe" | "dryRun" | "verbose" | "modelUpgradePrompt"
+    "dryRun" | "verbose" | "modelUpgradePrompt"
   >,
 ): Promise<ManagedConfigResult> {
   const existing = existsSync(configPath)
@@ -2689,9 +2648,7 @@ async function updateManagedConfig(
   const hadLegacyTeamRunTable = hasLegacyOmxTeamRunTable(existing);
   const currentModel = getRootModelName(existing);
   let modelOverride: string | undefined;
-  const codexVersion =
-    options.codexVersionProbe?.() ?? probeInstalledCodexVersion();
-  const omxManagesTui = shouldOmxManageTuiFromCodexVersion(codexVersion);
+  const omxManagesTui = true;
 
   if (currentModel === LEGACY_SETUP_MODEL) {
     const shouldPrompt =

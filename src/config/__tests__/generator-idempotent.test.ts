@@ -358,7 +358,7 @@ describe("config generator idempotency (#384)", () => {
     }
   });
 
-  it("merges OMX status_line into an existing user [tui] section without duplicating the table", async () => {
+  it("preserves a user-owned status_line in an existing [tui] section", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
     try {
       const configPath = join(wd, "config.toml");
@@ -371,18 +371,51 @@ describe("config generator idempotency (#384)", () => {
       await writeFile(configPath, userTui);
 
       await mergeConfig(configPath, wd);
+      await mergeConfig(configPath, wd);
       const toml = await readFile(configPath, "utf-8");
 
       assert.equal(count(toml, /^\[tui\]$/gm), 1, "[tui] should appear once");
       assert.match(toml, /^theme = "night"$/m, "user tui key preserved");
       assert.match(
         toml,
-        /^status_line = \["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit", "weekly-limit"\]$/m,
-        "status_line updated in-place",
+        /^status_line = \["git-branch"\]$/m,
+        "user status_line preserved",
       );
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
+  });
+
+  it("seeds the default status_line into a fresh [tui] section", () => {
+    const toml = buildMergedConfig("", "/tmp/omx");
+
+    assert.equal(count(toml, /^\[tui\]$/gm), 1, "[tui] should appear once");
+    assert.match(
+      toml,
+      /^status_line = \["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit", "weekly-limit"\]$/m,
+    );
+  });
+
+  it("preserves a customized managed-block status_line when refreshing setup", () => {
+    const firstRun = buildMergedConfig("", "/tmp/omx");
+    const customized = firstRun.replace(
+      /^status_line = \["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit", "weekly-limit"\]$/m,
+      'status_line = ["git-branch", "context-remaining"]',
+    );
+
+    const refreshed = buildMergedConfig(customized, "/tmp/omx");
+
+    assert.equal(count(refreshed, /^\[tui\]$/gm), 1, "[tui] should appear once");
+    assert.match(
+      refreshed,
+      /^status_line = \["git-branch", "context-remaining"\]$/m,
+      "customized status_line should survive managed-block stripping",
+    );
+    assert.doesNotMatch(
+      refreshed,
+      /^status_line = \["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit", "weekly-limit"\]$/m,
+      "default status_line should not overwrite customization",
+    );
   });
 
   it("skips emitting an OMX [tui] table when includeTui is disabled", () => {

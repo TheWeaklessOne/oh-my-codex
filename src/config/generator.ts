@@ -64,6 +64,8 @@ const OMX_TUI_STATUS_LINE =
   'status_line = ["model-with-reasoning", "git-branch", "context-remaining", "total-input-tokens", "total-output-tokens", "five-hour-limit", "weekly-limit"]';
 const LEGACY_OMX_TEAM_RUN_TABLE_PATTERN =
   /^\s*\[mcp_servers\.(?:"omx_team_run"|omx_team_run)\]\s*$/m;
+const OMX_CONFIG_MARKER = "oh-my-codex (OMX) Configuration";
+const OMX_CONFIG_END_MARKER = "# End oh-my-codex";
 
 export function hasLegacyOmxTeamRunTable(config: string): boolean {
   return LEGACY_OMX_TEAM_RUN_TABLE_PATTERN.test(config);
@@ -675,6 +677,51 @@ function stripOrphanedOmxSections(config: string): string {
   return result.join("\n");
 }
 
+function extractCustomizedTuiSectionsFromOmxBlocks(config: string): string[] {
+  const sections: string[] = [];
+  let searchStart = 0;
+
+  while (true) {
+    const markerIdx = config.indexOf(OMX_CONFIG_MARKER, searchStart);
+    if (markerIdx < 0) break;
+
+    const endIdx = config.indexOf(OMX_CONFIG_END_MARKER, markerIdx);
+    if (endIdx < 0) break;
+
+    const blockLines = config.slice(markerIdx, endIdx).split(/\r?\n/);
+
+    for (let i = 0; i < blockLines.length; i++) {
+      if (!/^\s*\[tui\]\s*$/.test(blockLines[i])) continue;
+
+      const tuiLines = [blockLines[i].trim()];
+      let hasCustomizedStatusLine = false;
+
+      for (let j = i + 1; j < blockLines.length; j++) {
+        if (/^\s*\[\[?[^\]]+\]?\]\s*$/.test(blockLines[j])) break;
+
+        const trimmed = blockLines[j].trim();
+        if (!trimmed) continue;
+
+        tuiLines.push(trimmed);
+        if (
+          /^status_line\s*=/.test(trimmed) &&
+          trimmed !== OMX_TUI_STATUS_LINE
+        ) {
+          hasCustomizedStatusLine = true;
+        }
+      }
+
+      if (hasCustomizedStatusLine) {
+        sections.push(tuiLines.join("\n"));
+      }
+    }
+
+    searchStart = endIdx + OMX_CONFIG_END_MARKER.length;
+  }
+
+  return sections;
+}
+
 function upsertTuiStatusLine(config: string): {
   cleaned: string;
   hadExistingTui: boolean;
@@ -702,6 +749,7 @@ function upsertTuiStatusLine(config: string): {
 
   const preservedKeyLines: string[] = [];
   const seenKeys = new Set<string>();
+  let preservedStatusLine: string | undefined;
 
   for (const section of sections) {
     for (let i = section.start + 1; i < section.end; i++) {
@@ -713,13 +761,21 @@ function upsertTuiStatusLine(config: string): {
       if (!keyMatch) continue;
 
       const key = keyMatch[1];
-      if (key === "status_line" || seenKeys.has(key)) continue;
+      if (key === "status_line") {
+        preservedStatusLine ??= trimmed;
+        continue;
+      }
+      if (seenKeys.has(key)) continue;
       seenKeys.add(key);
       preservedKeyLines.push(trimmed);
     }
   }
 
-  const mergedSection = ["[tui]", ...preservedKeyLines, OMX_TUI_STATUS_LINE];
+  const mergedSection = [
+    "[tui]",
+    ...preservedKeyLines,
+    preservedStatusLine ?? OMX_TUI_STATUS_LINE,
+  ];
   const firstStart = sections[0].start;
   const rebuilt: string[] = [];
 
@@ -754,13 +810,11 @@ export function stripExistingOmxBlocks(config: string): {
   cleaned: string;
   removed: number;
 } {
-  const marker = "oh-my-codex (OMX) Configuration";
-  const endMarker = "# End oh-my-codex";
   let cleaned = config;
   let removed = 0;
 
   while (true) {
-    const markerIdx = cleaned.indexOf(marker);
+    const markerIdx = cleaned.indexOf(OMX_CONFIG_MARKER);
     if (markerIdx < 0) break;
 
     let blockStart = cleaned.lastIndexOf("\n", markerIdx);
@@ -779,7 +833,7 @@ export function stripExistingOmxBlocks(config: string): {
     }
 
     let blockEnd = cleaned.length;
-    const endIdx = cleaned.indexOf(endMarker, markerIdx);
+    const endIdx = cleaned.indexOf(OMX_CONFIG_END_MARKER, markerIdx);
     if (endIdx >= 0) {
       const endLineBreak = cleaned.indexOf("\n", endIdx);
       blockEnd = endLineBreak >= 0 ? endLineBreak + 1 : cleaned.length;
@@ -1076,10 +1130,15 @@ export function buildMergedConfig(
 ): string {
   let existing = existingConfig;
   const includeTui = options.includeTui !== false;
+  const customizedManagedTuiSections =
+    extractCustomizedTuiSectionsFromOmxBlocks(existing);
 
-  if (existing.includes("oh-my-codex (OMX) Configuration")) {
+  if (existing.includes(OMX_CONFIG_MARKER)) {
     const stripped = stripExistingOmxBlocks(existing);
     existing = stripped.cleaned;
+    if (customizedManagedTuiSections.length > 0) {
+      existing = `${existing.trimEnd()}\n\n${customizedManagedTuiSections.join("\n\n")}\n`;
+    }
   }
   if (existing.includes(SHARED_MCP_REGISTRY_MARKER)) {
     const stripped = stripExistingSharedMcpRegistryBlock(existing);
