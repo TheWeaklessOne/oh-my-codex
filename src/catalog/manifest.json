@@ -33,6 +33,12 @@
       "core": true
     },
     {
+      "name": "mission-hardening",
+      "category": "execution",
+      "status": "active",
+      "core": false
+    },
+    {
       "name": "ecomode",
       "category": "execution",
       "status": "merged",
@@ -47,6 +53,12 @@
       "name": "autoresearch",
       "category": "execution",
       "status": "active"
+    },
+    {
+      "name": "pipeline",
+      "category": "execution",
+      "status": "active",
+      "core": false
     },
     {
       "name": "swarm",
@@ -120,8 +132,14 @@
     {
       "name": "web-clone",
       "category": "shortcut",
+      "status": "merged",
+      "canonical": "visual-ralph"
+    },
+    {
+      "name": "visual-ralph",
+      "category": "shortcut",
       "status": "active",
-      "canonical": "vision"
+      "canonical": "designer"
     },
     {
       "name": "frontend-ui-ux",

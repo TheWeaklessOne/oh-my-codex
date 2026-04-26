@@ -1,10 +1,10 @@
 {
-  "generatedAt": "2026-04-24T17:29:52.321Z",
+  "generatedAt": "2026-04-26T01:15:13.493Z",
   "version": "2026.02.28.1",
   "counts": {
-    "skillCount": 41,
+    "skillCount": 44,
     "promptCount": 30,
-    "activeSkillCount": 27,
+    "activeSkillCount": 29,
     "activeAgentCount": 18
   },
   "coreSkills": [
@@ -52,6 +52,13 @@
       "internalRequired": false
     },
     {
+      "name": "mission-hardening",
+      "category": "execution",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
       "name": "ecomode",
       "category": "execution",
       "status": "merged",
@@ -68,6 +75,13 @@
     },
     {
       "name": "autoresearch",
+      "category": "execution",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "pipeline",
       "category": "execution",
       "status": "active",
       "core": false,
@@ -168,8 +182,16 @@
     {
       "name": "web-clone",
       "category": "shortcut",
+      "status": "merged",
+      "canonical": "visual-ralph",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "visual-ralph",
+      "category": "shortcut",
       "status": "active",
-      "canonical": "vision",
+      "canonical": "designer",
       "core": false,
       "internalRequired": false
     },
@@ -504,6 +526,10 @@
     {
       "name": "build-fix",
       "canonical": "build-fixer"
+    },
+    {
+      "name": "web-clone",
+      "canonical": "visual-ralph"
     },
     {
       "name": "frontend-ui-ux",

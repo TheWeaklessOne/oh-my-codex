@@ -24,7 +24,7 @@ export const OMX_ENTRY_PATH_ENV = "OMX_ENTRY_PATH";
 export const OMX_STARTUP_CWD_ENV = "OMX_STARTUP_CWD";
 
 function resolveLauncherPath(rawPath: string, baseCwd: string): string {
-  return isAbsolute(rawPath) ? rawPath : resolve(baseCwd, rawPath);
+  return canonicalizeComparablePath(isAbsolute(rawPath) ? rawPath : resolve(baseCwd, rawPath));
 }
 
 export function canonicalizeComparablePath(rawPath: string): string {
@@ -100,8 +100,10 @@ export function resolveOmxCliEntryPath(
   } = {},
 ): string | null {
   const entry = resolveOmxEntryPath(options);
-  const hasExplicitCliArgv1 =
-    typeof options.argv1 === "string" && options.argv1.trim() !== "";
+  const rawArgv1 = Object.prototype.hasOwnProperty.call(options, "argv1")
+    ? options.argv1
+    : process.argv[1];
+  const hasCliArgv1 = typeof rawArgv1 === "string" && rawArgv1.trim() !== "";
 
   const packageRootDir = options.packageRootDir || packageRoot();
   const fallback = resolvePackagedOmxCliEntryPath(
@@ -109,7 +111,7 @@ export function resolveOmxCliEntryPath(
     options.cwd || process.cwd(),
   );
 
-  if (hasExplicitCliArgv1 && isOmxCliEntryPath(entry) && existsSync(entry)) {
+  if (hasCliArgv1 && isOmxCliEntryPath(rawArgv1) && isOmxCliEntryPath(entry) && existsSync(entry)) {
     return entry;
   }
 

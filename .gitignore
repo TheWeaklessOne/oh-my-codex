@@ -11,7 +11,10 @@ dist/
 # Local agent/worktree artifacts (never commit)
 .claude/
 .claire/
-.agents/
+.agents/*
+!.agents/plugins/
+.agents/plugins/*
+!.agents/plugins/marketplace.json
 .codex/
 .playwright-mcp/
 coverage/
@@ -26,9 +29,7 @@ bin/omx-explore-harness.meta.json
 authority.json
 backlog.json
 dispatch.json
-engine.lock
-events.json
-mailbox.json
-readiness.json
-replay.json
-snapshot.json
+events.ndjson
+mailbox/
+worker-*/
+worker-*-*.json

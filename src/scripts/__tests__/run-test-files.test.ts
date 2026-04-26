@@ -1,14 +1,26 @@
-import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { describe, it } from 'node:test';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, '..', '..', '..');
 const runTestFilesScript = join(repoRoot, 'dist', 'scripts', 'run-test-files.js');
+
+function runCompiledRunner(root: string, envOverrides: Record<string, string> = {}, timeoutMs = 5_000) {
+  return spawnSync(process.execPath, [runTestFilesScript, root], {
+    cwd: repoRoot,
+    encoding: 'utf-8',
+    env: {
+      ...process.env,
+      ...envOverrides,
+    },
+    timeout: timeoutMs,
+  });
+}
 
 describe('run-test-files', () => {
   it('spawns tests with isolated HOME and sanitized live notification env', () => {
@@ -78,6 +90,57 @@ describe('run-test-files', () => {
       assert.equal(childEnv.rustupHome, rustupHome);
     } finally {
       rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('applies a bounded node --test timeout so hanging tests fail with file context', () => {
+    const wd = mkdtempSync(join(tmpdir(), 'omx-run-test-files-'));
+    try {
+      const testsDir = join(wd, '__tests__');
+      mkdirSync(testsDir, { recursive: true });
+      writeFileSync(
+        join(testsDir, 'hang.test.js'),
+        [
+          "import { test } from 'node:test';",
+          "test('never resolves', async () => { await new Promise(() => setInterval(() => {}, 1_000)); });",
+          '',
+        ].join('\n'),
+      );
+
+      const result = runCompiledRunner(wd, {
+        OMX_NODE_TEST_TIMEOUT_MS: '250',
+        OMX_NODE_TEST_RUNNER_TIMEOUT_MS: '750',
+      });
+
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /per-test timeout 250ms/);
+      assert.match(result.stderr, /node --test did not exit normally|runner timeout 750ms/);
+      assert.match(`${result.stdout}\n${result.stderr}`, /hang\.test\.js|never resolves|cancelled/i);
+    } finally {
+      rmSync(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('logs that per-test timeout is disabled by default', () => {
+    const wd = mkdtempSync(join(tmpdir(), 'omx-run-test-files-'));
+    try {
+      const testsDir = join(wd, '__tests__');
+      mkdirSync(testsDir, { recursive: true });
+      writeFileSync(
+        join(testsDir, 'pass.test.js'),
+        [
+          "import { test } from 'node:test';",
+          "test('passes', () => {});",
+          '',
+        ].join('\n'),
+      );
+
+      const result = runCompiledRunner(wd);
+
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.match(result.stderr, /per-test timeout disabled/);
+    } finally {
+      rmSync(wd, { recursive: true, force: true });
     }
   });
 });

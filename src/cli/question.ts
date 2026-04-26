@@ -1,13 +1,22 @@
 import { evaluateQuestionPolicy } from '../question/policy.js';
+import * as questionState from '../question/state.js';
 import {
-	createQuestionRecord,
-	markQuestionTerminalError,
-	markQuestionPrompting,
-	waitForQuestionTerminalState,
+  createQuestionRecord,
+  markQuestionTerminalError,
+  markQuestionPrompting,
 } from '../question/state.js';
 import { isQuestionRendererAlive, launchQuestionRenderer } from '../question/renderer.js';
 import { normalizeQuestionInput } from '../question/types.js';
 import { runQuestionUi } from '../question/ui.js';
+
+const DEFAULT_QUESTION_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
+
+function parseQuestionWaitTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = String(env.OMX_QUESTION_WAIT_TIMEOUT_MS ?? '').trim();
+  if (!raw) return DEFAULT_QUESTION_WAIT_TIMEOUT_MS;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_QUESTION_WAIT_TIMEOUT_MS;
+}
 
 export const QUESTION_HELP = `omx question - OMX-owned blocking user question entrypoint
 
@@ -105,12 +114,22 @@ function extractErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function createJsonSafeInlineQuestionOutput(): { isTTY?: boolean; write(chunk: string): boolean } {
+  return {
+    get isTTY() {
+      return process.stdout.isTTY;
+    },
+    write(chunk: string): boolean {
+      return process.stderr.write(chunk);
+    },
+  };
+}
+
 interface QuestionCommandDeps {
   evaluateQuestionPolicyImpl?: typeof evaluateQuestionPolicy;
   createQuestionRecordImpl?: typeof createQuestionRecord;
   markQuestionTerminalErrorImpl?: typeof markQuestionTerminalError;
   markQuestionPromptingImpl?: typeof markQuestionPrompting;
-  waitForQuestionTerminalStateImpl?: typeof waitForQuestionTerminalState;
   launchQuestionRendererImpl?: typeof launchQuestionRenderer;
   isQuestionRendererAliveImpl?: typeof isQuestionRendererAlive;
 }
@@ -142,19 +161,17 @@ export async function questionCommand(
 
   const input = normalizeQuestionInput(rawInput);
   const cwd = process.cwd();
-  const evaluateQuestionPolicyImpl = deps.evaluateQuestionPolicyImpl ?? evaluateQuestionPolicy;
-  const createQuestionRecordImpl = deps.createQuestionRecordImpl ?? createQuestionRecord;
-  const markQuestionTerminalErrorImpl =
+  const evaluateQuestionPolicyFn: typeof evaluateQuestionPolicy = deps.evaluateQuestionPolicyImpl ?? evaluateQuestionPolicy;
+  const createQuestionRecordFn: typeof createQuestionRecord = deps.createQuestionRecordImpl ?? createQuestionRecord;
+  const markQuestionTerminalErrorFn: typeof markQuestionTerminalError =
     deps.markQuestionTerminalErrorImpl ?? markQuestionTerminalError;
-  const markQuestionPromptingImpl = deps.markQuestionPromptingImpl ?? markQuestionPrompting;
-  const waitForQuestionTerminalStateImpl =
-    deps.waitForQuestionTerminalStateImpl ?? waitForQuestionTerminalState;
-  const launchQuestionRendererImpl =
+  const markQuestionPromptingFn: typeof markQuestionPrompting = deps.markQuestionPromptingImpl ?? markQuestionPrompting;
+  const launchQuestionRendererFn: typeof launchQuestionRenderer =
     deps.launchQuestionRendererImpl ?? launchQuestionRenderer;
-  const isQuestionRendererAliveImpl =
+  const isQuestionRendererAliveFn: typeof isQuestionRendererAlive =
     deps.isQuestionRendererAliveImpl ?? isQuestionRendererAlive;
 
-  const policy = await evaluateQuestionPolicyImpl({ cwd, explicitSessionId: input.session_id });
+  const policy = await evaluateQuestionPolicyFn({ cwd, explicitSessionId: input.session_id });
   if (!policy.allowed) {
     printJson({
       ok: false,
@@ -167,26 +184,32 @@ export async function questionCommand(
     return;
   }
 
-  const { record, recordPath } = await createQuestionRecordImpl(cwd, input, policy.sessionId);
+  const { record, recordPath } = await createQuestionRecordFn(cwd, input, policy.sessionId);
 
   let finalRecord;
   try {
-    const renderer = launchQuestionRendererImpl({
+    const renderer = launchQuestionRendererFn({
       cwd,
       recordPath,
       sessionId: policy.sessionId,
     });
-    await markQuestionPromptingImpl(recordPath, renderer);
-    finalRecord = await waitForQuestionTerminalStateImpl(recordPath, {
-      onPending: async (pendingRecord) => {
-        if (pendingRecord.renderer && !isQuestionRendererAliveImpl(pendingRecord.renderer)) {
-          throw new Error('Question renderer exited before writing a terminal state.');
-        }
-      },
+    await markQuestionPromptingFn(recordPath, renderer);
+    if (renderer.renderer === 'inline-tty') {
+      await runQuestionUi(
+        recordPath,
+        parsed.json ? { output: createJsonSafeInlineQuestionOutput() } : {},
+      );
+    }
+    finalRecord = await questionState.waitForQuestionTerminalState(recordPath, {
+      timeoutMs: parseQuestionWaitTimeoutMs(),
+      rendererAlive: (currentRecord) => isQuestionRendererAliveFn(currentRecord.renderer),
+      rendererDeathMessage: (currentRecord) => (
+        `Question renderer ${currentRecord.renderer?.renderer ?? renderer.renderer} ${currentRecord.renderer?.target ?? renderer.target} exited before answering.`
+      ),
     });
   } catch (error) {
     const message = extractErrorMessage(error);
-    await markQuestionTerminalErrorImpl(
+    await markQuestionTerminalErrorFn(
       recordPath,
       'error',
       'question_runtime_failed',

@@ -2,9 +2,9 @@
 
 import { existsSync } from 'fs';
 import { appendFile, mkdir, open, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'fs/promises';
-import { spawnSync } from 'child_process';
 import { dirname, join, resolve } from 'path';
 import { homedir } from 'os';
+import { StringDecoder } from 'string_decoder';
 import { spawnPlatformCommandSync } from '../utils/platform-command.js';
 import { drainPendingTeamDispatch } from './notify-hook/team-dispatch.js';
 import {
@@ -97,6 +97,19 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+let atomicJsonWriteCounter = 0;
+
+async function writeJsonObjectAtomically(path: string, value: unknown): Promise<void> {
+  const tempPath = `${path}.${process.pid}.${Date.now()}.${++atomicJsonWriteCounter}.tmp`;
+  try {
+    await writeFile(tempPath, JSON.stringify(value, null, 2));
+    await rename(tempPath, path);
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
 async function waitForPidExit(pid: number, timeoutMs = 3000, stepMs = 50): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -164,6 +177,7 @@ interface WatcherFileMeta {
   offset: number;
   size: number;
   partial: string;
+  decoder: StringDecoder;
 }
 
 interface WatcherSessionMeta {
@@ -1350,7 +1364,7 @@ async function writeState(extra: Record<string, unknown> = {}): Promise<void> {
     },
     ...extra,
   };
-  await writeFile(statePath, JSON.stringify(state, null, 2)).catch(() => {});
+  await writeJsonObjectAtomically(statePath, state).catch(() => {});
 }
 
 async function writeAuthorityBackoffState(): Promise<void> {
@@ -1359,7 +1373,7 @@ async function writeAuthorityBackoffState(): Promise<void> {
   const state = existing && typeof existing === 'object'
     ? { ...existing, authority_backoff: lastAuthorityBackoff }
     : { authority_backoff: lastAuthorityBackoff };
-  await writeFile(statePath, JSON.stringify(state, null, 2)).catch(() => {});
+  await writeJsonObjectAtomically(statePath, state).catch(() => {});
 }
 
 async function readJsonObject(path: string): Promise<Record<string, unknown> | null> {
@@ -1693,11 +1707,10 @@ function buildNotifyPayload(meta: WatcherFileMeta, turnId: string, lastMessage: 
 }
 
 async function invokeNotifyHook(payload: Record<string, unknown>, filePath: string): Promise<void> {
-  const result = spawnSync(process.execPath, [notifyScript, JSON.stringify(payload)], {
+  const { result } = spawnPlatformCommandSync(process.execPath, [notifyScript, JSON.stringify(payload)], {
     cwd,
     encoding: 'utf-8',
-      windowsHide: true,
-    });
+  });
   const ok = result.status === 0;
   await eventLog({
     type: 'fallback_notify',
@@ -1757,7 +1770,9 @@ async function ensureTrackedFiles(): Promise<void> {
     const line = await readFirstLine(path).catch(() => '');
     const sessionMeta = parseSessionMetaLine(line);
     if (!sessionMeta) continue;
-    const size = (await stat(path).catch(() => ({ size: 0 }))).size || 0;
+    const fileStat = await stat(path).catch(() => null);
+    if (!fileStat) continue;
+    const size = fileStat.size || 0;
     const offset = runOnce ? 0 : size;
     fileState.set(path, {
       threadId: sessionMeta.threadId,
@@ -1768,6 +1783,7 @@ async function ensureTrackedFiles(): Promise<void> {
       offset,
       size,
       partial: '',
+      decoder: new StringDecoder('utf8'),
     });
   }
 }
@@ -1781,15 +1797,54 @@ function splitBufferedLines(partial: string, delta: string): { lines: string[]; 
   };
 }
 
+async function readFileDelta(
+  path: string,
+  offset: number,
+  currentSize: number,
+): Promise<{ bytes: Buffer; nextOffset: number }> {
+  const length = currentSize - offset;
+  if (length <= 0) return { bytes: Buffer.alloc(0), nextOffset: offset };
+  const handle = await open(path, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(length);
+    let totalBytesRead = 0;
+    while (totalBytesRead < length) {
+      const { bytesRead } = await handle.read(
+        buffer,
+        totalBytesRead,
+        length - totalBytesRead,
+        offset + totalBytesRead,
+      );
+      if (bytesRead === 0) break;
+      totalBytesRead += bytesRead;
+    }
+    return {
+      bytes: buffer.subarray(0, totalBytesRead),
+      nextOffset: offset + totalBytesRead,
+    };
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
 async function pollFiles(): Promise<number> {
   let processedCount = 0;
   for (const [path, meta] of fileState.entries()) {
-    const currentSize = (await stat(path).catch(() => ({ size: 0 }))).size || 0;
+    const fileStat = await stat(path).catch(() => null);
+    if (!fileStat) continue;
+    const currentSize = fileStat.size || 0;
+    if (currentSize < meta.offset) {
+      meta.offset = 0;
+      meta.partial = '';
+      meta.decoder = new StringDecoder('utf8');
+    }
     if (currentSize <= meta.offset) continue;
-    const content = await readFile(path, 'utf-8').catch(() => '');
-    if (!content) continue;
-    const delta = content.slice(meta.offset);
-    meta.offset = currentSize;
+    const read = await readFileDelta(path, meta.offset, currentSize).catch(() => null);
+    if (!read || read.bytes.length === 0) continue;
+    const { bytes, nextOffset } = read;
+    meta.offset = nextOffset;
+    const delta = meta.decoder.write(bytes);
+    if (!delta) continue;
     const buffered = splitBufferedLines(meta.partial, delta);
     const lines = buffered.lines;
     meta.partial = buffered.partial;
