@@ -76,6 +76,9 @@ import {
 } from './notify-hook/team-worker.js';
 import { DEFAULT_MARKER } from './tmux-hook-engine.js';
 
+const NOTIFY_HOOK_STATE_FILE = 'notify-hook-state.json';
+const NOTIFY_HOOK_TURN_DEDUPE_FILE = 'notify-hook-turn-dedupe.json';
+
 const RALPH_ACTIVE_PROGRESS_PHASES = new Set([
   'start',
   'started',
@@ -93,6 +96,47 @@ const RALPH_ACTIVE_PROGRESS_PHASES = new Set([
 function isTurnCompletePayload(payload: Record<string, unknown>): boolean {
   const type = safeString(payload.type || '').trim().toLowerCase();
   return type === '' || type === 'agent-turn-complete' || type === 'turn-complete';
+}
+
+async function recordProjectTurnIfFirst(
+  stateDir: string,
+  logsDir: string,
+  key: string,
+  details: {
+    threadId: string;
+    turnId: string;
+    eventType: string;
+    sessionId: string;
+    source: string;
+  },
+): Promise<boolean> {
+  const now = Date.now();
+  const dedupePath = join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_FILE);
+  const dedupeState = normalizeNotifyState(
+    await readFile(dedupePath, 'utf-8')
+      .then((content) => JSON.parse(content))
+      .catch(() => null),
+  );
+  dedupeState.recent_turns = pruneRecentTurns(dedupeState.recent_turns, now);
+  if (dedupeState.recent_turns[key]) {
+    await logNotifyHookEvent(logsDir, {
+      timestamp: new Date().toISOString(),
+      type: 'turn_duplicate_suppressed',
+      scope: 'project',
+      thread_id: details.threadId || null,
+      turn_id: details.turnId || null,
+      event_type: details.eventType,
+      omx_session_id: details.sessionId || null,
+      source: details.source || null,
+    });
+    return false;
+  }
+
+  dedupeState.recent_turns[key] = now;
+  dedupeState.last_event_at = new Date().toISOString();
+  await mkdir(dirname(dedupePath), { recursive: true }).catch(() => {});
+  await writeFile(dedupePath, JSON.stringify(dedupeState, null, 2)).catch(() => {});
+  return true;
 }
 
 async function main() {
@@ -188,9 +232,25 @@ async function main() {
       const eventType = safeString(payload.type || 'agent-turn-complete');
       const key = `${threadId || 'no-thread'}|${turnId}|${eventType}`;
       const dedupeSessionId = getEffectiveSessionId();
-      const dedupeStatePath = await getScopedStatePath(stateDir, 'notify-hook-state.json', dedupeSessionId);
+      const isProjectFirst = await recordProjectTurnIfFirst(
+        stateDir,
+        logsDir,
+        key,
+        {
+          threadId,
+          turnId,
+          eventType,
+          sessionId: dedupeSessionId,
+          source: safeString(payload.source || ''),
+        },
+      );
+      if (!isProjectFirst) {
+        process.exit(0);
+      }
+
+      const dedupeStatePath = await getScopedStatePath(stateDir, NOTIFY_HOOK_STATE_FILE, dedupeSessionId);
       const dedupeState = normalizeNotifyState(
-        await readScopedJsonIfExists(stateDir, 'notify-hook-state.json', dedupeSessionId, null),
+        await readScopedJsonIfExists(stateDir, NOTIFY_HOOK_STATE_FILE, dedupeSessionId, null),
       );
       dedupeState.recent_turns = pruneRecentTurns(dedupeState.recent_turns, now);
       if (dedupeState.recent_turns[key]) {
