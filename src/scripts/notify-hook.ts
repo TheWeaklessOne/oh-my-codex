@@ -18,7 +18,7 @@
  *   team-worker.js     – worker heartbeat and idle notification
  */
 
-import { writeFile, appendFile, mkdir, readFile } from 'fs/promises';
+import { writeFile, appendFile, mkdir, readFile, open, rm, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 
@@ -78,6 +78,9 @@ import { DEFAULT_MARKER } from './tmux-hook-engine.js';
 
 const NOTIFY_HOOK_STATE_FILE = 'notify-hook-state.json';
 const NOTIFY_HOOK_TURN_DEDUPE_FILE = 'notify-hook-turn-dedupe.json';
+const NOTIFY_HOOK_TURN_DEDUPE_LOCK_FILE = 'notify-hook-turn-dedupe.lock';
+const NOTIFY_HOOK_TURN_DEDUPE_LOCK_TIMEOUT_MS = 1500;
+const NOTIFY_HOOK_TURN_DEDUPE_LOCK_STALE_MS = 10_000;
 
 const RALPH_ACTIVE_PROGRESS_PHASES = new Set([
   'start',
@@ -98,7 +101,203 @@ function isTurnCompletePayload(payload: Record<string, unknown>): boolean {
   return type === '' || type === 'agent-turn-complete' || type === 'turn-complete';
 }
 
-async function recordProjectTurnIfFirst(
+type ProjectTurnDelivery = 'allow' | 'suppress';
+type ProjectTurnSourceKind = 'native' | 'fallback';
+
+interface ProjectTurnClaim {
+  timestamp: number;
+  delivery: ProjectTurnDelivery;
+  source_kind: ProjectTurnSourceKind;
+  source: string;
+  session_id: string;
+  audience: string;
+  reason: string;
+}
+
+interface ProjectTurnDedupeState {
+  recent_turns: Record<string, number>;
+  turn_claims: Record<string, ProjectTurnClaim>;
+  last_event_at: string;
+}
+
+interface ProjectTurnDedupeDecision {
+  shouldContinue: boolean;
+  suppressExternalDelivery: boolean;
+  reason: string;
+  existingClaim?: ProjectTurnClaim;
+  currentClaim: ProjectTurnClaim;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeTurnDedupeEventType(rawType: unknown): string {
+  const type = safeString(rawType || '').trim().toLowerCase();
+  if (!type || type === 'agent-turn-complete' || type === 'turn-complete') {
+    return 'agent-turn-complete';
+  }
+  return type;
+}
+
+function normalizeProjectTurnSourceKind(source: string): ProjectTurnSourceKind {
+  return source.trim().toLowerCase().startsWith('notify-fallback')
+    ? 'fallback'
+    : 'native';
+}
+
+function normalizeProjectTurnDelivery(value: string): ProjectTurnDelivery {
+  return value === 'allow' ? 'allow' : 'suppress';
+}
+
+function normalizeProjectTurnClaim(
+  value: unknown,
+  fallbackTimestamp: number | null,
+): ProjectTurnClaim | null {
+  const raw = asRecord(value);
+  if (!raw) return null;
+  const timestamp = asNumber(raw.timestamp) ?? fallbackTimestamp;
+  if (timestamp === null) return null;
+  const source = safeString(raw.source);
+  const sourceKind = safeString(raw.source_kind) === 'fallback' ? 'fallback' : 'native';
+  return {
+    timestamp,
+    delivery: normalizeProjectTurnDelivery(safeString(raw.delivery)),
+    source_kind: sourceKind,
+    source,
+    session_id: safeString(raw.session_id),
+    audience: safeString(raw.audience),
+    reason: safeString(raw.reason),
+  };
+}
+
+function normalizeProjectTurnDedupeState(raw: unknown, now: number): ProjectTurnDedupeState {
+  const base = normalizeNotifyState(raw);
+  const recentTurns = pruneRecentTurns(base.recent_turns, now);
+  const rawClaims = asRecord(asRecord(raw)?.turn_claims);
+  const minTimestamp = now - (24 * 60 * 60 * 1000);
+  const turnClaims: Record<string, ProjectTurnClaim> = {};
+  for (const [key, value] of Object.entries(rawClaims || {})) {
+    const claim = normalizeProjectTurnClaim(value, asNumber(recentTurns[key]));
+    if (!claim || claim.timestamp < minTimestamp) continue;
+    turnClaims[key] = claim;
+    recentTurns[key] = claim.timestamp;
+  }
+  return {
+    recent_turns: recentTurns,
+    turn_claims: turnClaims,
+    last_event_at: base.last_event_at,
+  };
+}
+
+async function acquireProjectTurnDedupeLock(stateDir: string): Promise<() => Promise<void>> {
+  const lockPath = join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_LOCK_FILE);
+  const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  const deadline = Date.now() + NOTIFY_HOOK_TURN_DEDUPE_LOCK_TIMEOUT_MS;
+
+  while (true) {
+    try {
+      await mkdir(dirname(lockPath), { recursive: true }).catch(() => {});
+      const handle = await open(lockPath, 'wx');
+      try {
+        await handle.writeFile(token);
+      } catch (error) {
+        await handle.close().catch(() => {});
+        await rm(lockPath, { force: true }).catch(() => {});
+        throw error;
+      } finally {
+        await handle.close().catch(() => {});
+      }
+      return async () => {
+        const currentToken = await readFile(lockPath, 'utf-8').catch(() => '');
+        if (currentToken === token) {
+          await rm(lockPath, { force: true }).catch(() => {});
+        }
+      };
+    } catch (error) {
+      const code = error && typeof error === 'object'
+        ? (error as NodeJS.ErrnoException).code
+        : '';
+      if (code !== 'EEXIST') {
+        throw error;
+      }
+      const lockStat = await stat(lockPath).catch(() => null);
+      if (lockStat && Date.now() - lockStat.mtimeMs > NOTIFY_HOOK_TURN_DEDUPE_LOCK_STALE_MS) {
+        await rm(lockPath, { force: true }).catch(() => {});
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error('project turn dedupe lock timeout');
+      }
+      await sleep(25);
+    }
+  }
+}
+
+async function withProjectTurnDedupeLock<T>(
+  stateDir: string,
+  action: () => Promise<T>,
+): Promise<T> {
+  const release = await acquireProjectTurnDedupeLock(stateDir);
+  try {
+    return await action();
+  } finally {
+    await release();
+  }
+}
+
+function createProjectTurnClaim(
+  now: number,
+  details: {
+    sessionId: string;
+    source: string;
+    audience: string;
+    delivery: ProjectTurnDelivery;
+    reason: string;
+  },
+): ProjectTurnClaim {
+  return {
+    timestamp: now,
+    delivery: details.delivery,
+    source_kind: normalizeProjectTurnSourceKind(details.source),
+    source: details.source,
+    session_id: details.sessionId,
+    audience: details.audience,
+    reason: details.reason,
+  };
+}
+
+function legacyProjectTurnClaim(timestamp: number): ProjectTurnClaim {
+  return {
+    timestamp,
+    delivery: 'allow',
+    source_kind: 'native',
+    source: 'legacy',
+    session_id: '',
+    audience: '',
+    reason: 'legacy_project_turn_dedupe',
+  };
+}
+
+function shouldUpgradeProjectTurnClaim(
+  existingClaim: ProjectTurnClaim,
+  currentClaim: ProjectTurnClaim,
+): boolean {
+  if (currentClaim.delivery === 'allow' && existingClaim.delivery === 'suppress') {
+    return true;
+  }
+  return currentClaim.delivery === 'allow'
+    && currentClaim.source_kind === 'native'
+    && existingClaim.source_kind === 'fallback';
+}
+
+async function recordProjectTurnDedupe(
   stateDir: string,
   logsDir: string,
   key: string,
@@ -108,17 +307,60 @@ async function recordProjectTurnIfFirst(
     eventType: string;
     sessionId: string;
     source: string;
+    audience: string;
+    delivery: ProjectTurnDelivery;
+    reason: string;
   },
-): Promise<boolean> {
+): Promise<ProjectTurnDedupeDecision> {
   const now = Date.now();
   const dedupePath = join(stateDir, NOTIFY_HOOK_TURN_DEDUPE_FILE);
-  const dedupeState = normalizeNotifyState(
-    await readFile(dedupePath, 'utf-8')
-      .then((content) => JSON.parse(content))
-      .catch(() => null),
-  );
-  dedupeState.recent_turns = pruneRecentTurns(dedupeState.recent_turns, now);
-  if (dedupeState.recent_turns[key]) {
+  const currentClaim = createProjectTurnClaim(now, details);
+  const decision = await withProjectTurnDedupeLock(stateDir, async () => {
+    const dedupeState = normalizeProjectTurnDedupeState(
+      await readFile(dedupePath, 'utf-8')
+        .then((content) => JSON.parse(content))
+        .catch(() => null),
+      now,
+    );
+    const existingTimestamp = asNumber(dedupeState.recent_turns[key]);
+    const existingClaim = dedupeState.turn_claims[key]
+      || (existingTimestamp !== null ? legacyProjectTurnClaim(existingTimestamp) : null);
+
+    if (existingClaim && !shouldUpgradeProjectTurnClaim(existingClaim, currentClaim)) {
+      return {
+        shouldContinue: false,
+        suppressExternalDelivery: false,
+        reason: 'duplicate',
+        existingClaim,
+        currentClaim,
+      };
+    }
+
+    dedupeState.recent_turns[key] = now;
+    dedupeState.turn_claims[key] = currentClaim;
+    dedupeState.last_event_at = new Date().toISOString();
+    await mkdir(dirname(dedupePath), { recursive: true }).catch(() => {});
+    await writeFile(dedupePath, JSON.stringify(dedupeState, null, 2)).catch(() => {});
+
+    if (existingClaim) {
+      return {
+        shouldContinue: true,
+        suppressExternalDelivery: existingClaim.delivery === 'allow',
+        reason: 'owner_upgrade',
+        existingClaim,
+        currentClaim,
+      };
+    }
+
+    return {
+      shouldContinue: true,
+      suppressExternalDelivery: false,
+      reason: 'first',
+      currentClaim,
+    };
+  });
+
+  if (!decision.shouldContinue) {
     await logNotifyHookEvent(logsDir, {
       timestamp: new Date().toISOString(),
       type: 'turn_duplicate_suppressed',
@@ -128,15 +370,31 @@ async function recordProjectTurnIfFirst(
       event_type: details.eventType,
       omx_session_id: details.sessionId || null,
       source: details.source || null,
+      existing_source: decision.existingClaim?.source || null,
+      existing_source_kind: decision.existingClaim?.source_kind || null,
+      existing_delivery: decision.existingClaim?.delivery || null,
     });
-    return false;
+    return decision;
   }
 
-  dedupeState.recent_turns[key] = now;
-  dedupeState.last_event_at = new Date().toISOString();
-  await mkdir(dirname(dedupePath), { recursive: true }).catch(() => {});
-  await writeFile(dedupePath, JSON.stringify(dedupeState, null, 2)).catch(() => {});
-  return true;
+  if (decision.reason === 'owner_upgrade') {
+    await logNotifyHookEvent(logsDir, {
+      timestamp: new Date().toISOString(),
+      type: 'turn_duplicate_owner_upgraded',
+      scope: 'project',
+      thread_id: details.threadId || null,
+      turn_id: details.turnId || null,
+      event_type: details.eventType,
+      omx_session_id: details.sessionId || null,
+      source: details.source || null,
+      previous_source: decision.existingClaim?.source || null,
+      previous_source_kind: decision.existingClaim?.source_kind || null,
+      previous_delivery: decision.existingClaim?.delivery || null,
+      suppress_external_delivery: decision.suppressExternalDelivery,
+    });
+  }
+
+  return decision;
 }
 
 async function main() {
@@ -207,6 +465,7 @@ async function main() {
   });
   let turnOrigin = originResolution.origin;
   const suppressExternalCompletedTurn = originResolution.delivery === 'suppress';
+  let suppressProjectCompletedTurnDelivery = false;
   await logNotifyHookEvent(logsDir, {
     timestamp: new Date().toISOString(),
     type: 'turn_origin_resolved',
@@ -229,10 +488,10 @@ async function main() {
     if (turnId) {
       const now = Date.now();
       const threadId = safeString(payload['thread-id'] || payload.thread_id || '');
-      const eventType = safeString(payload.type || 'agent-turn-complete');
+      const eventType = normalizeTurnDedupeEventType(payload.type);
       const key = `${threadId || 'no-thread'}|${turnId}|${eventType}`;
       const dedupeSessionId = getEffectiveSessionId();
-      const isProjectFirst = await recordProjectTurnIfFirst(
+      const projectDedupe = await recordProjectTurnDedupe(
         stateDir,
         logsDir,
         key,
@@ -242,11 +501,15 @@ async function main() {
           eventType,
           sessionId: dedupeSessionId,
           source: safeString(payload.source || ''),
+          audience: originResolution.audience,
+          delivery: normalizeProjectTurnDelivery(originResolution.delivery),
+          reason: originResolution.reason,
         },
       );
-      if (!isProjectFirst) {
+      if (!projectDedupe.shouldContinue) {
         process.exit(0);
       }
+      suppressProjectCompletedTurnDelivery = projectDedupe.suppressExternalDelivery;
 
       const dedupeStatePath = await getScopedStatePath(stateDir, NOTIFY_HOOK_STATE_FILE, dedupeSessionId);
       const dedupeState = normalizeNotifyState(
@@ -612,17 +875,24 @@ async function main() {
     }
   }
 
+  const suppressCompletedTurnDelivery = suppressExternalCompletedTurn || suppressProjectCompletedTurnDelivery;
+  const completedTurnDeliverySuppressionReason = suppressExternalCompletedTurn
+    ? originResolution.reason
+    : 'project_duplicate_previous_delivery';
+
   // 7. Dispatch native turn-complete hook event (best effort, post-dedupe).
   // Non-leader/internal-helper turns may contain private helper/subagent output,
   // so suppress extensibility hooks with the same policy as human-facing
   // completed-turn notifications.
-  if (suppressExternalCompletedTurn) {
+  if (suppressCompletedTurnDelivery) {
     await logNotifyHookEvent(logsDir, {
       timestamp: new Date().toISOString(),
-      type: 'turn_complete_hooks_suppressed_non_leader',
+      type: suppressExternalCompletedTurn
+        ? 'turn_complete_hooks_suppressed_non_leader'
+        : 'turn_complete_hooks_suppressed_duplicate',
       origin_kind: turnOrigin.kind,
       audience: originResolution.audience,
-      delivery_reason: originResolution.reason,
+      delivery_reason: completedTurnDeliverySuppressionReason,
       thread_id: safeString(payload['thread-id'] || payload.thread_id || ''),
       parent_thread_id: turnOrigin.parentThreadId || null,
       agent_nickname: turnOrigin.agentNickname || null,
@@ -700,13 +970,13 @@ async function main() {
       const notifySessionId = getEffectiveSessionId();
       const lastAssistantMessage = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '');
       const hasAssistantText = lastAssistantMessage.trim().length > 0;
-      if (suppressExternalCompletedTurn && hasAssistantText) {
+      if (suppressCompletedTurnDelivery && hasAssistantText) {
         const suppressionBase = {
           timestamp: new Date().toISOString(),
           origin_kind: turnOrigin.kind,
           audience: originResolution.audience,
-          delivery: originResolution.delivery,
-          reason: originResolution.reason,
+          delivery: 'suppress',
+          reason: completedTurnDeliverySuppressionReason,
           thread_id: safeString(payload['thread-id'] || payload.thread_id || ''),
           turn_id: safeString(payload['turn-id'] || payload.turn_id || ''),
           native_session_id: payloadSessionId || turnOrigin.nativeSessionId || null,
@@ -717,10 +987,18 @@ async function main() {
           origin_evidence: originResolution.evidence,
           evidence_sources: originResolution.evidence.map((entry) => entry.source),
         };
-        await logNotifyHookEvent(logsDir, {
-          ...suppressionBase,
-          type: 'completed_turn_suppressed_non_leader',
-        });
+        if (suppressExternalCompletedTurn) {
+          await logNotifyHookEvent(logsDir, {
+            ...suppressionBase,
+            type: 'completed_turn_suppressed_non_leader',
+          });
+        }
+        if (suppressProjectCompletedTurnDelivery) {
+          await logNotifyHookEvent(logsDir, {
+            ...suppressionBase,
+            type: 'completed_turn_duplicate_suppressed',
+          });
+        }
         await logNotifyHookEvent(logsDir, {
           ...suppressionBase,
           type: 'completed_turn_delivery_suppressed',
@@ -730,7 +1008,7 @@ async function main() {
       const canNotifyExternalCompletedTurn = Boolean(
         notifySessionId
         && hasAssistantText
-        && !suppressExternalCompletedTurn,
+        && !suppressCompletedTurnDelivery,
       );
       if (canNotifyExternalCompletedTurn) {
         await logNotifyHookEvent(logsDir, {

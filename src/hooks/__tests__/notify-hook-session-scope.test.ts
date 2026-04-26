@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { tmpdir } from 'os';
-import { spawnSync } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { VISUAL_NEXT_ACTIONS_LIMIT } from '../../visual/constants.js';
 
@@ -25,6 +25,47 @@ function runNotifyHook(
       ...envOverrides,
     },
   });
+}
+
+function runNotifyHookAsync(
+  payload: Record<string, unknown>,
+  envOverrides: Record<string, string> = {},
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  const testDir = dirname(fileURLToPath(import.meta.url));
+  const repoRoot = join(testDir, '..', '..', '..');
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['dist/scripts/notify-hook.js', JSON.stringify(payload)], {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        OMX_TEAM_WORKER: '',
+        TMUX: '',
+        TMUX_PANE: '',
+        ...envOverrides,
+      },
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf-8');
+    child.stderr.setEncoding('utf-8');
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    child.on('error', reject);
+    child.on('close', (status) => resolve({ status, stdout, stderr }));
+  });
+}
+
+async function readJsonLines(path: string): Promise<Array<Record<string, unknown>>> {
+  const content = await readFile(path, 'utf-8').catch(() => '');
+  return content
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
 describe('notify-hook session-scoped iteration updates', () => {
@@ -277,7 +318,7 @@ describe('notify-hook session-scoped iteration updates', () => {
     }
   });
 
-  it('dedupes the same native turn across different OMX session scopes', async () => {
+  it('dedupes the same completed turn across event-type aliases and different OMX session scopes', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-notify-cross-session-dedupe-'));
     try {
       const stateDir = join(wd, '.omx', 'state');
@@ -289,7 +330,7 @@ describe('notify-hook session-scoped iteration updates', () => {
       const payload = {
         cwd: wd,
         session_id: 'native-session-1',
-        type: 'agent-turn-complete',
+        type: 'turn-complete',
         thread_id: 'native-thread-cross-session',
         turn_id: 'native-turn-cross-session',
         input_messages: ['hello'],
@@ -301,6 +342,7 @@ describe('notify-hook session-scoped iteration updates', () => {
       const second = runNotifyHook(
         {
           ...payload,
+          type: 'agent-turn-complete',
           input_messages: ['[notify-fallback] synthesized from rollout task_complete'],
           source: 'notify-fallback-watcher',
         },
@@ -325,6 +367,114 @@ describe('notify-hook session-scoped iteration updates', () => {
       ) as { recent_turns?: Record<string, number> };
       assert.equal(
         Boolean(dedupeState.recent_turns?.['native-thread-cross-session|native-turn-cross-session|agent-turn-complete']),
+        true,
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('allows native owner bookkeeping after a fallback delivery claims the project turn first', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-notify-fallback-first-dedupe-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const canonicalSessionId = 'omx-canonical-owner';
+      const fallbackSessionId = 'omx-fallback-session';
+      const nativeThreadId = 'native-thread-fallback-first';
+      const turnId = 'native-turn-fallback-first';
+      await mkdir(join(stateDir, 'sessions', canonicalSessionId), { recursive: true });
+      await mkdir(join(stateDir, 'sessions', fallbackSessionId), { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+        session_id: canonicalSessionId,
+        native_session_id: nativeThreadId,
+        started_at: new Date().toISOString(),
+        cwd: wd,
+      }));
+
+      const payload = {
+        cwd: wd,
+        session_id: 'native-session-fallback-first',
+        type: 'agent-turn-complete',
+        thread_id: nativeThreadId,
+        turn_id: turnId,
+        input_messages: ['hello'],
+        last_assistant_message: 'fallback-first output',
+      };
+
+      const fallback = runNotifyHook(
+        {
+          ...payload,
+          input_messages: ['[notify-fallback] synthesized from rollout task_complete'],
+          source: 'notify-fallback-watcher',
+        },
+        { OMX_SESSION_ID: fallbackSessionId },
+      );
+      assert.equal(fallback.status, 0, fallback.stderr || fallback.stdout);
+
+      const native = runNotifyHook(payload, { OMX_SESSION_ID: canonicalSessionId });
+      assert.equal(native.status, 0, native.stderr || native.stdout);
+
+      assert.equal(existsSync(join(stateDir, 'sessions', fallbackSessionId, 'notify-hook-state.json')), true);
+      assert.equal(existsSync(join(stateDir, 'sessions', canonicalSessionId, 'notify-hook-state.json')), true);
+
+      const notifyLog = await readJsonLines(join(wd, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`));
+      assert.equal(
+        notifyLog.some((entry) => entry.type === 'turn_duplicate_owner_upgraded' && entry.turn_id === turnId),
+        true,
+      );
+      assert.equal(
+        notifyLog.filter((entry) => entry.type === 'completed_turn_delivery_allowed' && entry.turn_id === turnId).length,
+        1,
+      );
+      assert.equal(
+        notifyLog.some((entry) => entry.type === 'completed_turn_duplicate_suppressed' && entry.turn_id === turnId),
+        true,
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('atomically dedupes concurrent duplicate turn deliveries', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-notify-concurrent-dedupe-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionId = 'omx-concurrent-session';
+      await mkdir(join(stateDir, 'sessions', sessionId), { recursive: true });
+
+      const payload = {
+        cwd: wd,
+        session_id: 'native-session-concurrent',
+        type: 'agent-turn-complete',
+        thread_id: 'native-thread-concurrent',
+        turn_id: 'native-turn-concurrent',
+        input_messages: ['hello'],
+        last_assistant_message: 'concurrent duplicate output',
+      };
+
+      const results = await Promise.all(
+        Array.from({ length: 8 }, (_, idx) =>
+          runNotifyHookAsync(
+            {
+              ...payload,
+              input_messages: [`hello ${idx}`],
+            },
+            { OMX_SESSION_ID: sessionId },
+          )
+        ),
+      );
+      for (const result of results) {
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+      }
+
+      const turnsLog = join(wd, '.omx', 'logs', `turns-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const turns = await readJsonLines(turnsLog);
+      assert.equal(turns.length, 1);
+      assert.equal(turns[0].turn_id, 'native-turn-concurrent');
+
+      const notifyLog = await readJsonLines(join(wd, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`));
+      assert.equal(
+        notifyLog.some((entry) => entry.type === 'turn_duplicate_suppressed' && entry.scope === 'project'),
         true,
       );
     } finally {
