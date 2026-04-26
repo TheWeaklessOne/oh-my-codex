@@ -448,8 +448,20 @@ async function main() {
       hudState.last_turn_at = nowIso;
       (hudState as any).last_progress_at = nowIso;
       hudState.turn_count = (hudState.turn_count || 0) + 1;
-      (hudState as any).last_agent_output = (payload['last-assistant-message'] || payload.last_assistant_message || '')
-        .slice(0, 100);
+      const hudAssistantOutput = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '');
+      if (suppressExternalCompletedTurn) {
+        (hudState as any).last_agent_output = '';
+        (hudState as any).last_agent_output_redacted = true;
+        (hudState as any).last_agent_output_length = hudAssistantOutput.length;
+        (hudState as any).last_agent_output_suppression_reason = originResolution.reason;
+        (hudState as any).last_agent_output_audience = originResolution.audience;
+      } else {
+        (hudState as any).last_agent_output = hudAssistantOutput.slice(0, 100);
+        delete (hudState as any).last_agent_output_redacted;
+        delete (hudState as any).last_agent_output_length;
+        delete (hudState as any).last_agent_output_suppression_reason;
+        delete (hudState as any).last_agent_output_audience;
+      }
       await mkdir(dirname(hudStatePath), { recursive: true }).catch(() => {});
       await writeFile(hudStatePath, JSON.stringify(hudState, null, 2));
     } catch {

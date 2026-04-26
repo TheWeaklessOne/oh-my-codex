@@ -451,6 +451,57 @@ function buildCleanNotifyEnv(
   };
 }
 
+async function writeNotificationConfig(codexHome: string): Promise<void> {
+  await mkdir(codexHome, { recursive: true });
+  await writeFile(join(codexHome, '.omx-config.json'), JSON.stringify({
+    notifications: {
+      enabled: true,
+      verbosity: 'session',
+      webhook: {
+        enabled: true,
+        url: 'https://example.com/hooks/notify',
+      },
+      events: {
+        'session-start': { enabled: false },
+        'session-stop': { enabled: false },
+        'session-idle': { enabled: false },
+        'result-ready': { enabled: true },
+        'ask-user-question': { enabled: true },
+        'session-end': { enabled: true },
+      },
+    },
+  }, null, 2));
+}
+
+async function writeFetchCapturePreload(dir: string): Promise<string> {
+  const preloadPath = join(dir, 'mock-fetch.mjs');
+  await writeFile(preloadPath, `
+import { appendFileSync } from 'node:fs';
+
+const capturePath = process.env.OMX_FETCH_CAPTURE_PATH;
+globalThis.fetch = async (input, init = {}) => {
+  const url = typeof input === 'string' ? input : input instanceof URL ? String(input) : input.url;
+  if (capturePath) {
+    appendFileSync(capturePath, JSON.stringify({
+      url,
+      body: typeof init.body === 'string' ? init.body : '',
+    }) + '\\n');
+  }
+  return new Response('', { status: 200 });
+};
+`, 'utf-8');
+  return preloadPath;
+}
+
+async function readCapturedRequests(path: string): Promise<Array<{ url: string; body: string }>> {
+  const content = await readFile(path, 'utf-8').catch(() => '');
+  return content
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as { url: string; body: string });
+}
+
 describe('notify-fallback watcher', () => {
   it('uses offset-bounded rollout reads instead of re-reading whole tracked files', async () => {
     const source = await readFile(new URL('../../scripts/notify-fallback-watcher.js', import.meta.url), 'utf-8');
@@ -531,6 +582,74 @@ describe('notify-fallback watcher', () => {
       const fallbackLog = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
       const fallbackEntries = await readJsonLines(fallbackLog);
       assert.deepEqual(fallbackEntries.map((entry) => entry.type), ['fallback_notify']);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(tempHome, { recursive: true, force: true });
+      await rm(rolloutPath, { force: true });
+    }
+  });
+
+  it('one-shot mode suppresses no-owner unknown task_complete notifications fail-closed', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-no-owner-'));
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-home-'));
+    const codexHome = join(tempHome, 'codex-home');
+    const capturePath = join(tempHome, 'captures.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempHome);
+    const sid = `test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const sessionDir = todaySessionDir(tempHome);
+    const rolloutPath = join(sessionDir, `rollout-test-fallback-no-owner-${sid}.jsonl`);
+
+    try {
+      await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
+      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+      await writeNotificationConfig(codexHome);
+
+      const nowIso = new Date(Date.now() + 2_000).toISOString();
+      const threadId = `thread-${sid}`;
+      const turnId = `turn-no-owner-${sid}`;
+      await writeFile(rolloutPath, `${[
+        {
+          timestamp: nowIso,
+          type: 'session_meta',
+          payload: { id: threadId, cwd: wd },
+        },
+        {
+          timestamp: nowIso,
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: turnId,
+            last_agent_message: 'Implemented fallback result. Tests passed.',
+          },
+        },
+      ].map(v => JSON.stringify(v)).join('\n')}\n`);
+
+      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const result = spawnSync(
+        process.execPath,
+        [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
+        {
+          encoding: 'utf-8',
+          env: buildCleanNotifyEnv({
+            HOME: tempHome,
+            USERPROFILE: tempHome,
+            CODEX_HOME: codexHome,
+            OMX_FETCH_CAPTURE_PATH: capturePath,
+            NODE_OPTIONS: `--import=${preloadPath}`,
+          }),
+        },
+      );
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      assert.equal((await readCapturedRequests(capturePath)).length, 0);
+      const notifyLog = join(wd, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const notifyEntries = await readJsonLines(notifyLog);
+      const suppressed = notifyEntries.find((entry) => entry.type === 'completed_turn_delivery_suppressed');
+      assert.equal(suppressed?.origin_kind, 'unknown');
+      assert.equal(suppressed?.audience, 'unknown-non-owner');
+      assert.equal(suppressed?.reason, 'unknown_without_current_owner_fail_closed');
     } finally {
       await rm(wd, { recursive: true, force: true });
       await rm(tempHome, { recursive: true, force: true });
@@ -1161,13 +1280,7 @@ describe('notify-fallback watcher', () => {
           payload: { id: threadId, cwd: wd },
         })}\n`
       );
-      await writeFile(join(wd, '.omx', 'state', 'session.json'), JSON.stringify({
-        session_id: `sess-${sid}`,
-        native_session_id: threadId,
-        cwd: wd,
-        pid: process.pid,
-        platform: process.platform,
-      }, null, 2));
+      await writeSessionStart(wd, `sess-${sid}`, { nativeSessionId: threadId });
 
       const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
       const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;

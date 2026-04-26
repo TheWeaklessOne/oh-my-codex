@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -433,6 +433,76 @@ async function writeRolloutRecords(
   );
 }
 
+function parseLinuxProcStartTicks(statContent: string): number | undefined {
+  const commandEnd = statContent.lastIndexOf(')');
+  if (commandEnd === -1) return undefined;
+  const fields = statContent.slice(commandEnd + 1).trim().split(/\s+/);
+  if (fields.length <= 19) return undefined;
+  const value = Number(fields[19]);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function readCurrentLinuxIdentityForTest(): { startTicks: number; cmdline?: string } | null {
+  if (process.platform !== 'linux') return null;
+  try {
+    const startTicks = parseLinuxProcStartTicks(readFileSync(`/proc/${process.pid}/stat`, 'utf-8'));
+    if (typeof startTicks !== 'number') return null;
+    let cmdline = '';
+    try {
+      cmdline = readFileSync(`/proc/${process.pid}/cmdline`, 'utf-8')
+        .replace(/\u0000+/g, ' ')
+        .trim();
+    } catch {
+      cmdline = '';
+    }
+    return {
+      startTicks,
+      ...(cmdline ? { cmdline } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function buildOwnerSessionState(cwd: string, sessionId: string, nativeSessionId: string): Record<string, unknown> {
+  const linuxIdentity = readCurrentLinuxIdentityForTest();
+  return {
+    session_id: sessionId,
+    native_session_id: nativeSessionId,
+    started_at: new Date().toISOString(),
+    cwd,
+    ...(process.platform === 'linux' && !linuxIdentity
+      ? {}
+      : {
+        pid: process.pid,
+        platform: process.platform,
+      }),
+    ...(linuxIdentity
+      ? {
+        pid_start_ticks: linuxIdentity.startTicks,
+        ...(linuxIdentity.cmdline ? { pid_cmdline: linuxIdentity.cmdline } : {}),
+      }
+      : {}),
+  };
+}
+
+function writeOwnerSessionStateSync(cwd: string, sessionId: string, nativeSessionId: string): void {
+  const stateDir = join(cwd, '.omx', 'state');
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    join(stateDir, 'session.json'),
+    JSON.stringify(buildOwnerSessionState(cwd, sessionId, nativeSessionId), null, 2),
+  );
+}
+
+async function writeOwnerSessionState(cwd: string, sessionId: string, nativeSessionId: string): Promise<void> {
+  await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
+  await writeFile(
+    join(cwd, '.omx', 'state', 'session.json'),
+    JSON.stringify(buildOwnerSessionState(cwd, sessionId, nativeSessionId), null, 2),
+  );
+}
+
 function runNotifyHook(
   payload: Record<string, unknown>,
   env: NodeJS.ProcessEnv,
@@ -469,14 +539,7 @@ function runNotifyHook(
     && !existsSync(sessionPath)
     && !existsSync(trackingPath)
   ) {
-    mkdirSync(stateDir, { recursive: true });
-    writeFileSync(sessionPath, JSON.stringify({
-      session_id: sessionId,
-      native_session_id: nativeSessionId,
-      cwd,
-      pid: process.pid,
-      platform: process.platform,
-    }, null, 2));
+    writeOwnerSessionStateSync(cwd, sessionId, nativeSessionId);
   }
 
   return spawnSync(process.execPath, [join(repoRoot, 'dist/scripts/notify-hook.js'), JSON.stringify(payload)], {
@@ -1240,13 +1303,7 @@ describe('notify-hook semantic notifications', () => {
     try {
       await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
       await writeNotificationConfig(codexHome);
-      await writeFile(join(workdir, '.omx', 'state', 'session.json'), JSON.stringify({
-        session_id: sessionId,
-        native_session_id: ownerThreadId,
-        cwd: workdir,
-        pid: process.pid,
-        platform: process.platform,
-      }, null, 2));
+      await writeOwnerSessionState(workdir, sessionId, ownerThreadId);
       await writeSubagentTrackingFixture(workdir, sessionId, 'thread-stale-leader', ownerThreadId);
 
       const result = runNotifyHook({
@@ -1298,13 +1355,7 @@ describe('notify-hook semantic notifications', () => {
     try {
       await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
       await writeNotificationConfig(codexHome);
-      await writeFile(join(workdir, '.omx', 'state', 'session.json'), JSON.stringify({
-        session_id: ownerSessionId,
-        native_session_id: 'thread-current-owner',
-        cwd: workdir,
-        pid: process.pid,
-        platform: process.platform,
-      }, null, 2));
+      await writeOwnerSessionState(workdir, ownerSessionId, 'thread-current-owner');
 
       const result = runNotifyHook({
         cwd: workdir,
@@ -1346,6 +1397,7 @@ describe('notify-hook semantic notifications', () => {
     const capturePath = join(tempRoot, 'captures.ndjson');
     const preloadPath = await writeFetchCapturePreload(tempRoot);
     const workdir = join(tempRoot, 'repo');
+    const rawMessage = '{"findings":[{"severity":"critical","blocking":true}]}';
 
     try {
       await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
@@ -1358,7 +1410,7 @@ describe('notify-hook semantic notifications', () => {
         thread_id: 'thread-unmanaged-unknown',
         turn_id: 'turn-unmanaged-unknown',
         input_messages: [],
-        last_assistant_message: '{"findings":[{"severity":"critical","blocking":true}]}',
+        last_assistant_message: rawMessage,
       }, {
         CODEX_HOME: codexHome,
         HOME: tempRoot,
@@ -1377,6 +1429,15 @@ describe('notify-hook semantic notifications', () => {
       assert.equal(suppressed?.origin_kind, 'unknown');
       assert.equal(suppressed?.audience, 'unknown-non-owner');
       assert.equal(suppressed?.reason, 'unknown_without_current_owner_fail_closed');
+
+      const hudState = JSON.parse(
+        await readFile(join(workdir, '.omx', 'state', 'hud-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(hudState.last_agent_output, '');
+      assert.equal(hudState.last_agent_output_redacted, true);
+      assert.equal(hudState.last_agent_output_length, rawMessage.length);
+      assert.equal(hudState.last_agent_output_suppression_reason, 'unknown_without_current_owner_fail_closed');
+      assert.equal(hudState.last_agent_output_audience, 'unknown-non-owner');
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }
@@ -1394,13 +1455,7 @@ describe('notify-hook semantic notifications', () => {
     try {
       await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
       await writeNotificationConfig(codexHome);
-      await writeFile(join(workdir, '.omx', 'state', 'session.json'), JSON.stringify({
-        session_id: ownerSessionId,
-        native_session_id: 'thread-current-owner-no-poison',
-        cwd: workdir,
-        pid: process.pid,
-        platform: process.platform,
-      }, null, 2));
+      await writeOwnerSessionState(workdir, ownerSessionId, 'thread-current-owner-no-poison');
 
       const env = {
         CODEX_HOME: codexHome,
@@ -1443,13 +1498,7 @@ describe('notify-hook semantic notifications', () => {
     try {
       await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
       await writeNotificationConfig(codexHome);
-      await writeFile(join(workdir, '.omx', 'state', 'session.json'), JSON.stringify({
-        session_id: ownerSessionId,
-        native_session_id: ownerNativeSessionId,
-        cwd: workdir,
-        pid: process.pid,
-        platform: process.platform,
-      }, null, 2));
+      await writeOwnerSessionState(workdir, ownerSessionId, ownerNativeSessionId);
 
       const result = runNotifyHook({
         cwd: workdir,
@@ -1619,13 +1668,7 @@ describe('notify-hook semantic notifications', () => {
     try {
       await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
       await writeNotificationConfig(codexHome);
-      await writeFile(join(workdir, '.omx', 'state', 'session.json'), JSON.stringify({
-        session_id: ownerSessionId,
-        native_session_id: ownerNativeSessionId,
-        cwd: workdir,
-        pid: process.pid,
-        platform: process.platform,
-      }, null, 2));
+      await writeOwnerSessionState(workdir, ownerSessionId, ownerNativeSessionId);
       await writeSubagentTrackingFixture(workdir, ownerSessionId, ownerNativeSessionId, childThreadId);
 
       const result = runNotifyHook({
@@ -2013,13 +2056,7 @@ describe('notify-hook semantic notifications', () => {
     try {
       await writeNotificationConfig(codexHome);
       await writeSubagentTrackingFixture(workdir, sessionId, leaderThreadId, subagentThreadId);
-      await writeFile(join(workdir, '.omx', 'state', 'session.json'), JSON.stringify({
-        session_id: sessionId,
-        native_session_id: leaderThreadId,
-        cwd: workdir,
-        pid: process.pid,
-        platform: process.platform,
-      }, null, 2));
+      await writeOwnerSessionState(workdir, sessionId, leaderThreadId);
 
       const subagent = runNotifyHook({
         cwd: workdir,
@@ -2073,13 +2110,7 @@ describe('notify-hook semantic notifications', () => {
     try {
       await writeNotificationConfig(codexHome);
       await writeSubagentTrackingFixture(workdir, sessionId, leaderThreadId, subagentThreadId);
-      await writeFile(join(workdir, '.omx', 'state', 'session.json'), JSON.stringify({
-        session_id: sessionId,
-        native_session_id: leaderThreadId,
-        cwd: workdir,
-        pid: process.pid,
-        platform: process.platform,
-      }, null, 2));
+      await writeOwnerSessionState(workdir, sessionId, leaderThreadId);
 
       const result = runNotifyHook({
         cwd: workdir,
@@ -2444,13 +2475,7 @@ describe('notify-hook semantic notifications', () => {
       });
       assert.equal(resultReady.status, 0, resultReady.stderr || resultReady.stdout);
 
-      await writeFile(join(workdir, '.omx', 'state', 'session.json'), JSON.stringify({
-        session_id: 'sess-hook-input',
-        native_session_id: 'thread-hook-input',
-        cwd: workdir,
-        pid: process.pid,
-        platform: process.platform,
-      }, null, 2));
+      await writeOwnerSessionState(workdir, 'sess-hook-input', 'thread-hook-input');
       const askUser = runNotifyHook({
         cwd: workdir,
         type: 'agent-turn-complete',
