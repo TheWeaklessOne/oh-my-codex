@@ -9,6 +9,7 @@ import type {
   NotificationPlatform,
   NotificationTransportOverrides,
   TelegramCompletedTurnFormat,
+  TelegramAcceptedAckCleanupTarget,
   TelegramMessageEntity,
 } from "./types.js";
 import type {
@@ -22,6 +23,7 @@ export interface CompletedTurnReplyOrigin {
   platform: ReplyOriginPlatform;
   injectedInput: string;
   createdAt: string;
+  telegramAck?: TelegramAcceptedAckCleanupTarget;
 }
 
 export interface CompletedTurnTransportRenderPolicy {

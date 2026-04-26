@@ -973,6 +973,13 @@ const REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS_DEFAULT = 30;
 const REPLY_TELEGRAM_ALLOWED_UPDATES_DEFAULT = ["message"];
 const REPLY_TELEGRAM_STARTUP_BACKLOG_DEFAULT = "resume";
 const REPLY_ACK_MODES = new Set(["off", "minimal", "summary"]);
+const REPLY_TELEGRAM_ACK_MODES = new Set([
+  "off",
+  "minimal",
+  "summary",
+  "accepted",
+  "accepted-final-message",
+]);
 const REPLY_TELEGRAM_STARTUP_BACKLOG_POLICIES = new Set([
   "resume",
   "drop_pending",
@@ -988,6 +995,7 @@ interface ReplySettingsRaw {
   maxMessageLength?: unknown;
   includePrefix?: unknown;
   ackMode?: unknown;
+  telegramAckMode?: unknown;
   telegramPollTimeoutSeconds?: unknown;
   telegramAllowedUpdates?: unknown;
   telegramStartupBacklogPolicy?: unknown;
@@ -1052,6 +1060,21 @@ function parseReplyAckMode(
   return REPLY_ACK_MODES.has(candidate)
     ? candidate as "off" | "minimal" | "summary"
     : REPLY_ACK_MODE_DEFAULT;
+}
+
+function parseTelegramReplyAckMode(
+  envValue: string | undefined,
+  configValue: unknown,
+  fallback: "off" | "minimal" | "summary",
+): "off" | "minimal" | "summary" | "accepted" | "accepted-final-message" {
+  const candidate = typeof envValue === "string" && envValue.trim()
+    ? envValue.trim().toLowerCase()
+    : typeof configValue === "string" && configValue.trim()
+      ? configValue.trim().toLowerCase()
+      : fallback;
+  return REPLY_TELEGRAM_ACK_MODES.has(candidate)
+    ? candidate as "off" | "minimal" | "summary" | "accepted" | "accepted-final-message"
+    : fallback;
 }
 
 function parseTelegramStartupBacklogPolicy(
@@ -1154,13 +1177,19 @@ export function getReplyConfig(
     replyRaw?.telegramAllowedUpdates,
   );
 
+  const ackMode = parseReplyAckMode(process.env.OMX_REPLY_ACK_MODE, replyRaw?.ackMode);
   return {
     enabled: true,
     pollIntervalMs,
     maxMessageLength,
     rateLimitPerMinute,
     includePrefix: process.env.OMX_REPLY_INCLUDE_PREFIX !== "false" && (replyRaw?.includePrefix !== false),
-    ackMode: parseReplyAckMode(process.env.OMX_REPLY_ACK_MODE, replyRaw?.ackMode),
+    ackMode,
+    telegramAckMode: parseTelegramReplyAckMode(
+      process.env.OMX_REPLY_TELEGRAM_ACK_MODE,
+      replyRaw?.telegramAckMode,
+      ackMode,
+    ),
     authorizedDiscordUserIds,
     authorizedTelegramUserIds,
     telegramPollTimeoutSeconds,

@@ -4,12 +4,13 @@ import { spawn, type spawnSync } from 'node:child_process';
 import { request as httpsRequest } from 'node:https';
 import type { ClientRequestArgs, IncomingMessage } from 'node:http';
 import { PassThrough } from 'node:stream';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   RateLimiter,
+  buildInjectedReplyInput,
   captureReplyAcknowledgementSummary,
   formatReplyAcknowledgement,
   redactSensitiveTokens,
@@ -24,10 +25,11 @@ import {
   resetReplyListenerTransientState,
   startReplyListener,
 } from '../reply-listener.js';
-import type { ReplyListenerDaemonConfig, ReplyListenerState } from '../reply-listener.js';
+import type { ReplyListenerDaemonConfig, ReplyListenerRateLimiter, ReplyListenerState } from '../reply-listener.js';
 import type { SessionMapping } from '../session-registry.js';
 import { NO_TRACKED_SESSION_MESSAGE } from '../session-status.js';
 import { buildDiscordReplySource, buildTelegramReplySource } from '../reply-source.js';
+import { consumePendingReplyOrigin } from '../reply-origin-state.js';
 import { markMockTelegramTransportForTests } from '../../utils/test-env.js';
 import { OMX_ENTRY_PATH_ENV, OMX_STARTUP_CWD_ENV } from '../../utils/paths.js';
 
@@ -71,6 +73,25 @@ function createBaseState(): ReplyListenerState {
 
 function cloneState(state: ReplyListenerState): ReplyListenerState {
   return JSON.parse(JSON.stringify(state)) as ReplyListenerState;
+}
+
+async function findSavedAttachmentPath(root: string, fileName: string): Promise<string> {
+  const entries = await readdir(root, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = join(root, entry.name);
+    if (entry.isDirectory()) {
+      try {
+        return await findSavedAttachmentPath(fullPath, fileName);
+      } catch (error) {
+        if (!(error instanceof Error && error.message.includes('not found'))) {
+          throw error;
+        }
+      }
+    } else if (entry.isFile() && entry.name === fileName) {
+      return fullPath;
+    }
+  }
+  throw new Error(`Saved attachment ${fileName} not found under ${root}`);
 }
 
 async function importReplyListenerFresh() {
@@ -1729,6 +1750,509 @@ describe('pollTelegramOnce', () => {
     );
   });
 
+  it('injects Telegram media reply captions and saves screenshots for Codex context', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const attachmentRoot = await mkdtemp(join(tmpdir(), 'omx-telegram-attachments-'));
+    const projectRoot = await mkdtemp(join(tmpdir(), 'omx-telegram-origin-project-'));
+    const previousAttachmentDir = process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
+    process.env.OMX_TELEGRAM_ATTACHMENT_DIR = attachmentRoot;
+    let injectedText = '';
+
+    try {
+      await pollTelegramOnce(
+        config,
+        state,
+        new RateLimiter(10),
+        {
+          httpsRequestImpl: createHttpsRequestMock({
+            [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: [
+                  {
+                    update_id: 45,
+                    message: {
+                      message_id: 333,
+                      message_thread_id: 9001,
+                      chat: { id: 777 },
+                      from: { id: 'telegram-user-1' },
+                      caption: 'скрин и подробности в подписи',
+                      photo: [
+                        { file_id: 'photo-small', width: 320, height: 640, file_size: 4 },
+                        { file_id: 'photo-large', width: 1170, height: 2532, file_size: 12 },
+                      ],
+                      reply_to_message: { message_id: 222 },
+                    },
+                  },
+                ],
+              },
+            }),
+            [`GET /bot${config.telegramBotToken}/getFile?file_id=photo-large`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  file_path: 'photos/file_1.jpg',
+                  file_size: 12,
+                },
+              },
+            }),
+            [`GET /file/bot${config.telegramBotToken}/photos/file_1.jpg`]: () => ({
+              statusCode: 200,
+              body: 'image-bytes',
+            }),
+            [`POST /bot${config.telegramBotToken}/sendMessage`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: { message_id: 444 } },
+            }),
+          }),
+          lookupByMessageIdImpl: () => ({
+            ...createMapping('telegram'),
+            projectPath: projectRoot,
+          }),
+          injectReplyImpl: (_paneId, text, platform) => {
+            assert.equal(platform, 'telegram');
+            injectedText = text;
+            return true;
+          },
+        },
+      );
+
+      const savedPath = await findSavedAttachmentPath(attachmentRoot, '777-333-1-photo.jpg');
+      assert.equal(await readFile(savedPath, 'utf-8'), 'image-bytes');
+      const metadata = JSON.parse(await readFile(`${savedPath}.metadata.json`, 'utf-8')) as Record<string, unknown>;
+      assert.equal(metadata.kind, 'photo');
+      assert.equal(metadata.telegramFilePath, 'photos/file_1.jpg');
+      assert.match(injectedText, /скрин и подробности в подписи/);
+      assert.match(injectedText, /Telegram attachment saved locally:/);
+      assert.match(injectedText, /777-333-1-photo\.jpg/);
+      const origin = await consumePendingReplyOrigin(
+        projectRoot,
+        'session-1',
+        buildInjectedReplyInput(injectedText, 'telegram', config),
+      );
+      assert.equal(origin?.platform, 'telegram');
+      assert.match(origin?.injectedInput ?? '', /777-333-1-photo\.jpg/);
+      assert.equal(state.messagesInjected, 1);
+      assert.equal(state.telegramLastUpdateId, 45);
+    } finally {
+      if (previousAttachmentDir === undefined) {
+        delete process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
+      } else {
+        process.env.OMX_TELEGRAM_ATTACHMENT_DIR = previousAttachmentDir;
+      }
+      await rm(attachmentRoot, { recursive: true, force: true });
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('sends accepted Telegram ack before media download and records placeholder cleanup metadata', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig({ telegramAckMode: 'accepted-final-message' });
+    const state = createBaseState();
+    const attachmentRoot = await mkdtemp(join(tmpdir(), 'omx-telegram-accepted-attachments-'));
+    const projectRoot = await mkdtemp(join(tmpdir(), 'omx-telegram-accepted-origin-'));
+    const previousAttachmentDir = process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
+    process.env.OMX_TELEGRAM_ATTACHMENT_DIR = attachmentRoot;
+    const requestOrder: string[] = [];
+    const acceptedBodies: Array<Record<string, unknown>> = [];
+    let injectedText = '';
+
+    try {
+      await pollTelegramOnce(
+        config,
+        state,
+        new RateLimiter(10),
+        {
+          httpsRequestImpl: createHttpsRequestMock({
+            [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: [
+                  {
+                    update_id: 146,
+                    message: {
+                      message_id: 433,
+                      message_thread_id: 9001,
+                      chat: { id: 777 },
+                      from: { id: 'telegram-user-1' },
+                      caption: 'please inspect this accepted screenshot',
+                      photo: [{ file_id: 'accepted-photo', width: 1024, height: 768, file_size: 9 }],
+                      reply_to_message: { message_id: 222 },
+                    },
+                  },
+                ],
+              },
+            }),
+            [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+              requestOrder.push('accepted');
+              acceptedBodies.push(JSON.parse(body) as Record<string, unknown>);
+              return {
+                statusCode: 200,
+                body: { ok: true, result: { message_id: 701, message_thread_id: 9001 } },
+              };
+            },
+            [`POST /bot${config.telegramBotToken}/sendChatAction`]: (body) => {
+              requestOrder.push('typing');
+              const parsed = JSON.parse(body) as { chat_id: string; action: string; message_thread_id: number };
+              assert.equal(parsed.chat_id, config.telegramChatId);
+              assert.equal(parsed.action, 'typing');
+              assert.equal(parsed.message_thread_id, 9001);
+              return { statusCode: 200, body: { ok: true, result: true } };
+            },
+            [`GET /bot${config.telegramBotToken}/getFile?file_id=accepted-photo`]: () => {
+              requestOrder.push('getFile');
+              return {
+                statusCode: 200,
+                body: { ok: true, result: { file_path: 'photos/accepted.jpg', file_size: 9 } },
+              };
+            },
+            [`GET /file/bot${config.telegramBotToken}/photos/accepted.jpg`]: () => {
+              requestOrder.push('download');
+              return { statusCode: 200, body: 'accepted' };
+            },
+          }),
+          lookupByMessageIdImpl: () => ({
+            ...createMapping('telegram'),
+            projectPath: projectRoot,
+          }),
+          injectReplyImpl: (_paneId, text, platform) => {
+            assert.equal(platform, 'telegram');
+            injectedText = text;
+            return true;
+          },
+        },
+      );
+
+      assert.deepEqual(requestOrder, ['accepted', 'typing', 'getFile', 'download']);
+      const acceptedBody = acceptedBodies[0] ?? {};
+      assert.equal(acceptedBody.text, '✅ Принято, обрабатываю…');
+      assert.equal(acceptedBody.reply_to_message_id, 433);
+      assert.equal(acceptedBody.message_thread_id, 9001);
+      assert.equal('disable_notification' in acceptedBody, false);
+      assert.match(injectedText, /accepted screenshot/);
+      assert.match(injectedText, /777-433-1-photo\.jpg/);
+
+      const origin = await consumePendingReplyOrigin(
+        projectRoot,
+        'session-1',
+        buildInjectedReplyInput(injectedText, 'telegram', config),
+      );
+      assert.equal(origin?.platform, 'telegram');
+      assert.deepEqual(origin?.telegramAck, {
+        chatId: '777',
+        messageId: '701',
+        messageThreadId: '9001',
+      });
+      assert.equal(state.messagesInjected, 1);
+    } finally {
+      if (previousAttachmentDir === undefined) {
+        delete process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
+      } else {
+        process.env.OMX_TELEGRAM_ATTACHMENT_DIR = previousAttachmentDir;
+      }
+      await rm(attachmentRoot, { recursive: true, force: true });
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('deletes accepted Telegram ack before deferring retryable injection failures', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig({ telegramAckMode: 'accepted-final-message' });
+    const state = createBaseState();
+    const requestOrder: string[] = [];
+    const deleteBodies: Array<Record<string, unknown>> = [];
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 147,
+                  message: {
+                    message_id: 434,
+                    message_thread_id: 9001,
+                    chat: { id: 777 },
+                    from: { id: 'telegram-user-1' },
+                    text: 'retry this later',
+                    reply_to_message: { message_id: 222 },
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: () => {
+            requestOrder.push('accepted');
+            return {
+              statusCode: 200,
+              body: { ok: true, result: { message_id: 701, message_thread_id: 9001 } },
+            };
+          },
+          [`POST /bot${config.telegramBotToken}/deleteMessage`]: (body) => {
+            requestOrder.push('delete');
+            deleteBodies.push(JSON.parse(body) as Record<string, unknown>);
+            return { statusCode: 200, body: { ok: true, result: true } };
+          },
+        }),
+        lookupByMessageIdImpl: () => createMapping('telegram'),
+        injectReplyImpl: () => ({ outcome: 'retryable-failure', reason: 'temporary tmux failure' }),
+      },
+    );
+
+    assert.deepEqual(requestOrder, ['accepted', 'delete']);
+    assert.deepEqual(deleteBodies[0], { chat_id: '777', message_id: '701' });
+    assert.equal(state.messagesInjected, 0);
+    assert.equal(state.errors, 1);
+    assert.equal(state.telegramLastUpdateId, null);
+  });
+
+  it('downloads document, audio, and voice replies and injects paths plus metadata without transcription', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const attachmentRoot = await mkdtemp(join(tmpdir(), 'omx-telegram-attachments-'));
+    const previousAttachmentDir = process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
+    process.env.OMX_TELEGRAM_ATTACHMENT_DIR = attachmentRoot;
+    let injectedText = '';
+
+    try {
+      await pollTelegramOnce(
+        config,
+        state,
+        new RateLimiter(10),
+        {
+          httpsRequestImpl: createHttpsRequestMock({
+            [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: [
+                  {
+                    update_id: 46,
+                    message: {
+                      message_id: 334,
+                      message_thread_id: 9001,
+                      chat: { id: 777 },
+                      from: { id: 'telegram-user-1' },
+                      caption: 'media bundle',
+                      document: {
+                        file_id: 'document-image',
+                        file_name: 'screen.png',
+                        mime_type: 'image/png',
+                        file_size: 5,
+                      },
+                      audio: {
+                        file_id: 'audio-file',
+                        file_name: 'note.mp3',
+                        mime_type: 'audio/mpeg',
+                        duration: 42,
+                        file_size: 6,
+                      },
+                      voice: {
+                        file_id: 'voice-file',
+                        mime_type: 'audio/ogg',
+                        duration: 5,
+                        file_size: 7,
+                      },
+                      reply_to_message: { message_id: 222 },
+                    },
+                  },
+                ],
+              },
+            }),
+            [`GET /bot${config.telegramBotToken}/getFile?file_id=document-image`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: { file_path: 'documents/screen.png', file_size: 5 } },
+            }),
+            [`GET /file/bot${config.telegramBotToken}/documents/screen.png`]: () => ({ statusCode: 200, body: 'image' }),
+            [`GET /bot${config.telegramBotToken}/getFile?file_id=audio-file`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: { file_path: 'audio/note.mp3', file_size: 6 } },
+            }),
+            [`GET /file/bot${config.telegramBotToken}/audio/note.mp3`]: () => ({ statusCode: 200, body: 'audio!' }),
+            [`GET /bot${config.telegramBotToken}/getFile?file_id=voice-file`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: { file_path: 'voice/file.ogg', file_size: 7 } },
+            }),
+            [`GET /file/bot${config.telegramBotToken}/voice/file.ogg`]: () => ({ statusCode: 200, body: 'voice!!' }),
+            [`POST /bot${config.telegramBotToken}/sendMessage`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: { message_id: 445 } },
+            }),
+          }),
+          lookupByMessageIdImpl: () => createMapping('telegram'),
+          injectReplyImpl: (_paneId, text, platform) => {
+            assert.equal(platform, 'telegram');
+            injectedText = text;
+            return true;
+          },
+        },
+      );
+
+      assert.equal(await readFile(await findSavedAttachmentPath(attachmentRoot, '777-334-1-document.png'), 'utf-8'), 'image');
+      assert.equal(await readFile(await findSavedAttachmentPath(attachmentRoot, '777-334-2-audio.mp3'), 'utf-8'), 'audio!');
+      assert.equal(await readFile(await findSavedAttachmentPath(attachmentRoot, '777-334-3-voice.ogg'), 'utf-8'), 'voice!!');
+      assert.match(injectedText, /media bundle/);
+      assert.match(injectedText, /777-334-1-document\.png \(document, image\/png, 5 bytes, name=screen\.png\)/);
+      assert.match(injectedText, /777-334-2-audio\.mp3 \(audio, audio\/mpeg, 42s, 6 bytes, name=note\.mp3\)/);
+      assert.match(injectedText, /777-334-3-voice\.ogg \(voice, audio\/ogg, 5s, 7 bytes\)/);
+      assert.doesNotMatch(injectedText, /transcri/i);
+      assert.equal(state.messagesInjected, 1);
+    } finally {
+      if (previousAttachmentDir === undefined) {
+        delete process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
+      } else {
+        process.env.OMX_TELEGRAM_ATTACHMENT_DIR = previousAttachmentDir;
+      }
+      await rm(attachmentRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('injects media failure diagnostics and advances the Telegram cursor when attachment download fails', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    let injectedText = '';
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 47,
+                  message: {
+                    message_id: 335,
+                    message_thread_id: 9001,
+                    chat: { id: 777 },
+                    from: { id: 'telegram-user-1' },
+                    caption: 'keep this caption despite failed media',
+                    photo: [{ file_id: 'broken-photo', width: 100, height: 200, file_size: 8 }],
+                    reply_to_message: { message_id: 222 },
+                  },
+                },
+              ],
+            },
+          }),
+          [`GET /bot${config.telegramBotToken}/getFile?file_id=broken-photo`]: () => ({
+            statusCode: 500,
+            body: { ok: false, description: 'temporary Telegram file failure' },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: () => ({
+            statusCode: 200,
+            body: { ok: true, result: { message_id: 446 } },
+          }),
+        }),
+        lookupByMessageIdImpl: () => createMapping('telegram'),
+        injectReplyImpl: (_paneId, text, platform) => {
+          assert.equal(platform, 'telegram');
+          injectedText = text;
+          return true;
+        },
+      },
+    );
+
+    assert.match(injectedText, /keep this caption despite failed media/);
+    assert.match(injectedText, /Telegram attachment could not be saved:/);
+    assert.match(injectedText, /photo#1: temporary Telegram file failure/);
+    assert.equal(state.messagesInjected, 1);
+    assert.equal(state.telegramLastUpdateId, 47);
+  });
+
+  it('preserves saved Telegram media paths when long captions exceed injection limits', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig({ maxMessageLength: 400 });
+    const state = createBaseState();
+    const attachmentRoot = await mkdtemp(join(tmpdir(), 'omx-telegram-long-caption-'));
+    const previousAttachmentDir = process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
+    process.env.OMX_TELEGRAM_ATTACHMENT_DIR = attachmentRoot;
+    let injectedText = '';
+
+    try {
+      await pollTelegramOnce(
+        config,
+        state,
+        new RateLimiter(10),
+        {
+          httpsRequestImpl: createHttpsRequestMock({
+            [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: [
+                  {
+                    update_id: 48,
+                    message: {
+                      message_id: 336,
+                      message_thread_id: 9001,
+                      chat: { id: 777 },
+                      from: { id: 'telegram-user-1' },
+                      caption: `long caption ${'x'.repeat(1200)}`,
+                      photo: [{ file_id: 'long-caption-photo', width: 100, height: 200, file_size: 8 }],
+                      reply_to_message: { message_id: 222 },
+                    },
+                  },
+                ],
+              },
+            }),
+            [`GET /bot${config.telegramBotToken}/getFile?file_id=long-caption-photo`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: { file_path: 'photos/long-caption.jpg', file_size: 8 } },
+            }),
+            [`GET /file/bot${config.telegramBotToken}/photos/long-caption.jpg`]: () => ({
+              statusCode: 200,
+              body: 'longpath',
+            }),
+            [`POST /bot${config.telegramBotToken}/sendMessage`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: { message_id: 447 } },
+            }),
+          }),
+          lookupByMessageIdImpl: () => createMapping('telegram'),
+          injectReplyImpl: (_paneId, text, platform) => {
+            assert.equal(platform, 'telegram');
+            injectedText = text;
+            return true;
+          },
+        },
+      );
+
+      const injected = buildInjectedReplyInput(injectedText, 'telegram', config);
+      assert.ok(injected.length <= config.maxMessageLength);
+      assert.match(injected, /long caption/);
+      assert.match(injected, /…/);
+      assert.match(injected, /Telegram attachment saved locally:/);
+      assert.match(injected, /777-336-1-photo\.jpg/);
+      assert.equal(await readFile(await findSavedAttachmentPath(attachmentRoot, '777-336-1-photo.jpg'), 'utf-8'), 'longpath');
+      assert.equal(state.messagesInjected, 1);
+      assert.equal(state.telegramLastUpdateId, 48);
+    } finally {
+      if (previousAttachmentDir === undefined) {
+        delete process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
+      } else {
+        process.env.OMX_TELEGRAM_ATTACHMENT_DIR = previousAttachmentDir;
+      }
+      await rm(attachmentRoot, { recursive: true, force: true });
+    }
+  });
+
   it('ignores Telegram replies from the wrong chat', async () => {
     resetReplyListenerTransientState();
     const config = createBaseConfig();
@@ -1945,6 +2469,178 @@ describe('pollTelegramOnce', () => {
     assert.equal(parsedBody.message_thread_id, 9001);
     assert.match(parsedBody.text, /started a new omx session/i);
     assert.match(parsedBody.text, /omx-topic-session-1/);
+  });
+
+  it('launches a Telegram project topic with captioned media and submits the rendered prompt', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
+    const attachmentRoot = await mkdtemp(join(tmpdir(), 'omx-telegram-topic-attachments-'));
+    const projectRoot = await mkdtemp(join(tmpdir(), 'omx-telegram-topic-project-'));
+    const previousAttachmentDir = process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
+    process.env.OMX_TELEGRAM_ATTACHMENT_DIR = attachmentRoot;
+    const submittedPrompts: Array<{ paneId: string; text: string }> = [];
+
+    try {
+      await pollTelegramOnce(
+        config,
+        state,
+        new RateLimiter(10),
+        {
+          httpsRequestImpl: createHttpsRequestMock({
+            [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: [
+                  {
+                    update_id: 61,
+                    message: {
+                      message_id: 351,
+                      message_thread_id: 9001,
+                      chat: { id: 777, type: 'supergroup' },
+                      from: { id: 'telegram-user-1' },
+                      caption: 'Investigate this screenshot from Telegram topic',
+                      photo: [{ file_id: 'topic-photo', width: 100, height: 200, file_size: 8 }],
+                    },
+                  },
+                ],
+              },
+            }),
+            [`GET /bot${config.telegramBotToken}/getFile?file_id=topic-photo`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: { file_path: 'photos/topic.jpg', file_size: 8 } },
+            }),
+            [`GET /file/bot${config.telegramBotToken}/photos/topic.jpg`]: () => ({ statusCode: 200, body: 'topicimg' }),
+            [`POST /bot${config.telegramBotToken}/sendMessage`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: { message_id: 552, message_thread_id: 9001 } },
+            }),
+          }),
+          getNotificationConfigImpl: () => ({
+            enabled: true,
+            telegram: {
+              enabled: true,
+              botToken: config.telegramBotToken,
+              chatId: config.telegramChatId,
+              projectTopics: { enabled: true },
+            },
+          }) as any,
+          findTopicRecordByThreadIdImpl: async () => ({
+            sourceChatKey: telegramSource.key,
+            projectKey: 'project-key-1',
+            canonicalProjectPath: projectRoot,
+            displayName: 'worktree-a',
+            topicName: 'worktree-a',
+            messageThreadId: '9001',
+          }),
+          launchDetachedManagedSessionImpl: async () => ({
+            sessionId: 'omx-topic-session-media',
+            tmuxSessionName: 'omx-worktree-a-main',
+            leaderPaneId: '%91',
+            cwd: '/repos/worktree-a',
+          }),
+          waitForCodexPaneReadyImpl: () => true,
+          submitPromptToCodexPaneImpl: async (paneId, text) => {
+            submittedPrompts.push({ paneId, text });
+            return true;
+          },
+          registerMessageImpl: () => true,
+        },
+      );
+
+      const savedPath = await findSavedAttachmentPath(attachmentRoot, '777-351-1-photo.jpg');
+      assert.equal(await readFile(savedPath, 'utf-8'), 'topicimg');
+      assert.equal(submittedPrompts.length, 1);
+      assert.equal(submittedPrompts[0]?.paneId, '%91');
+      assert.match(submittedPrompts[0]?.text ?? '', /Investigate this screenshot/);
+      assert.match(submittedPrompts[0]?.text ?? '', /777-351-1-photo\.jpg/);
+      const origin = await consumePendingReplyOrigin(
+        projectRoot,
+        'omx-topic-session-media',
+        submittedPrompts[0]?.text ?? '',
+      );
+      assert.equal(origin?.platform, 'telegram');
+      assert.match(origin?.injectedInput ?? '', /777-351-1-photo\.jpg/);
+      assert.equal(state.messagesInjected, 1);
+      assert.equal(state.telegramLastUpdateId, 61);
+    } finally {
+      if (previousAttachmentDir === undefined) {
+        delete process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
+      } else {
+        process.env.OMX_TELEGRAM_ATTACHMENT_DIR = previousAttachmentDir;
+      }
+      await rm(attachmentRoot, { recursive: true, force: true });
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('rate-limits Telegram topic media before downloading attachments', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
+    const blockedRateLimiter: ReplyListenerRateLimiter = {
+      canProceed: () => false,
+      reset: () => {},
+    };
+
+    await pollTelegramOnce(
+      config,
+      state,
+      blockedRateLimiter,
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 62,
+                  message: {
+                    message_id: 352,
+                    message_thread_id: 9001,
+                    chat: { id: 777, type: 'supergroup' },
+                    from: { id: 'telegram-user-1' },
+                    caption: 'do not download yet',
+                    photo: [{ file_id: 'topic-photo-rate-limited', width: 100, height: 200, file_size: 8 }],
+                  },
+                },
+              ],
+            },
+          }),
+        }),
+        getNotificationConfigImpl: () => ({
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: config.telegramBotToken,
+            chatId: config.telegramChatId,
+            projectTopics: { enabled: true },
+          },
+        }) as any,
+        findTopicRecordByThreadIdImpl: async () => ({
+          sourceChatKey: telegramSource.key,
+          projectKey: 'project-key-1',
+          canonicalProjectPath: '/repos/worktree-a',
+          displayName: 'worktree-a',
+          topicName: 'worktree-a',
+          messageThreadId: '9001',
+        }),
+        launchDetachedManagedSessionImpl: async () => {
+          throw new Error('topic launch should not run when rate-limited');
+        },
+        submitPromptToCodexPaneImpl: async () => {
+          throw new Error('prompt submit should not run when rate-limited');
+        },
+      },
+    );
+
+    assert.equal(state.messagesInjected, 0);
+    assert.equal(state.errors, 1);
+    assert.equal(state.telegramLastUpdateId, null);
   });
 
   it('keeps topic-launch diagnostics when acknowledgement registration fails', async () => {
@@ -2790,6 +3486,204 @@ describe('pollTelegramOnce', () => {
 
     const parsedBody = JSON.parse(sendMessageBody) as { text: string };
     assert.match(parsedBody.text, /permissions confirmation/i);
+  });
+
+  it('does not download media for untracked Telegram replies', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    let sendMessageBody = '';
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 145,
+                  message: {
+                    message_id: 433,
+                    message_thread_id: 9001,
+                    chat: { id: 777 },
+                    from: { id: 'telegram-user-1' },
+                    caption: 'untracked screenshot',
+                    photo: [{ file_id: 'must-not-download', width: 100, height: 100, file_size: 5 }],
+                    reply_to_message: { message_id: 999999 },
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 455 } } };
+          },
+        }),
+        lookupByMessageIdImpl: () => null,
+        injectReplyImpl: () => {
+          throw new Error('injectReply should not run for untracked replies');
+        },
+      },
+    );
+
+    assert.equal(state.messagesInjected, 0);
+    assert.equal(state.errors, 0);
+    assert.match((JSON.parse(sendMessageBody) as { text: string }).text, /no tracked omx session/i);
+  });
+
+  it('does not download media for rate-limited Telegram replies', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const blockedRateLimiter: ReplyListenerRateLimiter = {
+      canProceed: () => false,
+      reset: () => {},
+    };
+
+    await pollTelegramOnce(
+      config,
+      state,
+      blockedRateLimiter,
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 146,
+                  message: {
+                    message_id: 434,
+                    message_thread_id: 9001,
+                    chat: { id: 777 },
+                    from: { id: 'telegram-user-1' },
+                    caption: 'rate limited screenshot',
+                    photo: [{ file_id: 'must-not-download', width: 100, height: 100, file_size: 5 }],
+                    reply_to_message: { message_id: 222 },
+                  },
+                },
+              ],
+            },
+          }),
+        }),
+        lookupByMessageIdImpl: () => createMapping('telegram'),
+        injectReplyImpl: () => {
+          throw new Error('injectReply should not run when rate-limited');
+        },
+      },
+    );
+
+    assert.equal(state.messagesInjected, 0);
+    assert.equal(state.errors, 1);
+    assert.equal(state.telegramLastUpdateId, null);
+  });
+
+  it('does not download media for Telegram status probes', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    let sendMessageBody = '';
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 147,
+                  message: {
+                    message_id: 435,
+                    message_thread_id: 9001,
+                    chat: { id: 777 },
+                    from: { id: 'telegram-user-1' },
+                    caption: 'status',
+                    photo: [{ file_id: 'must-not-download', width: 100, height: 100, file_size: 5 }],
+                    reply_to_message: { message_id: 222 },
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 456 } } };
+          },
+        }),
+        lookupByMessageIdImpl: () => createMapping('telegram'),
+        buildSessionStatusReplyImpl: async () => 'Tracked OMX session status',
+        injectReplyImpl: () => {
+          throw new Error('injectReply should not run for status probes');
+        },
+      },
+    );
+
+    assert.equal(state.messagesInjected, 0);
+    assert.equal(state.errors, 0);
+    assert.equal((JSON.parse(sendMessageBody) as { text: string }).text, 'Tracked OMX session status');
+  });
+
+  it('does not download media for unauthorized Telegram replies', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    let sendMessageBody = '';
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 148,
+                  message: {
+                    message_id: 436,
+                    message_thread_id: 9001,
+                    chat: { id: 777 },
+                    from: { id: 'intruder' },
+                    caption: 'unauthorized screenshot',
+                    photo: [{ file_id: 'must-not-download', width: 100, height: 100, file_size: 5 }],
+                    reply_to_message: { message_id: 222 },
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBody = body;
+            return { statusCode: 200, body: { ok: true, result: { message_id: 457 } } };
+          },
+        }),
+        lookupByMessageIdImpl: () => {
+          throw new Error('lookup should not run for unauthorized Telegram senders');
+        },
+        injectReplyImpl: () => {
+          throw new Error('injectReply should not run for unauthorized Telegram senders');
+        },
+      },
+    );
+
+    assert.equal(state.messagesInjected, 0);
+    assert.equal(state.errors, 0);
+    assert.match((JSON.parse(sendMessageBody) as { text: string }).text, /not authorized/i);
   });
 
   it('rejects unauthorized Telegram senders even when the chat matches', async () => {

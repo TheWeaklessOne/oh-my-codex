@@ -105,6 +105,12 @@ export interface TelegramNotificationConfig {
   projectTopics?: TelegramProjectTopicsConfig;
 }
 
+export interface TelegramAcceptedAckCleanupTarget {
+  chatId: string;
+  messageId: string;
+  messageThreadId?: string;
+}
+
 /** Slack platform configuration */
 export interface SlackNotificationConfig {
   enabled: boolean;
@@ -315,6 +321,8 @@ export interface FullNotificationPayload {
   tmuxTailLive?: boolean;
   /** Generic per-platform rendering overrides */
   transportOverrides?: NotificationTransportOverrides;
+  /** Accepted Telegram reply placeholder to delete after a successful fresh final sendMessage. */
+  telegramAcceptedAck?: TelegramAcceptedAckCleanupTarget;
   /** Agent name (populated by extensibility plugins, not set by core Codex CLI hooks) */
   agentName?: string;
   /** Agent type (populated by extensibility plugins, not set by core Codex CLI hooks) */
@@ -365,6 +373,10 @@ export interface NotificationsBlock extends FullNotificationConfig {
 
 /** Reply injection configuration */
 export type ReplyAcknowledgementMode = "off" | "minimal" | "summary";
+export type TelegramReplyAcknowledgementMode =
+  | ReplyAcknowledgementMode
+  | "accepted"
+  | "accepted-final-message";
 export type TelegramStartupBacklogPolicy = "resume" | "drop_pending" | "replay_once";
 
 export interface ReplyConfig {
@@ -379,6 +391,8 @@ export interface ReplyConfig {
   includePrefix: boolean;
   /** Reply acknowledgement verbosity (default: minimal) */
   ackMode: ReplyAcknowledgementMode;
+  /** Telegram-specific acknowledgement UX (default: ackMode) */
+  telegramAckMode?: TelegramReplyAcknowledgementMode;
   /** Authorized Discord user IDs (REQUIRED for Discord, empty = Discord disabled) */
   authorizedDiscordUserIds: string[];
   /** Authorized Telegram sender IDs (empty = fallback to chat-level auth only) */

@@ -589,6 +589,9 @@ export async function notifyCompletedTurn(
       maxIterations: data.maxIterations,
       question: data.question,
       incompleteTasks: data.incompleteTasks,
+      ...(decision.replyOrigin?.platform === "telegram" && decision.replyOrigin.telegramAck
+        ? { telegramAcceptedAck: decision.replyOrigin.telegramAck }
+        : {}),
     };
 
     const verbosity = getVerbosity(config);

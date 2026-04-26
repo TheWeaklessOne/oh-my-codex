@@ -42,6 +42,7 @@ import {
   isTelegramStaleTopicError,
 } from "./telegram-errors.js";
 import { updateTelegramTopicRegistryRecord } from "./telegram-topic-registry.js";
+import { deleteTelegramAcceptedAckBestEffort } from "./telegram-inbound/ack.js";
 import { shouldBlockLiveNotificationNetworkInTests } from "../utils/test-env.js";
 
 const SEND_TIMEOUT_MS = 10_000;
@@ -444,6 +445,13 @@ export async function sendTelegram(
         destination,
         messageThreadId,
       );
+      if (payload.telegramAcceptedAck) {
+        await deleteTelegramAcceptedAckBestEffort(
+          { botToken: config.botToken },
+          payload.telegramAcceptedAck,
+          deps,
+        );
+      }
 
       return {
         platform: "telegram",

@@ -41,6 +41,24 @@ function normalizePendingReplyOrigin(
   const createdAt = typeof raw.createdAt === "string"
     ? raw.createdAt
     : "";
+  const rawTelegramAck =
+    raw.telegramAck && typeof raw.telegramAck === "object" && !Array.isArray(raw.telegramAck)
+      ? raw.telegramAck as Record<string, unknown>
+      : null;
+  const telegramAck =
+    rawTelegramAck
+    && typeof rawTelegramAck.chatId === "string"
+    && rawTelegramAck.chatId.trim()
+    && typeof rawTelegramAck.messageId === "string"
+    && rawTelegramAck.messageId.trim()
+      ? {
+          chatId: rawTelegramAck.chatId,
+          messageId: rawTelegramAck.messageId,
+          ...(typeof rawTelegramAck.messageThreadId === "string" && rawTelegramAck.messageThreadId.trim()
+            ? { messageThreadId: rawTelegramAck.messageThreadId }
+            : {}),
+        }
+      : undefined;
 
   if (!platform || !injectedInput || !createdAt) {
     return null;
@@ -50,6 +68,7 @@ function normalizePendingReplyOrigin(
     platform,
     injectedInput,
     createdAt,
+    ...(platform === "telegram" && telegramAck ? { telegramAck } : {}),
   };
 }
 
@@ -113,6 +132,9 @@ export async function recordPendingReplyOrigin(
     platform: pending.platform,
     injectedInput: pending.injectedInput,
     createdAt: pending.createdAt || new Date().toISOString(),
+    ...(pending.platform === "telegram" && pending.telegramAck
+      ? { telegramAck: pending.telegramAck }
+      : {}),
   });
   const nextPendingOrigins = pendingOrigins.slice(-MAX_PENDING_REPLY_ORIGINS);
   await writePendingReplyOrigins(targetPath, nextPendingOrigins);

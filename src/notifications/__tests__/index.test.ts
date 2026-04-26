@@ -613,4 +613,68 @@ describe('notifyCompletedTurn transport override filtering', () => {
     assert.ok(result);
     assert.equal(capturedPayload?.transportOverrides, undefined);
   });
+
+  it('propagates Telegram accepted placeholder cleanup metadata into completed-turn payloads', async () => {
+    const { notifyCompletedTurn, planCompletedTurnNotification } = await import(`../index.js?completed-turn-telegram-ack=${Date.now()}`);
+    const decision = planCompletedTurnNotification({
+      semanticOutcome: {
+        kind: 'result-ready',
+        summary: 'Done.',
+        notificationEvent: 'result-ready',
+      },
+      replyOrigin: {
+        platform: 'telegram',
+        injectedInput: '[reply:telegram] show details',
+        createdAt: new Date('2026-04-27T00:00:00Z').toISOString(),
+        telegramAck: {
+          chatId: '777',
+          messageId: '701',
+          messageThreadId: '9001',
+        },
+      },
+      assistantText: 'Final answer',
+      turnId: 'turn-telegram-ack',
+    });
+    assert.ok(decision);
+
+    const config: FullNotificationConfig = {
+      enabled: true,
+      telegram: {
+        enabled: true,
+        botToken: '123456:abc',
+        chatId: '777',
+      },
+    };
+    let capturedPayload: { telegramAcceptedAck?: unknown } | undefined;
+
+    const result = await notifyCompletedTurn(
+      decision,
+      {
+        sessionId: 'sess-telegram-ack',
+        assistantText: 'Final answer',
+        timestamp: new Date('2026-04-27T12:00:00Z').toISOString(),
+      },
+      undefined,
+      {
+        getNotificationConfigImpl: () => config,
+        isEventEnabledImpl: () => true,
+        ensureReplyListenerForConfigImpl: () => {},
+        dispatchNotificationsImpl: async (_config: FullNotificationConfig, event: string, payload: unknown) => {
+          capturedPayload = payload as { telegramAcceptedAck?: unknown };
+          return {
+            event: event as never,
+            anySuccess: true,
+            results: [],
+          };
+        },
+      },
+    );
+
+    assert.ok(result);
+    assert.deepEqual(capturedPayload?.telegramAcceptedAck, {
+      chatId: '777',
+      messageId: '701',
+      messageThreadId: '9001',
+    });
+  });
 });

@@ -348,6 +348,173 @@ describe('sendTelegram', () => {
     assert.equal(parsedBody.message_thread_id, 9001);
   });
 
+  it('sends Telegram final answers as fresh non-silent messages then deletes accepted placeholders', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true },
+    };
+    const requestOrder: string[] = [];
+    const sendBodies: Array<Record<string, unknown>> = [];
+    const deleteBodies: Array<Record<string, unknown>> = [];
+
+    const result = await sendTelegram(
+      config,
+      {
+        ...basePayload,
+        event: 'result-ready',
+        message: 'Delayed final answer',
+        telegramAcceptedAck: {
+          chatId: '777',
+          messageId: '701',
+          messageThreadId: '9001',
+        },
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+          messageThreadId: '9001',
+          projectKey: 'project-key-1',
+          topicName: 'project-a',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+            requestOrder.push('sendMessage');
+            sendBodies.push(JSON.parse(body) as Record<string, unknown>);
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: 702,
+                  message_thread_id: 9001,
+                  is_topic_message: true,
+                },
+              },
+            };
+          },
+          [`POST /bot${config.botToken}/deleteMessage`]: (body) => {
+            requestOrder.push('deleteMessage');
+            deleteBodies.push(JSON.parse(body) as Record<string, unknown>);
+            return {
+              statusCode: 200,
+              body: { ok: true, result: true },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, true);
+    assert.deepEqual(requestOrder, ['sendMessage', 'deleteMessage']);
+    const sendBody = sendBodies[0] ?? {};
+    assert.equal(sendBody.text, 'Delayed final answer');
+    assert.equal(sendBody.message_thread_id, 9001);
+    assert.equal('disable_notification' in sendBody, false);
+    assert.deepEqual(deleteBodies[0], { chat_id: '777', message_id: '701' });
+  });
+
+  it('keeps Telegram final delivery successful when accepted placeholder deletion fails', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+    };
+    const requestOrder: string[] = [];
+
+    const result = await sendTelegram(
+      config,
+      {
+        ...basePayload,
+        event: 'result-ready',
+        message: 'Final answer survives cleanup failure',
+        telegramAcceptedAck: {
+          chatId: '777',
+          messageId: '701',
+        },
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+        }),
+        logger: {
+          warn: () => {},
+        },
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: () => {
+            requestOrder.push('sendMessage');
+            return {
+              statusCode: 200,
+              body: { ok: true, result: { message_id: 703 } },
+            };
+          },
+          [`POST /bot${config.botToken}/deleteMessage`]: () => {
+            requestOrder.push('deleteMessage');
+            return {
+              statusCode: 400,
+              body: { ok: false, description: 'message to delete not found' },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, true);
+    assert.equal(result.messageId, '703');
+    assert.deepEqual(requestOrder, ['sendMessage', 'deleteMessage']);
+  });
+
+  it('does not delete accepted Telegram placeholders when final sendMessage fails', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+    };
+    const requestOrder: string[] = [];
+
+    const result = await sendTelegram(
+      config,
+      {
+        ...basePayload,
+        event: 'result-ready',
+        message: 'Final answer fails before cleanup',
+        telegramAcceptedAck: {
+          chatId: '777',
+          messageId: '701',
+        },
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: () => {
+            requestOrder.push('sendMessage');
+            return {
+              statusCode: 500,
+              body: { ok: false, description: 'telegram unavailable' },
+            };
+          },
+          [`POST /bot${config.botToken}/deleteMessage`]: () => {
+            requestOrder.push('deleteMessage');
+            return {
+              statusCode: 200,
+              body: { ok: true, result: true },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, false);
+    assert.match(result.error ?? '', /telegram unavailable|HTTP 500/);
+    assert.deepEqual(requestOrder, ['sendMessage']);
+  });
+
   it('omits parse_mode when the payload explicitly disables telegram parsing', async () => {
     const config: TelegramNotificationConfig = {
       enabled: true,
