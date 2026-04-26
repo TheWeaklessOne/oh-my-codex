@@ -964,9 +964,9 @@ export async function resolveTurnOriginForNotification(
     appendEvidence(evidence, seenEvidence, "owner-state", "no_current_owner_state");
     return {
       origin,
-      audience: "external-owner",
-      delivery: "allow",
-      reason: "no_current_owner_direct_payload",
+      audience: "unknown-non-owner",
+      delivery: "suppress",
+      reason: "unknown_without_current_owner_fail_closed",
       evidence,
       ...(sessionMeta ? { sessionMeta } : {}),
     };

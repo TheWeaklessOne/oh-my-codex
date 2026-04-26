@@ -1161,6 +1161,13 @@ describe('notify-fallback watcher', () => {
           payload: { id: threadId, cwd: wd },
         })}\n`
       );
+      await writeFile(join(wd, '.omx', 'state', 'session.json'), JSON.stringify({
+        session_id: `sess-${sid}`,
+        native_session_id: threadId,
+        cwd: wd,
+        pid: process.pid,
+        platform: process.platform,
+      }, null, 2));
 
       const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
       const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;

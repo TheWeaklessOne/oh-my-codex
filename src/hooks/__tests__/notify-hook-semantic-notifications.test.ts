@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -435,8 +436,49 @@ async function writeRolloutRecords(
 function runNotifyHook(
   payload: Record<string, unknown>,
   env: NodeJS.ProcessEnv,
-  options: { teamWorkerEnv?: string } = {},
+  options: {
+    teamWorkerEnv?: string;
+    ownerState?: boolean;
+  } = {},
 ) {
+  const cwd = typeof payload.cwd === 'string' ? payload.cwd : '';
+  const stateDir = cwd ? join(cwd, '.omx', 'state') : '';
+  const sessionPath = stateDir ? join(stateDir, 'session.json') : '';
+  const trackingPath = stateDir ? join(stateDir, 'subagent-tracking.json') : '';
+  const sessionId = typeof payload.session_id === 'string' ? payload.session_id : '';
+  const nativeSessionId = typeof payload.thread_id === 'string' ? payload.thread_id : sessionId;
+  const origin = payload.origin && typeof payload.origin === 'object'
+    ? payload.origin as Record<string, unknown>
+    : null;
+  const sessionMeta = payload.session_meta && typeof payload.session_meta === 'object'
+    ? payload.session_meta as Record<string, unknown>
+    : null;
+  const sessionMetaSource = sessionMeta?.source && typeof sessionMeta.source === 'object'
+    ? sessionMeta.source as Record<string, unknown>
+    : null;
+  const isSubagentPayload = origin?.kind === 'native-subagent'
+    || origin?.kind === 'subagent'
+    || Boolean(sessionMetaSource?.subagent);
+  if (
+    options.ownerState !== false
+    && !options.teamWorkerEnv
+    && !isSubagentPayload
+    && cwd
+    && sessionId
+    && nativeSessionId
+    && !existsSync(sessionPath)
+    && !existsSync(trackingPath)
+  ) {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(sessionPath, JSON.stringify({
+      session_id: sessionId,
+      native_session_id: nativeSessionId,
+      cwd,
+      pid: process.pid,
+      platform: process.platform,
+    }, null, 2));
+  }
+
   return spawnSync(process.execPath, [join(repoRoot, 'dist/scripts/notify-hook.js'), JSON.stringify(payload)], {
     cwd: repoRoot,
     encoding: 'utf-8',
@@ -1298,6 +1340,48 @@ describe('notify-hook semantic notifications', () => {
     }
   });
 
+  it('suppresses unknown completed-turn output when no current owner state exists', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-unknown-no-owner-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+
+    try {
+      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
+      await writeNotificationConfig(codexHome);
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: 'sess-unmanaged-unknown',
+        thread_id: 'thread-unmanaged-unknown',
+        turn_id: 'turn-unmanaged-unknown',
+        input_messages: [],
+        last_assistant_message: '{"findings":[{"severity":"critical","blocking":true}]}',
+      }, {
+        CODEX_HOME: codexHome,
+        HOME: tempRoot,
+        USERPROFILE: tempRoot,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      }, {
+        ownerState: false,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      assert.equal((await readCapturedRequests(capturePath)).length, 0);
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      const suppressed = entries.find((entry) => entry.type === 'completed_turn_delivery_suppressed');
+      assert.equal(suppressed?.origin_kind, 'unknown');
+      assert.equal(suppressed?.audience, 'unknown-non-owner');
+      assert.equal(suppressed?.reason, 'unknown_without_current_owner_fail_closed');
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it('does not track suppressed unknown non-owner turns as leaders', async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-unknown-non-owner-tracking-'));
     const codexHome = join(tempRoot, 'codex-home');
@@ -1929,6 +2013,13 @@ describe('notify-hook semantic notifications', () => {
     try {
       await writeNotificationConfig(codexHome);
       await writeSubagentTrackingFixture(workdir, sessionId, leaderThreadId, subagentThreadId);
+      await writeFile(join(workdir, '.omx', 'state', 'session.json'), JSON.stringify({
+        session_id: sessionId,
+        native_session_id: leaderThreadId,
+        cwd: workdir,
+        pid: process.pid,
+        platform: process.platform,
+      }, null, 2));
 
       const subagent = runNotifyHook({
         cwd: workdir,
@@ -1982,6 +2073,13 @@ describe('notify-hook semantic notifications', () => {
     try {
       await writeNotificationConfig(codexHome);
       await writeSubagentTrackingFixture(workdir, sessionId, leaderThreadId, subagentThreadId);
+      await writeFile(join(workdir, '.omx', 'state', 'session.json'), JSON.stringify({
+        session_id: sessionId,
+        native_session_id: leaderThreadId,
+        cwd: workdir,
+        pid: process.pid,
+        platform: process.platform,
+      }, null, 2));
 
       const result = runNotifyHook({
         cwd: workdir,
@@ -2346,6 +2444,13 @@ describe('notify-hook semantic notifications', () => {
       });
       assert.equal(resultReady.status, 0, resultReady.stderr || resultReady.stdout);
 
+      await writeFile(join(workdir, '.omx', 'state', 'session.json'), JSON.stringify({
+        session_id: 'sess-hook-input',
+        native_session_id: 'thread-hook-input',
+        cwd: workdir,
+        pid: process.pid,
+        platform: process.platform,
+      }, null, 2));
       const askUser = runNotifyHook({
         cwd: workdir,
         type: 'agent-turn-complete',
