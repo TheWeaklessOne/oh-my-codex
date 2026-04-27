@@ -118,7 +118,7 @@ function normalizeConfig(raw: unknown): NormalizedConfig | null {
   };
 }
 
-async function readSidecarConfig(teamName: string, root: string): Promise<{ config: SidecarTeamConfig | null; source: string | null; warnings: string[] }> {
+async function readSidecarConfig(root: string): Promise<{ config: SidecarTeamConfig | null; source: string | null; warnings: string[] }> {
   const manifestPath = join(root, 'manifest.v2.json');
   const manifest = await readJson<unknown>(manifestPath);
   const manifestConfig = normalizeConfig(manifest);
@@ -349,7 +349,7 @@ function buildHighlights(workers: SidecarWorkerSnapshot[], tasks: SidecarTask[])
   return highlights;
 }
 
-function buildTopology(config: SidecarTeamConfig, workers: SidecarWorkerSnapshot[], tasks: SidecarTask[]): SidecarTopology {
+function buildTopology(workers: SidecarWorkerSnapshot[], tasks: SidecarTask[]): SidecarTopology {
   const activeWorkers = workers.filter((worker) => worker.status.state === 'working').length;
   const blockedWorkers = workers.filter((worker) => worker.status.state === 'blocked').length;
   const pendingTasks = tasks.filter((task) => task.status === 'pending').length;
@@ -373,7 +373,7 @@ export async function collectSidecarSnapshot(
   const env = options.env ?? process.env;
   const root = teamRoot(sanitized, cwd, env);
   const warnings: string[] = [];
-  const { config, source, warnings: configWarnings } = await readSidecarConfig(sanitized, root);
+  const { config, source, warnings: configWarnings } = await readSidecarConfig(root);
   if (!config) return null;
   warnings.push(...configWarnings);
   if (!source) warnings.push('team config source missing');
@@ -387,7 +387,7 @@ export async function collectSidecarSnapshot(
   const workers = await buildWorkers(config, tasks, root, monitorSnapshot);
   const panes = buildPanes(config);
   const highlights = buildHighlights(workers, tasks);
-  const topology = buildTopology(config, workers, tasks);
+  const topology = buildTopology(workers, tasks);
   return {
     schema_version: 'omx.sidecar/v1',
     generated_at: (options.now ?? new Date()).toISOString(),
