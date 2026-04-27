@@ -38,6 +38,14 @@ struct AttemptResult {
     output_markdown: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FallbackEvent {
+    from_model: String,
+    to_model: String,
+    exit_code: i32,
+    stderr: String,
+}
+
 #[derive(Debug)]
 struct AllowlistEnvironment {
     bin_dir: PathBuf,
@@ -111,21 +119,18 @@ where
         return Ok(());
     }
 
-    eprintln!(
-        "[omx explore] spark model `{}` unavailable or failed (exit {}). Falling back to `{}`.",
-        args.spark_model, spark_attempt.status_code, args.fallback_model
-    );
-    if !spark_attempt.stderr.trim().is_empty() {
-        eprintln!(
-            "[omx explore] spark stderr: {}",
-            spark_attempt.stderr.trim()
-        );
-    }
+    let fallback_event = FallbackEvent {
+        from_model: args.spark_model.clone(),
+        to_model: args.fallback_model.clone(),
+        exit_code: spark_attempt.status_code,
+        stderr: spark_attempt.stderr.clone(),
+    };
+    emit_model_fallback_event(&fallback_event);
 
     let fallback_attempt = invoke_codex(&args, &args.fallback_model, &prompt_contract)
         .map_err(|err| format!("fallback attempt failed to launch: {err}"))?;
     if fallback_attempt.status_code == 0 {
-        print_attempt_output(fallback_attempt)?;
+        print_attempt_output_with_fallback(fallback_attempt, &fallback_event)?;
         return Ok(());
     }
 
@@ -140,13 +145,58 @@ where
 }
 
 fn print_attempt_output(attempt: AttemptResult) -> Result<(), String> {
+    print_attempt_output_with_optional_fallback(attempt, None)
+}
+
+fn print_attempt_output_with_fallback(
+    attempt: AttemptResult,
+    fallback: &FallbackEvent,
+) -> Result<(), String> {
+    print_attempt_output_with_optional_fallback(attempt, Some(fallback))
+}
+
+fn print_attempt_output_with_optional_fallback(
+    attempt: AttemptResult,
+    fallback: Option<&FallbackEvent>,
+) -> Result<(), String> {
     if let Some(markdown) = attempt.output_markdown {
+        if let Some(event) = fallback {
+            print!("{}", fallback_output_notice(event));
+            if !markdown.starts_with('\n') {
+                println!();
+            }
+        }
         print!("{}", markdown);
         return Ok(());
     }
     Err(
         "codex completed successfully but did not produce the expected markdown output artifact"
             .to_string(),
+    )
+}
+
+fn emit_model_fallback_event(event: &FallbackEvent) {
+    eprintln!("{}", fallback_attempt_event_message(event));
+    eprintln!(
+        "[omx explore] spark model `{}` unavailable or failed (exit {}). Falling back to `{}`.",
+        event.from_model, event.exit_code, event.to_model
+    );
+    if !event.stderr.trim().is_empty() {
+        eprintln!("[omx explore] spark stderr: {}", event.stderr.trim());
+    }
+}
+
+fn fallback_attempt_event_message(event: &FallbackEvent) -> String {
+    format!(
+        "[omx explore] fallback-attempt=model from=`{}` to=`{}` reason=spark_attempt_failed exit={}. Cost/behavior boundary changed if fallback succeeds; stdout fallback notice is emitted only after successful fallback output.",
+        event.from_model, event.to_model, event.exit_code
+    )
+}
+
+fn fallback_output_notice(event: &FallbackEvent) -> String {
+    format!(
+        "## OMX Explore fallback\n- fallback: model\n- from: `{}`\n- to: `{}`\n- reason: spark attempt failed with exit {}\n- boundary: cost/behavior may differ from the low-cost spark path\n",
+        event.from_model, event.to_model, event.exit_code
     )
 }
 
@@ -1957,6 +2007,43 @@ printf '# Answer\nok\n' > "$output_path"
 
         assert!(status.success());
         assert_eq!(read_to_string(&bash_env_log).unwrap_or_default(), "");
+    }
+
+    fn fallback_test_event() -> FallbackEvent {
+        FallbackEvent {
+            from_model: "spark-model".to_string(),
+            to_model: "fallback-model".to_string(),
+            exit_code: 17,
+            stderr: "spark timed out".to_string(),
+        }
+    }
+
+    #[test]
+    fn fallback_attempt_event_distinguishes_attempt_from_output_notice() {
+        let event = fallback_test_event();
+
+        let message = fallback_attempt_event_message(&event);
+        assert!(message.contains("fallback-attempt=model"));
+        assert!(message.contains("from=`spark-model`"));
+        assert!(message.contains("to=`fallback-model`"));
+        assert!(message.contains("spark_attempt_failed exit=17"));
+        assert!(message
+            .contains("stdout fallback notice is emitted only after successful fallback output"));
+        assert!(!message.contains("output includes a fallback notice"));
+        assert!(!message.contains("## OMX Explore fallback"));
+    }
+
+    #[test]
+    fn fallback_output_notice_records_model_boundary() {
+        let event = fallback_test_event();
+
+        let notice = fallback_output_notice(&event);
+        assert!(notice.contains("## OMX Explore fallback"));
+        assert!(notice.contains("fallback: model"));
+        assert!(notice.contains("from: `spark-model`"));
+        assert!(notice.contains("to: `fallback-model`"));
+        assert!(notice.contains("spark attempt failed with exit 17"));
+        assert!(notice.contains("cost/behavior may differ from the low-cost spark path"));
     }
 
     #[test]
