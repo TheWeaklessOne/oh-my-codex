@@ -61,7 +61,7 @@ describe('omx doctor --team', () => {
     }
   });
 
-  it('prints prompt_resume_unavailable when live prompt workers cannot be reattached after restart', async () => {
+  it('warns without failing when a prompt worker pid is live but identity cannot be verified', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-doctor-team-prompt-'));
     const sleeper = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
       stdio: 'ignore',
@@ -78,14 +78,22 @@ describe('omx doctor --team', () => {
         tmux_session: 'prompt-team-alpha',
         workers: [{ name: 'worker-1', pid: sleeperPid }],
       }));
+      await writeFile(join(teamRoot, 'manifest.v2.json'), JSON.stringify({
+        name: 'prompt-alpha',
+        policy: { worker_launch_mode: 'prompt' },
+        tmux_session: 'prompt-team-alpha',
+        workers: [{ name: 'worker-1', pid: sleeperPid }],
+      }));
 
       const fakeBin = await createFakeTmuxBin(wd, '#!/bin/sh\n# prompt-mode teams do not require tmux session checks\nexit 0\n');
       const res = runOmx(wd, ['doctor', '--team'], { PATH: `${fakeBin}:${process.env.PATH || ''}` });
       if (shouldSkipForSpawnPermissions(res.error)) return;
-      assert.equal(res.status, 1, res.stderr || res.stdout);
+      assert.equal(res.status, 0, res.stderr || res.stdout);
       assert.match(res.stdout, /prompt_resume_unavailable/);
       assert.match(res.stdout, /prompt-alpha\/worker-1/);
       assert.match(res.stdout, new RegExp(String(sleeperPid)));
+      assert.match(res.stdout, /cannot verify that the PID still belongs/);
+      assert.match(res.stdout, /Results: 1 warnings, 0 failed/);
     } finally {
       if (sleeperPid > 0) {
         try {

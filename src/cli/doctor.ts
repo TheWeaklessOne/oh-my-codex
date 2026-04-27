@@ -312,8 +312,8 @@ async function collectTeamDoctorIssues(cwd: string): Promise<TeamDoctorIssue[]> 
         if (Number.isFinite(pid) && pid > 0 && isPidAlive(pid)) {
           issues.push({
             code: 'prompt_resume_unavailable',
-            message: `${teamName}/${worker.name ?? 'unknown'} pid ${pid} is still running, but prompt-mode worker handles are process-local and cannot be reattached after CLI restart; shut down the prompt worker or start a new team`,
-            severity: 'fail',
+            message: `${teamName}/${worker.name ?? 'unknown'} pid ${pid} appears to be running, but doctor cannot verify that the PID still belongs to the original prompt-mode worker after CLI restart; if this is the original worker, shut it down or start a new team`,
+            severity: 'warn',
           });
         }
       }
