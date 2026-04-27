@@ -235,6 +235,7 @@ If `Shift+Enter` still submits instead of inserting a newline inside an OMX-mana
 - `omx explore --prompt "..."` is for read-only repository lookup
 - `omx sparkshell <command>` is for shell-native inspection and bounded verification
 - when `.omx/wiki/` exists, `omx explore` can inject wiki-first context before falling back to broader repository search
+- fallback boundaries are explicit: sparkshell-backend fallback is reported on stderr, and spark-model fallback emits stderr metadata plus an `## OMX Explore fallback` notice in stdout so users can see when cost/behavior may differ from the low-cost path
 
 Examples:
 
