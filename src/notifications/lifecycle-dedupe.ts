@@ -1,11 +1,12 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { NotificationEvent, FullNotificationPayload } from './types.js';
+import { updateLockedJsonState } from '../scripts/notify-hook/state-io.js';
 
 const SESSION_ID_SAFE_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/;
 const LIFECYCLE_DEDUPE_FILE = 'lifecycle-notif-state.json';
 const LIFECYCLE_DEDUPE_WINDOW_MS = 5_000;
-const LIFECYCLE_PENDING_DEDUPE_WINDOW_MS = 60_000;
+const LIFECYCLE_PENDING_DEDUPE_WINDOW_MS = 10 * 60_000;
 const DEDUPED_EVENTS = new Set<NotificationEvent>(['session-start', 'session-stop', 'session-end']);
 
 interface LifecycleDedupeEntry {
@@ -18,6 +19,8 @@ interface LifecycleDedupeState {
   events?: Record<string, LifecycleDedupeEntry>;
   hookEvents?: Record<string, LifecycleDedupeEntry>;
 }
+
+type LifecycleDedupeBucket = 'events' | 'hookEvents';
 
 function normalizeFingerprint(payload: FullNotificationPayload): string {
   return JSON.stringify({
@@ -44,6 +47,15 @@ function readState(path: string): LifecycleDedupeState {
   } catch {
     return {};
   }
+}
+
+function normalizeState(raw: unknown): LifecycleDedupeState {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const state = raw as LifecycleDedupeState;
+  return {
+    events: state.events && typeof state.events === 'object' ? state.events : undefined,
+    hookEvents: state.hookEvents && typeof state.hookEvents === 'object' ? state.hookEvents : undefined,
+  };
 }
 
 function writeState(path: string, state: LifecycleDedupeState): void {
@@ -93,7 +105,7 @@ function shouldSendFingerprint(
 function shouldSendScopedLifecycleBroadcast(
   stateDir: string,
   sessionId: string | undefined,
-  bucket: 'events' | 'hookEvents',
+  bucket: LifecycleDedupeBucket,
   eventKey: string,
   fingerprint: string,
   nowMs: number = Date.now(),
@@ -111,7 +123,7 @@ function shouldSendScopedLifecycleBroadcast(
 function recordScopedLifecycleBroadcastSent(
   stateDir: string,
   sessionId: string | undefined,
-  bucket: 'events' | 'hookEvents',
+  bucket: LifecycleDedupeBucket,
   eventKey: string,
   fingerprint: string,
   nowMs: number = Date.now(),
@@ -132,55 +144,108 @@ function recordScopedLifecycleBroadcastSent(
   writeState(path, state);
 }
 
-function claimScopedLifecycleBroadcastPending(
+async function updateScopedLifecycleBroadcast<TResult>(
   stateDir: string,
   sessionId: string | undefined,
-  bucket: 'events' | 'hookEvents',
+  bucket: LifecycleDedupeBucket,
+  eventKey: string,
+  updateBucket: (bucketState: Record<string, LifecycleDedupeEntry>) => { result: TResult; write: boolean },
+): Promise<TResult> {
+  if (!sessionId || !stateDir) {
+    return updateBucket({}).result;
+  }
+
+  const path = getStatePath(stateDir, sessionId);
+  return updateLockedJsonState<TResult>(path, async (raw) => {
+    const state = normalizeState(raw);
+    const bucketState = state[bucket] && typeof state[bucket] === 'object'
+      ? { ...state[bucket] }
+      : {};
+    const { result, write } = updateBucket(bucketState);
+    if (!write) {
+      return { result, write: false };
+    }
+    state[bucket] = bucketState;
+    return {
+      result,
+      nextState: state,
+      write: true,
+    };
+  });
+}
+
+async function claimScopedLifecycleBroadcastPending(
+  stateDir: string,
+  sessionId: string | undefined,
+  bucket: LifecycleDedupeBucket,
   eventKey: string,
   fingerprint: string,
   nowMs: number = Date.now(),
-): boolean {
-  if (!sessionId || !stateDir) return true;
-
-  const path = getStatePath(stateDir, sessionId);
-  const state = readState(path);
-  const bucketState = state[bucket] && typeof state[bucket] === 'object'
-    ? state[bucket]
-    : {};
-  if (!shouldSendFingerprint(bucketState?.[eventKey], fingerprint, nowMs)) {
-    return false;
-  }
-  bucketState[eventKey] = {
-    fingerprint,
-    sentAt: new Date(nowMs).toISOString(),
-    status: 'pending',
-  };
-  state[bucket] = bucketState;
-  writeState(path, state);
-  return true;
+): Promise<boolean> {
+  return updateScopedLifecycleBroadcast(
+    stateDir,
+    sessionId,
+    bucket,
+    eventKey,
+    (bucketState) => {
+      if (!shouldSendFingerprint(bucketState[eventKey], fingerprint, nowMs)) {
+        return { result: false, write: false };
+      }
+      bucketState[eventKey] = {
+        fingerprint,
+        sentAt: new Date(nowMs).toISOString(),
+        status: 'pending',
+      };
+      return { result: true, write: true };
+    },
+  );
 }
 
-function clearScopedLifecycleBroadcastPending(
+async function recordScopedLifecycleBroadcastSentLocked(
   stateDir: string,
   sessionId: string | undefined,
-  bucket: 'events' | 'hookEvents',
+  bucket: LifecycleDedupeBucket,
   eventKey: string,
   fingerprint: string,
-): void {
-  if (!sessionId || !stateDir) return;
+  nowMs: number = Date.now(),
+): Promise<void> {
+  await updateScopedLifecycleBroadcast(
+    stateDir,
+    sessionId,
+    bucket,
+    eventKey,
+    (bucketState) => {
+      bucketState[eventKey] = {
+        fingerprint,
+        sentAt: new Date(nowMs).toISOString(),
+        status: 'sent',
+      };
+      return { result: undefined, write: true };
+    },
+  );
+}
 
-  const path = getStatePath(stateDir, sessionId);
-  const state = readState(path);
-  const bucketState = state[bucket] && typeof state[bucket] === 'object'
-    ? state[bucket]
-    : {};
-  const previous = bucketState?.[eventKey];
-  if (previous?.fingerprint !== fingerprint || previous.status !== 'pending') {
-    return;
-  }
-  delete bucketState[eventKey];
-  state[bucket] = bucketState;
-  writeState(path, state);
+async function clearScopedLifecycleBroadcastPending(
+  stateDir: string,
+  sessionId: string | undefined,
+  bucket: LifecycleDedupeBucket,
+  eventKey: string,
+  fingerprint: string,
+): Promise<void> {
+  await updateScopedLifecycleBroadcast(
+    stateDir,
+    sessionId,
+    bucket,
+    eventKey,
+    (bucketState) => {
+      const previous = bucketState[eventKey];
+      if (previous?.fingerprint !== fingerprint || previous.status !== 'pending') {
+        return { result: undefined, write: false };
+      }
+      delete bucketState[eventKey];
+      return { result: undefined, write: true };
+    },
+  );
 }
 
 export function createLifecycleBroadcastFingerprint(value: unknown): string {
@@ -207,8 +272,8 @@ export function claimLifecycleNotificationPending(
   stateDir: string,
   payload: FullNotificationPayload,
   nowMs: number = Date.now(),
-): boolean {
-  if (!shouldDedupeLifecycleNotification(payload.event)) return true;
+): Promise<boolean> {
+  if (!shouldDedupeLifecycleNotification(payload.event)) return Promise.resolve(true);
   return claimScopedLifecycleBroadcastPending(
     stateDir,
     payload.sessionId,
@@ -235,12 +300,28 @@ export function recordLifecycleNotificationSent(
   );
 }
 
+export function recordLifecycleNotificationSentLocked(
+  stateDir: string,
+  payload: FullNotificationPayload,
+  nowMs: number = Date.now(),
+): Promise<void> {
+  if (!shouldDedupeLifecycleNotification(payload.event)) return Promise.resolve();
+  return recordScopedLifecycleBroadcastSentLocked(
+    stateDir,
+    payload.sessionId,
+    'events',
+    payload.event,
+    normalizeFingerprint(payload),
+    nowMs,
+  );
+}
+
 export function clearLifecycleNotificationPending(
   stateDir: string,
   payload: FullNotificationPayload,
-): void {
-  if (!shouldDedupeLifecycleNotification(payload.event)) return;
-  clearScopedLifecycleBroadcastPending(
+): Promise<void> {
+  if (!shouldDedupeLifecycleNotification(payload.event)) return Promise.resolve();
+  return clearScopedLifecycleBroadcastPending(
     stateDir,
     payload.sessionId,
     'events',

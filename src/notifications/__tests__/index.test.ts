@@ -243,6 +243,48 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
     assert.equal(duplicateStart.anySuccess, true);
     assert.equal(openClawCalls, 0);
 
+    delete process.env.OMX_OPENCLAW;
+    let slowStandardCalls = 0;
+    const slowStandardControl: { resolve?: () => void } = {};
+    const slowStandardSessionId = `sess-start-slow-standard-${Date.now()}`;
+    const slowStandardResultPromise = notifyLifecycle('session-start', {
+      sessionId: slowStandardSessionId,
+      projectPath,
+    }, undefined, {
+      dispatchNotificationsImpl: async (_config: unknown, event: string, _payload: unknown) => {
+        slowStandardCalls += 1;
+        await new Promise<void>((resolve) => {
+          slowStandardControl.resolve = resolve;
+        });
+        return {
+          event,
+          anySuccess: true,
+          results: [{
+            platform: 'webhook',
+            success: true,
+          }],
+        };
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const duplicateSlowStandard = await notifyLifecycle('session-start', {
+      sessionId: slowStandardSessionId,
+      projectPath,
+    }, undefined, {
+      dispatchNotificationsImpl: async () => {
+        throw new Error('pending standard session-start should not dispatch twice');
+      },
+    });
+    assert.ok(duplicateSlowStandard);
+    assert.equal(duplicateSlowStandard.anySuccess, true);
+    assert.equal(slowStandardCalls, 1);
+    assert.ok(slowStandardControl.resolve);
+    slowStandardControl.resolve();
+    const slowStandardResult = await slowStandardResultPromise;
+    assert.ok(slowStandardResult);
+    assert.equal(slowStandardResult.anySuccess, true);
+
+    process.env.OMX_OPENCLAW = '1';
     openClawCalls = 0;
     openClawResolved = false;
     openClawStatus = 500;

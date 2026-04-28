@@ -5,7 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   shouldSendLifecycleNotification,
+  claimLifecycleNotificationPending,
+  clearLifecycleNotificationPending,
   recordLifecycleNotificationSent,
+  recordLifecycleNotificationSentLocked,
   shouldSendLifecycleHookBroadcast,
   recordLifecycleHookBroadcastSent,
 } from '../lifecycle-dedupe.js';
@@ -76,6 +79,31 @@ describe('lifecycle notification dedupe', () => {
 
       assert.equal(shouldSendLifecycleNotification(stateDir, payload, startMs + 4_999), false);
       assert.equal(shouldSendLifecycleNotification(stateDir, payload, startMs + 5_000), true);
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes concurrent pending lifecycle notification claims', async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), 'omx-lifecycle-dedupe-pending-'));
+    try {
+      const payload = buildPayload({ event: 'session-start', sessionId: 'pending-session' });
+      const startMs = Date.parse('2026-04-12T01:00:00.000Z');
+
+      const claims = await Promise.all([
+        claimLifecycleNotificationPending(stateDir, payload, startMs),
+        claimLifecycleNotificationPending(stateDir, payload, startMs),
+      ]);
+
+      assert.deepEqual(claims.sort(), [false, true]);
+      assert.equal(shouldSendLifecycleNotification(stateDir, payload, startMs + 1_000), false);
+
+      await clearLifecycleNotificationPending(stateDir, payload);
+      assert.equal(await claimLifecycleNotificationPending(stateDir, payload, startMs + 2_000), true);
+
+      await recordLifecycleNotificationSentLocked(stateDir, payload, startMs + 2_001);
+      assert.equal(shouldSendLifecycleNotification(stateDir, payload, startMs + 6_999), false);
+      assert.equal(shouldSendLifecycleNotification(stateDir, payload, startMs + 7_001), true);
     } finally {
       await rm(stateDir, { recursive: true, force: true });
     }

@@ -208,7 +208,7 @@ import {
   claimLifecycleNotificationPending,
   clearLifecycleNotificationPending,
   shouldSendLifecycleNotification,
-  recordLifecycleNotificationSent,
+  recordLifecycleNotificationSentLocked,
 } from "./lifecycle-dedupe.js";
 import type { OpenClawHookEvent, OpenClawResult } from "../openclaw/types.js";
 import { parseTmuxTail } from "./formatter.js";
@@ -543,36 +543,22 @@ export async function notifyLifecycle(
         results: [],
       };
     }
+    if (!await claimLifecycleNotificationPending(lifecycleStateDir, payload)) {
+      return {
+        event,
+        anySuccess: true,
+        results: [],
+      };
+    }
 
     const openClawEvent = toOpenClawEvent(event);
     const dispatchOpenClawLater = await buildOpenClawDispatch(event, payload);
     let nonStandardDispatchResult: Promise<NonStandardNotificationResult | null> | null = null;
 
     if (openClawEvent !== "ask-user-question" && dispatchOpenClawLater) {
-      if (!claimLifecycleNotificationPending(lifecycleStateDir, payload)) {
-        return {
-          event,
-          anySuccess: true,
-          results: [],
-        };
-      }
       // Let the non-blocking OpenClaw eligibility/import path overlap the primary
       // platform dispatch so session-start does not wait on background wake work.
       nonStandardDispatchResult = dispatchOpenClawLater();
-      void nonStandardDispatchResult
-        .then((nonStandardResult) => {
-          if (!nonStandardResult?.success) {
-            clearLifecycleNotificationPending(lifecycleStateDir, payload);
-            return;
-          }
-          recordLifecycleNotificationSent(lifecycleStateDir, payload);
-          if (event === "session-idle" && sessionIdleTmuxTailAllowed) {
-            recordSessionIdleTmuxTailSent(lifecycleStateDir, payload.sessionId, normalizedIdleTmuxTail);
-          }
-        })
-        .catch(() => {
-          clearLifecycleNotificationPending(lifecycleStateDir, payload);
-        });
     }
 
     const result = await dispatchNotificationsImpl(config, event, payload);
@@ -584,10 +570,27 @@ export async function notifyLifecycle(
     }
 
     if (result.anySuccess) {
-      recordLifecycleNotificationSent(lifecycleStateDir, payload);
+      await recordLifecycleNotificationSentLocked(lifecycleStateDir, payload);
       if (event === "session-idle" && sessionIdleTmuxTailAllowed) {
         recordSessionIdleTmuxTailSent(lifecycleStateDir, payload.sessionId, normalizedIdleTmuxTail);
       }
+    } else if (openClawEvent !== "ask-user-question" && nonStandardDispatchResult) {
+      void nonStandardDispatchResult
+        .then(async (nonStandardResult) => {
+          if (!nonStandardResult?.success) {
+            await clearLifecycleNotificationPending(lifecycleStateDir, payload);
+            return;
+          }
+          await recordLifecycleNotificationSentLocked(lifecycleStateDir, payload);
+          if (event === "session-idle" && sessionIdleTmuxTailAllowed) {
+            recordSessionIdleTmuxTailSent(lifecycleStateDir, payload.sessionId, normalizedIdleTmuxTail);
+          }
+        })
+        .catch(async () => {
+          await clearLifecycleNotificationPending(lifecycleStateDir, payload);
+        });
+    } else {
+      await clearLifecycleNotificationPending(lifecycleStateDir, payload);
     }
 
     await maybeRegisterReplyMappings(config, payload, result);
