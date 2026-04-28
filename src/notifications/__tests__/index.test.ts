@@ -1,6 +1,6 @@
 import { after, before, beforeEach, afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { FullNotificationConfig, NonStandardNotificationResult } from '../types.js';
@@ -36,6 +36,28 @@ fi
 exit 2
 `);
   chmodSync(tmuxPath, 0o755);
+}
+
+async function waitUntil(
+  predicate: () => boolean,
+  message: string,
+  timeoutMs = 1_000,
+): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(message);
+}
+
+function lifecycleEventStatus(projectPath: string, sessionId: string, event: string): string | undefined {
+  const statePath = join(projectPath, '.omx', 'state', 'sessions', sessionId, 'lifecycle-notif-state.json');
+  if (!existsSync(statePath)) return undefined;
+  const state = JSON.parse(readFileSync(statePath, 'utf-8')) as {
+    events?: Record<string, { status?: string }>;
+  };
+  return state.events?.[event]?.status;
 }
 
 describe('notifyLifecycle tmux tail auto-capture', () => {
@@ -105,6 +127,7 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
     let openClawCalls = 0;
     let openClawResolved = false;
     let openClawStatus = 200;
+    let openClawError = '';
 
     globalThis.fetch = async (input, init) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? String(input) : input.url;
@@ -114,6 +137,9 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
       openClawCalls += 1;
       await new Promise((resolve) => setTimeout(resolve, 60));
       openClawResolved = true;
+      if (openClawError) {
+        throw new Error(openClawError);
+      }
       return new Response('', { status: openClawStatus });
     };
 
@@ -221,9 +247,8 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
     assert.ok(pendingDuplicateStart);
     assert.equal(pendingDuplicateStart.anySuccess, true);
     assert.equal(openClawCalls, 1);
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    await waitUntil(() => openClawResolved, 'session-start deferred OpenClaw dispatch did not resolve');
     assert.equal(openClawCalls, 1);
-    assert.equal(openClawResolved, true, 'session-start should eventually finish the deferred OpenClaw dispatch');
     assert.ok(
       startElapsed < askElapsed,
       `session-start should remain faster than awaited ask-user-question dispatch (start=${startElapsed}ms ask=${askElapsed}ms)`,
@@ -266,7 +291,7 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
         };
       },
     });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await waitUntil(() => slowStandardCalls === 1, 'slow standard dispatch did not start');
     const duplicateSlowStandard = await notifyLifecycle('session-start', {
       sessionId: slowStandardSessionId,
       projectPath,
@@ -318,9 +343,76 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
     assert.equal(duplicateAmbiguousStandard.anySuccess, true);
     assert.equal(ambiguousStandardCalls, 1);
 
+    let timeoutStandardCalls = 0;
+    const timeoutStandardSessionId = `sess-start-timeout-standard-${Date.now()}`;
+    const timeoutStandardResult = await notifyLifecycle('session-start', {
+      sessionId: timeoutStandardSessionId,
+      projectPath,
+    }, undefined, {
+      dispatchNotificationsImpl: async (_config: unknown, event: string, _payload: unknown) => {
+        timeoutStandardCalls += 1;
+        return {
+          event,
+          anySuccess: false,
+          results: [{
+            platform: 'webhook',
+            success: false,
+            error: 'Dispatch timeout',
+          }],
+        };
+      },
+    });
+    assert.ok(timeoutStandardResult);
+    assert.equal(timeoutStandardResult.anySuccess, false);
+    const duplicateTimeoutStandard = await notifyLifecycle('session-start', {
+      sessionId: timeoutStandardSessionId,
+      projectPath,
+    }, undefined, {
+      dispatchNotificationsImpl: async () => {
+        throw new Error('timeout standard lifecycle failure should keep the pending claim');
+      },
+    });
+    assert.ok(duplicateTimeoutStandard);
+    assert.equal(duplicateTimeoutStandard.anySuccess, true);
+    assert.equal(timeoutStandardCalls, 1);
+
+    let telegramCleanupCalls = 0;
+    const telegramCleanupSessionId = `sess-start-telegram-cleanup-${Date.now()}`;
+    const telegramCleanupResult = await notifyLifecycle('session-start', {
+      sessionId: telegramCleanupSessionId,
+      projectPath,
+    }, undefined, {
+      dispatchNotificationsImpl: async (_config: unknown, event: string, _payload: unknown) => {
+        telegramCleanupCalls += 1;
+        return {
+          event,
+          anySuccess: false,
+          results: [{
+            platform: 'telegram',
+            success: false,
+            error: 'Telegram topic delivery mismatch cleanup failed',
+          }],
+        };
+      },
+    });
+    assert.ok(telegramCleanupResult);
+    assert.equal(telegramCleanupResult.anySuccess, false);
+    const duplicateTelegramCleanup = await notifyLifecycle('session-start', {
+      sessionId: telegramCleanupSessionId,
+      projectPath,
+    }, undefined, {
+      dispatchNotificationsImpl: async () => {
+        throw new Error('telegram cleanup ambiguity should keep the pending claim');
+      },
+    });
+    assert.ok(duplicateTelegramCleanup);
+    assert.equal(duplicateTelegramCleanup.anySuccess, true);
+    assert.equal(telegramCleanupCalls, 1);
+
     process.env.OMX_OPENCLAW = '1';
     openClawCalls = 0;
     openClawResolved = false;
+    openClawError = '';
     openClawStatus = 504;
     const ambiguousOpenClawSessionId = `sess-start-ambiguous-openclaw-${Date.now()}`;
     const ambiguousOpenClawResult = await notifyLifecycle('session-start', {
@@ -339,9 +431,8 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
     });
     assert.ok(ambiguousOpenClawResult);
     assert.equal(ambiguousOpenClawResult.anySuccess, false);
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    await waitUntil(() => openClawResolved, 'ambiguous deferred OpenClaw dispatch did not resolve');
     assert.equal(openClawCalls, 1);
-    assert.equal(openClawResolved, true);
     const duplicateAmbiguousOpenClaw = await notifyLifecycle('session-start', {
       sessionId: ambiguousOpenClawSessionId,
       projectPath,
@@ -356,6 +447,42 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
 
     openClawCalls = 0;
     openClawResolved = false;
+    openClawStatus = 200;
+    openClawError = 'Dispatch timeout';
+    const timeoutOpenClawSessionId = `sess-start-timeout-openclaw-${Date.now()}`;
+    const timeoutOpenClawResult = await notifyLifecycle('session-start', {
+      sessionId: timeoutOpenClawSessionId,
+      projectPath,
+    }, undefined, {
+      dispatchNotificationsImpl: async (_config: unknown, event: string, _payload: unknown) => ({
+        event,
+        anySuccess: false,
+        results: [{
+          platform: 'webhook',
+          success: false,
+          error: 'HTTP 500',
+        }],
+      }),
+    });
+    assert.ok(timeoutOpenClawResult);
+    assert.equal(timeoutOpenClawResult.anySuccess, false);
+    await waitUntil(() => openClawResolved, 'timeout deferred OpenClaw dispatch did not resolve');
+    assert.equal(openClawCalls, 1);
+    const duplicateTimeoutOpenClaw = await notifyLifecycle('session-start', {
+      sessionId: timeoutOpenClawSessionId,
+      projectPath,
+    }, undefined, {
+      dispatchNotificationsImpl: async () => {
+        throw new Error('timeout deferred OpenClaw failure should keep the pending claim');
+      },
+    });
+    assert.ok(duplicateTimeoutOpenClaw);
+    assert.equal(duplicateTimeoutOpenClaw.anySuccess, true);
+    assert.equal(openClawCalls, 1);
+
+    openClawCalls = 0;
+    openClawResolved = false;
+    openClawError = '';
     openClawStatus = 500;
     const failedStartSessionId = `sess-start-failed-${Date.now()}`;
     const failedStartResult = await notifyLifecycle('session-start', {
@@ -376,9 +503,12 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
     assert.ok(failedStartResult);
     assert.equal(failedStartResult.anySuccess, false);
     assert.equal(failedStartResult.nonStandardAnySuccess, undefined);
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    await waitUntil(() => openClawResolved, 'failed deferred OpenClaw dispatch did not resolve');
     assert.equal(openClawCalls, 1);
-    assert.equal(openClawResolved, true);
+    await waitUntil(
+      () => lifecycleEventStatus(projectPath, failedStartSessionId, 'session-start') === undefined,
+      'definitive lifecycle failure did not clear pending claim',
+    );
 
     openClawResolved = false;
     let standardRetryCalls = 0;
@@ -402,9 +532,8 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
     assert.ok(duplicateFailedStart);
     assert.equal(duplicateFailedStart.anySuccess, false);
     assert.equal(standardRetryCalls, 1);
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    await waitUntil(() => openClawResolved, 'retried deferred OpenClaw dispatch did not resolve');
     assert.equal(openClawCalls, 2);
-    assert.equal(openClawResolved, true);
 
     rmSync(projectPath, { recursive: true, force: true });
     delete process.env.OMX_OPENCLAW;

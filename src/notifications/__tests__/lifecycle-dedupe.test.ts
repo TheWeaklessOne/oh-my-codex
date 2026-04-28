@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import {
   shouldSendLifecycleNotification,
   claimLifecycleNotificationPending,
+  claimLifecycleNotificationPendingToken,
   clearLifecycleNotificationPending,
   recordLifecycleNotificationSent,
   recordLifecycleNotificationSentLocked,
@@ -109,6 +110,30 @@ describe('lifecycle notification dedupe', () => {
     }
   });
 
+  it('does not let older handlers clear or commit newer pending lifecycle claims', async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), 'omx-lifecycle-dedupe-stale-handler-'));
+    try {
+      const payload = buildPayload({ event: 'session-start', sessionId: 'stale-handler-session' });
+      const startMs = Date.parse('2026-04-12T02:30:00.000Z');
+
+      const firstClaim = await claimLifecycleNotificationPendingToken(stateDir, payload, startMs);
+      assert.equal(typeof firstClaim, 'string');
+      const secondClaim = await claimLifecycleNotificationPendingToken(stateDir, payload, startMs + 600_001);
+      assert.equal(typeof secondClaim, 'string');
+
+      await clearLifecycleNotificationPending(stateDir, payload, firstClaim || undefined);
+      assert.equal(shouldSendLifecycleNotification(stateDir, payload, startMs + 600_002), false);
+
+      await recordLifecycleNotificationSentLocked(stateDir, payload, startMs + 600_003, firstClaim || undefined);
+      assert.equal(shouldSendLifecycleNotification(stateDir, payload, startMs + 600_004), false);
+
+      await clearLifecycleNotificationPending(stateDir, payload, secondClaim || undefined);
+      assert.equal(shouldSendLifecycleNotification(stateDir, payload, startMs + 600_005), true);
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
   it('does not let older sent records overwrite newer pending lifecycle claims', async () => {
     const stateDir = await mkdtemp(join(tmpdir(), 'omx-lifecycle-dedupe-newer-pending-'));
     try {
@@ -130,6 +155,9 @@ describe('lifecycle notification dedupe', () => {
       await recordLifecycleNotificationSentLocked(stateDir, firstPayload, startMs + 2);
 
       assert.equal(shouldSendLifecycleNotification(stateDir, secondPayload, startMs + 3), false);
+
+      await clearLifecycleNotificationPending(stateDir, firstPayload);
+      assert.equal(shouldSendLifecycleNotification(stateDir, secondPayload, startMs + 4), false);
     } finally {
       await rm(stateDir, { recursive: true, force: true });
     }

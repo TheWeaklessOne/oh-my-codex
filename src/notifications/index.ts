@@ -205,7 +205,7 @@ import {
 import { basename } from "path";
 import { omxStateDir } from "../utils/paths.js";
 import {
-  claimLifecycleNotificationPending,
+  claimLifecycleNotificationPendingToken,
   clearLifecycleNotificationPending,
   shouldSendLifecycleNotification,
   recordLifecycleNotificationSentLocked,
@@ -435,6 +435,8 @@ function isAmbiguousNotificationError(value: unknown): boolean {
     || error.includes("killed by signal")
     || error.includes("sigterm")
     || error.includes("timeout")
+    || error.includes("telegram partial chunk delivery cleanup failed")
+    || error.includes("telegram topic delivery mismatch cleanup failed")
   ));
 }
 
@@ -572,7 +574,8 @@ export async function notifyLifecycle(
         results: [],
       };
     }
-    if (!await claimLifecycleNotificationPending(lifecycleStateDir, payload)) {
+    const lifecycleClaimToken = await claimLifecycleNotificationPendingToken(lifecycleStateDir, payload);
+    if (lifecycleClaimToken === null) {
       return {
         event,
         anySuccess: true,
@@ -600,7 +603,7 @@ export async function notifyLifecycle(
 
     const ambiguousDispatchFailure = hasAmbiguousDispatchFailure(result);
     if (result.anySuccess) {
-      await recordLifecycleNotificationSentLocked(lifecycleStateDir, payload);
+      await recordLifecycleNotificationSentLocked(lifecycleStateDir, payload, Date.now(), lifecycleClaimToken);
       if (event === "session-idle" && sessionIdleTmuxTailAllowed) {
         recordSessionIdleTmuxTailSent(lifecycleStateDir, payload.sessionId, normalizedIdleTmuxTail);
       }
@@ -611,10 +614,10 @@ export async function notifyLifecycle(
             if (ambiguousDispatchFailure || (nonStandardResult && isAmbiguousFailedResult(nonStandardResult))) {
               return;
             }
-            await clearLifecycleNotificationPending(lifecycleStateDir, payload);
+            await clearLifecycleNotificationPending(lifecycleStateDir, payload, lifecycleClaimToken);
             return;
           }
-          await recordLifecycleNotificationSentLocked(lifecycleStateDir, payload);
+          await recordLifecycleNotificationSentLocked(lifecycleStateDir, payload, Date.now(), lifecycleClaimToken);
           if (event === "session-idle" && sessionIdleTmuxTailAllowed) {
             recordSessionIdleTmuxTailSent(lifecycleStateDir, payload.sessionId, normalizedIdleTmuxTail);
           }
@@ -623,10 +626,10 @@ export async function notifyLifecycle(
           if (ambiguousDispatchFailure || isAmbiguousNotificationError(error)) {
             return;
           }
-          await clearLifecycleNotificationPending(lifecycleStateDir, payload);
+          await clearLifecycleNotificationPending(lifecycleStateDir, payload, lifecycleClaimToken);
         });
     } else if (!ambiguousDispatchFailure) {
-      await clearLifecycleNotificationPending(lifecycleStateDir, payload);
+      await clearLifecycleNotificationPending(lifecycleStateDir, payload, lifecycleClaimToken);
     }
 
     await maybeRegisterReplyMappings(config, payload, result);

@@ -958,6 +958,109 @@ describe('notify-hook semantic notifications', () => {
     }
   });
 
+  it('recovers completed-turn delivery when definitive failure evidence is newer than ambiguous evidence', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-result-ready-mixed-recover-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const stateDir = join(workdir, '.omx', 'state');
+    const logsDir = join(workdir, '.omx', 'logs');
+
+    try {
+      await mkdir(stateDir, { recursive: true });
+      await mkdir(logsDir, { recursive: true });
+      await writeNotificationConfig(codexHome);
+      const threadId = 'thread-result-ready-mixed-recover';
+      const turnId = 'turn-result-ready-mixed-recover';
+      const sessionId = 'sess-result-ready-mixed-recover';
+      const key = `${threadId}|${turnId}|agent-turn-complete`;
+      const claimAt = Date.now() - 1_000;
+      await writeFile(join(stateDir, 'notify-hook-turn-dedupe.json'), JSON.stringify({
+        recent_turns: { [key]: claimAt },
+        turn_claims: {
+          [key]: {
+            timestamp: claimAt,
+            delivery: 'allow',
+            delivery_status: 'dispatching',
+            delivery_status_at: claimAt,
+            source_kind: 'native',
+            source: '',
+            session_id: sessionId,
+            audience: 'external-owner',
+            reason: 'current_external_owner',
+          },
+        },
+        last_event_at: new Date(claimAt).toISOString(),
+      }, null, 2));
+      await writeFile(join(logsDir, 'notify-hook-seeded.jsonl'), [
+        {
+          timestamp: new Date(claimAt + 100).toISOString(),
+          type: 'completed_turn_delivery_failed',
+          thread_id: threadId,
+          turn_id: turnId,
+          omx_session_id: sessionId,
+          delivery_failure_kind: 'ambiguous_timeout',
+          notification_results: [{
+            platform: 'webhook',
+            success: false,
+            error: 'Dispatch timeout',
+          }],
+        },
+        {
+          timestamp: new Date(claimAt + 200).toISOString(),
+          type: 'completed_turn_delivery_failed',
+          thread_id: threadId,
+          turn_id: turnId,
+          omx_session_id: sessionId,
+          delivery_failure_kind: 'definitive',
+          error: 'HTTP 500',
+        },
+      ].map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: turnId,
+        input_messages: [],
+        last_assistant_message: 'Recover after newer definitive failure evidence. Tests passed.',
+      }, {
+        CODEX_HOME: codexHome,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      assert.equal((await readCapturedRequests(capturePath)).length, 1);
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      assert.equal(
+        entries.some((entry) =>
+          entry.type === 'project_turn_dedupe_allow_claim_recovered_before_delivery'
+          && entry.turn_id === turnId
+        ),
+        true,
+      );
+      assert.equal(
+        entries.some((entry) =>
+          entry.type === 'completed_turn_delivery_sent'
+          && entry.turn_id === turnId
+        ),
+        true,
+      );
+      const projectState = JSON.parse(
+        await readFile(join(stateDir, 'notify-hook-turn-dedupe.json'), 'utf-8'),
+      ) as {
+        turn_claims?: Record<string, { delivery_status?: string }>;
+      };
+      assert.equal(projectState.turn_claims?.[key]?.delivery_status, 'sent');
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it('treats standard webhook gateway timeout statuses as ambiguous', async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-result-ready-504-fail-closed-'));
     const codexHome = join(tempRoot, 'codex-home');

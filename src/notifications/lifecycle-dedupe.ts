@@ -174,14 +174,15 @@ async function updateScopedLifecycleBroadcast<TResult>(
   });
 }
 
-async function claimScopedLifecycleBroadcastPending(
+async function claimScopedLifecycleBroadcastPendingToken(
   stateDir: string,
   sessionId: string | undefined,
   bucket: LifecycleDedupeBucket,
   eventKey: string,
   fingerprint: string,
   nowMs: number = Date.now(),
-): Promise<boolean> {
+): Promise<string | null> {
+  const pendingAt = new Date(nowMs).toISOString();
   return updateScopedLifecycleBroadcast(
     stateDir,
     sessionId,
@@ -189,14 +190,14 @@ async function claimScopedLifecycleBroadcastPending(
     eventKey,
     (bucketState) => {
       if (!shouldSendFingerprint(bucketState[eventKey], fingerprint, nowMs)) {
-        return { result: false, write: false };
+        return { result: null, write: false };
       }
       bucketState[eventKey] = {
         fingerprint,
-        sentAt: new Date(nowMs).toISOString(),
+        sentAt: pendingAt,
         status: 'pending',
       };
-      return { result: true, write: true };
+      return { result: pendingAt, write: true };
     },
   );
 }
@@ -208,6 +209,7 @@ async function recordScopedLifecycleBroadcastSentLocked(
   eventKey: string,
   fingerprint: string,
   nowMs: number = Date.now(),
+  expectedPendingAt?: string,
 ): Promise<void> {
   await updateScopedLifecycleBroadcast(
     stateDir,
@@ -216,6 +218,15 @@ async function recordScopedLifecycleBroadcastSentLocked(
     eventKey,
     (bucketState) => {
       const previous = bucketState[eventKey];
+      if (expectedPendingAt !== undefined) {
+        if (
+          previous?.fingerprint !== fingerprint
+          || previous.status !== 'pending'
+          || previous.sentAt !== expectedPendingAt
+        ) {
+          return { result: undefined, write: false };
+        }
+      }
       if (previous?.fingerprint && previous.fingerprint !== fingerprint) {
         return { result: undefined, write: false };
       }
@@ -235,6 +246,7 @@ async function clearScopedLifecycleBroadcastPending(
   bucket: LifecycleDedupeBucket,
   eventKey: string,
   fingerprint: string,
+  expectedPendingAt?: string,
 ): Promise<void> {
   await updateScopedLifecycleBroadcast(
     stateDir,
@@ -243,7 +255,11 @@ async function clearScopedLifecycleBroadcastPending(
     eventKey,
     (bucketState) => {
       const previous = bucketState[eventKey];
-      if (previous?.fingerprint !== fingerprint || previous.status !== 'pending') {
+      if (
+        previous?.fingerprint !== fingerprint
+        || previous.status !== 'pending'
+        || (expectedPendingAt !== undefined && previous.sentAt !== expectedPendingAt)
+      ) {
         return { result: undefined, write: false };
       }
       delete bucketState[eventKey];
@@ -277,8 +293,17 @@ export function claimLifecycleNotificationPending(
   payload: FullNotificationPayload,
   nowMs: number = Date.now(),
 ): Promise<boolean> {
-  if (!shouldDedupeLifecycleNotification(payload.event)) return Promise.resolve(true);
-  return claimScopedLifecycleBroadcastPending(
+  return claimLifecycleNotificationPendingToken(stateDir, payload, nowMs)
+    .then((token) => token !== null);
+}
+
+export function claimLifecycleNotificationPendingToken(
+  stateDir: string,
+  payload: FullNotificationPayload,
+  nowMs: number = Date.now(),
+): Promise<string | null> {
+  if (!shouldDedupeLifecycleNotification(payload.event)) return Promise.resolve('');
+  return claimScopedLifecycleBroadcastPendingToken(
     stateDir,
     payload.sessionId,
     'events',
@@ -308,6 +333,7 @@ export function recordLifecycleNotificationSentLocked(
   stateDir: string,
   payload: FullNotificationPayload,
   nowMs: number = Date.now(),
+  expectedPendingAt?: string,
 ): Promise<void> {
   if (!shouldDedupeLifecycleNotification(payload.event)) return Promise.resolve();
   return recordScopedLifecycleBroadcastSentLocked(
@@ -317,12 +343,14 @@ export function recordLifecycleNotificationSentLocked(
     payload.event,
     normalizeFingerprint(payload),
     nowMs,
+    expectedPendingAt,
   );
 }
 
 export function clearLifecycleNotificationPending(
   stateDir: string,
   payload: FullNotificationPayload,
+  expectedPendingAt?: string,
 ): Promise<void> {
   if (!shouldDedupeLifecycleNotification(payload.event)) return Promise.resolve();
   return clearScopedLifecycleBroadcastPending(
@@ -331,6 +359,7 @@ export function clearLifecycleNotificationPending(
     'events',
     payload.event,
     normalizeFingerprint(payload),
+    expectedPendingAt,
   );
 }
 
