@@ -106,7 +106,7 @@ function isTurnCompletePayload(payload: Record<string, unknown>): boolean {
 
 type ProjectTurnDelivery = 'allow' | 'suppress';
 type ProjectTurnSourceKind = 'native' | 'fallback';
-type ProjectTurnDeliveryStatus = 'pending' | 'dispatching' | 'sent' | 'committed';
+type ProjectTurnDeliveryStatus = 'pending' | 'dispatching' | 'sent' | 'committed' | 'delivery_unknown';
 
 interface ProjectTurnClaim {
   timestamp: number;
@@ -188,7 +188,13 @@ function normalizeProjectTurnDeliveryStatus(
   value: unknown,
 ): ProjectTurnDeliveryStatus | undefined {
   const status = safeString(value).trim().toLowerCase();
-  if (status === 'pending' || status === 'dispatching' || status === 'sent' || status === 'committed') {
+  if (
+    status === 'pending'
+    || status === 'dispatching'
+    || status === 'sent'
+    || status === 'committed'
+    || status === 'delivery_unknown'
+  ) {
     return status;
   }
   return undefined;
@@ -327,6 +333,24 @@ function isStateFileLockTimeout(error: unknown): boolean {
   return error instanceof Error && error.message.includes('state file lock timeout');
 }
 
+function isMalformedJsonStateError(error: unknown): boolean {
+  return error instanceof SyntaxError;
+}
+
+function shouldFailClosedOnPrimaryReplayError(error: unknown): boolean {
+  if (isStateFileLockTimeout(error) || isMalformedJsonStateError(error)) {
+    return true;
+  }
+  const code = error && typeof error === 'object'
+    ? safeString((error as NodeJS.ErrnoException).code)
+    : '';
+  return code === 'EACCES'
+    || code === 'EPERM'
+    || code === 'EMFILE'
+    || code === 'ENFILE'
+    || code === 'EBUSY';
+}
+
 function fallbackDedupeStateExists(stateDir: string): boolean {
   return existsSync(join(stateDir, NOTIFY_HOOK_STATE_FILE))
     || existsSync(join(stateDir, `${NOTIFY_HOOK_STATE_FILE}.lock`));
@@ -336,8 +360,10 @@ function fallbackDedupeStateExists(stateDir: string): boolean {
 interface CompletedTurnLogEvidence {
   deliveryAllowed: boolean;
   deliverySent: boolean;
-  preDeliveryRecoveryFailure: boolean;
-  latestPreDeliveryRecoveryFailureAt: number | null;
+  definitivePreDeliveryRecoveryFailure: boolean;
+  latestDefinitivePreDeliveryRecoveryFailureAt: number | null;
+  ambiguousPreDeliveryFailure: boolean;
+  latestAmbiguousPreDeliveryFailureAt: number | null;
 }
 
 function isSameTurnLogEntry(
@@ -355,7 +381,7 @@ function isPreDeliveryRecoveryFailureLogEntry(entry: Record<string, unknown>): b
     type === 'project_turn_dedupe_delivery_status_failed'
     && safeString(entry.delivery_status) === 'dispatching'
   ) {
-    return true;
+    return safeString(entry.reason) !== 'claim_changed_before_dispatch';
   }
   if (type === 'project_fallback_turn_dedupe_upgrade_failed') return true;
   if (type === 'project_fallback_turn_dedupe_upgraded') return entry.upgraded === false;
@@ -363,8 +389,80 @@ function isPreDeliveryRecoveryFailureLogEntry(entry: Record<string, unknown>): b
   if (type === 'session_turn_dedupe_rollback_failed') return true;
   if (type === 'project_turn_dedupe_rolled_back') return entry.rolled_back === false;
   if (type === 'project_fallback_turn_dedupe_rolled_back') return entry.rolled_back === false;
-  if (type === 'completed_turn_delivery_failed') return true;
+  if (type === 'completed_turn_delivery_failed') {
+    return !isAmbiguousCompletedTurnDeliveryFailure(entry);
+  }
   return false;
+}
+
+function isAmbiguousNotificationError(value: unknown): boolean {
+  const error = safeString(value).trim().toLowerCase();
+  return Boolean(error && (
+    error.includes('dispatch timeout')
+    || error.includes('request timeout')
+    || error.includes('aborterror')
+    || error.includes('aborted')
+    || error.includes('signal timed out')
+    || error.includes('killed by signal')
+    || error.includes('sigterm')
+    || error.includes('timeout')
+    || error.includes('telegram partial chunk delivery cleanup failed')
+    || error.includes('telegram topic delivery mismatch cleanup failed')
+  ));
+}
+
+function isAmbiguousNotificationResult(value: unknown): boolean {
+  const result = asRecord(value);
+  const statusCode = asNumber(result?.statusCode) ?? asNumber(result?.status_code);
+  const httpErrorStatus = safeString(result?.error).match(/\bHTTP\s+(\d{3})\b/i);
+  const errorStatusCode = httpErrorStatus ? Number(httpErrorStatus[1]) : null;
+  const effectiveStatusCode = statusCode ?? errorStatusCode;
+  return Boolean(
+    result
+    && !result.success
+    && (
+      isAmbiguousNotificationError(result.error)
+      || effectiveStatusCode === 408
+      || effectiveStatusCode === 504
+      || effectiveStatusCode === 524
+    ),
+  );
+}
+
+function isAmbiguousCompletedTurnDeliveryFailure(entry: Record<string, unknown>): boolean {
+  if (safeString(entry.delivery_failure_kind) === 'ambiguous_timeout') return true;
+  const notificationResults = Array.isArray(entry.notification_results)
+    ? entry.notification_results
+    : [];
+  return isAmbiguousNotificationError(entry.error)
+    || notificationResults.some(isAmbiguousNotificationResult);
+}
+
+function summarizeNotificationResultsForLog(results: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(results)) return [];
+  const summarized: Array<Record<string, unknown>> = [];
+  for (const result of results) {
+    const raw = asRecord(result);
+    if (!raw) continue;
+    summarized.push({
+      platform: safeString(raw.platform || raw.transport),
+      success: raw.success === true,
+      ...(raw.error ? { error: safeString(raw.error) } : {}),
+      ...(raw.gateway ? { gateway: safeString(raw.gateway) } : {}),
+      ...(asNumber(raw.statusCode) !== null ? { status_code: asNumber(raw.statusCode) } : {}),
+      ...(asNumber(raw.status_code) !== null ? { status_code: asNumber(raw.status_code) } : {}),
+    });
+  }
+  return summarized;
+}
+
+function collectDispatchResultsForLog(result: unknown): unknown[] {
+  const raw = asRecord(result);
+  if (!raw) return [];
+  return [
+    ...(Array.isArray(raw.results) ? raw.results : []),
+    ...(Array.isArray(raw.nonStandardResults) ? raw.nonStandardResults : []),
+  ];
 }
 
 async function readCompletedTurnLogEvidence(
@@ -375,15 +473,19 @@ async function readCompletedTurnLogEvidence(
     return {
       deliveryAllowed: false,
       deliverySent: false,
-      preDeliveryRecoveryFailure: false,
-      latestPreDeliveryRecoveryFailureAt: null,
+      definitivePreDeliveryRecoveryFailure: false,
+      latestDefinitivePreDeliveryRecoveryFailureAt: null,
+      ambiguousPreDeliveryFailure: false,
+      latestAmbiguousPreDeliveryFailureAt: null,
     };
   }
   const evidence: CompletedTurnLogEvidence = {
     deliveryAllowed: false,
     deliverySent: false,
-    preDeliveryRecoveryFailure: false,
-    latestPreDeliveryRecoveryFailureAt: null,
+    definitivePreDeliveryRecoveryFailure: false,
+    latestDefinitivePreDeliveryRecoveryFailureAt: null,
+    ambiguousPreDeliveryFailure: false,
+    latestAmbiguousPreDeliveryFailureAt: null,
   };
   const names = (await readdir(logsDir).catch(() => []))
     .filter((name) => name.startsWith('notify-hook-') && name.endsWith('.jsonl'))
@@ -408,17 +510,35 @@ async function readCompletedTurnLogEvidence(
       if (safeString(entry.type) === 'completed_turn_delivery_sent') {
         evidence.deliverySent = true;
       }
-      if (isPreDeliveryRecoveryFailureLogEntry(entry)) {
-        evidence.preDeliveryRecoveryFailure = true;
+      if (
+        safeString(entry.type) === 'completed_turn_delivery_failed'
+        && isAmbiguousCompletedTurnDeliveryFailure(entry)
+      ) {
+        evidence.ambiguousPreDeliveryFailure = true;
         const failureAt = Date.parse(safeString(entry.timestamp));
         if (Number.isFinite(failureAt)) {
-          evidence.latestPreDeliveryRecoveryFailureAt = Math.max(
-            evidence.latestPreDeliveryRecoveryFailureAt ?? failureAt,
+          evidence.latestAmbiguousPreDeliveryFailureAt = Math.max(
+            evidence.latestAmbiguousPreDeliveryFailureAt ?? failureAt,
             failureAt,
           );
         }
       }
-      if (evidence.deliveryAllowed && evidence.deliverySent && evidence.preDeliveryRecoveryFailure) {
+      if (isPreDeliveryRecoveryFailureLogEntry(entry)) {
+        evidence.definitivePreDeliveryRecoveryFailure = true;
+        const failureAt = Date.parse(safeString(entry.timestamp));
+        if (Number.isFinite(failureAt)) {
+          evidence.latestDefinitivePreDeliveryRecoveryFailureAt = Math.max(
+            evidence.latestDefinitivePreDeliveryRecoveryFailureAt ?? failureAt,
+            failureAt,
+          );
+        }
+      }
+      if (
+        evidence.deliveryAllowed
+        && evidence.deliverySent
+        && evidence.definitivePreDeliveryRecoveryFailure
+        && evidence.ambiguousPreDeliveryFailure
+      ) {
         return evidence;
       }
     }
@@ -428,7 +548,11 @@ async function readCompletedTurnLogEvidence(
 
 function isProjectAllowClaimDeliveryClosed(claim: ProjectTurnClaim): boolean {
   return claim.delivery === 'allow'
-    && (claim.delivery_status === 'sent' || claim.delivery_status === 'committed');
+    && (
+      claim.delivery_status === 'sent'
+      || claim.delivery_status === 'committed'
+      || claim.delivery_status === 'delivery_unknown'
+    );
 }
 
 function projectTurnClaimStatusTimestamp(claim: ProjectTurnClaim): number {
@@ -477,11 +601,18 @@ async function shouldRecoverUndeliveredAllowClaim(
     return true;
   }
   if (
-    evidence.preDeliveryRecoveryFailure
-    && evidence.latestPreDeliveryRecoveryFailureAt !== null
-    && evidence.latestPreDeliveryRecoveryFailureAt >= projectTurnClaimStatusTimestamp(existingClaim)
+    evidence.definitivePreDeliveryRecoveryFailure
+    && evidence.latestDefinitivePreDeliveryRecoveryFailureAt !== null
+    && evidence.latestDefinitivePreDeliveryRecoveryFailureAt >= projectTurnClaimStatusTimestamp(existingClaim)
   ) {
     return true;
+  }
+  if (
+    evidence.ambiguousPreDeliveryFailure
+    && evidence.latestAmbiguousPreDeliveryFailureAt !== null
+    && evidence.latestAmbiguousPreDeliveryFailureAt >= projectTurnClaimStatusTimestamp(existingClaim)
+  ) {
+    return false;
   }
   const now = Date.now();
   if (isProjectAllowClaimPendingExpired(existingClaim, now)) {
@@ -1520,6 +1651,9 @@ async function main() {
         projectDedupeDetails,
         'before_project',
       );
+      if (beforeProjectFallbackReplay.failed && !beforeProjectFallbackReplay.lockTimedOut) {
+        process.exit(0);
+      }
       let recoveredBeforeProjectFallbackAllowClaim = false;
       if (beforeProjectFallbackReplay.decision && !beforeProjectFallbackReplay.decision.shouldContinue) {
         const shouldRecoverFallbackAllowClaim = beforeProjectFallbackReplay.decision.currentClaim.delivery === 'allow'
@@ -1840,7 +1974,12 @@ async function main() {
             suppress_external_delivery: afterProjectFallbackReplay.decision.suppressExternalDelivery,
             fallback_delivery_closed: afterProjectFallbackClosedAllow,
           });
-          const recoverFallbackAllowClaim = afterProjectFallbackReplay.decision.suppressExternalDelivery
+          const shouldCheckFallbackAllowRecovery = afterProjectFallbackReplay.decision.existingClaim?.delivery === 'allow'
+            && (
+              afterProjectFallbackReplay.decision.suppressExternalDelivery
+              || !afterProjectFallbackClosedAllow
+            );
+          const recoverFallbackAllowClaim = shouldCheckFallbackAllowRecovery
             && await shouldRecoverUndeliveredAllowClaim(
               logsDir,
               { threadId, turnId },
@@ -1861,9 +2000,51 @@ async function main() {
               existing_source_kind: afterProjectFallbackReplay.decision.existingClaim?.source_kind || null,
             });
           } else {
+            const fallbackExistingAllowClaim = afterProjectFallbackReplay.decision.existingClaim?.delivery === 'allow'
+              ? afterProjectFallbackReplay.decision.existingClaim
+              : null;
+            if (fallbackExistingAllowClaim && projectDedupe.currentClaim.delivery === 'allow') {
+              const replacementClaim = closeLegacyAllowClaimForFallbackRepair(fallbackExistingAllowClaim);
+              const mirrored = await replaceProjectTurnDedupeClaimIfCurrent(
+                stateDir,
+                key,
+                projectDedupe.currentClaim,
+                replacementClaim,
+              ).catch(async (error) => {
+                await logNotifyHookEvent(logsDir, {
+                  timestamp: new Date().toISOString(),
+                  level: 'warn',
+                  type: 'project_turn_dedupe_rollback_failed',
+                  thread_id: threadId || null,
+                  turn_id: turnId || null,
+                  event_type: eventType,
+                  omx_session_id: dedupeSessionId || null,
+                  reason: 'fallback_replay_existing_claim_suppressed',
+                  rollback_mode: 'mirror_fallback_claim',
+                  error: error instanceof Error ? error.message : String(error),
+                });
+                return false;
+              });
+              await logNotifyHookEvent(logsDir, {
+                timestamp: new Date().toISOString(),
+                level: 'warn',
+                type: 'project_turn_dedupe_rolled_back',
+                thread_id: threadId || null,
+                turn_id: turnId || null,
+                event_type: eventType,
+                omx_session_id: dedupeSessionId || null,
+                reason: 'fallback_replay_existing_claim_suppressed',
+                rollback_mode: 'mirror_fallback_claim',
+                rolled_back: mirrored,
+                replacement_source: replacementClaim.source || null,
+                replacement_source_kind: replacementClaim.source_kind,
+                replacement_delivery_status: replacementClaim.delivery_status || null,
+              });
+            }
             suppressProjectCompletedTurnDelivery ||=
               afterProjectFallbackReplay.decision.suppressExternalDelivery
-              || afterProjectFallbackClosedAllow;
+              || afterProjectFallbackClosedAllow
+              || (afterProjectFallbackReplay.decision.existingClaim?.delivery === 'allow');
           }
         }
         if (afterProjectFallbackReplay.decision?.persistenceFailed) {
@@ -1889,15 +2070,23 @@ async function main() {
             process.exit(0);
           }
         }
-        if (afterProjectFallbackReplay.lockTimedOut) {
-          const shouldFailClosedAfterPrimaryLockTimeout = projectDedupe.reason === 'first'
-            || (
-              projectDedupe.reason === 'owner_upgrade'
-              && !projectDedupe.suppressExternalDelivery
-              && projectDedupe.existingClaim
+        if (afterProjectFallbackReplay.failed) {
+          const fallbackReplayFailureReason = afterProjectFallbackReplay.lockTimedOut
+            ? 'fallback_replay_lock_timeout'
+            : 'fallback_replay_failed';
+          const shouldRestorePreviousPrimaryClaim =
+            Boolean(projectDedupe.existingClaim)
+            && (
+              recoveringUndeliveredProjectAllowClaim
+              || (
+                projectDedupe.reason === 'owner_upgrade'
+                && !projectDedupe.suppressExternalDelivery
+              )
             );
-          if (shouldFailClosedAfterPrimaryLockTimeout) {
-            const rollbackSucceeded = projectDedupe.reason === 'owner_upgrade' && projectDedupe.existingClaim
+          const shouldFailClosedAfterPrimaryReplayFailure =
+            projectDedupe.reason === 'first' || shouldRestorePreviousPrimaryClaim;
+          if (shouldFailClosedAfterPrimaryReplayFailure) {
+            const rollbackSucceeded = shouldRestorePreviousPrimaryClaim && projectDedupe.existingClaim
               ? await replaceProjectTurnDedupeClaimIfCurrent(
                 stateDir,
                 key,
@@ -1912,7 +2101,7 @@ async function main() {
                   turn_id: turnId || null,
                   event_type: eventType,
                   omx_session_id: dedupeSessionId || null,
-                  reason: 'fallback_replay_lock_timeout',
+                  reason: fallbackReplayFailureReason,
                   rollback_mode: 'restore_previous_claim',
                   error: error instanceof Error ? error.message : String(error),
                 });
@@ -1931,7 +2120,7 @@ async function main() {
                   turn_id: turnId || null,
                   event_type: eventType,
                   omx_session_id: dedupeSessionId || null,
-                  reason: 'fallback_replay_lock_timeout',
+                  reason: fallbackReplayFailureReason,
                   rollback_mode: 'remove_first_claim',
                   error: error instanceof Error ? error.message : String(error),
                 });
@@ -1945,8 +2134,8 @@ async function main() {
               turn_id: turnId || null,
               event_type: eventType,
               omx_session_id: dedupeSessionId || null,
-              reason: 'fallback_replay_lock_timeout',
-              rollback_mode: projectDedupe.reason === 'owner_upgrade'
+              reason: fallbackReplayFailureReason,
+              rollback_mode: shouldRestorePreviousPrimaryClaim
                 ? 'restore_previous_claim'
                 : 'remove_first_claim',
               rolled_back: rollbackSucceeded,
@@ -2019,40 +2208,67 @@ async function main() {
               omx_session_id: dedupeSessionId || null,
               error: error instanceof Error ? error.message : String(error),
             });
-            if (isStateFileLockTimeout(error)) {
-              if (fallbackProjectDedupe.reason === 'first') {
-                const rollbackSucceeded = await removeProjectFallbackTurnDedupeClaimIfCurrent(
-                  stateDir,
-                  key,
-                  fallbackProjectDedupe.currentClaim,
-                ).catch(async (rollbackError) => {
-                  await logNotifyHookEvent(logsDir, {
-                    timestamp: new Date().toISOString(),
-                    level: 'warn',
-                    type: 'project_fallback_turn_dedupe_rollback_failed',
-                    thread_id: threadId || null,
-                    turn_id: turnId || null,
-                    event_type: eventType,
-                    omx_session_id: dedupeSessionId || null,
-                    reason: 'primary_replay_lock_timeout',
-                    error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
-                  });
-                  return false;
-                });
+            if (!shouldFailClosedOnPrimaryReplayError(error)) {
+              return null;
+            }
+            const rollbackReason = isStateFileLockTimeout(error)
+              ? 'primary_replay_lock_timeout'
+              : 'primary_replay_failed';
+            let rollbackSucceeded = false;
+            if (fallbackProjectDedupe.reason === 'first') {
+              rollbackSucceeded = await removeProjectFallbackTurnDedupeClaimIfCurrent(
+                stateDir,
+                key,
+                fallbackProjectDedupe.currentClaim,
+              ).catch(async (rollbackError) => {
                 await logNotifyHookEvent(logsDir, {
                   timestamp: new Date().toISOString(),
                   level: 'warn',
-                  type: 'project_fallback_turn_dedupe_rolled_back',
+                  type: 'project_fallback_turn_dedupe_rollback_failed',
                   thread_id: threadId || null,
                   turn_id: turnId || null,
                   event_type: eventType,
                   omx_session_id: dedupeSessionId || null,
-                  reason: 'primary_replay_lock_timeout',
-                  rolled_back: rollbackSucceeded,
+                  reason: rollbackReason,
+                  error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
                 });
-              }
-              projectFallbackDedupeFailed = true;
+                return false;
+              });
+            } else if (fallbackProjectDedupe.reason === 'owner_upgrade' && fallbackProjectDedupe.existingClaim) {
+              rollbackSucceeded = await updateProjectFallbackTurnDedupeClaimIfCurrent(
+                stateDir,
+                key,
+                fallbackProjectDedupe.currentClaim,
+                fallbackProjectDedupe.existingClaim,
+              ).catch(async (rollbackError) => {
+                await logNotifyHookEvent(logsDir, {
+                  timestamp: new Date().toISOString(),
+                  level: 'warn',
+                  type: 'project_fallback_turn_dedupe_rollback_failed',
+                  thread_id: threadId || null,
+                  turn_id: turnId || null,
+                  event_type: eventType,
+                  omx_session_id: dedupeSessionId || null,
+                  reason: rollbackReason,
+                  error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+                });
+                return false;
+              });
             }
+            if (fallbackProjectDedupe.reason === 'first' || fallbackProjectDedupe.reason === 'owner_upgrade') {
+              await logNotifyHookEvent(logsDir, {
+                timestamp: new Date().toISOString(),
+                level: 'warn',
+                type: 'project_fallback_turn_dedupe_rolled_back',
+                thread_id: threadId || null,
+                turn_id: turnId || null,
+                event_type: eventType,
+                omx_session_id: dedupeSessionId || null,
+                reason: rollbackReason,
+                rolled_back: rollbackSucceeded,
+              });
+            }
+            projectFallbackDedupeFailed = true;
             return null;
           });
           if (primaryReplay && !primaryReplay.shouldContinue) {
@@ -2768,7 +2984,7 @@ async function main() {
   if (!isTeamWorker) {
     try {
       const { notifyCompletedTurn } = await import('../notifications/index.js');
-      const { getNotificationConfig, getEnabledPlatforms, isEventEnabled } = await import('../notifications/config.js');
+      const { getNotificationConfig, isEventEnabled } = await import('../notifications/config.js');
       const {
         shouldSendCompletedTurnNotification,
         recordCompletedTurnNotificationSent,
@@ -2888,11 +3104,6 @@ async function main() {
         && decision
         && isEventEnabled(notificationConfig, decision.effectiveEvent),
       );
-      const standardNotificationPlatformsEnabled = Boolean(
-        notificationConfig
-        && decision
-        && getEnabledPlatforms(notificationConfig, decision.effectiveEvent).length > 0,
-      );
       const completedTurnHookFingerprint = buildCompletedTurnHookFingerprint(
         decision,
         semanticOutcome,
@@ -2919,18 +3130,25 @@ async function main() {
       if (shouldNotifyCompletedTurn || shouldDispatchSessionIdleHookEvent) {
         if (shouldNotifyCompletedTurn) {
           const completedTurnResult = await notifyCompletedTurn(decision!, {
-              sessionId: notifySessionId,
-              projectPath: cwd,
-              contextSummary: semanticOutcome.summary || undefined,
-              question:
-                semanticOutcome.kind === 'input-needed'
-                  ? (semanticOutcome.question || semanticOutcome.summary || 'Input is needed to continue.')
-                  : undefined,
-              assistantText: lastAssistantMessage,
-            }, undefined, {
-              getNotificationConfigImpl: () => notificationConfig,
-            })
+            sessionId: notifySessionId,
+            projectPath: cwd,
+            contextSummary: semanticOutcome.summary || undefined,
+            question:
+              semanticOutcome.kind === 'input-needed'
+                ? (semanticOutcome.question || semanticOutcome.summary || 'Input is needed to continue.')
+                : undefined,
+            assistantText: lastAssistantMessage,
+          }, undefined, {
+            getNotificationConfigImpl: () => notificationConfig,
+          })
             .catch(async (error) => {
+              const deliveryFailureKind = isAmbiguousNotificationError(error instanceof Error ? error.message : error)
+                ? 'ambiguous_timeout'
+                : 'definitive';
+              completedTurnNotificationFailed = true;
+              if (deliveryFailureKind === 'ambiguous_timeout') {
+                completedTurnDeliveryStatus = 'delivery_unknown';
+              }
               await logNotifyHookEvent(logsDir, {
                 timestamp: new Date().toISOString(),
                 level: 'warn',
@@ -2950,10 +3168,16 @@ async function main() {
                 evidence_sources: originResolution.evidence.map((entry) => entry.source),
                 notification_event: decision!.effectiveEvent,
                 error: error instanceof Error ? error.message : String(error),
+                delivery_failure_kind: deliveryFailureKind,
               });
               return null;
             });
-          if (completedTurnResult && completedTurnResult.anySuccess) {
+          const completedTurnRecord = asRecord(completedTurnResult);
+          const nonStandardAnySuccess = completedTurnRecord?.nonStandardAnySuccess === true;
+          const notificationResults = summarizeNotificationResultsForLog(
+            collectDispatchResultsForLog(completedTurnResult),
+          );
+          if (completedTurnResult && (completedTurnResult.anySuccess || nonStandardAnySuccess)) {
             recordCompletedTurnNotificationSent(
               stateDir,
               notifySessionId,
@@ -2977,15 +3201,18 @@ async function main() {
               origin_evidence: originResolution.evidence,
               evidence_sources: originResolution.evidence.map((entry) => entry.source),
               notification_event: decision!.effectiveEvent,
+              any_success: completedTurnResult.anySuccess,
+              non_standard_any_success: nonStandardAnySuccess,
+              ...(notificationResults.length ? { notification_results: notificationResults } : {}),
             });
-          } else if (
-            notificationEventEnabled
-            && !standardNotificationPlatformsEnabled
-            && completedTurnResult
-          ) {
-            completedTurnDeliveryStatus = 'committed';
-          } else if (notificationEventEnabled) {
+          } else if (notificationEventEnabled && !completedTurnNotificationFailed) {
             completedTurnNotificationFailed = true;
+            const deliveryFailureKind = notificationResults.some(isAmbiguousNotificationResult)
+              ? 'ambiguous_timeout'
+              : 'definitive';
+            if (deliveryFailureKind === 'ambiguous_timeout') {
+              completedTurnDeliveryStatus = 'delivery_unknown';
+            }
             await logNotifyHookEvent(logsDir, {
               timestamp: new Date().toISOString(),
               level: 'warn',
@@ -3005,6 +3232,8 @@ async function main() {
               evidence_sources: originResolution.evidence.map((entry) => entry.source),
               notification_event: decision!.effectiveEvent,
               any_success: completedTurnResult?.anySuccess ?? false,
+              delivery_failure_kind: deliveryFailureKind,
+              notification_results: notificationResults,
             });
           }
         }

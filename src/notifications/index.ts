@@ -19,6 +19,7 @@ export type {
   NotificationTransportOverrides,
   NotificationResult,
   DispatchResult,
+  NonStandardNotificationResult,
   DiscordNotificationConfig,
   DiscordBotNotificationConfig,
   TelegramNotificationConfig,
@@ -173,6 +174,7 @@ import type {
   FullNotificationConfig,
   FullNotificationPayload,
   DispatchResult,
+  NonStandardNotificationResult,
 } from "./types.js";
 import {
   getNotificationConfig,
@@ -206,7 +208,7 @@ import {
   shouldSendLifecycleNotification,
   recordLifecycleNotificationSent,
 } from "./lifecycle-dedupe.js";
-import type { OpenClawHookEvent } from "../openclaw/types.js";
+import type { OpenClawHookEvent, OpenClawResult } from "../openclaw/types.js";
 import { parseTmuxTail } from "./formatter.js";
 import {
   shouldIncludeSessionIdleTmuxTail,
@@ -358,7 +360,7 @@ function buildOpenClawContext(payload: FullNotificationPayload): {
 async function buildOpenClawDispatch(
   event: NotificationEvent,
   payload: FullNotificationPayload,
-): Promise<(() => Promise<void>) | null> {
+): Promise<(() => Promise<NonStandardNotificationResult | null>) | null> {
   const openClawEvent = toOpenClawEvent(event);
   if (openClawEvent === null) {
     return null;
@@ -366,26 +368,63 @@ async function buildOpenClawDispatch(
 
   const tempContract = readNotifyTempContractFromEnv(process.env);
   const openClawContext = buildOpenClawContext(payload);
-  return async (): Promise<void> => {
+  return async (): Promise<NonStandardNotificationResult | null> => {
     try {
       const openClawAllowed = await shouldDispatchOpenClaw(
         openClawEvent,
         tempContract,
         process.env,
       );
-      if (!openClawAllowed) return;
+      if (!openClawAllowed) return null;
 
       const { wakeOpenClaw } = await import("../openclaw/index.js");
       if (openClawEvent === "ask-user-question") {
-        await wakeOpenClaw(openClawEvent, openClawContext);
-        return;
+        return normalizeOpenClawResult(await wakeOpenClaw(openClawEvent, openClawContext));
       }
 
       void wakeOpenClaw(openClawEvent, openClawContext);
-    } catch {
+      return { transport: "openclaw", success: true };
+    } catch (error) {
       // OpenClaw failures must never affect notification dispatch
+      return {
+        transport: "openclaw",
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
     }
   };
+}
+
+function normalizeOpenClawResult(result: OpenClawResult | null): NonStandardNotificationResult {
+  if (!result) {
+    return {
+      transport: "openclaw",
+      success: false,
+      error: "OpenClaw gateway unavailable",
+    };
+  }
+  return {
+    transport: "openclaw",
+    success: result.success,
+    gateway: result.gateway,
+    ...(result.error ? { error: result.error } : {}),
+    ...(result.statusCode !== undefined ? { statusCode: result.statusCode } : {}),
+  };
+}
+
+function appendNonStandardResult(
+  result: DispatchResult,
+  nonStandardResult: NonStandardNotificationResult | null,
+): void {
+  if (!nonStandardResult) return;
+  result.nonStandardResults = [
+    ...(result.nonStandardResults || []),
+    nonStandardResult,
+  ];
+  if (nonStandardResult.success) {
+    result.nonStandardAnySuccess = true;
+    result.anySuccess = true;
+  }
 }
 
 export async function shouldDispatchOpenClaw(
@@ -510,23 +549,27 @@ export async function notifyLifecycle(
 
     const openClawEvent = toOpenClawEvent(event);
     const dispatchOpenClawLater = await buildOpenClawDispatch(event, payload);
+    let nonStandardDispatchResult: Promise<NonStandardNotificationResult | null> | null = null;
 
     if (openClawEvent !== "ask-user-question" && dispatchOpenClawLater) {
       // Let the non-blocking OpenClaw eligibility/import path overlap the primary
       // platform dispatch so session-start does not wait on background wake work.
-      void dispatchOpenClawLater();
+      nonStandardDispatchResult = dispatchOpenClawLater();
     }
 
     const result = await dispatchNotificationsImpl(config, event, payload);
+    if (openClawEvent === "ask-user-question" && dispatchOpenClawLater) {
+      nonStandardDispatchResult = dispatchOpenClawLater();
+    }
+    if (nonStandardDispatchResult) {
+      appendNonStandardResult(result, await nonStandardDispatchResult);
+    }
+
     if (result.anySuccess) {
       recordLifecycleNotificationSent(lifecycleStateDir, payload);
       if (event === "session-idle" && sessionIdleTmuxTailAllowed) {
         recordSessionIdleTmuxTailSent(lifecycleStateDir, payload.sessionId, normalizedIdleTmuxTail);
       }
-    }
-
-    if (openClawEvent === "ask-user-question" && dispatchOpenClawLater) {
-      await dispatchOpenClawLater();
     }
 
     await maybeRegisterReplyMappings(config, payload, result);
@@ -628,9 +671,10 @@ export async function notifyCompletedTurn(
       decision.effectiveEvent,
       payload,
     );
+    let nonStandardDispatchResult: Promise<NonStandardNotificationResult | null> | null = null;
 
     if (openClawEvent !== "ask-user-question" && dispatchOpenClawLater) {
-      void dispatchOpenClawLater();
+      nonStandardDispatchResult = dispatchOpenClawLater();
     }
 
     const result = await dispatchNotificationsImpl(
@@ -640,7 +684,10 @@ export async function notifyCompletedTurn(
     );
 
     if (openClawEvent === "ask-user-question" && dispatchOpenClawLater) {
-      await dispatchOpenClawLater();
+      nonStandardDispatchResult = dispatchOpenClawLater();
+    }
+    if (nonStandardDispatchResult) {
+      appendNonStandardResult(result, await nonStandardDispatchResult);
     }
 
     await maybeRegisterReplyMappings(config, payload, result);

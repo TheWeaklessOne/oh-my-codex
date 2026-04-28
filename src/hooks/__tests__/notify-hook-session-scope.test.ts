@@ -2055,7 +2055,7 @@ describe('notify-hook session-scoped iteration updates', () => {
     }
   });
 
-  it('continues with healthy primary dedupe when fallback replay state is malformed', async () => {
+  it('fails closed when fallback replay state is malformed', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-notify-project-fallback-malformed-'));
     try {
       const stateDir = join(wd, '.omx', 'state');
@@ -2077,8 +2077,7 @@ describe('notify-hook session-scoped iteration updates', () => {
       assert.equal(result.status, 0, result.stderr || result.stdout);
 
       const turns = await readJsonLogFiles(join(wd, '.omx', 'logs'), 'turns-');
-      assert.equal(turns.length, 1);
-      assert.equal(turns[0].turn_id, turnId);
+      assert.equal(turns.length, 0);
       const notifyLog = await readJsonLogFiles(join(wd, '.omx', 'logs'), 'notify-hook-');
       assert.equal(
         notifyLog.some((entry) =>
@@ -2088,15 +2087,7 @@ describe('notify-hook session-scoped iteration updates', () => {
         ),
         true,
       );
-      const projectState = JSON.parse(
-        await readFile(join(stateDir, 'notify-hook-turn-dedupe.json'), 'utf-8'),
-      ) as {
-        recent_turns?: Record<string, unknown>;
-        turn_claims?: Record<string, unknown>;
-      };
-      const key = `${threadId}|${turnId}|agent-turn-complete`;
-      assert.equal(Boolean(projectState.recent_turns?.[key]), true);
-      assert.equal(Boolean(projectState.turn_claims?.[key]), true);
+      assert.equal(existsSync(join(stateDir, 'notify-hook-turn-dedupe.json')), false);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -2235,6 +2226,113 @@ describe('notify-hook session-scoped iteration updates', () => {
     }
   });
 
+  it('fails closed when a fresh fallback-source allow claim appears before the post-write check', async (t) => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-notify-fallback-source-post-fallback-pending-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionId = 'omx-fallback-source-post-fallback-pending';
+      const threadId = 'native-thread-fallback-source-post-fallback-pending';
+      const turnId = 'native-turn-fallback-source-post-fallback-pending';
+      const key = `${threadId}|${turnId}|agent-turn-complete`;
+      const timestamp = Date.now();
+      const projectDedupePath = join(stateDir, 'notify-hook-turn-dedupe.json');
+      const fallbackDedupePath = join(stateDir, 'notify-hook-state.json');
+      await mkdir(join(stateDir, 'sessions', sessionId), { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+        session_id: sessionId,
+        native_session_id: threadId,
+        started_at: new Date(timestamp).toISOString(),
+        cwd: wd,
+      }));
+
+      const fallbackAppearsDuringPrimaryWrite = replaceFifoWithMissingAfterRead(
+        t,
+        projectDedupePath,
+        {
+          recent_turns: {},
+          turn_claims: {},
+          last_event_at: '',
+        },
+        fallbackDedupePath,
+        {
+          recent_turns: { [key]: timestamp },
+          turn_claims: {
+            [key]: {
+              timestamp,
+              delivery: 'allow',
+              delivery_status: 'pending',
+              delivery_status_at: timestamp,
+              source_kind: 'fallback',
+              source: 'notify-fallback-watcher',
+              session_id: 'omx-earlier-fallback-source-post-fallback-pending',
+              audience: 'external-owner',
+              reason: 'test-post-primary-fresh-fallback-race',
+            },
+          },
+          last_event_at: new Date(timestamp).toISOString(),
+        },
+      );
+      if (!fallbackAppearsDuringPrimaryWrite) return;
+
+      const result = runNotifyHook({
+        cwd: wd,
+        session_id: 'native-session-fallback-source-post-fallback-pending',
+        origin: { kind: 'leader', thread_id: threadId },
+        type: 'agent-turn-complete',
+        source: 'notify-fallback-watcher',
+        thread_id: threadId,
+        turn_id: turnId,
+        input_messages: ['[notify-fallback] synthesized from rollout task_complete'],
+        last_assistant_message: 'fallback-source post fallback fresh pending race output',
+      }, { OMX_SESSION_ID: sessionId });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      await fallbackAppearsDuringPrimaryWrite;
+
+      const notifyLog = await readJsonLogFiles(join(wd, '.omx', 'logs'), 'notify-hook-');
+      assert.equal(
+        notifyLog.some((entry) =>
+          entry.type === 'project_fallback_turn_dedupe_primary_won_race'
+          && entry.turn_id === turnId
+          && entry.fallback_delivery_closed === false
+        ),
+        true,
+      );
+      assert.equal(
+        notifyLog.some((entry) =>
+          entry.type === 'completed_turn_delivery_allowed'
+          && entry.turn_id === turnId
+        ),
+        false,
+      );
+      assert.equal(
+        notifyLog.some((entry) =>
+          entry.type === 'completed_turn_delivery_sent'
+          && entry.turn_id === turnId
+        ),
+        false,
+      );
+      assert.equal(
+        notifyLog.some((entry) =>
+          entry.type === 'completed_turn_duplicate_suppressed'
+          && entry.turn_id === turnId
+        ),
+        true,
+      );
+      const fallbackState = JSON.parse(
+        await readFile(fallbackDedupePath, 'utf-8'),
+      ) as { turn_claims?: Record<string, { delivery_status?: string; source_kind?: string }> };
+      assert.equal(fallbackState.turn_claims?.[key]?.delivery_status, 'pending');
+      assert.equal(fallbackState.turn_claims?.[key]?.source_kind, 'fallback');
+      const projectState = JSON.parse(
+        await readFile(projectDedupePath, 'utf-8'),
+      ) as { turn_claims?: Record<string, { delivery_status?: string; source_kind?: string }> };
+      assert.equal(projectState.turn_claims?.[key]?.delivery_status, 'pending');
+      assert.equal(projectState.turn_claims?.[key]?.source_kind, 'fallback');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('suppresses a primary writer when a closed fallback claim appears before the post-write check', async (t) => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-notify-primary-post-fallback-closed-'));
     try {
@@ -2321,8 +2419,14 @@ describe('notify-hook session-scoped iteration updates', () => {
       );
       const fallbackState = JSON.parse(
         await readFile(fallbackDedupePath, 'utf-8'),
-      ) as { turn_claims?: Record<string, { delivery_status?: string }> };
+      ) as { turn_claims?: Record<string, { delivery_status?: string; source_kind?: string }> };
       assert.equal(fallbackState.turn_claims?.[key]?.delivery_status, 'sent');
+      assert.equal(fallbackState.turn_claims?.[key]?.source_kind, 'fallback');
+      const projectState = JSON.parse(
+        await readFile(projectDedupePath, 'utf-8'),
+      ) as { turn_claims?: Record<string, { delivery_status?: string; source_kind?: string }> };
+      assert.equal(projectState.turn_claims?.[key]?.delivery_status, 'sent');
+      assert.equal(projectState.turn_claims?.[key]?.source_kind, 'fallback');
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

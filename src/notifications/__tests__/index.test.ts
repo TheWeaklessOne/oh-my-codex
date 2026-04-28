@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { FullNotificationConfig } from '../types.js';
+import type { FullNotificationConfig, NonStandardNotificationResult } from '../types.js';
 
 const ENV_KEYS = ['CODEX_HOME', 'TMUX', 'TMUX_PANE', 'PATH'] as const;
 
@@ -164,10 +164,11 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
     }, undefined, {
       dispatchNotificationsImpl: async (_config: unknown, event: string, _payload: unknown) => ({
         event,
-        anySuccess: true,
+        anySuccess: false,
         results: [{
           platform: 'webhook',
-          success: true,
+          success: false,
+          error: 'HTTP 500',
         }],
       }),
     });
@@ -175,23 +176,30 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
 
     assert.ok(askResult);
     assert.equal(askResult.anySuccess, true);
+    assert.equal(askResult.nonStandardAnySuccess, true);
+    assert.equal(askResult.nonStandardResults?.some((entry: NonStandardNotificationResult) =>
+      entry.transport === 'openclaw'
+      && entry.success === true
+    ), true);
     assert.equal(openClawCalls, 1);
     assert.equal(openClawResolved, true);
     assert.ok(askElapsed >= 50, `ask-user-question should await OpenClaw dispatch, got ${askElapsed}ms`);
 
     openClawCalls = 0;
     openClawResolved = false;
+    const startSessionId = `sess-start-${Date.now()}`;
     const startStarted = Date.now();
     const startResult = await notifyLifecycle('session-start', {
-      sessionId: `sess-start-${Date.now()}`,
+      sessionId: startSessionId,
       projectPath,
     }, undefined, {
       dispatchNotificationsImpl: async (_config: unknown, event: string, _payload: unknown) => ({
         event,
-        anySuccess: true,
+        anySuccess: false,
         results: [{
           platform: 'webhook',
-          success: true,
+          success: false,
+          error: 'HTTP 500',
         }],
       }),
     });
@@ -199,6 +207,7 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
 
     assert.ok(startResult);
     assert.equal(startResult.anySuccess, true);
+    assert.equal(startResult.nonStandardAnySuccess, true);
     assert.equal(openClawCalls, 1);
     assert.equal(openClawResolved, false, 'session-start should keep fire-and-forget OpenClaw dispatch');
     await new Promise((resolve) => setTimeout(resolve, 80));
@@ -208,6 +217,19 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
       `session-start should remain faster than awaited ask-user-question dispatch (start=${startElapsed}ms ask=${askElapsed}ms)`,
     );
     assert.ok(startElapsed < 60, `session-start should return before the 60ms OpenClaw dispatch delay, got ${startElapsed}ms`);
+
+    openClawCalls = 0;
+    const duplicateStart = await notifyLifecycle('session-start', {
+      sessionId: startSessionId,
+      projectPath,
+    }, undefined, {
+      dispatchNotificationsImpl: async () => {
+        throw new Error('deduped session-start should not dispatch standard transports');
+      },
+    });
+    assert.ok(duplicateStart);
+    assert.equal(duplicateStart.anySuccess, true);
+    assert.equal(openClawCalls, 0);
 
     rmSync(projectPath, { recursive: true, force: true });
     delete process.env.OMX_OPENCLAW;

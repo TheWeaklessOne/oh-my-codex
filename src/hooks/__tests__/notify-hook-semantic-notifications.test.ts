@@ -95,6 +95,44 @@ globalThis.fetch = async (input, init = {}) => {
   return preloadPath;
 }
 
+async function writeFetchFailureCapturePreload(dir: string, errorMessage = 'Dispatch timeout'): Promise<string> {
+  const preloadPath = join(dir, 'mock-fetch-failure.mjs');
+  await writeFile(preloadPath, `
+import { appendFileSync } from 'node:fs';
+
+const capturePath = process.env.OMX_FETCH_CAPTURE_PATH;
+globalThis.fetch = async (input, init = {}) => {
+  const url = typeof input === 'string' ? input : input instanceof URL ? String(input) : input.url;
+  if (capturePath) {
+    appendFileSync(capturePath, JSON.stringify({
+      url,
+      body: typeof init.body === 'string' ? init.body : '',
+    }) + '\\n');
+  }
+  const error = new Error(${JSON.stringify(errorMessage)});
+  error.name = 'AbortError';
+  throw error;
+};
+`, 'utf-8');
+  return preloadPath;
+}
+
+async function writeOpenClawCommandCaptureScript(dir: string, capturePath: string): Promise<string> {
+  const scriptPath = join(dir, 'capture-openclaw-command.mjs');
+  await writeFile(scriptPath, `
+import { appendFileSync } from 'node:fs';
+
+appendFileSync(${JSON.stringify(capturePath)}, JSON.stringify({
+  argv: process.argv.slice(2),
+  env: {
+    OMX_OPENCLAW: process.env.OMX_OPENCLAW || '',
+    OMX_OPENCLAW_COMMAND: process.env.OMX_OPENCLAW_COMMAND || '',
+  },
+}) + '\\n');
+`, 'utf-8');
+  return scriptPath;
+}
+
 function buildFixedDatePreloadSource(fixedNowIso: string): string {
   return `
 const __OMX_TEST_FIXED_NOW_ISO__ = ${JSON.stringify(fixedNowIso)};
@@ -690,10 +728,363 @@ describe('notify-hook semantic notifications', () => {
       const projectState = JSON.parse(
         await readFile(join(workdir, '.omx', 'state', 'notify-hook-turn-dedupe.json'), 'utf-8'),
       ) as {
-        turn_claims?: Record<string, { delivery_status?: string }>;
+        turn_claims?: Record<string, { delivery_status?: string; delivery_status_at?: number }>;
       };
       const key = 'thread-result-ready-failed-retry|turn-result-ready-failed-retry|agent-turn-complete';
       assert.equal(projectState.turn_claims?.[key]?.delivery_status, 'dispatching');
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not immediately retry completed-turn delivery after ambiguous dispatch timeout evidence', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-result-ready-timeout-fail-closed-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const timeoutPreloadPath = await writeFetchFailureCapturePreload(tempRoot);
+    const successPreloadPath = await writeFetchCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const stateDir = join(workdir, '.omx', 'state');
+
+    try {
+      await mkdir(stateDir, { recursive: true });
+      await writeNotificationConfig(codexHome);
+      const threadId = 'thread-result-ready-timeout-fail-closed';
+      const turnId = 'turn-result-ready-timeout-fail-closed';
+      const key = `${threadId}|${turnId}|agent-turn-complete`;
+
+      const payload = {
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: 'sess-result-ready-timeout-fail-closed',
+        thread_id: threadId,
+        turn_id: turnId,
+        input_messages: [],
+        last_assistant_message: 'Do not immediately retry an ambiguous timeout.',
+      };
+
+      const first = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${timeoutPreloadPath}`,
+      });
+      assert.equal(first.status, 0, first.stderr || first.stdout);
+
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const firstEntries = await readJsonLines(notifyLog);
+      const failure = firstEntries.find((entry) =>
+        entry.type === 'completed_turn_delivery_failed'
+        && entry.turn_id === turnId
+      );
+      assert.equal(failure?.delivery_failure_kind, 'ambiguous_timeout');
+      assert.equal(
+        (failure?.notification_results as Array<Record<string, unknown>>).some((entry) =>
+          entry.success === false
+          && String(entry.error).includes('Dispatch timeout')
+        ),
+        true,
+      );
+      assert.equal(
+        firstEntries.filter((entry) =>
+          entry.type === 'completed_turn_delivery_allowed'
+          && entry.turn_id === turnId
+        ).length,
+        1,
+      );
+
+      const second = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${successPreloadPath}`,
+      });
+      assert.equal(second.status, 0, second.stderr || second.stdout);
+
+      assert.equal((await readCapturedRequests(capturePath)).length, 1);
+      const entries = await readJsonLines(notifyLog);
+      assert.equal(
+        entries.filter((entry) =>
+          entry.type === 'completed_turn_delivery_allowed'
+          && entry.turn_id === turnId
+        ).length,
+        1,
+      );
+      assert.equal(
+        entries.some((entry) =>
+          entry.type === 'turn_duplicate_suppressed'
+          && entry.scope === 'project'
+          && entry.turn_id === turnId
+        ),
+        true,
+      );
+      assert.equal(
+        entries.some((entry) =>
+          entry.type === 'completed_turn_delivery_sent'
+          && entry.turn_id === turnId
+        ),
+        false,
+      );
+      const projectState = JSON.parse(
+        await readFile(join(stateDir, 'notify-hook-turn-dedupe.json'), 'utf-8'),
+      ) as {
+        turn_claims?: Record<string, { delivery_status?: string; delivery_status_at?: number }>;
+      };
+      assert.equal(projectState.turn_claims?.[key]?.delivery_status, 'delivery_unknown');
+
+      projectState.turn_claims![key] = {
+        ...projectState.turn_claims![key],
+        delivery_status_at: 0,
+      };
+      await writeFile(
+        join(stateDir, 'notify-hook-turn-dedupe.json'),
+        JSON.stringify(projectState, null, 2),
+      );
+      await rm(notifyLog, { force: true });
+
+      const third = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${successPreloadPath}`,
+      });
+      assert.equal(third.status, 0, third.stderr || third.stdout);
+      assert.equal((await readCapturedRequests(capturePath)).length, 1);
+      const finalEntries = await readJsonLines(notifyLog);
+      assert.equal(
+        finalEntries.some((entry) =>
+          entry.type === 'completed_turn_delivery_sent'
+          && entry.turn_id === turnId
+        ),
+        false,
+      );
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('treats standard webhook gateway timeout statuses as ambiguous', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-result-ready-504-fail-closed-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot, '', 504);
+    const workdir = join(tempRoot, 'repo');
+
+    try {
+      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
+      await writeNotificationConfig(codexHome);
+      const payload = {
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: 'sess-result-ready-504-fail-closed',
+        thread_id: 'thread-result-ready-504-fail-closed',
+        turn_id: 'turn-result-ready-504-fail-closed',
+        input_messages: [],
+        last_assistant_message: 'Do not immediately retry a gateway timeout response.',
+      };
+
+      const first = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(first.status, 0, first.stderr || first.stdout);
+
+      const second = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(second.status, 0, second.stderr || second.stdout);
+
+      assert.equal((await readCapturedRequests(capturePath)).length, 1);
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      const failure = entries.find((entry) =>
+        entry.type === 'completed_turn_delivery_failed'
+        && entry.turn_id === 'turn-result-ready-504-fail-closed'
+      );
+      assert.equal(failure?.delivery_failure_kind, 'ambiguous_timeout');
+      assert.equal(
+        (failure?.notification_results as Array<Record<string, unknown>>).some((entry) =>
+          entry.platform === 'webhook'
+          && entry.success === false
+          && entry.error === 'HTTP 504'
+          && entry.status_code === 504
+        ),
+        true,
+      );
+      assert.equal(
+        entries.filter((entry) =>
+          entry.type === 'completed_turn_delivery_allowed'
+          && entry.turn_id === 'turn-result-ready-504-fail-closed'
+        ).length,
+        1,
+      );
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not recover fresh claims from stale claim-changed dispatch evidence', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-claim-changed-fail-closed-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const stateDir = join(workdir, '.omx', 'state');
+    const logsDir = join(workdir, '.omx', 'logs');
+
+    try {
+      await mkdir(stateDir, { recursive: true });
+      await mkdir(logsDir, { recursive: true });
+      await writeNotificationConfig(codexHome);
+      const threadId = 'thread-claim-changed-fail-closed';
+      const turnId = 'turn-claim-changed-fail-closed';
+      const key = `${threadId}|${turnId}|agent-turn-complete`;
+      const timestamp = Date.now() - 1_000;
+      await writeFile(join(stateDir, 'notify-hook-turn-dedupe.json'), JSON.stringify({
+        recent_turns: { [key]: timestamp },
+        turn_claims: {
+          [key]: {
+            timestamp,
+            delivery: 'allow',
+            delivery_status: 'pending',
+            delivery_status_at: timestamp,
+            source_kind: 'native',
+            source: 'native-after-stale-claim',
+            session_id: 'sess-claim-changed-fail-closed',
+            audience: 'external-owner',
+            reason: 'current_external_owner',
+          },
+        },
+        last_event_at: new Date(timestamp).toISOString(),
+      }));
+      await writeFile(join(logsDir, 'notify-hook-existing.jsonl'), `${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        level: 'warn',
+        type: 'project_turn_dedupe_delivery_status_failed',
+        delivery_status: 'dispatching',
+        thread_id: threadId,
+        turn_id: turnId,
+        omx_session_id: 'sess-stale-owner',
+        source: 'stale-owner',
+        reason: 'claim_changed_before_dispatch',
+      })}\n`);
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: 'sess-claim-changed-fail-closed',
+        thread_id: threadId,
+        turn_id: turnId,
+        input_messages: [],
+        last_assistant_message: 'Do not recover a fresh claim from stale claim-changed dispatch evidence.',
+      }, {
+        CODEX_HOME: codexHome,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      assert.equal((await readCapturedRequests(capturePath)).length, 0);
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      assert.equal(
+        entries.some((entry) =>
+          entry.type === 'completed_turn_delivery_allowed'
+          && entry.turn_id === turnId
+        ),
+        false,
+      );
+      assert.equal(
+        entries.some((entry) =>
+          entry.type === 'turn_duplicate_suppressed'
+          && entry.scope === 'project'
+          && entry.turn_id === turnId
+        ),
+        true,
+      );
+      const projectState = JSON.parse(
+        await readFile(join(stateDir, 'notify-hook-turn-dedupe.json'), 'utf-8'),
+      ) as {
+        turn_claims?: Record<string, { delivery_status?: string; source?: string }>;
+      };
+      assert.equal(projectState.turn_claims?.[key]?.delivery_status, 'pending');
+      assert.equal(projectState.turn_claims?.[key]?.source, 'native-after-stale-claim');
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when degraded fallback cannot replay malformed primary dedupe', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-primary-replay-malformed-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const stateDir = join(workdir, '.omx', 'state');
+
+    try {
+      await mkdir(stateDir, { recursive: true });
+      await writeNotificationConfig(codexHome);
+      await writeFile(join(stateDir, 'notify-hook-turn-dedupe.json'), '{ malformed');
+
+      const payload = {
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: 'sess-primary-replay-malformed',
+        thread_id: 'thread-primary-replay-malformed',
+        turn_id: 'turn-primary-replay-malformed',
+        input_messages: [],
+        last_assistant_message: 'Do not deliver when degraded fallback cannot validate malformed primary dedupe.',
+      };
+
+      const result = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      assert.equal((await readCapturedRequests(capturePath)).length, 0);
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      assert.equal(
+        entries.some((entry) =>
+          entry.type === 'project_turn_dedupe_failed'
+          && entry.turn_id === 'turn-primary-replay-malformed'
+        ),
+        true,
+      );
+      assert.equal(
+        entries.some((entry) =>
+          entry.type === 'project_turn_dedupe_replay_failed'
+          && entry.turn_id === 'turn-primary-replay-malformed'
+        ),
+        true,
+      );
+      assert.equal(
+        entries.some((entry) =>
+          entry.type === 'project_fallback_turn_dedupe_rolled_back'
+          && entry.reason === 'primary_replay_failed'
+          && entry.rolled_back === true
+          && entry.turn_id === 'turn-primary-replay-malformed'
+        ),
+        true,
+      );
+      assert.equal(
+        entries.some((entry) =>
+          entry.type === 'completed_turn_delivery_allowed'
+          && entry.turn_id === 'turn-primary-replay-malformed'
+        ),
+        false,
+      );
+
+      const fallbackState = JSON.parse(
+        await readFile(join(stateDir, 'notify-hook-state.json'), 'utf-8'),
+      ) as {
+        turn_claims?: Record<string, unknown>;
+      };
+      const key = 'thread-primary-replay-malformed|turn-primary-replay-malformed|agent-turn-complete';
+      assert.equal(Boolean(fallbackState.turn_claims?.[key]), false);
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }
@@ -777,7 +1168,7 @@ describe('notify-hook semantic notifications', () => {
       const projectState = JSON.parse(
         await readFile(join(workdir, '.omx', 'state', 'notify-hook-turn-dedupe.json'), 'utf-8'),
       ) as {
-        turn_claims?: Record<string, { delivery_status?: string }>;
+        turn_claims?: Record<string, { delivery_status?: string; delivery_status_at?: number }>;
       };
       const key = 'thread-result-ready-retry-succeeds|turn-result-ready-retry-succeeds|agent-turn-complete';
       assert.equal(projectState.turn_claims?.[key]?.delivery_status, 'sent');
@@ -786,114 +1177,78 @@ describe('notify-hook semantic notifications', () => {
     }
   });
 
-  it('commits completed-turn dedupe when only non-standard transports are enabled', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-result-ready-openclaw-only-'));
+  it('commits completed-turn dedupe when only non-standard OpenClaw transport runs', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-ask-openclaw-only-'));
     const codexHome = join(tempRoot, 'codex-home');
     const workdir = join(tempRoot, 'repo');
+    const commandCapturePath = join(tempRoot, 'openclaw-command.ndjson');
+    const commandScriptPath = await writeOpenClawCommandCaptureScript(tempRoot, commandCapturePath);
 
     try {
       await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
       await writeNotificationConfig(codexHome, {
         webhook: { enabled: false },
-        openclaw: { enabled: true },
-      });
-
-      const payload = {
-        cwd: workdir,
-        type: 'agent-turn-complete',
-        session_id: 'sess-result-ready-openclaw-only',
-        thread_id: 'thread-result-ready-openclaw-only',
-        turn_id: 'turn-result-ready-openclaw-only',
-        input_messages: [],
-        last_assistant_message: 'Implemented OpenClaw-only notification dedupe handling.',
-      };
-
-      const first = runNotifyHook(payload, { CODEX_HOME: codexHome });
-      assert.equal(first.status, 0, first.stderr || first.stdout);
-
-      const second = runNotifyHook(payload, { CODEX_HOME: codexHome });
-      assert.equal(second.status, 0, second.stderr || second.stdout);
-
-      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
-      const entries = await readJsonLines(notifyLog);
-      assert.equal(
-        entries.some((entry) =>
-          entry.type === 'completed_turn_delivery_failed'
-          && entry.turn_id === 'turn-result-ready-openclaw-only'
-        ),
-        false,
-      );
-      assert.equal(
-        entries.filter((entry) =>
-          entry.type === 'completed_turn_delivery_allowed'
-          && entry.turn_id === 'turn-result-ready-openclaw-only'
-        ).length,
-        1,
-      );
-      assert.equal(
-        entries.some((entry) =>
-          entry.type === 'turn_duplicate_suppressed'
-          && entry.scope === 'project'
-          && entry.turn_id === 'turn-result-ready-openclaw-only'
-        ),
-        true,
-      );
-      const projectState = JSON.parse(
-        await readFile(join(workdir, '.omx', 'state', 'notify-hook-turn-dedupe.json'), 'utf-8'),
-      ) as {
-        turn_claims?: Record<string, { delivery_status?: string }>;
-      };
-      const key = 'thread-result-ready-openclaw-only|turn-result-ready-openclaw-only|agent-turn-complete';
-      assert.equal(projectState.turn_claims?.[key]?.delivery_status, 'committed');
-    } finally {
-      await rm(tempRoot, { recursive: true, force: true });
-    }
-  });
-
-  it('commits completed-turn dedupe when only custom transports are enabled', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-result-ready-custom-only-'));
-    const codexHome = join(tempRoot, 'codex-home');
-    const workdir = join(tempRoot, 'repo');
-
-    try {
-      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
-      await writeNotificationConfig(codexHome, {
-        webhook: { enabled: false },
-        custom_cli_command: {
-          command: 'echo notify',
-          events: ['result-ready'],
+        openclaw: {
+          enabled: true,
+          gateways: {
+            capture: {
+              type: 'command',
+              command: `${process.execPath} ${commandScriptPath}`,
+            },
+          },
+          hooks: {
+            'ask-user-question': {
+              enabled: true,
+              gateway: 'capture',
+              instruction: 'capture ask-user-question',
+            },
+          },
         },
       });
 
       const payload = {
         cwd: workdir,
         type: 'agent-turn-complete',
-        session_id: 'sess-result-ready-custom-only',
-        thread_id: 'thread-result-ready-custom-only',
-        turn_id: 'turn-result-ready-custom-only',
+        session_id: 'sess-ask-openclaw-only',
+        thread_id: 'thread-ask-openclaw-only',
+        turn_id: 'turn-ask-openclaw-only',
         input_messages: [],
-        last_assistant_message: 'Implemented custom-only notification dedupe handling.',
+        last_assistant_message: 'Would you like me to continue with the OpenClaw-only verification?',
       };
 
-      const first = runNotifyHook(payload, { CODEX_HOME: codexHome });
+      const first = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_OPENCLAW: '1',
+        OMX_OPENCLAW_COMMAND: '1',
+      });
       assert.equal(first.status, 0, first.stderr || first.stdout);
 
-      const second = runNotifyHook(payload, { CODEX_HOME: codexHome });
+      const second = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_OPENCLAW: '1',
+        OMX_OPENCLAW_COMMAND: '1',
+      });
       assert.equal(second.status, 0, second.stderr || second.stdout);
+
+      const commandCaptures = await readJsonLines(commandCapturePath);
+      assert.equal(commandCaptures.length, 1);
+      const commandEnv = commandCaptures[0].env as Record<string, string>;
+      assert.equal(commandEnv.OMX_OPENCLAW, '1');
+      assert.equal(commandEnv.OMX_OPENCLAW_COMMAND, '1');
 
       const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
       const entries = await readJsonLines(notifyLog);
       assert.equal(
         entries.some((entry) =>
           entry.type === 'completed_turn_delivery_failed'
-          && entry.turn_id === 'turn-result-ready-custom-only'
+          && entry.turn_id === 'turn-ask-openclaw-only'
         ),
         false,
       );
       assert.equal(
         entries.filter((entry) =>
           entry.type === 'completed_turn_delivery_allowed'
-          && entry.turn_id === 'turn-result-ready-custom-only'
+          && entry.turn_id === 'turn-ask-openclaw-only'
         ).length,
         1,
       );
@@ -901,7 +1256,7 @@ describe('notify-hook semantic notifications', () => {
         entries.some((entry) =>
           entry.type === 'turn_duplicate_suppressed'
           && entry.scope === 'project'
-          && entry.turn_id === 'turn-result-ready-custom-only'
+          && entry.turn_id === 'turn-ask-openclaw-only'
         ),
         true,
       );
@@ -910,8 +1265,447 @@ describe('notify-hook semantic notifications', () => {
       ) as {
         turn_claims?: Record<string, { delivery_status?: string }>;
       };
-      const key = 'thread-result-ready-custom-only|turn-result-ready-custom-only|agent-turn-complete';
-      assert.equal(projectState.turn_claims?.[key]?.delivery_status, 'committed');
+      const key = 'thread-ask-openclaw-only|turn-ask-openclaw-only|agent-turn-complete';
+      assert.equal(projectState.turn_claims?.[key]?.delivery_status, 'sent');
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not immediately retry after an ambiguous non-standard OpenClaw timeout', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-ask-openclaw-timeout-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const workdir = join(tempRoot, 'repo');
+    const capturePath = join(tempRoot, 'openclaw-http.ndjson');
+    const preloadPath = await writeFetchFailureCapturePreload(tempRoot);
+
+    try {
+      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
+      await writeNotificationConfig(codexHome, {
+        webhook: { enabled: false },
+        openclaw: {
+          enabled: true,
+          gateways: {
+            capture: {
+              type: 'http',
+              url: 'https://example.com/openclaw',
+            },
+          },
+          hooks: {
+            'ask-user-question': {
+              enabled: true,
+              gateway: 'capture',
+              instruction: 'capture ask-user-question',
+            },
+          },
+        },
+      });
+
+      const payload = {
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: 'sess-ask-openclaw-timeout',
+        thread_id: 'thread-ask-openclaw-timeout',
+        turn_id: 'turn-ask-openclaw-timeout',
+        input_messages: [],
+        last_assistant_message: 'Would you like me to continue after this OpenClaw timeout?',
+      };
+
+      const first = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_OPENCLAW: '1',
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(first.status, 0, first.stderr || first.stdout);
+
+      const second = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_OPENCLAW: '1',
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(second.status, 0, second.stderr || second.stdout);
+
+      const requests = await readJsonLines(capturePath);
+      assert.equal(requests.length, 1);
+
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      const failure = entries.find((entry) =>
+        entry.type === 'completed_turn_delivery_failed'
+        && entry.turn_id === 'turn-ask-openclaw-timeout'
+      );
+      assert.equal(failure?.delivery_failure_kind, 'ambiguous_timeout');
+      assert.deepEqual(failure?.notification_results, [{
+        platform: 'openclaw',
+        success: false,
+        error: 'Dispatch timeout',
+        gateway: 'capture',
+      }]);
+      assert.equal(
+        entries.filter((entry) =>
+          entry.type === 'completed_turn_delivery_allowed'
+          && entry.turn_id === 'turn-ask-openclaw-timeout'
+        ).length,
+        1,
+      );
+      assert.equal(
+        entries.some((entry) =>
+          entry.type === 'completed_turn_delivery_sent'
+          && entry.turn_id === 'turn-ask-openclaw-timeout'
+        ),
+        false,
+      );
+      const projectState = JSON.parse(
+        await readFile(join(workdir, '.omx', 'state', 'notify-hook-turn-dedupe.json'), 'utf-8'),
+      ) as {
+        turn_claims?: Record<string, { delivery_status?: string }>;
+      };
+      const key = 'thread-ask-openclaw-timeout|turn-ask-openclaw-timeout|agent-turn-complete';
+      assert.equal(projectState.turn_claims?.[key]?.delivery_status, 'delivery_unknown');
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('treats non-standard OpenClaw gateway timeout statuses as ambiguous', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-ask-openclaw-504-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const workdir = join(tempRoot, 'repo');
+    const capturePath = join(tempRoot, 'openclaw-http.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot, '', 504);
+
+    try {
+      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
+      await writeNotificationConfig(codexHome, {
+        webhook: { enabled: false },
+        openclaw: {
+          enabled: true,
+          gateways: {
+            capture: {
+              type: 'http',
+              url: 'https://example.com/openclaw',
+            },
+          },
+          hooks: {
+            'ask-user-question': {
+              enabled: true,
+              gateway: 'capture',
+              instruction: 'capture ask-user-question',
+            },
+          },
+        },
+      });
+
+      const payload = {
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: 'sess-ask-openclaw-504',
+        thread_id: 'thread-ask-openclaw-504',
+        turn_id: 'turn-ask-openclaw-504',
+        input_messages: [],
+        last_assistant_message: 'Would you like me to continue after this OpenClaw gateway timeout?',
+      };
+
+      const first = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_OPENCLAW: '1',
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(first.status, 0, first.stderr || first.stdout);
+
+      const second = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_OPENCLAW: '1',
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(second.status, 0, second.stderr || second.stdout);
+
+      assert.equal((await readJsonLines(capturePath)).length, 1);
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      const failure = entries.find((entry) =>
+        entry.type === 'completed_turn_delivery_failed'
+        && entry.turn_id === 'turn-ask-openclaw-504'
+      );
+      assert.equal(failure?.delivery_failure_kind, 'ambiguous_timeout');
+      assert.deepEqual(failure?.notification_results, [{
+        platform: 'openclaw',
+        success: false,
+        error: 'HTTP 504',
+        gateway: 'capture',
+        status_code: 504,
+      }]);
+      assert.equal(
+        entries.filter((entry) =>
+          entry.type === 'completed_turn_delivery_allowed'
+          && entry.turn_id === 'turn-ask-openclaw-504'
+        ).length,
+        1,
+      );
+      const projectState = JSON.parse(
+        await readFile(join(workdir, '.omx', 'state', 'notify-hook-turn-dedupe.json'), 'utf-8'),
+      ) as {
+        turn_claims?: Record<string, { delivery_status?: string }>;
+      };
+      const key = 'thread-ask-openclaw-504|turn-ask-openclaw-504|agent-turn-complete';
+      assert.equal(projectState.turn_claims?.[key]?.delivery_status, 'delivery_unknown');
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('commits completed-turn dedupe when only custom CLI transport runs', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-ask-custom-only-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const workdir = join(tempRoot, 'repo');
+    const commandCapturePath = join(tempRoot, 'custom-command.ndjson');
+    const commandScriptPath = await writeOpenClawCommandCaptureScript(tempRoot, commandCapturePath);
+
+    try {
+      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
+      await writeNotificationConfig(codexHome, {
+        webhook: { enabled: false },
+        custom_cli_command: {
+          command: `${process.execPath} ${commandScriptPath}`,
+          events: ['ask-user-question'],
+        },
+      });
+
+      const payload = {
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: 'sess-ask-custom-only',
+        thread_id: 'thread-ask-custom-only',
+        turn_id: 'turn-ask-custom-only',
+        input_messages: [],
+        last_assistant_message: 'Would you like me to continue with the custom-only verification?',
+      };
+
+      const first = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_OPENCLAW: '1',
+        OMX_OPENCLAW_COMMAND: '1',
+      });
+      assert.equal(first.status, 0, first.stderr || first.stdout);
+
+      const second = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_OPENCLAW: '1',
+        OMX_OPENCLAW_COMMAND: '1',
+      });
+      assert.equal(second.status, 0, second.stderr || second.stdout);
+
+      const commandCaptures = await readJsonLines(commandCapturePath);
+      assert.equal(commandCaptures.length, 1);
+      const commandEnv = commandCaptures[0].env as Record<string, string>;
+      assert.equal(commandEnv.OMX_OPENCLAW, '1');
+      assert.equal(commandEnv.OMX_OPENCLAW_COMMAND, '1');
+
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      assert.equal(
+        entries.some((entry) =>
+          entry.type === 'completed_turn_delivery_failed'
+          && entry.turn_id === 'turn-ask-custom-only'
+        ),
+        false,
+      );
+      assert.equal(
+        entries.filter((entry) =>
+          entry.type === 'completed_turn_delivery_allowed'
+          && entry.turn_id === 'turn-ask-custom-only'
+        ).length,
+        1,
+      );
+      assert.equal(
+        entries.some((entry) =>
+          entry.type === 'turn_duplicate_suppressed'
+          && entry.scope === 'project'
+          && entry.turn_id === 'turn-ask-custom-only'
+        ),
+        true,
+      );
+      const projectState = JSON.parse(
+        await readFile(join(workdir, '.omx', 'state', 'notify-hook-turn-dedupe.json'), 'utf-8'),
+      ) as {
+        turn_claims?: Record<string, { delivery_status?: string; delivery_status_at?: number }>;
+      };
+      const key = 'thread-ask-custom-only|turn-ask-custom-only|agent-turn-complete';
+      assert.equal(projectState.turn_claims?.[key]?.delivery_status, 'sent');
+
+      projectState.turn_claims![key] = {
+        ...projectState.turn_claims![key],
+        delivery_status: 'dispatching',
+        delivery_status_at: 0,
+      };
+      await writeFile(
+        join(workdir, '.omx', 'state', 'notify-hook-turn-dedupe.json'),
+        JSON.stringify(projectState, null, 2),
+      );
+
+      const third = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_OPENCLAW: '1',
+        OMX_OPENCLAW_COMMAND: '1',
+      });
+      assert.equal(third.status, 0, third.stderr || third.stdout);
+      assert.equal((await readJsonLines(commandCapturePath)).length, 1);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('closes completed-turn dedupe when custom transport succeeds despite standard transport failure', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-ask-mixed-custom-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const workdir = join(tempRoot, 'repo');
+    const fetchCapturePath = join(tempRoot, 'webhook.ndjson');
+    const commandCapturePath = join(tempRoot, 'custom-command.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot, '', 500);
+    const commandScriptPath = await writeOpenClawCommandCaptureScript(tempRoot, commandCapturePath);
+
+    try {
+      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
+      await writeNotificationConfig(codexHome, {
+        webhook: { enabled: true, url: 'https://example.com/hooks/notify' },
+        custom_cli_command: {
+          command: `${process.execPath} ${commandScriptPath}`,
+          events: ['ask-user-question'],
+        },
+      });
+
+      const payload = {
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: 'sess-ask-mixed-custom',
+        thread_id: 'thread-ask-mixed-custom',
+        turn_id: 'turn-ask-mixed-custom',
+        input_messages: [],
+        last_assistant_message: 'Would you like me to continue with the mixed custom verification?',
+      };
+
+      const first = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_FETCH_CAPTURE_PATH: fetchCapturePath,
+        OMX_OPENCLAW: '1',
+        OMX_OPENCLAW_COMMAND: '1',
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(first.status, 0, first.stderr || first.stdout);
+
+      const second = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_FETCH_CAPTURE_PATH: fetchCapturePath,
+        OMX_OPENCLAW: '1',
+        OMX_OPENCLAW_COMMAND: '1',
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(second.status, 0, second.stderr || second.stdout);
+
+      assert.equal((await readJsonLines(fetchCapturePath)).length, 1);
+      assert.equal((await readJsonLines(commandCapturePath)).length, 1);
+
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      const sent = entries.find((entry) =>
+        entry.type === 'completed_turn_delivery_sent'
+        && entry.turn_id === 'turn-ask-mixed-custom'
+      );
+      assert.equal(sent?.non_standard_any_success, true);
+      assert.deepEqual(sent?.notification_results, [
+        { platform: 'webhook', success: false, error: 'HTTP 500', status_code: 500 },
+        { platform: 'openclaw', success: true, gateway: 'custom-cli' },
+      ]);
+      const projectState = JSON.parse(
+        await readFile(join(workdir, '.omx', 'state', 'notify-hook-turn-dedupe.json'), 'utf-8'),
+      ) as {
+        turn_claims?: Record<string, { delivery_status?: string }>;
+      };
+      const key = 'thread-ask-mixed-custom|turn-ask-mixed-custom|agent-turn-complete';
+      assert.equal(projectState.turn_claims?.[key]?.delivery_status, 'sent');
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not commit custom-only completed-turn dedupe until the custom transport succeeds', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-ask-custom-only-gated-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const workdir = join(tempRoot, 'repo');
+    const commandCapturePath = join(tempRoot, 'custom-command.ndjson');
+    const commandScriptPath = await writeOpenClawCommandCaptureScript(tempRoot, commandCapturePath);
+
+    try {
+      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
+      await writeNotificationConfig(codexHome, {
+        webhook: { enabled: false },
+        custom_cli_command: {
+          command: `${process.execPath} ${commandScriptPath}`,
+          events: ['ask-user-question'],
+        },
+      });
+
+      const payload = {
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: 'sess-ask-custom-only-gated',
+        thread_id: 'thread-ask-custom-only-gated',
+        turn_id: 'turn-ask-custom-only-gated',
+        input_messages: [],
+        last_assistant_message: 'Would you like me to continue with the gated custom verification?',
+      };
+
+      const first = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_OPENCLAW: '1',
+      });
+      assert.equal(first.status, 0, first.stderr || first.stdout);
+      assert.deepEqual(await readJsonLines(commandCapturePath), []);
+
+      const key = 'thread-ask-custom-only-gated|turn-ask-custom-only-gated|agent-turn-complete';
+      let projectState = JSON.parse(
+        await readFile(join(workdir, '.omx', 'state', 'notify-hook-turn-dedupe.json'), 'utf-8'),
+      ) as {
+        turn_claims?: Record<string, { delivery_status?: string }>;
+      };
+      assert.equal(projectState.turn_claims?.[key]?.delivery_status, 'dispatching');
+
+      const second = runNotifyHook(payload, {
+        CODEX_HOME: codexHome,
+        OMX_OPENCLAW: '1',
+        OMX_OPENCLAW_COMMAND: '1',
+      });
+      assert.equal(second.status, 0, second.stderr || second.stdout);
+
+      const commandCaptures = await readJsonLines(commandCapturePath);
+      assert.equal(commandCaptures.length, 1);
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      assert.equal(
+        entries.filter((entry) =>
+          entry.type === 'completed_turn_delivery_failed'
+          && entry.turn_id === 'turn-ask-custom-only-gated'
+        ).length,
+        1,
+      );
+      assert.equal(
+        entries.filter((entry) =>
+          entry.type === 'completed_turn_delivery_allowed'
+          && entry.turn_id === 'turn-ask-custom-only-gated'
+        ).length,
+        2,
+      );
+
+      projectState = JSON.parse(
+        await readFile(join(workdir, '.omx', 'state', 'notify-hook-turn-dedupe.json'), 'utf-8'),
+      ) as {
+        turn_claims?: Record<string, { delivery_status?: string }>;
+      };
+      assert.equal(projectState.turn_claims?.[key]?.delivery_status, 'sent');
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }

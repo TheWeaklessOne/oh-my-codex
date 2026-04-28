@@ -291,6 +291,38 @@ describe('sendTelegram', () => {
     assert.equal(resolverCalled, false);
   });
 
+  it('surfaces Telegram HTTP failure status codes in transport results', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+    };
+
+    const result = await sendTelegram(
+      config,
+      basePayload,
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: () => ({
+            statusCode: 504,
+            body: {
+              ok: false,
+              error_code: 504,
+              description: 'Gateway timeout',
+            },
+          }),
+        }),
+      },
+    );
+
+    assert.equal(result.success, false);
+    assert.equal(result.statusCode, 504);
+  });
+
   it('passes message_thread_id and returns topic metadata when the resolver selects a project topic', async () => {
     const config: TelegramNotificationConfig = {
       enabled: true,

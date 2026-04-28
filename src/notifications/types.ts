@@ -334,6 +334,8 @@ export interface NotificationResult {
   platform: NotificationPlatform;
   success: boolean;
   error?: string;
+  /** HTTP status code when the transport received a non-success HTTP response. */
+  statusCode?: number;
   messageId?: string;
   /** All message IDs produced by transports that split one notification. */
   messageIds?: string[];
@@ -342,12 +344,31 @@ export interface NotificationResult {
   topicName?: string;
 }
 
+/** Result from a configured non-standard transport that is dispatched outside
+ * the standard platform fan-out (currently OpenClaw/custom aliases). */
+export interface NonStandardNotificationResult {
+  transport: "openclaw";
+  success: boolean;
+  error?: string;
+  gateway?: string;
+  statusCode?: number;
+}
+
 /** Result of dispatching notifications for an event */
 export interface DispatchResult {
   event: NotificationEvent;
   results: NotificationResult[];
   /** Whether at least one notification was sent successfully */
   anySuccess: boolean;
+  /**
+   * Whether a configured non-standard transport (currently OpenClaw/custom
+   * aliases) succeeded. A successful non-standard transport also contributes
+   * to anySuccess; this flag lets callers distinguish that from standard
+   * platform delivery when they need to.
+   */
+  nonStandardAnySuccess?: boolean;
+  /** Per-attempt evidence for non-standard transports, including failures. */
+  nonStandardResults?: NonStandardNotificationResult[];
 }
 
 /** Named notification profiles configuration */

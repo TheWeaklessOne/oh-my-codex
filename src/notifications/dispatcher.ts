@@ -235,6 +235,7 @@ export async function sendDiscord(
         platform: "discord",
         success: false,
         error: `HTTP ${response.status}`,
+        statusCode: response.status,
       };
     }
 
@@ -289,6 +290,7 @@ export async function sendDiscordBot(
         platform: "discord-bot",
         success: false,
         error: `HTTP ${response.status}`,
+        statusCode: response.status,
       };
     }
 
@@ -308,6 +310,20 @@ export async function sendDiscordBot(
       error: error instanceof Error ? error.message : "Unknown error",
     };
   }
+}
+
+function telegramFailureResult(
+  error: unknown,
+  extra: Partial<NotificationResult> = {},
+): NotificationResult {
+  const classification = classifyTelegramBotApiError(error);
+  return {
+    platform: "telegram",
+    success: false,
+    error: error instanceof Error ? error.message : "Unknown error",
+    ...(classification.statusCode !== undefined ? { statusCode: classification.statusCode } : {}),
+    ...extra,
+  };
 }
 
 export async function sendTelegram(
@@ -478,13 +494,10 @@ export async function sendTelegram(
           error instanceof Error ? error.message : String(error),
         );
         if (!canRetryStaleTelegramTopic(config, destination)) {
-          return {
-            platform: "telegram",
-            success: false,
-            error: error instanceof Error ? error.message : "Unknown error",
+          return telegramFailureResult(error, {
             projectKey: destination.projectKey,
             topicName: destination.topicName,
-          };
+          });
         }
         continue;
       }
@@ -504,13 +517,10 @@ export async function sendTelegram(
           error instanceof Error ? error.message : String(error),
         );
         if (!canRetryStaleTelegramTopic(config, destination)) {
-          return {
-            platform: "telegram",
-            success: false,
-            error: error instanceof Error ? error.message : "Unknown error",
+          return telegramFailureResult(error, {
             projectKey: destination.projectKey,
             topicName: destination.topicName,
-          };
+          });
         }
         continue;
       }
@@ -524,11 +534,7 @@ export async function sendTelegram(
         );
       }
 
-      return {
-        platform: "telegram",
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
+      return telegramFailureResult(error);
     }
   }
 }
@@ -918,6 +924,7 @@ export async function sendSlack(
         platform: "slack",
         success: false,
         error: `HTTP ${response.status}`,
+        statusCode: response.status,
       };
     }
 
@@ -979,6 +986,7 @@ export async function sendWebhook(
         platform: "webhook",
         success: false,
         error: `HTTP ${response.status}`,
+        statusCode: response.status,
       };
     }
 
