@@ -210,6 +210,17 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
     assert.equal(startResult.anySuccess, false);
     assert.equal(startResult.nonStandardAnySuccess, undefined);
     assert.equal(openClawResolved, false, 'session-start should keep fire-and-forget OpenClaw dispatch');
+    const pendingDuplicateStart = await notifyLifecycle('session-start', {
+      sessionId: startSessionId,
+      projectPath,
+    }, undefined, {
+      dispatchNotificationsImpl: async () => {
+        throw new Error('pending duplicate session-start should not dispatch standard transports');
+      },
+    });
+    assert.ok(pendingDuplicateStart);
+    assert.equal(pendingDuplicateStart.anySuccess, true);
+    assert.equal(openClawCalls, 1);
     await new Promise((resolve) => setTimeout(resolve, 80));
     assert.equal(openClawCalls, 1);
     assert.equal(openClawResolved, true, 'session-start should eventually finish the deferred OpenClaw dispatch');

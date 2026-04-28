@@ -205,6 +205,8 @@ import {
 import { basename } from "path";
 import { omxStateDir } from "../utils/paths.js";
 import {
+  claimLifecycleNotificationPending,
+  clearLifecycleNotificationPending,
   shouldSendLifecycleNotification,
   recordLifecycleNotificationSent,
 } from "./lifecycle-dedupe.js";
@@ -547,18 +549,29 @@ export async function notifyLifecycle(
     let nonStandardDispatchResult: Promise<NonStandardNotificationResult | null> | null = null;
 
     if (openClawEvent !== "ask-user-question" && dispatchOpenClawLater) {
+      if (!claimLifecycleNotificationPending(lifecycleStateDir, payload)) {
+        return {
+          event,
+          anySuccess: true,
+          results: [],
+        };
+      }
       // Let the non-blocking OpenClaw eligibility/import path overlap the primary
       // platform dispatch so session-start does not wait on background wake work.
-      void dispatchOpenClawLater()
+      nonStandardDispatchResult = dispatchOpenClawLater();
+      void nonStandardDispatchResult
         .then((nonStandardResult) => {
-          if (!nonStandardResult?.success) return;
+          if (!nonStandardResult?.success) {
+            clearLifecycleNotificationPending(lifecycleStateDir, payload);
+            return;
+          }
           recordLifecycleNotificationSent(lifecycleStateDir, payload);
           if (event === "session-idle" && sessionIdleTmuxTailAllowed) {
             recordSessionIdleTmuxTailSent(lifecycleStateDir, payload.sessionId, normalizedIdleTmuxTail);
           }
         })
         .catch(() => {
-          // Non-blocking OpenClaw failures must not affect standard notification dispatch.
+          clearLifecycleNotificationPending(lifecycleStateDir, payload);
         });
     }
 
@@ -566,7 +579,7 @@ export async function notifyLifecycle(
     if (openClawEvent === "ask-user-question" && dispatchOpenClawLater) {
       nonStandardDispatchResult = dispatchOpenClawLater();
     }
-    if (nonStandardDispatchResult) {
+    if (openClawEvent === "ask-user-question" && nonStandardDispatchResult) {
       appendNonStandardResult(result, await nonStandardDispatchResult);
     }
 
