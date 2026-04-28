@@ -614,10 +614,20 @@ export async function notifyLifecycle(
             if (ambiguousDispatchFailure || (nonStandardResult && isAmbiguousFailedResult(nonStandardResult))) {
               return;
             }
-            await clearLifecycleNotificationPending(lifecycleStateDir, payload, lifecycleClaimToken);
+            await clearLifecycleNotificationPending(lifecycleStateDir, payload, lifecycleClaimToken)
+              .catch(() => {
+                // If state persistence fails after a definitive transport failure,
+                // leave the pending claim in place so a duplicate lifecycle hook
+                // fails closed until stale recovery instead of risking a replay.
+              });
             return;
           }
-          await recordLifecycleNotificationSentLocked(lifecycleStateDir, payload, Date.now(), lifecycleClaimToken);
+          await recordLifecycleNotificationSentLocked(lifecycleStateDir, payload, Date.now(), lifecycleClaimToken)
+            .catch(() => {
+              // The OpenClaw/custom send already succeeded. If we cannot commit
+              // the sent marker, keep the pending claim rather than clearing it
+              // through the transport-error path below.
+            });
           if (event === "session-idle" && sessionIdleTmuxTailAllowed) {
             recordSessionIdleTmuxTailSent(lifecycleStateDir, payload.sessionId, normalizedIdleTmuxTail);
           }

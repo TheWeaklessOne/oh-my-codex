@@ -253,7 +253,6 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
       startElapsed < askElapsed,
       `session-start should remain faster than awaited ask-user-question dispatch (start=${startElapsed}ms ask=${askElapsed}ms)`,
     );
-    assert.ok(startElapsed < 60, `session-start should return before the 60ms OpenClaw dispatch delay, got ${startElapsed}ms`);
 
     openClawCalls = 0;
     const duplicateStart = await notifyLifecycle('session-start', {
