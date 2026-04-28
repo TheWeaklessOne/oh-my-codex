@@ -284,7 +284,76 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
     assert.ok(slowStandardResult);
     assert.equal(slowStandardResult.anySuccess, true);
 
+    let ambiguousStandardCalls = 0;
+    const ambiguousStandardSessionId = `sess-start-ambiguous-standard-${Date.now()}`;
+    const ambiguousStandardResult = await notifyLifecycle('session-start', {
+      sessionId: ambiguousStandardSessionId,
+      projectPath,
+    }, undefined, {
+      dispatchNotificationsImpl: async (_config: unknown, event: string, _payload: unknown) => {
+        ambiguousStandardCalls += 1;
+        return {
+          event,
+          anySuccess: false,
+          results: [{
+            platform: 'webhook',
+            success: false,
+            error: 'HTTP 504',
+            statusCode: 504,
+          }],
+        };
+      },
+    });
+    assert.ok(ambiguousStandardResult);
+    assert.equal(ambiguousStandardResult.anySuccess, false);
+    const duplicateAmbiguousStandard = await notifyLifecycle('session-start', {
+      sessionId: ambiguousStandardSessionId,
+      projectPath,
+    }, undefined, {
+      dispatchNotificationsImpl: async () => {
+        throw new Error('ambiguous standard lifecycle failure should keep the pending claim');
+      },
+    });
+    assert.ok(duplicateAmbiguousStandard);
+    assert.equal(duplicateAmbiguousStandard.anySuccess, true);
+    assert.equal(ambiguousStandardCalls, 1);
+
     process.env.OMX_OPENCLAW = '1';
+    openClawCalls = 0;
+    openClawResolved = false;
+    openClawStatus = 504;
+    const ambiguousOpenClawSessionId = `sess-start-ambiguous-openclaw-${Date.now()}`;
+    const ambiguousOpenClawResult = await notifyLifecycle('session-start', {
+      sessionId: ambiguousOpenClawSessionId,
+      projectPath,
+    }, undefined, {
+      dispatchNotificationsImpl: async (_config: unknown, event: string, _payload: unknown) => ({
+        event,
+        anySuccess: false,
+        results: [{
+          platform: 'webhook',
+          success: false,
+          error: 'HTTP 500',
+        }],
+      }),
+    });
+    assert.ok(ambiguousOpenClawResult);
+    assert.equal(ambiguousOpenClawResult.anySuccess, false);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(openClawCalls, 1);
+    assert.equal(openClawResolved, true);
+    const duplicateAmbiguousOpenClaw = await notifyLifecycle('session-start', {
+      sessionId: ambiguousOpenClawSessionId,
+      projectPath,
+    }, undefined, {
+      dispatchNotificationsImpl: async () => {
+        throw new Error('ambiguous deferred OpenClaw failure should keep the pending claim');
+      },
+    });
+    assert.ok(duplicateAmbiguousOpenClaw);
+    assert.equal(duplicateAmbiguousOpenClaw.anySuccess, true);
+    assert.equal(openClawCalls, 1);
+
     openClawCalls = 0;
     openClawResolved = false;
     openClawStatus = 500;

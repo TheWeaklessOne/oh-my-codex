@@ -424,6 +424,35 @@ function appendNonStandardResult(
   }
 }
 
+function isAmbiguousNotificationError(value: unknown): boolean {
+  const error = String(value ?? "").trim().toLowerCase();
+  return Boolean(error && (
+    error.includes("dispatch timeout")
+    || error.includes("request timeout")
+    || error.includes("aborterror")
+    || error.includes("aborted")
+    || error.includes("signal timed out")
+    || error.includes("killed by signal")
+    || error.includes("sigterm")
+    || error.includes("timeout")
+  ));
+}
+
+function isAmbiguousFailedResult(result: { success: boolean; error?: string; statusCode?: number }): boolean {
+  return !result.success
+    && (
+      isAmbiguousNotificationError(result.error)
+      || result.statusCode === 408
+      || result.statusCode === 504
+      || result.statusCode === 524
+    );
+}
+
+function hasAmbiguousDispatchFailure(result: DispatchResult): boolean {
+  return result.results.some(isAmbiguousFailedResult)
+    || result.nonStandardResults?.some(isAmbiguousFailedResult) === true;
+}
+
 export async function shouldDispatchOpenClaw(
   event: OpenClawHookEvent,
   tempContract: NotifyTempContract | null,
@@ -569,6 +598,7 @@ export async function notifyLifecycle(
       appendNonStandardResult(result, await nonStandardDispatchResult);
     }
 
+    const ambiguousDispatchFailure = hasAmbiguousDispatchFailure(result);
     if (result.anySuccess) {
       await recordLifecycleNotificationSentLocked(lifecycleStateDir, payload);
       if (event === "session-idle" && sessionIdleTmuxTailAllowed) {
@@ -578,6 +608,9 @@ export async function notifyLifecycle(
       void nonStandardDispatchResult
         .then(async (nonStandardResult) => {
           if (!nonStandardResult?.success) {
+            if (ambiguousDispatchFailure || (nonStandardResult && isAmbiguousFailedResult(nonStandardResult))) {
+              return;
+            }
             await clearLifecycleNotificationPending(lifecycleStateDir, payload);
             return;
           }
@@ -586,10 +619,13 @@ export async function notifyLifecycle(
             recordSessionIdleTmuxTailSent(lifecycleStateDir, payload.sessionId, normalizedIdleTmuxTail);
           }
         })
-        .catch(async () => {
+        .catch(async (error) => {
+          if (ambiguousDispatchFailure || isAmbiguousNotificationError(error)) {
+            return;
+          }
           await clearLifecycleNotificationPending(lifecycleStateDir, payload);
         });
-    } else {
+    } else if (!ambiguousDispatchFailure) {
       await clearLifecycleNotificationPending(lifecycleStateDir, payload);
     }
 

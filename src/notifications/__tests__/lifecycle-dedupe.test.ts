@@ -109,6 +109,32 @@ describe('lifecycle notification dedupe', () => {
     }
   });
 
+  it('does not let older sent records overwrite newer pending lifecycle claims', async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), 'omx-lifecycle-dedupe-newer-pending-'));
+    try {
+      const firstPayload = buildPayload({
+        event: 'session-start',
+        sessionId: 'pending-session',
+        reason: 'first',
+      });
+      const secondPayload = buildPayload({
+        event: 'session-start',
+        sessionId: 'pending-session',
+        reason: 'second',
+      });
+      const startMs = Date.parse('2026-04-12T02:00:00.000Z');
+
+      assert.equal(await claimLifecycleNotificationPending(stateDir, firstPayload, startMs), true);
+      assert.equal(await claimLifecycleNotificationPending(stateDir, secondPayload, startMs + 1), true);
+
+      await recordLifecycleNotificationSentLocked(stateDir, firstPayload, startMs + 2);
+
+      assert.equal(shouldSendLifecycleNotification(stateDir, secondPayload, startMs + 3), false);
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
+
   it('tracks hook dedupe separately from notification dedupe state', async () => {
     const stateDir = await mkdtemp(join(tmpdir(), 'omx-lifecycle-dedupe-hook-'));
     try {

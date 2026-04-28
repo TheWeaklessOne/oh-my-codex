@@ -601,18 +601,22 @@ async function shouldRecoverUndeliveredAllowClaim(
     return true;
   }
   if (
+    evidence.ambiguousPreDeliveryFailure
+    && evidence.latestAmbiguousPreDeliveryFailureAt !== null
+    && evidence.latestAmbiguousPreDeliveryFailureAt >= projectTurnClaimStatusTimestamp(existingClaim)
+    && (
+      evidence.latestDefinitivePreDeliveryRecoveryFailureAt === null
+      || evidence.latestAmbiguousPreDeliveryFailureAt >= evidence.latestDefinitivePreDeliveryRecoveryFailureAt
+    )
+  ) {
+    return false;
+  }
+  if (
     evidence.definitivePreDeliveryRecoveryFailure
     && evidence.latestDefinitivePreDeliveryRecoveryFailureAt !== null
     && evidence.latestDefinitivePreDeliveryRecoveryFailureAt >= projectTurnClaimStatusTimestamp(existingClaim)
   ) {
     return true;
-  }
-  if (
-    evidence.ambiguousPreDeliveryFailure
-    && evidence.latestAmbiguousPreDeliveryFailureAt !== null
-    && evidence.latestAmbiguousPreDeliveryFailureAt >= projectTurnClaimStatusTimestamp(existingClaim)
-  ) {
-    return false;
   }
   const now = Date.now();
   if (isProjectAllowClaimPendingExpired(existingClaim, now)) {

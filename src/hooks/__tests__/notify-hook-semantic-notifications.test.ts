@@ -860,6 +860,104 @@ describe('notify-hook semantic notifications', () => {
     }
   });
 
+  it('keeps newer ambiguous completed-turn evidence fail-closed over older definitive failures', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-result-ready-mixed-fail-closed-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const stateDir = join(workdir, '.omx', 'state');
+    const logsDir = join(workdir, '.omx', 'logs');
+
+    try {
+      await mkdir(stateDir, { recursive: true });
+      await mkdir(logsDir, { recursive: true });
+      await writeNotificationConfig(codexHome);
+      const threadId = 'thread-result-ready-mixed-fail-closed';
+      const turnId = 'turn-result-ready-mixed-fail-closed';
+      const sessionId = 'sess-result-ready-mixed-fail-closed';
+      const key = `${threadId}|${turnId}|agent-turn-complete`;
+      const claimAt = Date.now() - 1_000;
+      await writeFile(join(stateDir, 'notify-hook-turn-dedupe.json'), JSON.stringify({
+        recent_turns: { [key]: claimAt },
+        turn_claims: {
+          [key]: {
+            timestamp: claimAt,
+            delivery: 'allow',
+            delivery_status: 'dispatching',
+            delivery_status_at: claimAt,
+            source_kind: 'native',
+            source: '',
+            session_id: sessionId,
+            audience: 'external-owner',
+            reason: 'current_external_owner',
+          },
+        },
+        last_event_at: new Date(claimAt).toISOString(),
+      }, null, 2));
+      await writeFile(join(logsDir, 'notify-hook-seeded.jsonl'), [
+        {
+          timestamp: new Date(claimAt + 1_000).toISOString(),
+          type: 'completed_turn_delivery_failed',
+          thread_id: threadId,
+          turn_id: turnId,
+          omx_session_id: sessionId,
+          delivery_failure_kind: 'definitive',
+          error: 'HTTP 500',
+        },
+        {
+          timestamp: new Date(claimAt + 2_000).toISOString(),
+          type: 'completed_turn_delivery_failed',
+          thread_id: threadId,
+          turn_id: turnId,
+          omx_session_id: sessionId,
+          delivery_failure_kind: 'ambiguous_timeout',
+          notification_results: [{
+            platform: 'webhook',
+            success: false,
+            error: 'Dispatch timeout',
+          }],
+        },
+      ].map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: turnId,
+        input_messages: [],
+        last_assistant_message: 'Do not recover after newer ambiguous timeout evidence.',
+      }, {
+        CODEX_HOME: codexHome,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      assert.equal((await readCapturedRequests(capturePath)).length, 0);
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      assert.equal(
+        entries.some((entry) =>
+          entry.type === 'completed_turn_delivery_allowed'
+          && entry.turn_id === turnId
+        ),
+        false,
+      );
+      assert.equal(
+        entries.some((entry) =>
+          entry.type === 'turn_duplicate_suppressed'
+          && entry.scope === 'project'
+          && entry.turn_id === turnId
+        ),
+        true,
+      );
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it('treats standard webhook gateway timeout statuses as ambiguous', async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-result-ready-504-fail-closed-'));
     const codexHome = join(tempRoot, 'codex-home');

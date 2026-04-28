@@ -215,6 +215,10 @@ async function recordScopedLifecycleBroadcastSentLocked(
     bucket,
     eventKey,
     (bucketState) => {
+      const previous = bucketState[eventKey];
+      if (previous?.fingerprint && previous.fingerprint !== fingerprint) {
+        return { result: undefined, write: false };
+      }
       bucketState[eventKey] = {
         fingerprint,
         sentAt: new Date(nowMs).toISOString(),
