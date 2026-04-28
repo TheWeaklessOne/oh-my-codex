@@ -378,12 +378,7 @@ async function buildOpenClawDispatch(
       if (!openClawAllowed) return null;
 
       const { wakeOpenClaw } = await import("../openclaw/index.js");
-      if (openClawEvent === "ask-user-question") {
-        return normalizeOpenClawResult(await wakeOpenClaw(openClawEvent, openClawContext));
-      }
-
-      void wakeOpenClaw(openClawEvent, openClawContext);
-      return { transport: "openclaw", success: true };
+      return normalizeOpenClawResult(await wakeOpenClaw(openClawEvent, openClawContext));
     } catch (error) {
       // OpenClaw failures must never affect notification dispatch
       return {
@@ -554,7 +549,17 @@ export async function notifyLifecycle(
     if (openClawEvent !== "ask-user-question" && dispatchOpenClawLater) {
       // Let the non-blocking OpenClaw eligibility/import path overlap the primary
       // platform dispatch so session-start does not wait on background wake work.
-      nonStandardDispatchResult = dispatchOpenClawLater();
+      void dispatchOpenClawLater()
+        .then((nonStandardResult) => {
+          if (!nonStandardResult?.success) return;
+          recordLifecycleNotificationSent(lifecycleStateDir, payload);
+          if (event === "session-idle" && sessionIdleTmuxTailAllowed) {
+            recordSessionIdleTmuxTailSent(lifecycleStateDir, payload.sessionId, normalizedIdleTmuxTail);
+          }
+        })
+        .catch(() => {
+          // Non-blocking OpenClaw failures must not affect standard notification dispatch.
+        });
     }
 
     const result = await dispatchNotificationsImpl(config, event, payload);
@@ -674,7 +679,7 @@ export async function notifyCompletedTurn(
     let nonStandardDispatchResult: Promise<NonStandardNotificationResult | null> | null = null;
 
     if (openClawEvent !== "ask-user-question" && dispatchOpenClawLater) {
-      nonStandardDispatchResult = dispatchOpenClawLater();
+      void dispatchOpenClawLater();
     }
 
     const result = await dispatchNotificationsImpl(

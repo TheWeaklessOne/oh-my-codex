@@ -104,6 +104,7 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
   it('awaits ask-user-question OpenClaw dispatch so reply routing stays on the live launch path', async () => {
     let openClawCalls = 0;
     let openClawResolved = false;
+    let openClawStatus = 200;
 
     globalThis.fetch = async (input, init) => {
       const url = typeof input === 'string' ? input : input instanceof URL ? String(input) : input.url;
@@ -113,7 +114,7 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
       openClawCalls += 1;
       await new Promise((resolve) => setTimeout(resolve, 60));
       openClawResolved = true;
-      return new Response('', { status: 200 });
+      return new Response('', { status: openClawStatus });
     };
 
     writeFileSync(join(codexHome, '.omx-config.json'), JSON.stringify({
@@ -206,11 +207,11 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
     const startElapsed = Date.now() - startStarted;
 
     assert.ok(startResult);
-    assert.equal(startResult.anySuccess, true);
-    assert.equal(startResult.nonStandardAnySuccess, true);
-    assert.equal(openClawCalls, 1);
+    assert.equal(startResult.anySuccess, false);
+    assert.equal(startResult.nonStandardAnySuccess, undefined);
     assert.equal(openClawResolved, false, 'session-start should keep fire-and-forget OpenClaw dispatch');
     await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(openClawCalls, 1);
     assert.equal(openClawResolved, true, 'session-start should eventually finish the deferred OpenClaw dispatch');
     assert.ok(
       startElapsed < askElapsed,
@@ -230,6 +231,58 @@ describe('notifyLifecycle tmux tail auto-capture', () => {
     assert.ok(duplicateStart);
     assert.equal(duplicateStart.anySuccess, true);
     assert.equal(openClawCalls, 0);
+
+    openClawCalls = 0;
+    openClawResolved = false;
+    openClawStatus = 500;
+    const failedStartSessionId = `sess-start-failed-${Date.now()}`;
+    const failedStartResult = await notifyLifecycle('session-start', {
+      sessionId: failedStartSessionId,
+      projectPath,
+    }, undefined, {
+      dispatchNotificationsImpl: async (_config: unknown, event: string, _payload: unknown) => ({
+        event,
+        anySuccess: false,
+        results: [{
+          platform: 'webhook',
+          success: false,
+          error: 'HTTP 500',
+        }],
+      }),
+    });
+
+    assert.ok(failedStartResult);
+    assert.equal(failedStartResult.anySuccess, false);
+    assert.equal(failedStartResult.nonStandardAnySuccess, undefined);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(openClawCalls, 1);
+    assert.equal(openClawResolved, true);
+
+    openClawResolved = false;
+    let standardRetryCalls = 0;
+    const duplicateFailedStart = await notifyLifecycle('session-start', {
+      sessionId: failedStartSessionId,
+      projectPath,
+    }, undefined, {
+      dispatchNotificationsImpl: async (_config: unknown, event: string, _payload: unknown) => {
+        standardRetryCalls += 1;
+        return {
+          event,
+          anySuccess: false,
+          results: [{
+            platform: 'webhook',
+            success: false,
+            error: 'HTTP 500',
+          }],
+        };
+      },
+    });
+    assert.ok(duplicateFailedStart);
+    assert.equal(duplicateFailedStart.anySuccess, false);
+    assert.equal(standardRetryCalls, 1);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(openClawCalls, 2);
+    assert.equal(openClawResolved, true);
 
     rmSync(projectPath, { recursive: true, force: true });
     delete process.env.OMX_OPENCLAW;
