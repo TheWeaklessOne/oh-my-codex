@@ -71,7 +71,7 @@ Before Phase `ralplan` starts or resumes:
 - Each phase must write/update Autopilot state before handing off.
 - Use existing hooks, `.omx/state`, `$ralplan`, `$ralph`, `$code-review`, and pipeline primitives; do not invent a separate execution framework.
 - Continue automatically through safe reversible phase transitions. Ask only for destructive, credential-gated, or materially preference-dependent branches.
-- Apply the shared workflow guidance pattern: concise, evidence-dense progress and completion reporting, local overrides for the active workflow branch, persistent inspection/verification while the Autopilot loop depends on it, and automatic continuation for safe reversible steps. Ask only for material, destructive, or preference-dependent branches.
+- Apply the shared workflow guidance pattern: outcome-first framing, concise visible updates for multi-step execution, local overrides for the active workflow branch, validation proportional to risk, explicit stop rules, and automatic continuation for safe reversible steps. Ask only for material, destructive, credentialed, external-production, or preference-dependent branches.
 </Execution_Policy>
 
 <State_Management>

@@ -9,7 +9,9 @@ function rx(pattern: string): RegExp {
 }
 
 const ROOT_TEMPLATE_PATTERNS = [
-  rx('quality-first.*intent-deepening responses'),
+  rx('outcome-first.*quality-focused responses'),
+  rx('target result.*success criteria.*constraints.*available evidence.*expected output.*stop condition'),
+  rx('concise visible preamble|visible preamble'),
   rx('clear, low-risk, reversible next steps'),
   rx('AUTO-CONTINUE.*clear.*already-requested.*low-risk.*reversible.*local'),
   rx('ASK only.*destructive.*irreversible.*credential-gated.*external-production.*materially scope-changing'),
@@ -19,7 +21,7 @@ const ROOT_TEMPLATE_PATTERNS = [
   rx('Keep going unless blocked'),
   rx('Ask only when blocked|Ask only when progress is impossible'),
   rx('local overrides?.*non-conflicting instructions'),
-  rx('reflexive web/tool escalation'),
+  rx('smallest useful tool loop|reflexive web/tool escalation'),
   rx('Choose the lane before acting'),
   rx('Solo execute'),
   rx('Outside active `team`/`swarm` mode, use `executor`'),
@@ -37,13 +39,16 @@ const ROOT_TEMPLATE_PATTERNS = [
   rx('Stop / escalate'),
   rx('Default update/final shape'),
   rx('do not skip prerequisites|task is grounded and verified'),
-  rx('quality-first evidence summaries'),
+  rx('coding work.*targeted tests|targeted tests for changed behavior'),
+  rx('validation.*cannot run|validation gap'),
 ];
 
 const CORE_ROLE_PATTERNS = {
   executor: [
-    rx('quality-first.*intent-deepening outputs'),
-    rx('reflexive web/tool escalation'),
+    rx('outcome-first.*quality-focused execution'),
+    rx('target result.*constraints.*success criteria.*validation path.*stop condition'),
+    rx('concise preamble'),
+    rx('smallest useful tool loop|reflexive web/tool escalation'),
     rx('local overrides?.*non-conflicting constraints'),
     rx('task is grounded and verified'),
     rx('AUTO-CONTINUE.*clear.*already-requested.*low-risk.*reversible.*local'),
@@ -53,10 +58,12 @@ const CORE_ROLE_PATTERNS = {
     rx('Ask only when progress is impossible|Ask only when blocked'),
   ],
   planner: [
-    rx('quality-first.*intent-deepening plan summaries'),
-    rx('reflexive web/tool escalation'),
+    rx('outcome-first.*execution-ready plans'),
+    rx('desired result.*success criteria.*constraints.*evidence.*validation path.*stop condition'),
+    rx('concise visible preamble'),
+    rx('smallest useful tool loop|reflexive web/tool escalation'),
     rx('local overrides?.*non-conflicting constraints'),
-    rx('plan is grounded in evidence'),
+    rx('plan is grounded|requirements.*affected resources.*validation commands.*failure behavior'),
     rx('AUTO-CONTINUE.*clear.*already-requested.*low-risk.*reversible.*local'),
     rx('ASK only.*destructive.*irreversible.*credential-gated.*external-production.*materially scope-changing'),
     rx('AUTO-CONTINUE branches.*permission-handoff phrasing'),
@@ -64,7 +71,8 @@ const CORE_ROLE_PATTERNS = {
     rx('Ask only when a real planning blocker|Ask only when blocked'),
   ],
   verifier: [
-    rx('quality-first, evidence-dense summaries'),
+    rx('outcome-first, evidence-dense verdicts'),
+    rx('claim.*success criteria.*validation evidence.*gaps.*stop condition'),
     rx('proof that matters|tool churn'),
     rx('verdict is grounded'),
     rx('non-conflicting acceptance criteria'),
@@ -77,19 +85,19 @@ const CORE_ROLE_PATTERNS = {
 };
 
 const WAVE_TWO_PATTERNS = [
-  rx('Default final-output shape: quality-first and evidence-dense'),
+  rx('Default final-output shape: outcome-first and evidence-dense'),
   rx('Treat newer user task updates as local overrides'),
   rx('user says `continue`'),
 ];
 
 const CATALOG_PATTERNS = [
-  rx('Default final-output shape: quality-first and evidence-dense'),
+  rx('Default final-output shape: outcome-first and evidence-dense'),
   rx('Treat newer user task updates as local overrides'),
   rx('user says `continue`'),
 ];
 
 const SKILL_PATTERNS = [
-  rx('concise, evidence-dense progress and completion reporting'),
+  rx('outcome-first.*progress and completion reporting|outcome-first framing'),
   rx('local overrides for the active workflow branch'),
   rx('user says `continue`'),
 ];
@@ -203,7 +211,8 @@ export const SPECIALIZED_PROMPT_CONTRACTS: GuidanceSurfaceContract[] = [
     id: 'sisyphus-lite',
     path: 'prompts/sisyphus-lite.md',
     requiredPatterns: [
-      rx('quality-first.*intent-deepening outputs'),
+      rx('outcome-first.*quality-focused outputs'),
+      rx('target result.*success criteria.*evidence.*output shape.*stop condition'),
       rx('Treat newer user instructions as local overrides'),
       rx('No evidence = not complete'),
       rx('specialized worker behavior prompt|worker behavior prompt'),

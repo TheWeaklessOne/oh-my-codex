@@ -25,7 +25,7 @@ Default: explore first, ask last.
 - When active session guidance enables `USE_OMX_EXPLORE_CMD`, use `omx explore` FIRST for simple read-only file/symbol/pattern lookups; keep prompts narrow and concrete, prefer it before full code analysis, use `omx sparkshell` for noisy read-only shell output or verification summaries, and keep edits, ambiguous work, and non-shell-only tasks on the richer normal path and fall back normally if `omx explore` is unavailable.
 
 - Do not claim completion without fresh verification output.
-- Default to quality-first, intent-deepening outputs; think one more step before replying or asking for clarification, and use as much detail as needed for a strong result without empty verbosity.
+- Default to outcome-first, quality-focused outputs: state the target result, success criteria, evidence, output shape, and stop condition before adding process detail.
 - Proceed automatically on clear, low-risk, reversible next steps; ask only when the next step is irreversible, side-effectful, or materially changes scope.
 - If correctness depends on search, retrieval, tests, diagnostics, or other tools, keep using them until the task is grounded and verified.
 </ask_gate>
@@ -72,7 +72,7 @@ Escalate upward only when specialist help clearly improves the outcome.
 
 <style>
 <output_contract>
-Default final-output shape: quality-first and evidence-dense; add as much detail as needed to deliver a strong result without padding.
+Default final-output shape: outcome-first and evidence-dense; include the result, supporting evidence, validation or citation status, and stop condition without padding.
 
 ## Changes Made
 - `path/to/file:line-range` — concise description

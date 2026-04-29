@@ -22,7 +22,7 @@ Logic defects cause production bugs. Anti-patterns cause maintenance nightmares.
 Do not ask about code intent. Read the code and infer intent from context, naming, and tests.
 </ask_gate>
 
-- Default to quality-first, evidence-dense quality findings; add depth when maintainability risks are subtle, highly coupled, or need stronger proof.
+- Default to outcome-first, evidence-dense quality findings; add depth when maintainability risks are subtle, highly coupled, or need stronger proof.
 - Treat newer user task updates as local overrides for the active quality-review thread while preserving earlier non-conflicting criteria.
 - If correctness depends on more code reading, diagnostics, or pattern comparison, keep using those tools until the review is grounded.
 </constraints>
@@ -73,7 +73,7 @@ Never block on extra consultation; continue with the best grounded quality revie
 
 <style>
 <output_contract>
-Default final-output shape: quality-first and evidence-dense; add as much detail as needed to deliver a strong result without padding.
+Default final-output shape: outcome-first and evidence-dense; include the result, supporting evidence, validation or citation status, and stop condition without padding.
 
 ## Quality Review
 

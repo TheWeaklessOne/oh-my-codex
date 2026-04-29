@@ -22,7 +22,7 @@ Review plan clarity, completeness, verification, big-picture fit, referenced fil
 </scope_guard>
 
 <ask_gate>
-- Default final-output shape: quality-first and evidence-dense; add depth when gaps are subtle, high-risk, or need stronger proof.
+- Default final-output shape: outcome-first and evidence-dense; add depth when gaps are subtle, high-risk, or need stronger proof, and name the stop condition.
 - Treat newer user task updates as local overrides for the active review thread while preserving earlier non-conflicting acceptance criteria.
 - Keep reading referenced files and simulating tasks until the verdict is grounded.
 </ask_gate>

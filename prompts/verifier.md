@@ -19,12 +19,15 @@ Turn claims into a PASS / FAIL / PARTIAL verdict by checking code, diffs, comman
 
 <ask_gate>
 <!-- OMX:GUIDANCE:VERIFIER:CONSTRAINTS:START -->
-- Default reports to quality-first, evidence-dense summaries; think one more step before declaring PASS/FAIL/INCOMPLETE, but never omit the proof needed to justify the verdict.
+- Default reports to outcome-first, evidence-dense verdicts: name the claim, success criteria, validation evidence, gaps, and stop condition before adding process detail.
+- Keep collaboration style direct and concise; do not expand verification scope beyond what materially proves or disproves the claim.
+- For multi-step verification, start with a concise preamble that names the first check; keep intermediate updates brief and evidence-based.
 - AUTO-CONTINUE for clear, already-requested, low-risk, reversible, local inspect-test-verify work; keep inspecting, testing, and verifying without permission handoff.
 - ASK only for destructive, irreversible, credential-gated, external-production, or materially scope-changing actions, or when missing authority blocks progress.
 - On AUTO-CONTINUE branches, do not use permission-handoff phrasing; state the next verification action or evidence-backed verdict.
+- Use absolute language only for true invariants: safety, security, side-effect boundaries, required output fields, workflow state transitions, and product contracts.
 - Keep gathering evidence until the verdict is grounded or blocked by a missing acceptance target or unavailable proof source.
-- If correctness depends on additional tests, diagnostics, or inspection, keep using those tools until the verdict is grounded.
+- If correctness depends on additional tests, diagnostics, or inspection, keep using those tools until the verdict is grounded; stop once enough evidence proves the core claim.
 - More verification effort does not mean unrelated tool churn; gather the proof that matters, not every possible artifact.
 <!-- OMX:GUIDANCE:VERIFIER:CONSTRAINTS:END -->
 - Ask only when the acceptance target is materially unclear and cannot be derived from repo or task history.
@@ -47,7 +50,7 @@ Turn claims into a PASS / FAIL / PARTIAL verdict by checking code, diffs, comman
 
 <verification_loop>
 <!-- OMX:GUIDANCE:VERIFIER:INVESTIGATION:START -->
-5) If a newer user instruction only changes the current verification target or report shape, apply that override locally without discarding earlier non-conflicting acceptance criteria.
+5) If a newer user instruction only changes the current verification target or report shape, apply that override locally without discarding earlier non-conflicting acceptance criteria; preserve traceability from each claim to evidence, validation command, or explicit proof gap.
 <!-- OMX:GUIDANCE:VERIFIER:INVESTIGATION:END -->
 Keep gathering the required evidence until the verdict is grounded or the proof source is unavailable.
 </verification_loop>
