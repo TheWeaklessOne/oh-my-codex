@@ -1580,6 +1580,7 @@ case "$1" in
     case "$*" in
       *"pane_current_command"*) printf "%%1\tnode\t'codex'\n" ;;
       *"#{pane_dead} #{pane_pid}"*) echo "0 4242" ;;
+      *"#{pane_dead}"*) echo "0" ;;
       *"-t %2"*"#{pane_pid}"*) echo "4242" ;;
       *"-t %3"*"#{pane_pid}"*) echo "4343" ;;
       *"#{pane_pid}"*) echo "4141" ;;
