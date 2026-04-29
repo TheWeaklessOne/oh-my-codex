@@ -80,7 +80,7 @@ exit 1
 }
 
 describe('state operations directory initialization', () => {
-  it('creates .omx/state for state operations without setup', async () => {
+  it('keeps state_list_active side-effect-free without setup', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-test-'));
     try {
       const stateDir = join(wd, '.omx', 'state');
@@ -92,15 +92,59 @@ describe('state operations directory initialization', () => {
         workingDirectory: wd,
       });
 
-      assert.equal(existsSync(stateDir), true);
-      assert.equal(existsSync(tmuxHookConfig), true);
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
       assert.deepEqual(response.payload, { active_modes: [] });
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });
 
-  it('bootstraps tmux-hook from the current tmux pane when available', async () => {
+  it('keeps state_get_status side-effect-free when session_id is provided', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-status-readonly-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionDir = join(stateDir, 'sessions', 'sess1');
+      const tmuxHookConfig = join(wd, '.omx', 'tmux-hook.json');
+      assert.equal(existsSync(sessionDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
+
+      const response = await executeStateOperation('state_get_status', {
+        workingDirectory: wd,
+        session_id: 'sess1',
+      });
+
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(sessionDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
+      assert.deepEqual(response.payload, { statuses: {} });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps missing state_read side-effect-free without setup', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-readonly-missing-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const tmuxHookConfig = join(wd, '.omx', 'tmux-hook.json');
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
+
+      const response = await executeStateOperation('state_read', {
+        workingDirectory: wd,
+        mode: 'deep-interview',
+      });
+
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
+      assert.deepEqual(response.payload, { exists: false, mode: 'deep-interview' });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('bootstraps tmux-hook from the current tmux pane for mutating state operations', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-live-'));
     try {
       const tmuxHookConfig = join(wd, '.omx', 'tmux-hook.json');
@@ -113,10 +157,14 @@ describe('state operations directory initialization', () => {
           PATH: `${fakeBin}:${process.env.PATH || ''}`,
         },
         async () => {
-          const response = await executeStateOperation('state_list_active', {
+          const response = await executeStateOperation('state_write', {
             workingDirectory: wd,
+            mode: 'deep-interview',
+            active: true,
+            current_phase: 'deep-interview',
           });
-          assert.deepEqual(response.payload, { active_modes: [] });
+          assert.equal(response.isError, undefined);
+          assert.equal((response.payload as { success?: boolean }).success, true);
         },
       );
 
@@ -215,24 +263,6 @@ describe('state operations directory initialization', () => {
       });
 
       assert.deepEqual(response.payload, { active_modes: [] });
-    } finally {
-      await rm(wd, { recursive: true, force: true });
-    }
-  });
-
-  it('creates session-scoped state directory when session_id is provided', async () => {
-    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-session-'));
-    try {
-      const sessionDir = join(wd, '.omx', 'state', 'sessions', 'sess1');
-      assert.equal(existsSync(sessionDir), false);
-
-      const response = await executeStateOperation('state_get_status', {
-        workingDirectory: wd,
-        session_id: 'sess1',
-      });
-
-      assert.equal(existsSync(sessionDir), true);
-      assert.deepEqual(response.payload, { statuses: {} });
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

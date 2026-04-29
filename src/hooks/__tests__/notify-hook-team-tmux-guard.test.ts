@@ -5,25 +5,29 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+
+function isolatedChildEnv(fakeBinDir: string): NodeJS.ProcessEnv {
+  const tmuxBin = join(fakeBinDir, 'tmux');
+  return {
+    PATH: `${fakeBinDir}:${process.env.PATH ?? ''}`,
+    OMX_TEST_TMUX_BIN: tmuxBin,
+    ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
+    ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}),
+    ...(process.env.TEMP ? { TEMP: process.env.TEMP } : {}),
+    ...(process.env.TMP ? { TMP: process.env.TMP } : {}),
+    ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+    ...(process.env.WINDIR ? { WINDIR: process.env.WINDIR } : {}),
+    ...(process.env.COMSPEC ? { COMSPEC: process.env.COMSPEC } : {}),
+    ...(process.env.ComSpec ? { ComSpec: process.env.ComSpec } : {}),
+  };
+}
+
 function buildFakeTmux(tmuxLogPath: string): string {
   return `#!/bin/sh
 set -eu
 echo "$@" >> "${tmuxLogPath}"
 exit 0
 `;
-}
-
-function buildChildEnv(fakeBinDir: string): NodeJS.ProcessEnv {
-  return {
-    PATH: `${fakeBinDir}:${process.env.PATH ?? ''}`,
-    HOME: process.env.HOME ?? '',
-    TMPDIR: process.env.TMPDIR ?? '',
-    TMP: process.env.TMP ?? '',
-    TEMP: process.env.TEMP ?? '',
-    ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
-    ...(process.env.COMSPEC ? { COMSPEC: process.env.COMSPEC } : {}),
-    ...(process.env.ComSpec ? { ComSpec: process.env.ComSpec } : {}),
-  };
 }
 
 function runSendPaneInputInChild(params: {
@@ -38,16 +42,20 @@ function runSendPaneInputInChild(params: {
     paneTarget: params.paneTarget,
     prompt: params.prompt,
     submitKeyPresses: params.submitKeyPresses,
+    tmuxBin: join(params.fakeBinDir, 'tmux'),
     typePrompt: params.typePrompt,
   });
   const script = `
-    import { sendPaneInput } from ${JSON.stringify(params.moduleUrl)};
-    const result = await sendPaneInput(${payload});
+    const input = ${payload};
+    process.env.OMX_TEST_TMUX_BIN = input.tmuxBin;
+    process.env.PATH = ${JSON.stringify('__CHILD_PATH__')};
+    const { sendPaneInput } = await import(${JSON.stringify(params.moduleUrl)});
+    const result = await sendPaneInput(input);
     process.stdout.write(JSON.stringify(result));
-  `;
+  `.replace('__CHILD_PATH__', `${params.fakeBinDir}:${process.env.PATH ?? ''}`);
   return spawnSync(process.execPath, ['--input-type=module', '-e', script], {
     encoding: 'utf-8',
-    env: buildChildEnv(params.fakeBinDir),
+    env: isolatedChildEnv(params.fakeBinDir),
   });
 }
 
@@ -60,16 +68,19 @@ function runEvaluatePaneInjectionReadinessInChild(params: {
   const payload = JSON.stringify({
     paneTarget: params.paneTarget,
     options: params.options ?? {},
+    tmuxBin: join(params.fakeBinDir, 'tmux'),
   });
   const script = `
-    import { evaluatePaneInjectionReadiness } from ${JSON.stringify(params.moduleUrl)};
     const input = ${payload};
+    process.env.OMX_TEST_TMUX_BIN = input.tmuxBin;
+    process.env.PATH = ${JSON.stringify('__CHILD_PATH__')};
+    const { evaluatePaneInjectionReadiness } = await import(${JSON.stringify(params.moduleUrl)});
     const result = await evaluatePaneInjectionReadiness(input.paneTarget, input.options);
     process.stdout.write(JSON.stringify(result));
-  `;
+  `.replace('__CHILD_PATH__', `${params.fakeBinDir}:${process.env.PATH ?? ''}`);
   return spawnSync(process.execPath, ['--input-type=module', '-e', script], {
     encoding: 'utf-8',
-    env: buildChildEnv(params.fakeBinDir),
+    env: isolatedChildEnv(params.fakeBinDir),
   });
 }
 

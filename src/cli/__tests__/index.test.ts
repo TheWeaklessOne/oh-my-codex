@@ -16,6 +16,8 @@ import {
   resolveCliInvocation,
   commandOwnsLocalHelp,
   resolveCodexLaunchPolicy,
+  resolveEffectiveLeaderLaunchPolicyOverride,
+  resolveEnvLaunchPolicyOverride,
   resolveLeaderLaunchPolicyOverride,
   classifyCodexExecFailure,
   resolveSignalExitCode,
@@ -34,6 +36,7 @@ import {
   readPersistedSetupScope,
   resolveCodexConfigPathForLaunch,
   resolveCodexHomeForLaunch,
+  resolveProjectLocalCodexHomeForLaunch,
   buildDetachedSessionBootstrapSteps,
   buildDetachedTmuxSessionName,
   buildDetachedSessionFinalizeSteps,
@@ -244,10 +247,24 @@ describe("normalizeCodexLaunchArgs", () => {
     ]);
   });
 
+  it("strips --direct from leader codex args", () => {
+    assert.deepEqual(normalizeCodexLaunchArgs(["--direct", "--yolo"]), [
+      "--yolo",
+    ]);
+  });
+
   it("preserves literal --tmux after -- in leader codex args", () => {
     assert.deepEqual(normalizeCodexLaunchArgs(["--", "--tmux", "--yolo"]), [
       "--",
       "--tmux",
+      "--yolo",
+    ]);
+  });
+
+  it("preserves literal --direct after -- in leader codex args", () => {
+    assert.deepEqual(normalizeCodexLaunchArgs(["--", "--direct", "--yolo"]), [
+      "--",
+      "--direct",
       "--yolo",
     ]);
   });
@@ -258,6 +275,24 @@ describe("resolveLeaderLaunchPolicyOverride", () => {
     assert.equal(
       resolveLeaderLaunchPolicyOverride(["--tmux", "--model", "gpt-5"]),
       "detached-tmux",
+    );
+  });
+
+  it("detects explicit direct launch requests", () => {
+    assert.equal(
+      resolveLeaderLaunchPolicyOverride(["--direct", "--model", "gpt-5"]),
+      "direct",
+    );
+  });
+
+  it("uses the last CLI launch policy flag before --", () => {
+    assert.equal(
+      resolveLeaderLaunchPolicyOverride(["--direct", "--tmux"]),
+      "detached-tmux",
+    );
+    assert.equal(
+      resolveLeaderLaunchPolicyOverride(["--tmux", "--direct"]),
+      "direct",
     );
   });
 
@@ -272,6 +307,68 @@ describe("resolveLeaderLaunchPolicyOverride", () => {
     assert.equal(
       resolveLeaderLaunchPolicyOverride(["--", "--tmux", "--model", "gpt-5"]),
       undefined,
+    );
+  });
+
+  it("stops scanning for --direct after the end-of-options marker", () => {
+    assert.equal(
+      resolveLeaderLaunchPolicyOverride(["--", "--direct", "--model", "gpt-5"]),
+      undefined,
+    );
+  });
+});
+
+describe("resolveEnvLaunchPolicyOverride", () => {
+  it("accepts direct, tmux, detached-tmux, auto, and empty policy values", () => {
+    assert.equal(resolveEnvLaunchPolicyOverride({ OMX_LAUNCH_POLICY: "direct" }), "direct");
+    assert.equal(
+      resolveEnvLaunchPolicyOverride({ OMX_LAUNCH_POLICY: "tmux" }),
+      "detached-tmux",
+    );
+    assert.equal(
+      resolveEnvLaunchPolicyOverride({ OMX_LAUNCH_POLICY: "detached-tmux" }),
+      "detached-tmux",
+    );
+    assert.equal(resolveEnvLaunchPolicyOverride({ OMX_LAUNCH_POLICY: "auto" }), undefined);
+    assert.equal(resolveEnvLaunchPolicyOverride({ OMX_LAUNCH_POLICY: "" }), undefined);
+  });
+
+  it("warns once for invalid OMX_LAUNCH_POLICY and falls back to auto", () => {
+    const warn = mock.method(console, "warn", () => {});
+    assert.equal(
+      resolveEnvLaunchPolicyOverride({ OMX_LAUNCH_POLICY: "banana" }),
+      undefined,
+    );
+    assert.equal(
+      resolveEnvLaunchPolicyOverride({ OMX_LAUNCH_POLICY: "banana" }),
+      undefined,
+    );
+    assert.equal(warn.mock.callCount(), 1);
+  });
+});
+
+describe("resolveEffectiveLeaderLaunchPolicyOverride", () => {
+  it("uses env policy when no CLI policy flag is present", () => {
+    assert.equal(
+      resolveEffectiveLeaderLaunchPolicyOverride(["--yolo"], {
+        OMX_LAUNCH_POLICY: "direct",
+      }),
+      "direct",
+    );
+  });
+
+  it("lets CLI policy flags override OMX_LAUNCH_POLICY", () => {
+    assert.equal(
+      resolveEffectiveLeaderLaunchPolicyOverride(["--tmux", "--yolo"], {
+        OMX_LAUNCH_POLICY: "direct",
+      }),
+      "detached-tmux",
+    );
+    assert.equal(
+      resolveEffectiveLeaderLaunchPolicyOverride(["--direct", "--yolo"], {
+        OMX_LAUNCH_POLICY: "tmux",
+      }),
+      "direct",
     );
   });
 });
@@ -1058,15 +1155,56 @@ describe("resolveCliInvocation", () => {
   it("advertises the explicit update command in top-level help", () => {
     assert.match(HELP, /omx update\s+Check npm now, update the global install immediately, then refresh setup/);
   });
+
+  it("advertises direct launch policy controls in top-level help", () => {
+    assert.match(HELP, /--direct\s+Launch the interactive leader directly/);
+    assert.match(HELP, /OMX_LAUNCH_POLICY=direct\|tmux\|detached-tmux\|auto/);
+    assert.match(HELP, /unset OMX_LAUNCH_POLICY/);
+    assert.match(HELP, /omx --direct --yolo/);
+    assert.match(HELP, /OMX_LAUNCH_POLICY=direct omx --tmux --yolo/);
+    assert.match(HELP, /Config files are intentionally not used/);
+  });
 });
 
 describe("resolveSetupInstallModeArg", () => {
-  it("maps --plugin to plugin install mode", () => {
+  it("maps explicit setup install mode flags", () => {
     assert.equal(resolveSetupInstallModeArg(["--dry-run"]), undefined);
     assert.equal(resolveSetupInstallModeArg(["--plugin"]), "plugin");
+    assert.equal(resolveSetupInstallModeArg(["--legacy"]), "legacy");
+    assert.equal(
+      resolveSetupInstallModeArg(["--install-mode", "legacy"]),
+      "legacy",
+    );
+    assert.equal(
+      resolveSetupInstallModeArg(["--install-mode=plugin"]),
+      "plugin",
+    );
     assert.equal(
       resolveSetupInstallModeArg(["--scope", "project", "--plugin"]),
       "plugin",
+    );
+  });
+
+  it("rejects invalid setup install mode flags", () => {
+    assert.throws(
+      () => resolveSetupInstallModeArg(["--install-mode"]),
+      /Missing setup install mode value after --install-mode/,
+    );
+    assert.throws(
+      () => resolveSetupInstallModeArg(["--install-mode", "workspace"]),
+      /Invalid setup install mode: workspace/,
+    );
+    assert.throws(
+      () => resolveSetupInstallModeArg(["--plugin", "--legacy"]),
+      /Conflicting setup install mode flags/,
+    );
+    assert.throws(
+      () => resolveSetupInstallModeArg(["--plugin", "--install-mode", "legacy"]),
+      /Conflicting setup install mode flags/,
+    );
+    assert.throws(
+      () => resolveSetupInstallModeArg(["--legacy", "--install-mode=plugin"]),
+      /Conflicting setup install mode flags/,
     );
   });
 });
@@ -1189,6 +1327,39 @@ describe("project launch scope helpers", () => {
       assert.equal(
         resolveCodexConfigPathForLaunch(wd, {}),
         join(wd, ".codex", "config.toml"),
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("marks only persisted project CODEX_HOME as project-local cleanup target", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-launch-scope-"));
+    try {
+      await mkdir(join(wd, ".omx"), { recursive: true });
+      await writeFile(
+        join(wd, ".omx", "setup-scope.json"),
+        JSON.stringify({ scope: "project" }),
+      );
+      assert.equal(resolveProjectLocalCodexHomeForLaunch(wd, {}), join(wd, ".codex"));
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not mark explicit CODEX_HOME as project-local cleanup target", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-launch-scope-"));
+    try {
+      await mkdir(join(wd, ".omx"), { recursive: true });
+      await writeFile(
+        join(wd, ".omx", "setup-scope.json"),
+        JSON.stringify({ scope: "project" }),
+      );
+      assert.equal(
+        resolveProjectLocalCodexHomeForLaunch(wd, {
+          CODEX_HOME: "/tmp/user-global-codex-home",
+        }),
+        undefined,
       );
     } finally {
       await rm(wd, { recursive: true, force: true });
@@ -1341,6 +1512,66 @@ describe("resolveCodexLaunchPolicy", () => {
         "detached-tmux",
       ),
       "detached-tmux",
+    );
+  });
+
+  it("honors explicit direct launch requests outside tmux", () => {
+    assert.equal(
+      resolveCodexLaunchPolicy(
+        {},
+        "linux",
+        true,
+        false,
+        true,
+        true,
+        "direct",
+      ),
+      "direct",
+    );
+  });
+
+  it("honors explicit direct launch requests inside tmux", () => {
+    assert.equal(
+      resolveCodexLaunchPolicy(
+        { TMUX: "/tmp/tmux-1000/default,123,0" },
+        "linux",
+        true,
+        false,
+        true,
+        true,
+        "direct",
+      ),
+      "direct",
+    );
+  });
+
+  it("keeps explicit tmux policy tmux-aware inside tmux", () => {
+    assert.equal(
+      resolveCodexLaunchPolicy(
+        { TMUX: "/tmp/tmux-1000/default,123,0" },
+        "linux",
+        true,
+        false,
+        true,
+        true,
+        "detached-tmux",
+      ),
+      "inside-tmux",
+    );
+  });
+
+  it("falls back directly for explicit tmux requests when tmux is unavailable", () => {
+    assert.equal(
+      resolveCodexLaunchPolicy(
+        {},
+        "linux",
+        false,
+        false,
+        true,
+        true,
+        "detached-tmux",
+      ),
+      "direct",
     );
   });
 
@@ -1619,7 +1850,7 @@ describe("detached tmux new-session sequencing", () => {
     const source = await readFile(join(repoRoot, 'src', 'cli', 'index.ts'), 'utf-8');
     assert.match(
       source,
-      /buildTmuxPaneCommand\("env", \[`OMX_SESSION_ID=\$\{sessionId\}`, "node", omxBin, "hud", "--watch"\]\)/,
+      /buildTmuxPaneCommand\("env",\s*\[\s*`OMX_SESSION_ID=\$\{sessionId\}`,\s*"node",\s*omxBin,\s*"hud",\s*"--watch",?\s*\]\)/,
     );
   });
 
@@ -2035,6 +2266,24 @@ exit 0
     ]);
   });
 
+  it("acquireTmuxExtendedKeysLease can bind lease liveness to a long-lived owner pid", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-tmux-lease-owner-pid-"));
+    try {
+      const execStub = (_file: string, args: readonly string[]) => {
+        if (args[0] === "display-message") return "/tmp/tmux-owner-pid.sock\n";
+        if (args[0] === "show-options") return "off\n";
+        return "";
+      };
+
+      const lease = acquireTmuxExtendedKeysLease(cwd, execStub, 12345);
+
+      assert.match(lease ?? "", /^\/tmp\/tmux-owner-pid\.sock\t12345-/);
+      if (lease) releaseTmuxExtendedKeysLease(cwd, lease, execStub);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("overlapping tmux extended-keys leases restore only after the last holder exits", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-tmux-lease-overlap-"));
     const calls: string[][] = [];
@@ -2214,6 +2463,185 @@ exit 0
 
     if (lease) releaseTmuxExtendedKeysLease(cwd, lease, execStub);
     await rm(cwd, { recursive: true, force: true });
+  });
+
+  it("acquireTmuxExtendedKeysLease reaps dead holders and restores before taking a new lease", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-tmux-dead-holder-acquire-"));
+    try {
+      const leaseDir = join(cwd, ".omx", "state", "tmux-extended-keys");
+      const leasePath = join(leaseDir, "tmp-stale-holder-sock.json");
+      await mkdir(leaseDir, { recursive: true });
+      await writeFile(
+        leasePath,
+        JSON.stringify({
+          originalMode: "off",
+          holders: ["2147483647-stale-holder"],
+        }),
+        "utf-8",
+      );
+
+      const calls: string[][] = [];
+      const execStub = (_file: string, args: readonly string[]): string => {
+        calls.push([...args]);
+        if (args[0] === "display-message") return "/tmp/stale-holder.sock\n";
+        if (args[0] === "show-options") return "off\n";
+        return "";
+      };
+
+      const lease = acquireTmuxExtendedKeysLease(cwd, execStub);
+
+      assert.equal(typeof lease, "string");
+      const persisted = JSON.parse(await readFile(leasePath, "utf-8")) as {
+        holders: Array<string | { id?: string; pid?: number; linuxStartTicks?: number }>;
+      };
+      assert.equal(persisted.holders.length, 1);
+      const holder = persisted.holders[0];
+      const holderId = typeof holder === "string" ? holder : holder?.id ?? "";
+      assert.match(holderId, new RegExp(`^${process.pid}-`));
+      assert.equal(typeof holder === "object" ? holder.pid : process.pid, process.pid);
+      assert.doesNotMatch(JSON.stringify(persisted), /2147483647-stale-holder/);
+
+      if (lease) releaseTmuxExtendedKeysLease(cwd, lease, execStub);
+
+      assert.deepEqual(calls, [
+        ["display-message", "-p", "#{socket_path}"],
+        ["set-option", "-sq", "extended-keys", "off"],
+        ["show-options", "-sv", "extended-keys"],
+        ["set-option", "-sq", "extended-keys", "always"],
+        ["set-option", "-sq", "extended-keys", "off"],
+      ]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("releaseTmuxExtendedKeysLease preserves live legacy string holders", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-tmux-live-legacy-holder-"));
+    try {
+      const leaseDir = join(cwd, ".omx", "state", "tmux-extended-keys");
+      const leasePath = join(leaseDir, "tmp-live-legacy-sock.json");
+      const legacyHolder = `${process.pid}-legacy-holder`;
+      await mkdir(leaseDir, { recursive: true });
+      await writeFile(
+        leasePath,
+        JSON.stringify({
+          originalMode: "off",
+          holders: [legacyHolder],
+        }),
+        "utf-8",
+      );
+
+      const calls: string[][] = [];
+      const execStub = (_file: string, args: readonly string[]): string => {
+        calls.push([...args]);
+        return "";
+      };
+
+      releaseTmuxExtendedKeysLease(
+        cwd,
+        "/tmp/live-legacy.sock\tmissing-holder",
+        execStub,
+      );
+
+      const persisted = JSON.parse(await readFile(leasePath, "utf-8")) as {
+        holders: string[];
+      };
+      assert.deepEqual(persisted.holders, [legacyHolder]);
+      assert.deepEqual(
+        calls,
+        [],
+        "live legacy string holders should not be restored away",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("acquireTmuxExtendedKeysLease reaps Linux PID-reuse identity mismatches", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-tmux-pid-reuse-holder-"));
+    try {
+      const leaseDir = join(cwd, ".omx", "state", "tmux-extended-keys");
+      const leasePath = join(leaseDir, "tmp-pid-reuse-sock.json");
+      await mkdir(leaseDir, { recursive: true });
+      await writeFile(
+        leasePath,
+        JSON.stringify({
+          originalMode: "off",
+          holders: [{
+            id: `${process.pid}-reused-holder`,
+            pid: process.pid,
+            platform: "linux",
+            linuxStartTicks: -1,
+          }],
+        }),
+        "utf-8",
+      );
+
+      const calls: string[][] = [];
+      const execStub = (_file: string, args: readonly string[]): string => {
+        calls.push([...args]);
+        if (args[0] === "display-message") return "/tmp/pid-reuse.sock\n";
+        if (args[0] === "show-options") return "off\n";
+        return "";
+      };
+
+      const lease = acquireTmuxExtendedKeysLease(cwd, execStub);
+
+      assert.equal(typeof lease, "string");
+      const persisted = JSON.parse(await readFile(leasePath, "utf-8")) as {
+        holders: Array<string | { id?: string; pid?: number }>;
+      };
+      const holderIds = persisted.holders.map((holder) =>
+        typeof holder === "string" ? holder : holder.id ?? "",
+      );
+      if (process.platform === "linux") {
+        assert.equal(persisted.holders.length, 1);
+        assert.match(holderIds[0] ?? "", new RegExp(`^${process.pid}-`));
+        assert.doesNotMatch(JSON.stringify(persisted), /reused-holder/);
+        assert.deepEqual(calls, [
+          ["display-message", "-p", "#{socket_path}"],
+          ["set-option", "-sq", "extended-keys", "off"],
+          ["show-options", "-sv", "extended-keys"],
+          ["set-option", "-sq", "extended-keys", "always"],
+        ]);
+      } else {
+        assert.ok(holderIds.includes(`${process.pid}-reused-holder`));
+      }
+
+      if (lease) releaseTmuxExtendedKeysLease(cwd, lease, execStub);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("releaseTmuxExtendedKeysLease restores when all remaining holders are dead", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-tmux-dead-holder-release-"));
+    try {
+      const leaseDir = join(cwd, ".omx", "state", "tmux-extended-keys");
+      const leasePath = join(leaseDir, "tmp-dead-release-sock.json");
+      await mkdir(leaseDir, { recursive: true });
+      await writeFile(
+        leasePath,
+        JSON.stringify({
+          originalMode: "off",
+          holders: ["2147483647-stale-holder"],
+        }),
+        "utf-8",
+      );
+
+      const calls: string[][] = [];
+      const execStub = (_file: string, args: readonly string[]): string => {
+        calls.push([...args]);
+        return "";
+      };
+
+      releaseTmuxExtendedKeysLease(cwd, "/tmp/dead-release.sock\tmissing-holder", execStub);
+
+      assert.ok(!existsSync(leasePath), "stale-only lease file should be removed");
+      assert.deepEqual(calls, [["set-option", "-sq", "extended-keys", "off"]]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
     it("buildDetachedSessionFinalizeSteps keeps schedule after split-capture and before attach", () => {
     const steps = buildDetachedSessionFinalizeSteps(
@@ -2401,6 +2829,23 @@ describe("buildTmuxPaneCommand", () => {
     assert.ok(
       !result.startsWith("'/bin/sh' -c "),
       "should not fall back to /bin/sh for supported Homebrew zsh",
+    );
+    assert.ok(result.includes("source ~/.zshrc"), "should source .zshrc");
+  });
+
+  it("keeps MacPorts zsh instead of downgrading to /bin/sh", () => {
+    const result = buildTmuxPaneCommand(
+      "codex",
+      ["--model", "gpt-5"],
+      "/opt/local/bin/zsh",
+    );
+    assert.ok(
+      result.startsWith("'/opt/local/bin/zsh' -c "),
+      "should preserve MacPorts zsh when SHELL points to it",
+    );
+    assert.ok(
+      !result.startsWith("'/bin/sh' -c "),
+      "should not fall back to /bin/sh for supported MacPorts zsh",
     );
     assert.ok(result.includes("source ~/.zshrc"), "should source .zshrc");
   });
@@ -2624,6 +3069,21 @@ describe("team worker launch arg inheritance helpers", () => {
     assert.deepEqual(
       collectInheritableTeamWorkerArgs(["--model=gpt-5.3-codex"]),
       ["--model", "gpt-5.3-codex"],
+    );
+  });
+
+
+  it("collectInheritableTeamWorkerArgs preserves only safe model_provider config overrides", () => {
+    assert.deepEqual(
+      collectInheritableTeamWorkerArgs([
+        "-c",
+        'sandbox_mode="danger-full-access"',
+        "-c",
+        'model_provider="cheapRouter"',
+        "--model",
+        "gpt-5.5",
+      ]),
+      ["-c", 'model_provider="cheapRouter"', "--model", "gpt-5.5"],
     );
   });
 

@@ -20,7 +20,7 @@
 
 import { writeFile, appendFile, mkdir, readFile } from 'fs/promises';
 import { existsSync } from 'fs';
-import { dirname, join } from 'path';
+import { dirname, join, resolve } from 'path';
 
 import { safeString, asNumber } from './notify-hook/utils.js';
 import {
@@ -1557,9 +1557,11 @@ async function main() {
   const parsedTeamWorker = parseTeamWorkerEnv(teamWorkerEnv);
   const isTeamWorker = !!parsedTeamWorker;
 
-  const stateDir = (isTeamWorker && parsedTeamWorker)
+  const resolvedWorkerStateDir = (isTeamWorker && parsedTeamWorker)
     ? await resolveTeamStateDirForWorker(cwd, parsedTeamWorker)
-    : join(cwd, '.omx', 'state');
+    : null;
+  const workerStateRootResolved = !isTeamWorker || !!resolvedWorkerStateDir;
+  const stateDir = resolvedWorkerStateDir || join(cwd, '.omx', 'state');
   const logsDir = join(cwd, '.omx', 'logs');
   const omxDir = join(cwd, '.omx');
   let currentOmxSessionId = '';
@@ -1567,8 +1569,10 @@ async function main() {
 
   // Ensure directories exist
   await mkdir(logsDir, { recursive: true }).catch(() => {});
-  await mkdir(stateDir, { recursive: true }).catch(() => {});
-  currentOmxSessionId = await readCurrentSessionId(stateDir).catch(() => '') || '';
+  if (workerStateRootResolved) {
+    await mkdir(stateDir, { recursive: true }).catch(() => {});
+    currentOmxSessionId = await readCurrentSessionId(stateDir).catch(() => '') || '';
+  }
 
   const currentSessionState = isTeamWorker
     ? null
@@ -1621,6 +1625,7 @@ async function main() {
   // Turn-level dedupe prevents double-processing when native notify and fallback
   // watcher both emit the same completed turn.
   try {
+    if (!workerStateRootResolved) throw new Error('worker_state_root_unresolved');
     const turnId = safeString(payload['turn-id'] || payload.turn_id || '');
     if (turnId) {
       const now = Date.now();
@@ -2617,6 +2622,32 @@ async function main() {
   await appendFile(logFile, JSON.stringify(logEntry) + '\n').catch(() => {});
 
   if (!isTurnComplete) {
+    return;
+  }
+
+  if (isTeamWorker && !workerStateRootResolved) {
+    await logNotifyHookEvent(logsDir, {
+      timestamp: new Date().toISOString(),
+      level: 'warn',
+      type: 'team_worker_state_root_unresolved',
+      team_worker: teamWorkerEnv || null,
+      reason: 'skip_team_worker_state_mutations',
+    }).catch(() => {});
+
+    // Keep the fail-closed worker state-root behavior for normal team-worker
+    // mutations, but allow the narrow auto-nudge path to use an explicitly
+    // supplied, already-existing worker state root. Auto-nudge only needs the
+    // worker-scoped state files/pane anchor and should not fall back to creating
+    // local `.omx/state` when identity resolution failed.
+    const explicitWorkerStateRoot = safeString(process.env.OMX_TEAM_STATE_ROOT || '').trim();
+    const autoNudgeStateDir = explicitWorkerStateRoot ? resolve(cwd, explicitWorkerStateRoot) : '';
+    if (autoNudgeStateDir && existsSync(autoNudgeStateDir)) {
+      try {
+        await maybeAutoNudge({ cwd, stateDir: autoNudgeStateDir, logsDir, payload });
+      } catch {
+        // Non-critical
+      }
+    }
     return;
   }
 

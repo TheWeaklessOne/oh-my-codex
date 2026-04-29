@@ -72,6 +72,7 @@ if (originalHome) {
   childEnv.CARGO_HOME ??= join(originalHome, '.cargo');
   childEnv.RUSTUP_HOME ??= join(originalHome, '.rustup');
 }
+childEnv.OMX_TEST_RELAX_TMUX_TIMEOUT = '1';
 
 try {
   const result = spawnSync(process.execPath, testArgs, {

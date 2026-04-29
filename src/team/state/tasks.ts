@@ -5,6 +5,7 @@ import { readFile, readdir } from 'fs/promises';
 import type { TeamTaskStatus } from '../contracts.js';
 import type {
   TeamTask,
+  TeamTaskDelegationComplianceEvidence,
   TeamTaskV2,
   TaskReadiness,
   ClaimTaskResult,
@@ -112,6 +113,38 @@ export async function claimTask(
   return lock.value;
 }
 
+function extractDelegationComplianceEvidence(
+  task: TeamTaskV2,
+  terminalData: { result?: string; error?: string } | undefined,
+): TeamTaskDelegationComplianceEvidence | null {
+  const plan = task.delegation;
+  if (!plan || plan.mode === 'none') return null;
+  if (plan.mode === 'optional' && plan.required_parallel_probe !== true) return null;
+
+  const result = typeof terminalData?.result === 'string' ? terminalData.result : '';
+  const spawnMatch = result.match(/^\s*Subagent spawn evidence:\s*(.+)$/im);
+  if (spawnMatch?.[1]?.trim()) {
+    const detail = spawnMatch[1].trim();
+    if (!/^none\b|^0\b/i.test(detail)) {
+      return { status: 'spawned', source: 'terminal_result', detail, recorded_at: new Date().toISOString() };
+    }
+  }
+
+  if (plan.skip_allowed_reason_required === true) {
+    const skipMatch = result.match(/^\s*Subagent skip reason:\s*(.+)$/im);
+    if (skipMatch?.[1]?.trim()) {
+      return { status: 'skipped', source: 'terminal_result', detail: skipMatch[1].trim(), recorded_at: new Date().toISOString() };
+    }
+  }
+
+  return null;
+}
+
+function requiresDelegationComplianceEvidence(task: TeamTaskV2): boolean {
+  const plan = task.delegation;
+  return !!plan && (plan.mode === 'auto' || plan.mode === 'required' || plan.required_parallel_probe === true);
+}
+
 interface TransitionDeps extends ClaimTaskDeps {
   canTransitionTaskStatus: (from: TeamTaskStatus, to: TeamTaskStatus) => boolean;
   appendTeamEvent: (
@@ -155,12 +188,20 @@ export async function transitionTaskStatus(
 
     const normalizedResult = typeof terminalData?.result === 'string' ? terminalData.result : undefined;
     const normalizedError = typeof terminalData?.error === 'string' ? terminalData.error : undefined;
+    const delegationCompliance = to === 'completed'
+      ? extractDelegationComplianceEvidence(v, terminalData)
+      : null;
+    if (to === 'completed' && requiresDelegationComplianceEvidence(v) && !delegationCompliance) {
+      return { ok: false as const, error: 'missing_delegation_compliance_evidence' as const };
+    }
+
     const updated: TeamTaskV2 = {
       ...v,
       status: to,
       completed_at: new Date().toISOString(),
       result: to === 'completed' ? normalizedResult : undefined,
       error: to === 'failed' ? normalizedError : undefined,
+      delegation_compliance: to === 'completed' ? delegationCompliance ?? v.delegation_compliance : v.delegation_compliance,
       claim: undefined,
       version: v.version + 1,
     };

@@ -20,6 +20,7 @@ export interface SessionState {
   platform?: NodeJS.Platform;
   pid_start_ticks?: number;
   pid_cmdline?: string;
+  tmux_session_name?: string;
 }
 
 const SESSION_FILE = 'session.json';
@@ -160,6 +161,7 @@ interface SessionStartOptions {
   nativeSessionId?: string;
   ownerKind?: 'external-owner' | 'child' | 'internal-helper' | 'team-worker' | 'unknown-non-owner';
   parentThreadId?: string;
+  tmuxSessionName?: string;
 }
 
 function defaultIsPidAlive(pid: number): boolean {
@@ -223,11 +225,15 @@ function createSessionState(
     nowIso?: string;
     nativeSessionId?: string;
     startedAt?: string;
+    tmuxSessionName?: string;
   } = {},
 ): SessionState {
   const nowIso = options.nowIso ?? new Date().toISOString();
   const nativeSessionId = typeof options.nativeSessionId === 'string' && options.nativeSessionId.trim()
     ? options.nativeSessionId.trim()
+    : undefined;
+  const tmuxSessionName = typeof options.tmuxSessionName === 'string' && options.tmuxSessionName.trim()
+    ? options.tmuxSessionName.trim()
     : undefined;
 
   return {
@@ -239,6 +245,7 @@ function createSessionState(
     platform,
     pid_start_ticks: linuxIdentity?.startTicks,
     pid_cmdline: linuxIdentity?.cmdline ?? undefined,
+    ...(tmuxSessionName ? { tmux_session_name: tmuxSessionName } : {}),
   };
 }
 
@@ -295,6 +302,7 @@ export async function writeSessionStart(
     : null;
   const state = createSessionState(cwd, sessionId, pid, platform, linuxIdentity, {
     nativeSessionId: options.nativeSessionId,
+    tmuxSessionName: options.tmuxSessionName,
   });
 
   await writeFile(sessionPath(cwd), JSON.stringify(state, null, 2));
@@ -390,6 +398,7 @@ export async function reconcileNativeSessionStart(
     nowIso,
     nativeSessionId,
     startedAt: existing.started_at,
+    tmuxSessionName: existing.tmux_session_name,
   });
 
   await writeFile(sessionPath(cwd), JSON.stringify(state, null, 2));

@@ -1,6 +1,6 @@
 {
   "name": "oh-my-codex",
-  "version": "0.15.0",
+  "version": "0.15.1",
   "description": "Multi-agent orchestration layer for OpenAI Codex CLI",
   "type": "module",
   "main": "dist/index.js",
@@ -53,7 +53,8 @@
     "sync:plugin": "node dist/scripts/sync-plugin-mirror.js",
     "sync:plugin:check": "node dist/scripts/sync-plugin-mirror.js --check",
     "verify:plugin-bundle": "node dist/scripts/sync-plugin-mirror.js --check",
-    "verify:native-agents": "node dist/scripts/verify-native-agents.js"
+    "verify:native-agents": "node dist/scripts/verify-native-agents.js",
+    "prompt:inventory": "node dist/scripts/prompt-inventory.js"
   },
   "engines": {
     "node": ">=20"

@@ -1,20 +1,25 @@
 import { execFileSync } from "child_process";
-import { existsSync, readFileSync } from "fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync } from "fs";
 import { mkdir, readFile, readdir, writeFile } from "fs/promises";
-import { join, resolve } from "path";
+import { join, relative, resolve } from "path";
 import { pathToFileURL } from "url";
 import { readModeState, readModeStateForSession, updateModeState } from "../modes/base.js";
 import {
   listActiveSkills,
   readVisibleSkillActiveState,
 } from "../state/skill-active.js";
-import { readSubagentSessionSummary } from "../subagents/tracker.js";
-import { resolveCanonicalTeamStateRoot } from "../team/state-root.js";
 import {
+  readSubagentSessionSummary,
+  recordSubagentTurnForSession,
+} from "../subagents/tracker.js";
+import { resolveCanonicalTeamStateRoot, resolveWorkerNotifyTeamStateRootPath } from "../team/state-root.js";
+import {
+  appendToLog,
   isSessionStateUsable,
   readSessionState,
   readUsableSessionState,
   reconcileNativeSessionStart,
+  type SessionState,
 } from "../hooks/session.js";
 import {
   appendTeamEvent,
@@ -25,6 +30,7 @@ import {
   writeTeamPhase,
 } from "../team/state.js";
 import { omxNotepadPath, omxProjectMemoryPath } from "../utils/paths.js";
+import { findGitLayout } from "../utils/git-layout.js";
 import { getStateFilePath, getStatePath } from "../mcp/state-paths.js";
 import {
   detectKeywords,
@@ -43,6 +49,7 @@ import {
   buildNativePreToolUseOutput,
   detectMcpTransportFailure,
 } from "./codex-native-pre-post.js";
+import { handleTeamWorkerPostToolUseSuccess } from "./notify-hook/team-worker-posttooluse.js";
 import {
   resolveCodexExecutionSurface,
   type CodexLauncherKind,
@@ -56,7 +63,8 @@ import { dispatchHookEvent } from "../hooks/extensibility/dispatcher.js";
 import { reconcileHudForPromptSubmit } from "../hud/reconcile.js";
 import { onSessionStart as buildWikiSessionStartContext } from "../wiki/lifecycle.js";
 import { readAutoresearchCompletionStatus, readAutoresearchModeState } from "../autoresearch/skill-validation.js";
-import { shouldContinueRun } from "../runtime/run-loop.js";
+import { readRunState } from "../runtime/run-state.js";
+import { getRunContinuationSnapshot, shouldContinueRun } from "../runtime/run-loop.js";
 import {
   recordCodexSessionOrigin,
   resolveSessionStartOrigin,
@@ -79,6 +87,7 @@ import {
   evaluateFinalHandoffDocumentRefresh,
   isFinalHandoffDocumentRefreshCandidate,
 } from "../document-refresh/enforcer.js";
+import { buildExecFollowupStopOutput } from "../exec/followup.js";
 
 type CodexHookEventName =
   | "SessionStart"
@@ -126,6 +135,7 @@ const SHORT_FOLLOWUP_PRIORITY_PATTERNS = [
   /(?:按照|按|基于)(?:这个|上述|当前)?(?:plan|计划|方案)/u,
   /\b(?:follow up|latest request|this turn|current turn|newest request)\b/i,
 ] as const;
+const MAX_SESSION_META_LINE_BYTES = 256 * 1024;
 
 function safeString(value: unknown): string {
   return typeof value === "string" ? value : "";
@@ -133,6 +143,144 @@ function safeString(value: unknown): string {
 
 function safeObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? value as Record<string, unknown> : {};
+}
+
+interface NativeSubagentSessionStartMetadata {
+  parentThreadId: string;
+  agentNickname?: string;
+  agentRole?: string;
+}
+
+function readBoundedFirstLineSync(path: string): string {
+  const fd = openSync(path, "r");
+  try {
+    const chunks: Buffer[] = [];
+    const buffer = Buffer.alloc(Math.min(8192, MAX_SESSION_META_LINE_BYTES));
+    let totalBytesRead = 0;
+
+    while (totalBytesRead < MAX_SESSION_META_LINE_BYTES) {
+      const bytesToRead = Math.min(buffer.length, MAX_SESSION_META_LINE_BYTES - totalBytesRead);
+      const bytesRead = readSync(fd, buffer, 0, bytesToRead, totalBytesRead);
+      if (bytesRead <= 0) break;
+
+      totalBytesRead += bytesRead;
+      const chunk = buffer.subarray(0, bytesRead);
+      const newlineOffset = chunk.indexOf(0x0a);
+      if (newlineOffset >= 0) {
+        chunks.push(Buffer.from(chunk.subarray(0, newlineOffset)));
+        break;
+      }
+      chunks.push(Buffer.from(chunk));
+    }
+
+    return Buffer.concat(chunks).toString("utf-8").replace(/\r$/, "");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function readNativeSubagentSessionStartMetadata(transcriptPath: string): NativeSubagentSessionStartMetadata | null {
+  const normalizedPath = transcriptPath.trim();
+  if (!normalizedPath) return null;
+
+  try {
+    const firstLine = readBoundedFirstLineSync(normalizedPath).trim();
+    if (!firstLine) return null;
+    const firstRecord = safeObject(JSON.parse(firstLine));
+    if (safeString(firstRecord.type) !== "session_meta") return null;
+
+    const payload = safeObject(firstRecord.payload);
+    const source = safeObject(payload.source);
+    const subagent = safeObject(source.subagent);
+    const threadSpawn = safeObject(subagent.thread_spawn);
+    const parentThreadId = safeString(threadSpawn.parent_thread_id).trim();
+    if (!parentThreadId) return null;
+
+    const agentNickname = safeString(threadSpawn.agent_nickname ?? payload.agent_nickname).trim();
+    const agentRole = safeString(threadSpawn.agent_role ?? payload.agent_role).trim();
+    return {
+      parentThreadId,
+      ...(agentNickname ? { agentNickname } : {}),
+      ...(agentRole ? { agentRole } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function recordNativeSubagentSessionStart(
+  cwd: string,
+  canonicalSessionId: string,
+  childSessionId: string,
+  metadata: NativeSubagentSessionStartMetadata,
+  transcriptPath: string,
+): Promise<void> {
+  const trackingSessionIds = [...new Set([
+    canonicalSessionId.trim(),
+    metadata.parentThreadId.trim(),
+  ].filter(Boolean))];
+  for (const sessionId of trackingSessionIds) {
+    await recordSubagentTurnForSession(cwd, {
+      sessionId,
+      threadId: metadata.parentThreadId,
+    }).catch(() => {});
+    await recordSubagentTurnForSession(cwd, {
+      sessionId,
+      threadId: childSessionId,
+      mode: metadata.agentRole,
+    }).catch(() => {});
+  }
+  await appendToLog(cwd, {
+    event: "subagent_session_start",
+    session_id: canonicalSessionId,
+    native_owner_session_id: metadata.parentThreadId,
+    native_session_id: childSessionId,
+    parent_thread_id: metadata.parentThreadId,
+    ...(metadata.agentNickname ? { agent_nickname: metadata.agentNickname } : {}),
+    ...(metadata.agentRole ? { agent_role: metadata.agentRole } : {}),
+    ...(transcriptPath ? { transcript_path: transcriptPath } : {}),
+    timestamp: new Date().toISOString(),
+  }).catch(() => {});
+}
+
+async function nativeSubagentSessionStartBelongsToCanonicalSession(
+  cwd: string,
+  canonicalSessionId: string,
+  currentSessionState: SessionState | null,
+  metadata: NativeSubagentSessionStartMetadata,
+): Promise<boolean> {
+  const parentThreadId = metadata.parentThreadId.trim();
+  if (!parentThreadId) return false;
+
+  const currentNativeSessionId = safeString(currentSessionState?.native_session_id).trim();
+  if (currentNativeSessionId && currentNativeSessionId === parentThreadId) {
+    return true;
+  }
+
+  const summary = await readSubagentSessionSummary(cwd, canonicalSessionId).catch(() => null);
+  if (!summary) return false;
+  if (summary.leaderThreadId === parentThreadId) return true;
+  return summary.allThreadIds.includes(parentThreadId);
+}
+
+async function recordIgnoredNativeSubagentSessionStart(
+  cwd: string,
+  canonicalSessionId: string,
+  childSessionId: string,
+  metadata: NativeSubagentSessionStartMetadata,
+  transcriptPath: string,
+): Promise<void> {
+  await appendToLog(cwd, {
+    event: "subagent_session_start_ignored",
+    reason: "parent_not_in_canonical_session",
+    session_id: canonicalSessionId,
+    native_session_id: childSessionId,
+    parent_thread_id: metadata.parentThreadId,
+    ...(metadata.agentNickname ? { agent_nickname: metadata.agentNickname } : {}),
+    ...(metadata.agentRole ? { agent_role: metadata.agentRole } : {}),
+    ...(transcriptPath ? { transcript_path: transcriptPath } : {}),
+    timestamp: new Date().toISOString(),
+  }).catch(() => {});
 }
 
 function safePositiveInteger(value: unknown): number | null {
@@ -295,10 +443,49 @@ async function readActiveAutoresearchState(
   return state;
 }
 
+interface ActiveRalphStopState {
+  state: Record<string, unknown>;
+  path: string;
+}
+
+function isRalphStartingPhase(state: Record<string, unknown>): boolean {
+  return safeString(state.current_phase ?? state.currentPhase).trim().toLowerCase() === "starting";
+}
+
+function shouldHonorCanonicalTerminalRunState(
+  runState: Record<string, unknown> | null,
+  mode: string,
+): boolean {
+  if (!runState) return false;
+  const runMode = safeString(runState.mode).trim();
+  if (runMode && runMode !== mode) return false;
+  return getRunContinuationSnapshot(runState)?.terminal === true;
+}
+
+async function readCanonicalTerminalRunStateForStop(
+  cwd: string,
+  sessionId: string | undefined,
+  mode: string,
+): Promise<Record<string, unknown> | null> {
+  if (!safeString(sessionId).trim()) return null;
+  const runState = await readRunState(cwd, sessionId).catch(() => null);
+  const runRecord = runState as unknown as Record<string, unknown> | null;
+  return shouldHonorCanonicalTerminalRunState(runRecord, mode) ? runRecord : null;
+}
+
+async function isVisibleRalphActiveForSession(cwd: string, sessionId: string): Promise<boolean> {
+  const canonicalState = await readVisibleSkillActiveState(cwd, sessionId);
+  if (!canonicalState) return false;
+  return listActiveSkills(canonicalState).some((entry) => (
+    entry.skill === "ralph"
+    && matchesSkillStopContext(entry, canonicalState, sessionId, "")
+  ));
+}
+
 async function readActiveRalphState(
   stateDir: string,
   preferredSessionId?: string,
-): Promise<Record<string, unknown> | null> {
+): Promise<ActiveRalphStopState | null> {
   const cwd = resolve(stateDir, "..", "..");
   const [rawSessionInfo, usableSessionInfo] = await Promise.all([
     readSessionState(cwd),
@@ -320,17 +507,29 @@ async function readActiveRalphState(
     if (staleCurrentSessionId && sessionId === staleCurrentSessionId) {
       continue;
     }
-    const sessionScoped = await readStopSessionPinnedState("ralph-state.json", cwd, sessionId);
+    if (await readCanonicalTerminalRunStateForStop(cwd, sessionId, "ralph")) {
+      continue;
+    }
+    const sessionScopedPath = getStateFilePath("ralph-state.json", cwd, sessionId);
+    const sessionScoped = await readJsonIfExists(sessionScopedPath);
+    if (
+      sessionScoped?.active === true
+      && isRalphStartingPhase(sessionScoped)
+      && !(await isVisibleRalphActiveForSession(cwd, sessionId))
+    ) {
+      continue;
+    }
     if (sessionScoped?.active === true && shouldContinueRun(sessionScoped)) {
-      return sessionScoped;
+      return { state: sessionScoped, path: sessionScopedPath };
     }
   }
 
   if (sessionCandidates.length > 0) return null;
 
-  const direct = await readJsonIfExists(join(stateDir, "ralph-state.json"));
+  const directPath = join(stateDir, "ralph-state.json");
+  const direct = await readJsonIfExists(directPath);
   if (direct?.active === true && shouldContinueRun(direct)) {
-    return direct;
+    return { state: direct, path: directPath };
   }
 
   return null;
@@ -448,6 +647,22 @@ function tryReadGitValue(cwd: string, args: string[]): string | null {
   }
 }
 
+
+function localExcludeAlreadyIgnoresOmx(cwd: string): boolean {
+  const layout = findGitLayout(cwd);
+  if (!layout) return false;
+  const excludePath = join(layout.gitDir, "info", "exclude");
+  try {
+    const lines = readFileSync(excludePath, "utf-8")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"));
+    return lines.includes(".omx/") || lines.includes(".omx");
+  } catch {
+    return false;
+  }
+}
+
 function isPathIgnoredByGit(cwd: string, path: string): boolean {
   try {
     execFileSync("git", ["check-ignore", "-q", path], {
@@ -464,7 +679,7 @@ function isPathIgnoredByGit(cwd: string, path: string): boolean {
 async function ensureOmxLocalIgnoreEntry(cwd: string): Promise<{ changed: boolean; excludePath?: string }> {
   const repoRoot = tryReadGitValue(cwd, ["rev-parse", "--show-toplevel"]);
   if (!repoRoot) return { changed: false };
-  if (isPathIgnoredByGit(repoRoot, ".omx/")) {
+  if (localExcludeAlreadyIgnoresOmx(repoRoot) || isPathIgnoredByGit(repoRoot, ".omx/")) {
     return { changed: false };
   }
 
@@ -909,47 +1124,13 @@ function parseTeamWorkerEnv(rawValue: string): { teamName: string; workerName: s
   };
 }
 
-async function readTeamStateRootFromJson(path: string): Promise<string | null> {
-  const parsed = await readJsonIfExists(path);
-  const value = safeString(parsed?.team_state_root).trim();
-  return value || null;
-}
-
 async function resolveTeamStateDirForWorkerContext(
   cwd: string,
   workerContext: { teamName: string; workerName: string },
-): Promise<string> {
-  const explicitStateRoot = safeString(process.env.OMX_TEAM_STATE_ROOT).trim();
-  if (explicitStateRoot) {
-    return resolve(cwd, explicitStateRoot);
-  }
-
-  const leaderCwd = safeString(process.env.OMX_TEAM_LEADER_CWD).trim();
-  const candidateStateDirs = [
-    ...(leaderCwd ? [join(resolve(leaderCwd), ".omx", "state")] : []),
-    join(cwd, ".omx", "state"),
-  ];
-
-  for (const candidateStateDir of candidateStateDirs) {
-    const teamRoot = join(candidateStateDir, "team", workerContext.teamName);
-    if (!existsSync(teamRoot)) continue;
-
-    const identityRoot = await readTeamStateRootFromJson(
-      join(teamRoot, "workers", workerContext.workerName, "identity.json"),
-    );
-    if (identityRoot) return resolve(cwd, identityRoot);
-
-    const manifestRoot = await readTeamStateRootFromJson(join(teamRoot, "manifest.v2.json"));
-    if (manifestRoot) return resolve(cwd, manifestRoot);
-
-    const configRoot = await readTeamStateRootFromJson(join(teamRoot, "config.json"));
-    if (configRoot) return resolve(cwd, configRoot);
-
-    return candidateStateDir;
-  }
-
-  return join(cwd, ".omx", "state");
+): Promise<string | null> {
+  return resolveWorkerNotifyTeamStateRootPath(cwd, workerContext, process.env);
 }
+
 
 async function buildTeamWorkerStopOutput(
   cwd: string,
@@ -958,6 +1139,7 @@ async function buildTeamWorkerStopOutput(
   if (!workerContext) return null;
 
   const stateDir = await resolveTeamStateDirForWorkerContext(cwd, workerContext);
+  if (!stateDir) return null;
   const workerRoot = join(stateDir, "team", workerContext.teamName, "workers", workerContext.workerName);
   const [identity, status] = await Promise.all([
     readJsonIfExists(join(workerRoot, "identity.json")),
@@ -1057,6 +1239,9 @@ async function readTeamModeStateForStop(
 }
 
 async function buildTeamStopOutput(cwd: string, sessionId?: string): Promise<Record<string, unknown> | null> {
+  if (await readCanonicalTerminalRunStateForStop(cwd, sessionId, "team")) {
+    return null;
+  }
   const teamState = await readTeamModeStateForStop(cwd, sessionId);
   if (teamState?.active !== true) return null;
   const teamName = safeString(teamState.team_name).trim();
@@ -1361,6 +1546,12 @@ function buildRepeatableStopSignature(
     lastAssistantMessage,
     normalizedDetail || "no-detail",
   ].join("|");
+}
+
+function formatStopStatePath(cwd: string, statePath: string): string {
+  const relativePath = relative(cwd, statePath);
+  if (!relativePath || relativePath.startsWith("..")) return statePath;
+  return relativePath.replace(/\\/g, "/");
 }
 
 function readNativeStopSessionKey(
@@ -1676,6 +1867,8 @@ async function buildStopHookOutput(
   const sessionId = readPayloadSessionId(payload);
   const canonicalSessionId = await resolveInternalSessionIdForPayload(cwd, sessionId);
   const threadId = readPayloadThreadId(payload);
+  const execFollowupOutput = await buildExecFollowupStopOutput(cwd, canonicalSessionId);
+  if (execFollowupOutput) return execFollowupOutput;
   const ralphState = await readActiveRalphState(stateDir, canonicalSessionId);
   if (!ralphState) {
     const autoresearchState = await readActiveAutoresearchState(cwd, canonicalSessionId);
@@ -1788,7 +1981,9 @@ async function buildStopHookOutput(
         );
       }
 
-      const canonicalTeam = await findCanonicalActiveTeamForSession(cwd, canonicalSessionId);
+      const canonicalTeam = await readCanonicalTerminalRunStateForStop(cwd, canonicalSessionId, "team")
+        ? null
+        : await findCanonicalActiveTeamForSession(cwd, canonicalSessionId);
       if (canonicalTeam) {
         const canonicalTeamOutput = buildTeamStopOutputForPhase(
           canonicalTeam.teamName,
@@ -1868,10 +2063,11 @@ async function buildStopHookOutput(
     return null;
   }
 
-  const currentPhase = safeString(ralphState?.current_phase).trim() || "executing";
+  const currentPhase = safeString(ralphState.state.current_phase).trim() || "executing";
+  const blockingPath = formatStopStatePath(cwd, ralphState.path);
   const stopReason = `ralph_${currentPhase}`;
   const systemMessage =
-    `OMX Ralph is still active (phase: ${currentPhase}); continue the task and gather fresh verification evidence before stopping.`;
+    `OMX Ralph is still active (phase: ${currentPhase}; state: ${blockingPath}); continue the task and gather fresh verification evidence before stopping.`;
 
   return await returnPersistentStopBlock(
     payload,
@@ -1907,6 +2103,7 @@ export async function dispatchCodexNativeHook(
   const currentSessionState = await readUsableSessionState(cwd);
   let canonicalSessionId = safeString(currentSessionState?.session_id).trim();
   let resolvedNativeSessionId = nativeSessionId;
+  let skipCanonicalSessionStartContext = false;
 
   if (hookEventName === "SessionStart" && nativeSessionId) {
     const sessionOrigin = resolveSessionStartOrigin({
@@ -1925,15 +2122,48 @@ export async function dispatchCodexNativeHook(
       audience: sessionOrigin.audience,
       evidence: sessionOrigin.evidence,
     }).catch(() => null);
-    const sessionState = await reconcileNativeSessionStart(cwd, nativeSessionId, {
-      pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
-      ownerKind: sessionOrigin.ownerKind,
-      parentThreadId: sessionOrigin.origin.parentThreadId,
-    });
-    canonicalSessionId = sessionOrigin.ownerKind === "external-owner" || currentSessionState
-      ? safeString(sessionState.session_id).trim()
-      : "";
-    resolvedNativeSessionId = safeString(sessionState.native_session_id).trim() || nativeSessionId;
+
+    const transcriptPath = safeString(payload.transcript_path ?? payload.transcriptPath).trim();
+    const subagentSessionStart = readNativeSubagentSessionStartMetadata(transcriptPath);
+    if (subagentSessionStart && canonicalSessionId) {
+      const belongsToCanonicalSession = await nativeSubagentSessionStartBelongsToCanonicalSession(
+        cwd,
+        canonicalSessionId,
+        currentSessionState,
+        subagentSessionStart,
+      );
+      if (belongsToCanonicalSession) {
+        resolvedNativeSessionId = nativeSessionId;
+        await recordNativeSubagentSessionStart(
+          cwd,
+          canonicalSessionId,
+          nativeSessionId,
+          subagentSessionStart,
+          transcriptPath,
+        );
+      } else {
+        skipCanonicalSessionStartContext = true;
+        resolvedNativeSessionId =
+          safeString(currentSessionState?.native_session_id).trim() || nativeSessionId;
+        await recordIgnoredNativeSubagentSessionStart(
+          cwd,
+          canonicalSessionId,
+          nativeSessionId,
+          subagentSessionStart,
+          transcriptPath,
+        );
+      }
+    } else {
+      const sessionState = await reconcileNativeSessionStart(cwd, nativeSessionId, {
+        pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
+        ownerKind: sessionOrigin.ownerKind,
+        parentThreadId: sessionOrigin.origin.parentThreadId,
+      });
+      canonicalSessionId = sessionOrigin.ownerKind === "external-owner" || currentSessionState
+        ? safeString(sessionState.session_id).trim()
+        : "";
+      resolvedNativeSessionId = safeString(sessionState.native_session_id).trim() || nativeSessionId;
+    }
   } else if (!canonicalSessionId) {
     canonicalSessionId = safeString(currentSessionState?.session_id).trim();
   }
@@ -2048,7 +2278,7 @@ export async function dispatchCodexNativeHook(
     await reconcileHudForPromptSubmitFn(cwd, { sessionId: canonicalSessionId || sessionIdForState || undefined }).catch(() => {});
   }
 
-  if (omxEventName) {
+  if (omxEventName && !skipCanonicalSessionStartContext) {
     const baseContext = buildBaseContext(cwd, payload, hookEventName!, canonicalSessionId);
     if (resolvedNativeSessionId) {
       baseContext.native_session_id = resolvedNativeSessionId;
@@ -2070,7 +2300,7 @@ export async function dispatchCodexNativeHook(
     await dispatchHookEvent(event, { cwd });
   }
 
-  if (hookEventName === "SessionStart" || hookEventName === "UserPromptSubmit") {
+  if ((hookEventName === "SessionStart" && !skipCanonicalSessionStartContext) || hookEventName === "UserPromptSubmit") {
     const additionalContext = hookEventName === "SessionStart"
       ? await buildSessionStartContext(cwd, canonicalSessionId || nativeSessionId, {
         hookEventName,
@@ -2094,6 +2324,7 @@ export async function dispatchCodexNativeHook(
       await markTeamTransportFailure(cwd, payload);
     }
     outputJson = buildNativePostToolUseOutput(payload);
+    await handleTeamWorkerPostToolUseSuccess(payload, cwd);
   } else if (hookEventName === "Stop") {
     outputJson = await buildStopHookOutput(payload, cwd, stateDir);
   }
@@ -2187,6 +2418,8 @@ export async function runCodexNativeHookCli(): Promise<void> {
     const result = await dispatchCodexNativeHook(payload);
     if (result.outputJson) {
       writeNativeHookJsonStdout(result.outputJson);
+    } else if (result.hookEventName === "Stop") {
+      writeNativeHookJsonStdout({});
     }
   } catch (error) {
     if (readHookEventName(payload) !== "Stop") {

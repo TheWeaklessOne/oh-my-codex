@@ -317,6 +317,7 @@ describe('team state', () => {
       policy.delegation_only = true;
       policy.nested_teams_allowed = true;
       policy.cleanup_requires_all_workers_inactive = false;
+      policy.team_decomposition = { decomposition_source: 'dag_sidecar' };
       manifest.policy = policy;
       delete manifest.governance;
       await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
@@ -330,6 +331,8 @@ describe('team state', () => {
       assert.equal('delegation_only' in (loaded?.policy ?? {}), false);
       assert.equal('nested_teams_allowed' in (loaded?.policy ?? {}), false);
       assert.equal('cleanup_requires_all_workers_inactive' in (loaded?.policy ?? {}), false);
+      assert.equal('team_decomposition' in (loaded?.policy ?? {}), false);
+      assert.deepEqual(loaded?.team_decomposition, { decomposition_source: 'dag_sidecar' });
 
       const freshCwd = await mkdtemp(join(tmpdir(), 'omx-team-manifest-policy-default-'));
       try {
@@ -906,6 +909,159 @@ exit 1
       const content = await readFile(eventsPath, 'utf-8');
       assert.match(content, /\"type\":\"task_completed\"/);
       assert.match(content, new RegExp(`\"task_id\":\"${t.id}\"`));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('transitionTaskStatus rejects broad delegated completion without spawn evidence or skip reason', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-delegation-evidence-'));
+    try {
+      await initTeamState('team-delegation-evidence', 't', 'executor', 1, cwd);
+      const t = await createTask('team-delegation-evidence', {
+        subject: 'Investigate flaky runtime behavior',
+        description: 'Search runtime and debug flaky assignment behavior',
+        status: 'pending',
+        delegation: {
+          mode: 'auto',
+          required_parallel_probe: true,
+          skip_allowed_reason_required: true,
+        },
+      }, cwd);
+      const claim = await claimTask('team-delegation-evidence', t.id, 'worker-1', t.version ?? 1, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+
+      const missing = await transitionTaskStatus(
+        'team-delegation-evidence',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        { result: 'Verification:\nPASS - focused regression' },
+      );
+
+      assert.equal(missing.ok, false);
+      assert.equal(missing.ok ? 'x' : missing.error, 'missing_delegation_compliance_evidence');
+      const reread = await readTask('team-delegation-evidence', t.id, cwd);
+      assert.equal(reread?.status, 'in_progress');
+
+      const completedWithSpawnEvidence = await transitionTaskStatus(
+        'team-delegation-evidence',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        {
+          result: [
+            'Verification:',
+            'PASS - focused regression',
+            'Subagent spawn evidence: spawned 2 native subagents for runtime map and test probe',
+          ].join('\n'),
+        },
+      );
+      assert.equal(completedWithSpawnEvidence.ok, true);
+      assert.equal(completedWithSpawnEvidence.task.delegation_compliance?.status, 'spawned');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('transitionTaskStatus requires evidence when optional delegation carries required parallel probe', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-optional-required-probe-'));
+    try {
+      await initTeamState('team-optional-required-probe', 't', 'executor', 1, cwd);
+      const t = await createTask('team-optional-required-probe', {
+        subject: 'Investigate optional delegated runtime behavior',
+        description: 'Optional mode was elevated by a required parallel probe from review enforcement',
+        status: 'pending',
+        delegation: {
+          mode: 'optional',
+          required_parallel_probe: true,
+          skip_allowed_reason_required: true,
+        },
+      }, cwd);
+      const claim = await claimTask('team-optional-required-probe', t.id, 'worker-1', t.version ?? 1, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+
+      const missing = await transitionTaskStatus(
+        'team-optional-required-probe',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        { result: 'Verification:\nPASS - focused regression' },
+      );
+
+      assert.equal(missing.ok, false);
+      assert.equal(missing.ok ? 'x' : missing.error, 'missing_delegation_compliance_evidence');
+      const reread = await readTask('team-optional-required-probe', t.id, cwd);
+      assert.equal(reread?.status, 'in_progress');
+
+      const completed = await transitionTaskStatus(
+        'team-optional-required-probe',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        {
+          result: [
+            'Verification:',
+            'PASS - focused regression',
+            'Subagent spawn evidence: spawned 1 native subagent for delegation evidence regression mapping',
+          ].join('\n'),
+        },
+      );
+
+      assert.equal(completed.ok, true);
+      assert.equal(completed.task.delegation_compliance?.status, 'spawned');
+      assert.equal(completed.task.delegation_compliance?.source, 'terminal_result');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('transitionTaskStatus accepts documented skip reason for broad delegated completion', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-delegation-skip-'));
+    try {
+      await initTeamState('team-delegation-skip', 't', 'executor', 1, cwd);
+      const t = await createTask('team-delegation-skip', {
+        subject: 'Review focused regression',
+        description: 'Audit one already-isolated failing test',
+        status: 'pending',
+        delegation: {
+          mode: 'auto',
+          required_parallel_probe: true,
+          skip_allowed_reason_required: true,
+        },
+      }, cwd);
+      const claim = await claimTask('team-delegation-skip', t.id, 'worker-1', t.version ?? 1, cwd);
+      assert.equal(claim.ok, true);
+      if (!claim.ok) return;
+
+      const completed = await transitionTaskStatus(
+        'team-delegation-skip',
+        t.id,
+        'in_progress',
+        'completed',
+        claim.claimToken,
+        cwd,
+        {
+          result: [
+            'Verification:',
+            'PASS - focused regression',
+            'Subagent skip reason: task scope collapsed to one isolated assertion; spawning would duplicate serial verification',
+          ].join('\n'),
+        },
+      );
+
+      assert.equal(completed.ok, true);
+      assert.equal(completed.task.delegation_compliance?.status, 'skipped');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

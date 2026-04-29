@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { updateModeState, startMode, readModeState } from '../modes/base.js';
 import { getStatePath, validateSessionId } from '../mcp/state-paths.js';
 import { monitorTeam, resumeTeam, shutdownTeam, startTeam, type TeamRuntime, type TeamSnapshot } from '../team/runtime.js';
+import { buildRepoAwareTeamExecutionPlan } from '../team/repo-aware-decomposition.js';
 import { DEFAULT_MAX_WORKERS } from '../team/state.js';
 import { sanitizeTeamName } from '../team/tmux-session.js';
 import { readTeamEvents, waitForTeamEvent } from '../team/state/events.js';
@@ -38,6 +39,7 @@ interface ParsedTeamArgs {
   explicitWorkerCount: boolean;
   task: string;
   teamName: string;
+  allowRepoAwareDagHandoff: boolean;
 }
 
 
@@ -155,6 +157,7 @@ Notes:
   --worktree is deprecated for omx team and is now only a backward-compatible no-op override.
   omx team is a tmux-runtime surface by default; in Codex App or plain outside-tmux sessions, launch OMX CLI from shell first instead of treating team as directly available.
   use native Codex subagents for small in-session fanout; use omx team for durable tmux/state/worktree coordination.
+  repo-aware DAG handoff is opt-in: Team only imports a DAG when the invocation matches the latest approved PRD/test-spec launch hint (or a short approved follow-up like \`omx team team\`).
 
 Examples:
   omx team 3:executor "fix failing tests"
@@ -708,8 +711,14 @@ function parseTeamArgs(args: string[], cwd: string = process.cwd()): ParsedTeamA
     }
   }
 
+  const approvedHint = readApprovedExecutionLaunchHint(cwd, 'team');
+  const matchesApprovedLaunchHint = approvedHint?.task.trim() === effectiveTask.trim()
+    && (approvedHint.workerCount == null || approvedHint.workerCount === workerCount)
+    && (approvedHint.agentType == null || approvedHint.agentType === agentType);
+  const allowRepoAwareDagHandoff = followupContext != null || matchesApprovedLaunchHint;
+
   const teamName = sanitizeTeamName(slugifyTask(effectiveTask));
-  return { workerCount, agentType, explicitAgentType, explicitWorkerCount, task: effectiveTask, teamName };
+  return { workerCount, agentType, explicitAgentType, explicitWorkerCount, task: effectiveTask, teamName, allowRepoAwareDagHandoff };
 }
 
 export function parseTeamStartArgs(args: string[]): ParsedTeamStartArgs {
@@ -1099,6 +1108,7 @@ async function persistTeamShutdownModeState(
         explicitAgentType: false,
         explicitWorkerCount: false,
         teamName,
+        allowRepoAwareDagHandoff: false,
       });
     } else {
       await startMode('team', `shutdown team ${teamName}`, 50, cwd);
@@ -1388,6 +1398,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
       explicitAgentType: false,
       explicitWorkerCount: false,
       teamName: runtime.teamName,
+      allowRepoAwareDagHandoff: false,
     });
     const availableAgentTypes = await resolveAvailableAgentTypes(cwd);
     const staffingPlan = buildFollowupStaffingPlan('team', runtime.config.task, availableAgentTypes, {
@@ -1430,13 +1441,16 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
   }
 
   const parsed = parseTeamArgs(teamArgs, cwd);
-  const executionPlan = buildTeamExecutionPlan(
-    parsed.task,
-    parsed.workerCount,
-    parsed.agentType,
-    parsed.explicitAgentType,
-    parsed.explicitWorkerCount,
-  );
+  const executionPlan = buildRepoAwareTeamExecutionPlan({
+    task: parsed.task,
+    workerCount: parsed.workerCount,
+    agentType: parsed.agentType,
+    explicitAgentType: parsed.explicitAgentType,
+    explicitWorkerCount: parsed.explicitWorkerCount,
+    cwd,
+    buildLegacyPlan: buildTeamExecutionPlan,
+    allowDagHandoff: parsed.allowRepoAwareDagHandoff,
+  });
   const tasks = executionPlan.tasks;
   const effectiveParsed = executionPlan.workerCount === parsed.workerCount
     ? parsed
@@ -1453,7 +1467,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
     executionPlan.workerCount,
     tasks,
     cwd,
-    { worktreeMode },
+    { worktreeMode, decompositionMetadata: executionPlan.metadata },
   );
 
   await ensureTeamModeState(effectiveParsed, tasks);

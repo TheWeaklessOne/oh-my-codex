@@ -35,6 +35,7 @@ export const SUPPORTED_STATE_READ_MODES = [
   'ultraqa',
   'ralplan',
   'deep-interview',
+  'skill-active',
 ] as const;
 
 export type SupportedStateReadMode = (typeof SUPPORTED_STATE_READ_MODES)[number];
@@ -131,6 +132,18 @@ async function listStateSessionIds(cwd: string): Promise<string[]> {
     .filter((entry) => entry.trim().length > 0);
 }
 
+function hasExplicitStateField(
+  fields: Record<string, unknown>,
+  customState: unknown,
+  key: string,
+): boolean {
+  return Object.prototype.hasOwnProperty.call(fields, key)
+    || (
+      customState != null
+      && Object.prototype.hasOwnProperty.call(customState as Record<string, unknown>, key)
+    );
+}
+
 export async function listStateStatuses(
   cwd: string,
   explicitSessionId?: string,
@@ -198,10 +211,6 @@ export async function executeStateOperation(
   }
 
   try {
-    const stateScope = await resolveStateScope(cwd, explicitSessionId);
-    const effectiveSessionId = stateScope.sessionId;
-    await initializeStateEnvironment(cwd, effectiveSessionId);
-
     switch (name) {
       case 'state_read': {
         const mode = validateStrictReadableMode(rawArgs.mode);
@@ -215,6 +224,10 @@ export async function executeStateOperation(
       }
 
       case 'state_write': {
+        const stateScope = await resolveStateScope(cwd, explicitSessionId);
+        const effectiveSessionId = stateScope.sessionId;
+        await initializeStateEnvironment(cwd, effectiveSessionId);
+
         const mode = validateStateModeSegment(rawArgs.mode);
         const path = getStatePath(mode, cwd, effectiveSessionId);
         const {
@@ -243,13 +256,14 @@ export async function executeStateOperation(
             ...fields,
             ...((customState as Record<string, unknown>) || {}),
           } as Record<string, unknown>;
-          const explicitRunOutcome = Object.prototype.hasOwnProperty.call(fields, 'run_outcome')
-            || (
-              customState != null
-              && Object.prototype.hasOwnProperty.call(customState as Record<string, unknown>, 'run_outcome')
-            );
-          if (!explicitRunOutcome) {
+          if (!hasExplicitStateField(fields, customState, 'run_outcome')) {
             delete mergedRaw.run_outcome;
+          }
+          if (!hasExplicitStateField(fields, customState, 'lifecycle_outcome')) {
+            delete mergedRaw.lifecycle_outcome;
+          }
+          if (!hasExplicitStateField(fields, customState, 'terminal_outcome')) {
+            delete mergedRaw.terminal_outcome;
           }
 
           if (
@@ -354,6 +368,10 @@ export async function executeStateOperation(
       }
 
       case 'state_clear': {
+        const stateScope = await resolveStateScope(cwd, explicitSessionId);
+        const effectiveSessionId = stateScope.sessionId;
+        await initializeStateEnvironment(cwd, effectiveSessionId);
+
         const mode = validateStateModeSegment(rawArgs.mode);
         const allSessions = rawArgs.all_sessions === true;
 

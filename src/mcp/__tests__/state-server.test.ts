@@ -78,7 +78,7 @@ exit 1
 }
 
 describe('state-server directory initialization', () => {
-  it('creates .omx/state for state tools without setup', async () => {
+  it('keeps read-only state tools side-effect-free without setup', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
     const { handleStateToolCall } = await import('../state-server.js');
 
@@ -96,8 +96,8 @@ describe('state-server directory initialization', () => {
         },
       });
 
-      assert.equal(existsSync(stateDir), true);
-      assert.equal(existsSync(tmuxHookConfig), true);
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
       assert.deepEqual(
         JSON.parse(response.content[0]?.text || '{}'),
         { active_modes: [] },
@@ -107,7 +107,65 @@ describe('state-server directory initialization', () => {
     }
   });
 
-  it('bootstraps state-tool tmux-hook from the current tmux pane when available', async () => {
+  it('keeps missing state_read side-effect-free without setup', async () => {
+    process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
+    const { handleStateToolCall } = await import('../state-server.js');
+
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-read-test-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const tmuxHookConfig = join(wd, '.omx', 'tmux-hook.json');
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
+
+      const response = await handleStateToolCall({
+        params: {
+          name: 'state_read',
+          arguments: { workingDirectory: wd, mode: 'deep-interview' },
+        },
+      });
+
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
+      assert.deepEqual(
+        JSON.parse(response.content[0]?.text || '{}'),
+        { exists: false, mode: 'deep-interview' },
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps state_get_status side-effect-free without setup', async () => {
+    process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
+    const { handleStateToolCall } = await import('../state-server.js');
+
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-status-test-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const tmuxHookConfig = join(wd, '.omx', 'tmux-hook.json');
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
+
+      const response = await handleStateToolCall({
+        params: {
+          name: 'state_get_status',
+          arguments: { workingDirectory: wd },
+        },
+      });
+
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
+      assert.deepEqual(
+        JSON.parse(response.content[0]?.text || '{}'),
+        { statuses: {} },
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('bootstraps state-tool tmux-hook from the current tmux pane for mutating tools', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
     const { handleStateToolCall } = await import('../state-server.js');
 
@@ -125,11 +183,17 @@ describe('state-server directory initialization', () => {
         async () => {
           const response = await handleStateToolCall({
             params: {
-              name: 'state_list_active',
-              arguments: { workingDirectory: wd },
+              name: 'state_write',
+              arguments: {
+                workingDirectory: wd,
+                mode: 'deep-interview',
+                active: true,
+                current_phase: 'deep-interview',
+              },
             },
           });
-          assert.deepEqual(JSON.parse(response.content[0]?.text || '{}'), { active_modes: [] });
+          const payload = JSON.parse(response.content[0]?.text || '{}');
+          assert.equal(payload.success, true);
         },
       );
 
@@ -272,14 +336,18 @@ describe('state-server directory initialization', () => {
     }
   });
 
-  it('creates session-scoped state directory when session_id is provided', async () => {
+  it('keeps session-scoped state_get_status side-effect-free when session_id is provided', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
     const { handleStateToolCall } = await import('../state-server.js');
 
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-test-'));
     try {
+      const stateDir = join(wd, '.omx', 'state');
       const sessionDir = join(wd, '.omx', 'state', 'sessions', 'sess1');
+      const tmuxHookConfig = join(wd, '.omx', 'tmux-hook.json');
+      assert.equal(existsSync(stateDir), false);
       assert.equal(existsSync(sessionDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
 
       const response = await handleStateToolCall({
         params: {
@@ -288,7 +356,9 @@ describe('state-server directory initialization', () => {
         },
       });
 
-      assert.equal(existsSync(sessionDir), true);
+      assert.equal(existsSync(stateDir), false);
+      assert.equal(existsSync(sessionDir), false);
+      assert.equal(existsSync(tmuxHookConfig), false);
       assert.deepEqual(
         JSON.parse(response.content[0]?.text || '{}'),
         { statuses: {} },

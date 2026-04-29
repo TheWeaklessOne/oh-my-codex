@@ -4,6 +4,23 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-04-29
+
+Patch release focused on release-train hardening after `0.15.0`: direct/non-tmux leader launch controls, passive read-only state operations, concrete repo-aware Team DAG dependency remapping, setup/plugin-mode recovery, audited exec follow-ups, and runtime/hook reliability fixes.
+
+### Added
+- **Direct leader launch controls** — `omx --direct` and `OMX_LAUNCH_POLICY=direct|tmux|detached-tmux|auto` let operators opt out of OMX tmux/HUD management without changing the default detached-tmux startup behavior.
+- **Audited exec follow-ups** — running non-interactive `omx exec` jobs can receive queued follow-up instructions through the audited inject path.
+
+### Changed
+- **State reads are passive** — `state_read`, `state_list_active`, and `state_get_status` no longer initialize `.omx/state` or tmux-hook config as a side effect.
+- **Repo-aware Team DAG handoffs use concrete task IDs** — symbolic dependencies are remapped after task creation, then patched onto runtime task records before worker inbox/bootstrap generation.
+- **Setup/plugin guidance is clearer** — setup preserves explicit legacy/plugin choices, archives stale legacy assets in plugin mode, and documents direct launch escape hatches.
+
+### Fixed
+- **Runtime and hook hardening** — Stop lifecycle reads prefer canonical run-state, MCP state persistence survives transport disconnects, prompt resume avoids unverified PID hard failures, source-log text no longer trips hook blocks, and macOS startup polling pressure is reduced.
+- **Release metadata drift** — Node/Cargo metadata, lockfiles, plugin manifest, changelog, release body, release notes, and release-readiness collateral are aligned to `0.15.1`.
+
 ## [0.15.0] - 2026-04-25
 
 Minor release focused on making OMX easier to install, ship, and operate across Codex CLI, Codex App, plugin, native-agent, tmux, and Rust-backed execution surfaces. This release prepares the plugin delivery train, Visual Ralph, setup install-mode selection, native agent/model routing, hook/runtime hardening, Windows/tmux question reliability, CI hang protection, Rust compatibility fixes, and release collateral for the `0.15.0` cut.

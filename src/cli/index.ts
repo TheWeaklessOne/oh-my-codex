@@ -13,6 +13,7 @@ import { version } from "./version.js";
 import { tmuxHookCommand } from "./tmux-hook.js";
 import { hooksCommand } from "./hooks.js";
 import { hudCommand } from "../hud/index.js";
+import { sidecarCommand } from "../sidecar/index.js";
 import { teamCommand } from "./team.js";
 import { ralphCommand } from "./ralph.js";
 import { missionCommand } from "./mission.js";
@@ -55,6 +56,7 @@ import {
 import {
   resolveCodexConfigPathForLaunch,
   resolveCodexHomeForLaunch,
+  resolveProjectLocalCodexHomeForLaunch,
 } from "./codex-home.js";
 
 export {
@@ -62,6 +64,7 @@ export {
   readPersistedSetupScope,
   resolveCodexConfigPathForLaunch,
   resolveCodexHomeForLaunch,
+  resolveProjectLocalCodexHomeForLaunch,
 } from "./codex-home.js";
 import { SKILL_ACTIVE_STATE_MODE, syncCanonicalSkillStateForMode } from "../state/skill-active.js";
 import { isTrackedWorkflowMode } from "../state/workflow-transition.js";
@@ -99,7 +102,7 @@ import {
 } from "../team/tmux-session.js";
 import { getPackageRoot } from "../utils/package.js";
 import { codexConfigPath, preferLogicalPath, rememberOmxLaunchContext, resolveOmxEntryPath } from "../utils/paths.js";
-import { repairConfigIfNeeded } from "../config/generator.js";
+import { cleanCodexModelAvailabilityNuxIfNeeded, repairConfigIfNeeded } from "../config/generator.js";
 import { HUD_TMUX_HEIGHT_LINES } from "../hud/constants.js";
 import {
   createHudWatchPane as createSharedHudWatchPane,
@@ -138,6 +141,7 @@ import {
   type ParseNotifyTempContractResult,
 } from "../notifications/temp-contract.js";
 import { emitOmxWarpTabTitle } from "../warp/integration.js";
+import { execInjectCommand } from "../exec/followup.js";
 
 export function resolveNotifyFallbackWatcherScript(pkgRoot = getPackageRoot()): string {
   return resolveDistScript(pkgRoot, "notify-fallback-watcher.js");
@@ -159,8 +163,10 @@ export const HELP = `
 oh-my-codex (omx) - Multi-agent orchestration for Codex CLI
 
 Usage:
-  omx           Launch Codex CLI (HUD auto-attaches only when already inside tmux)
+  omx           Launch Codex CLI (detached tmux by default on supported interactive terminals)
   omx exec      Run codex exec non-interactively with OMX AGENTS/overlay injection
+  omx exec inject <session-id> --prompt <text>
+                Queue audited follow-up instructions for a running non-interactive exec job
   omx setup     Install skills, prompts, MCP servers, and scope-specific AGENTS.md
                 (user scope prompts for legacy vs plugin skill delivery when needed)
   omx update    Check npm now, update the global install immediately, then refresh setup
@@ -189,6 +195,7 @@ Usage:
   omx tmux-hook Manage tmux prompt injection workaround (init|status|validate|test)
   omx hooks     Manage hook plugins (init|status|validate|test)
   omx hud       Show HUD statusline (--watch, --json, --preset=NAME)
+  omx sidecar   Show read-only team/multi-agent visualization (--watch, --json, --tmux)
   omx state     Read/write/list OMX mode state via CLI parity surface
   omx notepad   CLI parity for OMX notepad MCP tools
   omx project-memory
@@ -220,6 +227,7 @@ Options:
   --madmax-spark  spark model for workers + bypass approvals for leader and workers
                 (shorthand for: --spark --madmax)
   --notify-temp  Enable temporary notification routing for this run/session only
+  --direct       Launch the interactive leader directly without OMX tmux/HUD management
   --tmux         Launch the interactive leader session in detached tmux
   --discord      Select Discord provider for temporary notification mode
   --slack        Select Slack provider for temporary notification mode
@@ -230,13 +238,32 @@ Options:
   -w, --worktree[=<name>]
                 Launch Codex in a git worktree (detached when no name is given)
   --force       Force reinstall (overwrite existing files)
+  --merge-agents
+                Merge OMX-managed AGENTS.md sections into an existing AGENTS.md
+                instead of overwriting user-authored content
   --dry-run     Show what would be done without doing it
   --plugin      Use Codex plugin delivery for omx setup and remove legacy OMX-managed user/project components
+  --legacy      Use legacy setup delivery for omx setup, overriding persisted plugin mode
+  --install-mode <legacy|plugin>
+                Explicit setup install mode (canonical form; --legacy/--plugin are aliases)
   --keep-config Skip config.toml cleanup during uninstall
   --purge       Remove .omx/ cache directory during uninstall
   --verbose     Show detailed output
   --scope       Setup scope for "omx setup" only:
                 user | project
+
+Launch policy:
+  OMX_LAUNCH_POLICY=direct|tmux|detached-tmux|auto
+                Choose the default leader launch policy when no CLI policy flag is present
+  unset OMX_LAUNCH_POLICY
+                Return to the auto/default policy (detached tmux on supported interactive terminals)
+  omx --direct --yolo
+                Run this launch without OMX tmux/HUD management
+  OMX_LAUNCH_POLICY=direct omx --yolo
+                Use direct launch from the environment
+  OMX_LAUNCH_POLICY=direct omx --tmux --yolo
+                CLI policy flags override the environment for one launch
+  Config files are intentionally not used for launch policy in this release.
 `;
 
 const REASONING_KEY = "model_reasoning_effort";
@@ -269,6 +296,7 @@ const ALLOWED_SHELLS = new Set([
   "/usr/local/bin/bash",
   "/usr/local/bin/zsh",
   "/usr/local/bin/fish",
+  "/opt/local/bin/zsh",
   "/opt/homebrew/bin/zsh",
 ]);
 const WINDOWS_DETACHED_BOOTSTRAP_DELAY_MS = 2500;
@@ -306,6 +334,7 @@ type CliCommand =
   | "tmux-hook"
   | "hooks"
   | "hud"
+  | "sidecar"
   | "state"
   | "wiki"
   | "mcp-serve"
@@ -329,6 +358,7 @@ const NESTED_HELP_COMMANDS = new Set<CliCommand>([
   "hooks",
   "list",
   "hud",
+  "sidecar",
   "state",
   "wiki",
   "mcp-serve",
@@ -348,8 +378,54 @@ export interface ResolvedCliInvocation {
 }
 
 export function resolveSetupInstallModeArg(args: string[]): SetupInstallMode | undefined {
-  if (args.includes("--plugin")) return "plugin";
-  return undefined;
+  let value: SetupInstallMode | undefined;
+  const setValue = (next: SetupInstallMode, source: string): void => {
+    if (value && value !== next) {
+      throw new Error(
+        `Conflicting setup install mode flags: ${source} selects ${next}, but another flag already selected ${value}`,
+      );
+    }
+    value = next;
+  };
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--plugin") {
+      setValue("plugin", arg);
+      continue;
+    }
+    if (arg === "--legacy") {
+      setValue("legacy", arg);
+      continue;
+    }
+    if (arg === "--install-mode") {
+      const next = args[index + 1];
+      if (!next || next.startsWith("-")) {
+        throw new Error(
+          `Missing setup install mode value after --install-mode. Expected one of: legacy, plugin`,
+        );
+      }
+      if (next !== "legacy" && next !== "plugin") {
+        throw new Error(
+          `Invalid setup install mode: ${next}. Expected one of: legacy, plugin`,
+        );
+      }
+      setValue(next, arg);
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--install-mode=")) {
+      const next = arg.slice("--install-mode=".length);
+      if (next !== "legacy" && next !== "plugin") {
+        throw new Error(
+          `Invalid setup install mode: ${next}. Expected one of: legacy, plugin`,
+        );
+      }
+      setValue(next, "--install-mode");
+    }
+  }
+
+  return value;
 }
 
 export function resolveSetupScopeArg(args: string[]): SetupScope | undefined {
@@ -416,6 +492,9 @@ export function commandOwnsLocalHelp(command: CliCommand): boolean {
 
 export type CodexLaunchPolicy = "inside-tmux" | "detached-tmux" | "direct";
 
+const OMX_LAUNCH_POLICY_ENV = "OMX_LAUNCH_POLICY";
+let warnedInvalidEnvLaunchPolicy = false;
+
 function splitLeaderLaunchPolicyArgs(args: string[]): {
   explicitPolicy?: CodexLaunchPolicy;
   remainingArgs: string[];
@@ -436,6 +515,11 @@ function splitLeaderLaunchPolicyArgs(args: string[]): {
       continue;
     }
 
+    if (arg === "--direct") {
+      explicitPolicy = "direct";
+      continue;
+    }
+
     if (arg === "--tmux") {
       explicitPolicy = "detached-tmux";
       continue;
@@ -453,6 +537,36 @@ export function resolveLeaderLaunchPolicyOverride(
   return splitLeaderLaunchPolicyArgs(args).explicitPolicy;
 }
 
+export function resolveEnvLaunchPolicyOverride(
+  env: NodeJS.ProcessEnv = process.env,
+): CodexLaunchPolicy | undefined {
+  const rawValue = env[OMX_LAUNCH_POLICY_ENV]?.trim();
+  if (!rawValue) return undefined;
+
+  const value = rawValue.toLowerCase();
+  if (value === "auto") return undefined;
+  if (value === "direct") return "direct";
+  if (value === "tmux" || value === "detached-tmux") return "detached-tmux";
+
+  if (!warnedInvalidEnvLaunchPolicy) {
+    warnedInvalidEnvLaunchPolicy = true;
+    console.warn(
+      `[omx] warning: invalid ${OMX_LAUNCH_POLICY_ENV}="${rawValue}". ` +
+        "Expected direct, tmux, detached-tmux, or auto. Falling back to auto/default launch policy.",
+    );
+  }
+  return undefined;
+}
+
+export function resolveEffectiveLeaderLaunchPolicyOverride(
+  args: string[],
+  env: NodeJS.ProcessEnv = process.env,
+): CodexLaunchPolicy | undefined {
+  return (
+    resolveLeaderLaunchPolicyOverride(args) ?? resolveEnvLaunchPolicyOverride(env)
+  );
+}
+
 export function resolveCodexLaunchPolicy(
   env: NodeJS.ProcessEnv = process.env,
   _platform: NodeJS.Platform = process.platform,
@@ -462,9 +576,9 @@ export function resolveCodexLaunchPolicy(
   stdoutIsTTY: boolean = Boolean(process.stdout.isTTY),
   explicitPolicy?: CodexLaunchPolicy,
 ): CodexLaunchPolicy {
+  if (explicitPolicy === "direct") return "direct";
   if (env.TMUX) return tmuxAvailable ? "inside-tmux" : "direct";
   if (explicitPolicy === "detached-tmux") return tmuxAvailable ? "detached-tmux" : "direct";
-  if (explicitPolicy === "direct") return "direct";
   if (_platform === "win32") return "direct";
   if (nativeWindows) return "direct";
   if (!stdinIsTTY || !stdoutIsTTY) return "direct";
@@ -527,7 +641,10 @@ function tmuxFailureMessage(error: unknown): string {
 }
 
 function isBenignMissingTmuxServerMessage(message: string): boolean {
-  return /no server running/i.test(message);
+  return (
+    /no server running/i.test(message) ||
+    /error connecting to .*\(No such file or directory\)/i.test(message)
+  );
 }
 
 export interface TmuxLaunchHealth {
@@ -736,6 +853,7 @@ export async function main(args: string[]): Promise<void> {
     "tmux-hook",
     "hooks",
     "hud",
+    "sidecar",
     "state",
     "mcp-serve",
     "status",
@@ -749,6 +867,7 @@ export async function main(args: string[]): Promise<void> {
   const flags = new Set(args.filter((a) => a.startsWith("--")));
   const options = {
     force: flags.has("--force"),
+    mergeAgents: flags.has("--merge-agents"),
     dryRun: flags.has("--dry-run"),
     verbose: flags.has("--verbose"),
     team: flags.has("--team"),
@@ -770,6 +889,7 @@ export async function main(args: string[]): Promise<void> {
       case "setup":
         await setup({
           force: options.force,
+          mergeAgents: options.mergeAgents,
           dryRun: options.dryRun,
           verbose: options.verbose,
           scope: resolveSetupScopeArg(args.slice(1)),
@@ -827,7 +947,11 @@ export async function main(args: string[]): Promise<void> {
         await exploreCommand(args.slice(1));
         break;
       case "exec":
-        await execWithOverlay(launchArgs);
+        if (launchArgs[0] === "inject") {
+          await execInjectCommand(launchArgs);
+        } else {
+          await execWithOverlay(launchArgs);
+        }
         break;
       case "sparkshell":
         await sparkshellCommand(args.slice(1));
@@ -849,6 +973,9 @@ export async function main(args: string[]): Promise<void> {
         break;
       case "hud":
         await hudCommand(args.slice(1));
+        break;
+      case "sidecar":
+        await sidecarCommand(args.slice(1));
         break;
       case "state":
         await stateCommand(args.slice(1));
@@ -1047,10 +1174,12 @@ export async function launchWithHud(args: string[]): Promise<void> {
     parsedWorktree.remainingArgs,
     process.env,
   );
-  const explicitLaunchPolicy = resolveLeaderLaunchPolicyOverride(
+  const explicitLaunchPolicy = resolveEffectiveLeaderLaunchPolicyOverride(
     notifyTempResult.passthroughArgs,
+    process.env,
   );
   const codexHomeOverride = resolveCodexHomeForLaunch(launchCwd, process.env);
+  const projectLocalCodexHomeForCleanup = resolveProjectLocalCodexHomeForLaunch(launchCwd, process.env);
   const { launchPolicy, effectiveExplicitLaunchPolicy } =
     resolveTmuxAwareLaunchPolicy(explicitLaunchPolicy, isNativeWindows());
   const enableNotifyFallbackAuthority = launchPolicy === "direct";
@@ -1145,7 +1274,7 @@ export async function launchWithHud(args: string[]): Promise<void> {
     );
   } finally {
     // ── Phase 3: postLaunch ─────────────────────────────────────────────
-    await postLaunch(cwd, sessionId, codexHomeOverride, enableNotifyFallbackAuthority);
+    await postLaunch(cwd, sessionId, codexHomeOverride, enableNotifyFallbackAuthority, projectLocalCodexHomeForCleanup);
   }
 }
 
@@ -1157,6 +1286,7 @@ export async function execWithOverlay(args: string[]): Promise<void> {
     process.env,
   );
   const codexHomeOverride = resolveCodexHomeForLaunch(launchCwd, process.env);
+  const projectLocalCodexHomeForCleanup = resolveProjectLocalCodexHomeForLaunch(launchCwd, process.env);
   const normalizedArgs = normalizeCodexLaunchArgs(
     notifyTempResult.passthroughArgs,
   );
@@ -1245,7 +1375,7 @@ export async function execWithOverlay(args: string[]): Promise<void> {
       : codexEnvBase;
     runCodexBlocking(cwd, codexArgs, codexEnv);
   } finally {
-    await postLaunch(cwd, sessionId, codexHomeOverride, true);
+    await postLaunch(cwd, sessionId, codexHomeOverride, true, projectLocalCodexHomeForCleanup);
   }
 }
 
@@ -1633,9 +1763,18 @@ function escapeShellDoubleQuotedValue(value: string): string {
   return value.replace(/["\\$`]/g, "\\$&");
 }
 
+interface TmuxExtendedKeysLeaseHolderRecord {
+  id: string;
+  pid: number;
+  platform?: NodeJS.Platform;
+  linuxStartTicks?: number;
+}
+
+type TmuxExtendedKeysLeaseHolder = string | TmuxExtendedKeysLeaseHolderRecord;
+
 interface TmuxExtendedKeysLeaseState {
   originalMode: string;
-  holders: string[];
+  holders: TmuxExtendedKeysLeaseHolder[];
 }
 
 function sanitizeTmuxLeaseKey(value: string): string {
@@ -1676,6 +1815,27 @@ function tmuxExtendedKeysLeasePath(cwd: string, socketPath: string): string {
   );
 }
 
+function isTmuxExtendedKeysLeaseHolderRecord(
+  holder: unknown,
+): holder is TmuxExtendedKeysLeaseHolderRecord {
+  if (!holder || typeof holder !== "object") return false;
+  const record = holder as Record<string, unknown>;
+  if (typeof record.id !== "string" || !record.id.trim()) return false;
+  if (!Number.isSafeInteger(record.pid) || Number(record.pid) <= 0) return false;
+  if (record.platform !== undefined && typeof record.platform !== "string") return false;
+  if (
+    record.linuxStartTicks !== undefined &&
+    !Number.isSafeInteger(record.linuxStartTicks)
+  ) return false;
+  return true;
+}
+
+function isTmuxExtendedKeysLeaseHolder(
+  holder: unknown,
+): holder is TmuxExtendedKeysLeaseHolder {
+  return typeof holder === "string" || isTmuxExtendedKeysLeaseHolderRecord(holder);
+}
+
 function readTmuxExtendedKeysLeaseState(
   leasePath: string,
 ): TmuxExtendedKeysLeaseState | null {
@@ -1688,7 +1848,7 @@ function readTmuxExtendedKeysLeaseState(
     if (
       typeof parsed.originalMode !== "string" ||
       !Array.isArray(parsed.holders) ||
-      !parsed.holders.every((holder) => typeof holder === "string")
+      !parsed.holders.every(isTmuxExtendedKeysLeaseHolder)
     ) {
       return null;
     }
@@ -1707,6 +1867,92 @@ function writeTmuxExtendedKeysLeaseState(
 ): void {
   mkdirSync(dirname(leasePath), { recursive: true });
   writeFileSync(leasePath, JSON.stringify(state, null, 2));
+}
+
+function parseTmuxExtendedKeysLeaseHolderPid(holder: string): number | null {
+  const match = /^([1-9]\d*)-/.exec(holder);
+  if (!match) return null;
+  const pid = Number.parseInt(match[1], 10);
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+}
+
+function getTmuxExtendedKeysLeaseHolderId(holder: TmuxExtendedKeysLeaseHolder): string {
+  return typeof holder === "string" ? holder : holder.id;
+}
+
+function getTmuxExtendedKeysLeaseHolderPid(holder: TmuxExtendedKeysLeaseHolder): number | null {
+  if (typeof holder === "string") return parseTmuxExtendedKeysLeaseHolderPid(holder);
+  return Number.isSafeInteger(holder.pid) && holder.pid > 0 ? holder.pid : null;
+}
+
+function parseLinuxProcStartTicks(statContent: string): number | null {
+  const commandEnd = statContent.lastIndexOf(")");
+  if (commandEnd === -1) return null;
+
+  const remainder = statContent.slice(commandEnd + 1).trim();
+  const fields = remainder.split(/\s+/);
+  if (fields.length <= 19) return null;
+
+  const startTicks = Number(fields[19]);
+  return Number.isSafeInteger(startTicks) ? startTicks : null;
+}
+
+function readLinuxProcessStartTicks(pid: number): number | null {
+  try {
+    return parseLinuxProcStartTicks(readFileSync(`/proc/${pid}/stat`, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+function createTmuxExtendedKeysLeaseHolder(
+  id: string,
+  pid: number,
+): TmuxExtendedKeysLeaseHolderRecord {
+  const linuxStartTicks = process.platform === "linux"
+    ? readLinuxProcessStartTicks(pid) ?? undefined
+    : undefined;
+  return {
+    id,
+    pid,
+    platform: process.platform,
+    ...(linuxStartTicks !== undefined ? { linuxStartTicks } : {}),
+  };
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code =
+      err && typeof err === "object" && "code" in err
+        ? String((err as NodeJS.ErrnoException).code)
+        : "";
+    return code === "EPERM";
+  }
+}
+
+function isTmuxExtendedKeysLeaseHolderAlive(
+  holder: TmuxExtendedKeysLeaseHolder,
+): boolean {
+  const pid = getTmuxExtendedKeysLeaseHolderPid(holder);
+  if (pid === null || !isProcessAlive(pid)) return false;
+
+  if (typeof holder === "string") return true;
+  if (holder.platform !== "linux" || process.platform !== "linux") return true;
+  if (holder.linuxStartTicks === undefined) return true;
+
+  return readLinuxProcessStartTicks(pid) === holder.linuxStartTicks;
+}
+
+function reapDeadTmuxExtendedKeysLeaseHolders(
+  state: TmuxExtendedKeysLeaseState,
+): TmuxExtendedKeysLeaseState {
+  return {
+    originalMode: state.originalMode,
+    holders: state.holders.filter(isTmuxExtendedKeysLeaseHolderAlive),
+  };
 }
 
 function withTmuxExtendedKeysLeaseLock<T>(
@@ -1813,13 +2059,24 @@ export function acquireTmuxExtendedKeysLease(
       encoding: "utf-8",
       ...(process.platform === "win32" ? { windowsHide: true } : {}),
     }) as string,
+  ownerPid = process.pid,
 ): string | null {
   try {
     const socketPath = resolveTmuxSocketPath(execFileSyncImpl);
     const leasePath = tmuxExtendedKeysLeasePath(cwd, socketPath);
-    const leaseId = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const holderPid =
+      Number.isSafeInteger(ownerPid) && ownerPid > 0 ? ownerPid : process.pid;
+    const leaseId = `${holderPid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     withTmuxExtendedKeysLeaseLock(cwd, socketPath, () => {
-      const state = readTmuxExtendedKeysLeaseState(leasePath);
+      const stateRaw = readTmuxExtendedKeysLeaseState(leasePath);
+      const state = stateRaw ? reapDeadTmuxExtendedKeysLeaseHolders(stateRaw) : null;
+      if (stateRaw && state?.holders.length === 0) {
+        execTmuxSync(
+          ["set-option", "-sq", "extended-keys", state.originalMode],
+          execFileSyncImpl,
+        );
+        rmSync(leasePath, { force: true });
+      }
       if (!state || state.holders.length === 0) {
         const previousMode =
           execTmuxSync(["show-options", "-sv", "extended-keys"], execFileSyncImpl) ||
@@ -1830,12 +2087,12 @@ export function acquireTmuxExtendedKeysLease(
         );
         writeTmuxExtendedKeysLeaseState(leasePath, {
           originalMode: previousMode,
-          holders: [leaseId],
+          holders: [createTmuxExtendedKeysLeaseHolder(leaseId, holderPid)],
         });
         return;
       }
 
-      state.holders.push(leaseId);
+      state.holders.push(createTmuxExtendedKeysLeaseHolder(leaseId, holderPid));
       writeTmuxExtendedKeysLeaseState(leasePath, state);
     });
     return `${socketPath}\t${leaseId}`;
@@ -1862,13 +2119,22 @@ export function releaseTmuxExtendedKeysLease(
   try {
     const leasePath = tmuxExtendedKeysLeasePath(cwd, socketPath);
     withTmuxExtendedKeysLeaseLock(cwd, socketPath, () => {
-      const state = readTmuxExtendedKeysLeaseState(leasePath);
+      const stateRaw = readTmuxExtendedKeysLeaseState(leasePath);
+      const state = stateRaw ? reapDeadTmuxExtendedKeysLeaseHolders(stateRaw) : null;
       if (!state || state.holders.length === 0) {
+        if (stateRaw) {
+          execTmuxSync(
+            ["set-option", "-sq", "extended-keys", stateRaw.originalMode],
+            execFileSyncImpl,
+          );
+        }
         rmSync(leasePath, { force: true });
         return;
       }
 
-      const holders = state.holders.filter((holder) => holder !== leaseId);
+      const holders = state.holders.filter(
+        (holder) => getTmuxExtendedKeysLeaseHolderId(holder) !== leaseId,
+      );
       if (holders.length > 0) {
         writeTmuxExtendedKeysLeaseState(leasePath, {
           originalMode: state.originalMode,
@@ -1897,7 +2163,7 @@ function buildTmuxExtendedKeysHelperCommand(
   const tmuxBinaryLiteral = quoteShellArg(resolveTmuxExecutableForLaunch());
   const script =
     operation === "acquire"
-      ? `const mod = await import(${moduleUrlLiteral}); const lease = mod.acquireTmuxExtendedKeysLease(${cwdLiteral}); if (lease) process.stdout.write(lease);`
+      ? `const mod = await import(${moduleUrlLiteral}); const ownerPid = Number.parseInt(process.argv[1] ?? "", 10); const lease = mod.acquireTmuxExtendedKeysLease(${cwdLiteral}, undefined, Number.isSafeInteger(ownerPid) && ownerPid > 0 ? ownerPid : undefined); if (lease) process.stdout.write(lease);`
       : `const mod = await import(${moduleUrlLiteral}); mod.releaseTmuxExtendedKeysLease(${cwdLiteral}, process.argv[1] ?? "");`;
   return `OMX_TMUX_BINARY=${tmuxBinaryLiteral} ${quoteShellArg(process.execPath)} --input-type=module -e ${quoteShellArg(script)}`;
 }
@@ -1913,7 +2179,7 @@ function buildTmuxExtendedKeysAcquireShellSnippet(cwd: string): string {
   const showOptionsCmd = buildTmuxShellCommandLiteral(["show-options", "-sv", "extended-keys"]);
   const setAlwaysCmd = buildTmuxShellCommandLiteral(["set-option", "-sq", "extended-keys", TMUX_EXTENDED_KEYS_MODE]);
   return [
-    `OMX_TMUX_EXTENDED_KEYS_LEASE=$(${buildTmuxExtendedKeysHelperCommand(cwd, "acquire")} 2>/dev/null || true);`,
+    `OMX_TMUX_EXTENDED_KEYS_LEASE=$(${buildTmuxExtendedKeysHelperCommand(cwd, "acquire")} "$$" 2>/dev/null || true);`,
     'if [ -z "${OMX_TMUX_EXTENDED_KEYS_LEASE:-}" ]; then',
     `${displaySocketCmd} >/dev/null 2>&1 || true;`,
     `OMX_TMUX_EXTENDED_KEYS_ORIGINAL=$(${showOptionsCmd} 2>/dev/null || printf ${quoteShellArg(TMUX_EXTENDED_KEYS_FALLBACK_MODE)});`,
@@ -2696,6 +2962,10 @@ function runCodex(
       ? buildWindowsPromptCommand("codex", launchArgs)
       : null;
     const sessionName = buildDetachedTmuxSessionName(cwd, sessionId);
+    void writeSessionStart(cwd, sessionId, { tmuxSessionName: sessionName }).catch((err) => {
+      logCliOperationFailure(err);
+      // Non-fatal: managed tmux recovery can still use compatibility fallback.
+    });
     let createdDetachedSession = false;
     let registeredHookTarget: string | null = null;
     let registeredHookName: string | null = null;
@@ -2958,6 +3228,7 @@ async function postLaunch(
   sessionId: string,
   codexHomeOverride?: string,
   enableNotifyFallbackAuthority: boolean = false,
+  projectLocalCodexHomeForCleanup?: string,
 ): Promise<void> {
   // Capture session start time before cleanup (writeSessionEnd deletes session.json)
   let sessionStartedAt: string | undefined;
@@ -3002,6 +3273,19 @@ async function postLaunch(
   } catch (err) {
     logCliOperationFailure(err);
     // Non-fatal
+  }
+
+  // 0.5. Remove Codex transient TUI NUX counters from project-local config only.
+  try {
+    if (projectLocalCodexHomeForCleanup) {
+      await cleanCodexModelAvailabilityNuxIfNeeded(
+        join(projectLocalCodexHomeForCleanup, "config.toml"),
+      );
+    }
+  } catch (err) {
+    console.error(
+      `[omx] postLaunch: project config transient NUX cleanup failed: ${err instanceof Error ? err.message : err}`,
+    );
   }
 
   // 1. Remove session-scoped model instructions file

@@ -152,6 +152,7 @@ export function detectMcpTransportFailure(
   payload: CodexHookPayload,
 ): McpTransportFailureSignal | null {
   const normalized = normalizePostToolUsePayload(payload);
+  if (normalized.isBash) return null;
   const combined = [
     normalized.stderrText,
     normalized.stdoutText,
@@ -591,10 +592,6 @@ function buildGitCommitEnforcementOutput(commandText: string): Record<string, un
       "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
-      additionalContext: [
-        "Lore-format git commit enforcement triggered.",
-        ...errors.map((error) => `- ${error}`),
-      ].join("\n"),
     },
     systemMessage: [
       "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
@@ -764,10 +761,17 @@ function containsHardFailure(text: string): boolean {
   return /command not found|permission denied|no such file or directory/i.test(text);
 }
 
+function hasActionableBashHardFailure(normalized: NormalizedPostToolUsePayload): boolean {
+  if (containsHardFailure(normalized.stderrText)) return true;
+  if (normalized.exitCode === null || normalized.exitCode === 0) return false;
+  return containsHardFailure(`${normalized.stderrText}\n${normalized.stdoutText}`);
+}
+
 export function buildNativePostToolUseOutput(
   payload: CodexHookPayload,
 ): Record<string, unknown> | null {
-  const mcpTransportFailure = detectMcpTransportFailure(payload);
+  const normalized = normalizePostToolUsePayload(payload);
+  const mcpTransportFailure = normalized.isBash ? null : detectMcpTransportFailure(payload);
   if (mcpTransportFailure) {
     const fallbackCommand = buildOmxParityFallbackCommand(payload, mcpTransportFailure.toolName);
     const fallbackText = fallbackCommand
@@ -784,12 +788,10 @@ export function buildNativePostToolUseOutput(
     };
   }
 
-  const normalized = normalizePostToolUsePayload(payload);
   if (!normalized.isBash) return null;
 
   const combined = `${normalized.stderrText}\n${normalized.stdoutText}`.trim();
-  if (normalized.exitCode === 0) return null;
-  if (containsHardFailure(combined)) {
+  if (hasActionableBashHardFailure(normalized)) {
     return {
       decision: "block",
       reason: "The Bash output indicates a command/setup failure that should be fixed before retrying.",

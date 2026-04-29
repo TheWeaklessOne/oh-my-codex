@@ -51,7 +51,7 @@ It keeps Codex as the execution engine and makes it easier to:
 | HaD0Yun | [@HaD0Yun](https://github.com/HaD0Yun) |
 | Junho Yeo | [@junhoyeo](https://github.com/junhoyeo) |
 | JiHongKim98 | [@JiHongKim98](https://github.com/JiHongKim98) |
-| Lor | — |
+| Lor | [@gobylor](https://github.com/gobylor) |
 | HyunjunJeon | [@HyunjunJeon](https://github.com/HyunjunJeon) |
 
 ## Recommended default flow
@@ -65,7 +65,7 @@ omx --madmax --high
 
 On a real `oh-my-codex` version bump, the global npm install now prints an explicit reminder instead of launching `omx setup` automatically. When you're ready, run `omx setup` manually or use `omx update` to check npm and then run the same setup refresh path.
 
-**Codex plugin install note:** this repo also ships an official Codex plugin layout at `plugins/oh-my-codex` with marketplace metadata in `.agents/plugins/marketplace.json`. That plugin now bundles the mirrored skill surface plus plugin-scoped companion metadata for MCP servers and apps. Native/runtime hooks still stay on the setup/runtime side rather than the installable plugin manifest. It is still **not** a replacement for `npm install -g oh-my-codex` plus `omx setup`: `omx setup` remains responsible for native agents, prompts/config/hooks/AGENTS.md/HUD/runtime wiring, including native `.codex/hooks.json` coverage.
+**Codex plugin install note:** this repo also ships an official Codex plugin layout at `plugins/oh-my-codex` with marketplace metadata in `.agents/plugins/marketplace.json`. That plugin bundles the mirrored skill surface plus plugin-scoped companion metadata for MCP servers and apps. Native/runtime hooks still stay on the setup/runtime side rather than the installable plugin manifest. It is still **not** a replacement for `npm install -g oh-my-codex` plus `omx setup`: legacy setup mode installs native agents and prompts, while plugin setup mode relies on plugin discovery for bundled skills and archives/removes legacy OMX-managed prompts/native-agent TOMLs so stale role files cannot shadow plugin behavior.
 
 Then work normally inside Codex:
 
@@ -119,12 +119,40 @@ Launch OMX the recommended way:
 omx --madmax --high
 ```
 
-This starts the interactive leader session directly by default.
-If you explicitly want the leader session in tmux, use:
+On macOS/Linux interactive terminals with `tmux` available, this starts the
+leader in OMX-managed detached tmux by default so the HUD/runtime panes can be
+created and recovered.
+
+If you want a one-off launch with no OMX tmux/HUD management, use `--direct`:
 
 ```bash
-omx --tmux --madmax --high
+omx --direct --yolo
 ```
+
+For a persistent shell/profile preference, set an environment policy:
+
+```bash
+OMX_LAUNCH_POLICY=direct omx --yolo
+```
+
+Return to the auto/default behavior with:
+
+```bash
+unset OMX_LAUNCH_POLICY
+```
+
+CLI policy flags win over the environment, and the last CLI policy flag before
+`--` wins:
+
+```bash
+OMX_LAUNCH_POLICY=direct omx --tmux --yolo
+```
+
+Use `OMX_LAUNCH_POLICY=direct|tmux|detached-tmux|auto`. This iteration only
+adds CLI and environment controls; it intentionally does not add a config-file
+setting. If you run `--direct` from inside an existing tmux pane, OMX will not
+create HUD splits, enable mouse mode, or wrap extended-key handling, but the
+process still runs inside that already-open terminal pane.
 
 Then try the canonical workflow:
 
@@ -205,6 +233,7 @@ These are operator/support surfaces:
 - Codex plugin marketplace install/discovery can cache the plugin under `${CODEX_HOME:-~/.codex}/plugins/cache/$MARKETPLACE_NAME/oh-my-codex/$VERSION/` (local installs may use `local` as the version identifier); that packaged plugin now includes plugin-scoped companion metadata for MCP servers and apps, while native/runtime hooks remain setup-owned, so it is still not the full OMX runtime setup
 - `omx setup` installs prompts, skills, AGENTS scaffolding, `.codex/config.toml`, and OMX-managed native Codex hooks in `.codex/hooks.json`
   - setup refresh preserves non-OMX hook entries in `.codex/hooks.json` and only rewrites OMX-managed wrappers
+  - `omx setup --merge-agents` preserves existing `AGENTS.md` guidance while inserting or refreshing generated OMX sections between `<!-- OMX:AGENTS:START -->` / `<!-- OMX:AGENTS:END -->`; without `--merge-agents` or `--force`, non-interactive setup keeps skipping existing `AGENTS.md` files
   - `omx uninstall` removes OMX-managed wrappers from `.codex/hooks.json` but keeps the file when user hooks remain
 - `omx update` checks npm immediately, installs the newest global OMX build, then reruns the same interactive setup refresh path
 - fresh OMX-managed `gpt-5.5` config seeding now recommends `model_context_window = 250000` and `model_auto_compact_token_limit = 200000`, but only when those keys are missing
@@ -393,6 +422,7 @@ If `Shift+Enter` still submits instead of inserting a newline inside an OMX-mana
 - `omx explore --prompt "..."` is for read-only repository lookup
 - `omx sparkshell <command>` is for shell-native inspection and bounded verification
 - when `.omx/wiki/` exists, `omx explore` can inject wiki-first context before falling back to broader repository search
+- fallback boundaries are explicit: sparkshell-backend fallback is reported on stderr, and spark-model fallback emits stderr metadata plus an `## OMX Explore fallback` notice in stdout so users can see when cost/behavior may differ from the low-cost path
 
 Examples:
 
