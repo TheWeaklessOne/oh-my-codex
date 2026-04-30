@@ -15,6 +15,7 @@ Resolved setup scope: user
   [OK] Legacy skill roots: no ~/.agents/skills overlap detected
   [!!] AGENTS.md: not found in <CODEX_HOME>/AGENTS.md (run omx setup --scope user)
   [!!] State dir: <REPO_STATE_DIR> (not created yet)
+  [OK] Session actor routing: no active session; runtime delivery code has no legacy origin-index authority
   [!!] MCP Servers: 1 servers but no OMX servers yet (expected before first setup; run "omx setup --force" once)
   [OK] Prompt triage: config: enabled (default)
 

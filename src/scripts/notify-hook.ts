@@ -68,6 +68,8 @@ import {
   planCompletedTurnNotification,
 } from '../notifications/completed-turn.js';
 import { resolveTurnOriginForNotification } from '../runtime/codex-session-origin.js';
+import { markOwnerCompleted } from '../runtime/session-actors.js';
+import { reconcileRalphTerminalStateScope } from '../runtime/ralph-state-scope.js';
 import { consumePendingReplyOrigin } from '../notifications/reply-origin-state.js';
 import {
   expirePendingRoutes,
@@ -1639,9 +1641,28 @@ async function main() {
     reason: originResolution.reason,
     actor_id: originResolution.actorId || null,
     owner_actor_id: originResolution.ownerActorId || null,
+    actor_lifecycle_status: originResolution.actorLifecycleStatus || null,
+    actor_claim_strength: originResolution.actorClaimStrength || null,
+    owner_lifecycle_status: originResolution.ownerLifecycleStatus || null,
+    owner_claim_strength: originResolution.ownerClaimStrength || null,
+    replaceable_owner: originResolution.replaceableOwner ?? null,
     origin_evidence: originResolution.evidence,
     evidence_sources: originResolution.evidence.map((entry) => entry.source),
   });
+  if (!isTeamWorker) {
+    const ralphScopeReconcile = await reconcileRalphTerminalStateScope(cwd, getEffectiveSessionId())
+      .catch(() => null);
+    if (ralphScopeReconcile?.reconciled) {
+      await logNotifyHookEvent(logsDir, {
+        timestamp: new Date().toISOString(),
+        type: 'ralph_session_scope_terminal_reconciled',
+        omx_session_id: getEffectiveSessionId() || null,
+        reason: ralphScopeReconcile.reason,
+        root_path: ralphScopeReconcile.rootPath || null,
+        session_path: ralphScopeReconcile.sessionPath || null,
+      });
+    }
+  }
 
   // Turn-level dedupe prevents double-processing when native notify and fallback
   // watcher both emit the same completed turn.
@@ -3079,6 +3100,11 @@ async function main() {
           omx_session_id: notifySessionId || null,
           actor_id: originResolution.actorId || null,
           owner_actor_id: originResolution.ownerActorId || null,
+          actor_lifecycle_status: originResolution.actorLifecycleStatus || null,
+          actor_claim_strength: originResolution.actorClaimStrength || null,
+          owner_lifecycle_status: originResolution.ownerLifecycleStatus || null,
+          owner_claim_strength: originResolution.ownerClaimStrength || null,
+          replaceable_owner: originResolution.replaceableOwner ?? null,
           parent_thread_id: turnOrigin.parentThreadId || null,
           agent_nickname: turnOrigin.agentNickname || null,
           agent_role: turnOrigin.agentRole || null,
@@ -3157,6 +3183,11 @@ async function main() {
           omx_session_id: notifySessionId || null,
           actor_id: originResolution.actorId || null,
           owner_actor_id: originResolution.ownerActorId || null,
+          actor_lifecycle_status: originResolution.actorLifecycleStatus || null,
+          actor_claim_strength: originResolution.actorClaimStrength || null,
+          owner_lifecycle_status: originResolution.ownerLifecycleStatus || null,
+          owner_claim_strength: originResolution.ownerClaimStrength || null,
+          replaceable_owner: originResolution.replaceableOwner ?? null,
           parent_thread_id: turnOrigin.parentThreadId || null,
           agent_nickname: turnOrigin.agentNickname || null,
           agent_role: turnOrigin.agentRole || null,
@@ -3303,6 +3334,13 @@ async function main() {
               notifySessionId,
               decision!.effectiveFingerprint,
             );
+            await markOwnerCompleted({
+              cwd,
+              sessionId: notifySessionId,
+              actorId: originResolution.actorId || originResolution.ownerActorId,
+              turnId: safeString(payload['turn-id'] || payload.turn_id || ''),
+              source: 'notify-hook-delivered',
+            }).catch(() => null);
             completedTurnDeliveryStatus = 'sent';
             await logNotifyHookEvent(logsDir, {
               timestamp: new Date().toISOString(),

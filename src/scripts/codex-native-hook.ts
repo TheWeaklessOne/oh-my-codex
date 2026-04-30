@@ -65,8 +65,10 @@ import { readRunState } from "../runtime/run-state.js";
 import { getRunContinuationSnapshot, shouldContinueRun } from "../runtime/run-loop.js";
 import {
   classifySessionStartActor,
+  recordActorTranscriptLifecycle,
   registerActorSessionStart,
 } from "../runtime/session-actors.js";
+import { readCodexTranscriptLifecycle } from "../runtime/codex-transcript-lifecycle.js";
 import { triagePrompt } from "../hooks/triage-heuristic.js";
 import { readTriageConfig } from "../hooks/triage-config.js";
 import {
@@ -2083,13 +2085,16 @@ export async function dispatchCodexNativeHook(
   let resolvedNativeSessionId = nativeSessionId;
   let skipCanonicalSessionStartContext = false;
 
-if (hookEventName === "SessionStart" && nativeSessionId) {
+  if (hookEventName === "SessionStart" && nativeSessionId) {
     const transcriptPath = safeString(payload.transcript_path ?? payload.transcriptPath).trim();
-    const transcriptSessionMeta = readTranscriptSessionMetaPayload(transcriptPath);
+    const transcriptLifecycle = await readCodexTranscriptLifecycle(transcriptPath).catch(() => null);
+    const transcriptSessionMeta = transcriptLifecycle?.sessionMeta
+      ?? readTranscriptSessionMetaPayload(transcriptPath);
     const actorClassification = classifySessionStartActor({
       payload: {
         ...payload,
         thread_id: threadId || nativeSessionId,
+        omx_session_id: canonicalSessionId || currentSessionState?.session_id,
       },
       transcriptSessionMeta,
       env: process.env,
@@ -2102,6 +2107,8 @@ if (hookEventName === "SessionStart" && nativeSessionId) {
         sessionId: canonicalSessionId,
         classification: actorClassification,
         pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
+        transcriptPath,
+        lifecycle: transcriptLifecycle,
       }).catch(() => null);
       if (registration?.outcome === "actor-registered" && subagentSessionStart) {
         resolvedNativeSessionId = nativeSessionId;
@@ -2128,6 +2135,8 @@ if (hookEventName === "SessionStart" && nativeSessionId) {
         const sessionState = await reconcileNativeSessionStart(cwd, nativeSessionId, {
           pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
           ownerKind: "external-owner",
+          transcriptPath,
+          lifecycle: transcriptLifecycle,
         });
         canonicalSessionId = safeString(sessionState.session_id).trim() || canonicalSessionId;
         resolvedNativeSessionId = safeString(sessionState.native_session_id).trim()
@@ -2145,6 +2154,8 @@ if (hookEventName === "SessionStart" && nativeSessionId) {
         pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
         ownerKind: actorClassification.audience,
         parentThreadId: actorClassification.parentThreadId,
+        transcriptPath,
+        lifecycle: transcriptLifecycle,
       });
       canonicalSessionId = actorClassification.audience === "external-owner" || currentSessionState
         ? safeString(sessionState.session_id).trim()
@@ -2166,6 +2177,23 @@ if (hookEventName === "SessionStart" && nativeSessionId) {
     if (canonicalSessionId && safeString(currentSessionState?.session_id).trim() === canonicalSessionId) {
       resolvedNativeSessionId =
         safeString(currentSessionState?.native_session_id).trim() || resolvedNativeSessionId;
+    }
+    const transcriptPath = safeString(payload.transcript_path ?? payload.transcriptPath).trim();
+    const transcriptLifecycle = await readCodexTranscriptLifecycle(transcriptPath).catch(() => null);
+    if (canonicalSessionId && transcriptLifecycle) {
+      await recordActorTranscriptLifecycle({
+        cwd,
+        sessionId: canonicalSessionId,
+        actorIds: [
+          threadId,
+          nativeSessionId,
+          resolvedNativeSessionId,
+          transcriptLifecycle.sessionMeta?.id as string | undefined,
+        ],
+        transcriptPath,
+        lifecycle: transcriptLifecycle,
+        timestamp: new Date().toISOString(),
+      }).catch(() => null);
     }
   }
 

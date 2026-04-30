@@ -14,7 +14,7 @@ import {
   isSessionStale,
   type SessionState,
 } from '../session.js';
-import { readSessionActors, registerActorSessionStart } from '../../runtime/session-actors.js';
+import { readSessionActors, recordActorLifecycleEvent, registerActorSessionStart } from '../../runtime/session-actors.js';
 import { writeSubagentTrackingState } from '../../subagents/tracker.js';
 
 interface SessionHistoryEntry {
@@ -311,6 +311,284 @@ describe('session lifecycle manager', () => {
       const dailyLog = await readFile(dailyLogPath, 'utf-8');
       assert.match(dailyLog, /"event":"session_start_external_owner_mismatch_quarantined"/);
       assert.match(dailyLog, /"native_session_id":"codex-native-new"/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not promote unknown SessionStart actors when the actor registry is missing', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-missing-registry-unknown-'));
+    try {
+      const sessionId = 'omx-missing-registry-unknown';
+      await writeSessionStart(cwd, sessionId, {
+        nativeSessionId: 'codex-owner-before-registry-loss',
+      });
+      await rm(join(cwd, '.omx', 'state', 'sessions', sessionId, 'actors.json'), { force: true });
+
+      const registration = await registerActorSessionStart({
+        cwd,
+        sessionId,
+        classification: {
+          kind: 'unknown',
+          audience: 'unknown-non-owner',
+          origin: {
+            kind: 'unknown',
+            threadId: 'codex-unknown-after-registry-loss',
+            nativeSessionId: 'codex-unknown-after-registry-loss',
+            source: 'session-start-payload',
+          },
+          actorId: 'codex-unknown-after-registry-loss',
+          threadId: 'codex-unknown-after-registry-loss',
+          nativeSessionId: 'codex-unknown-after-registry-loss',
+          source: 'session-start-payload',
+          reason: 'session_start_unknown-non-owner',
+          evidence: [{ source: 'session-start-payload', detail: 'origin_kind=unknown' }],
+          managedSessionId: sessionId,
+        },
+        pid: process.pid,
+      });
+
+      assert.equal(registration.outcome, 'actor-quarantined');
+      assert.equal(registration.reason, 'non_owner_without_owner');
+
+      const registry = await readSessionActors(cwd, sessionId);
+      assert.equal(registry.ownerActorId, undefined);
+      assert.equal(registry.actors['codex-unknown-after-registry-loss']?.quarantined, true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rebinds canonical native session when the prior owner aborted before completion', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-native-aborted-rebind-'));
+    try {
+      await writeSessionStart(cwd, 'omx-aborted-rebind', {
+        nativeSessionId: 'codex-native-aborted-owner',
+      });
+      await recordActorLifecycleEvent({
+        cwd,
+        sessionId: 'omx-aborted-rebind',
+        actorIds: ['codex-native-aborted-owner'],
+        event: 'task_started',
+        turnId: 'turn-aborted-owner',
+        source: 'test',
+      });
+      await recordActorLifecycleEvent({
+        cwd,
+        sessionId: 'omx-aborted-rebind',
+        actorIds: ['codex-native-aborted-owner'],
+        event: 'turn_aborted',
+        turnId: 'turn-aborted-owner',
+        source: 'test',
+      });
+
+      const reconciled = await reconcileNativeSessionStart(cwd, 'codex-native-replacement-owner', {
+        pid: process.pid,
+        platform: 'win32',
+        lifecycle: {
+          sessionMeta: { id: 'codex-native-replacement-owner', cwd },
+          contextCwd: cwd,
+          startedTurnCount: 1,
+          completedTurnCount: 0,
+          abortedTurnCount: 0,
+          lastTurnStatus: 'started',
+        },
+      });
+
+      assert.equal(reconciled.session_id, 'omx-aborted-rebind');
+      assert.equal(reconciled.native_session_id, 'codex-native-replacement-owner');
+
+      const persisted = await readSessionState(cwd);
+      assert.equal(persisted?.native_session_id, 'codex-native-replacement-owner');
+
+      const registry = await readSessionActors(cwd, 'omx-aborted-rebind');
+      assert.equal(registry.ownerActorId, 'codex-native-replacement-owner');
+      assert.equal(registry.actors['codex-native-aborted-owner']?.lifecycleStatus, 'superseded');
+      assert.equal(
+        registry.actors['codex-native-aborted-owner']?.supersededReason,
+        'owner_rebound_after_aborted_candidate',
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('quarantines aborted-owner replacements that lack authoritative transcript start evidence', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-native-aborted-missing-evidence-'));
+    try {
+      await writeSessionStart(cwd, 'omx-aborted-missing-evidence', {
+        nativeSessionId: 'codex-native-aborted-missing-evidence-owner',
+      });
+      await recordActorLifecycleEvent({
+        cwd,
+        sessionId: 'omx-aborted-missing-evidence',
+        actorIds: ['codex-native-aborted-missing-evidence-owner'],
+        event: 'task_started',
+        turnId: 'turn-aborted-missing-evidence-owner',
+        source: 'test',
+      });
+      await recordActorLifecycleEvent({
+        cwd,
+        sessionId: 'omx-aborted-missing-evidence',
+        actorIds: ['codex-native-aborted-missing-evidence-owner'],
+        event: 'turn_aborted',
+        turnId: 'turn-aborted-missing-evidence-owner',
+        source: 'test',
+      });
+
+      const reconciled = await reconcileNativeSessionStart(cwd, 'codex-native-replacement-no-evidence', {
+        pid: process.pid,
+        platform: 'win32',
+      });
+
+      assert.equal(reconciled.session_id, 'omx-aborted-missing-evidence');
+      assert.equal(reconciled.native_session_id, 'codex-native-aborted-missing-evidence-owner');
+
+      const registry = await readSessionActors(cwd, 'omx-aborted-missing-evidence');
+      assert.equal(registry.ownerActorId, 'codex-native-aborted-missing-evidence-owner');
+      assert.equal(registry.actors['codex-native-replacement-no-evidence']?.quarantined, true);
+      assert.equal(
+        registry.actors['codex-native-replacement-no-evidence']?.quarantineReason,
+        'owner_rebind_denied_missing_replacement_evidence',
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps replacement native session quarantined when an aborted owner became active again', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-native-active-again-no-rebind-'));
+    try {
+      await writeSessionStart(cwd, 'omx-active-again-no-rebind', {
+        nativeSessionId: 'codex-native-active-again-owner',
+      });
+      await recordActorLifecycleEvent({
+        cwd,
+        sessionId: 'omx-active-again-no-rebind',
+        actorIds: ['codex-native-active-again-owner'],
+        event: 'task_started',
+        turnId: 'turn-aborted-owner',
+        source: 'test',
+      });
+      await recordActorLifecycleEvent({
+        cwd,
+        sessionId: 'omx-active-again-no-rebind',
+        actorIds: ['codex-native-active-again-owner'],
+        event: 'turn_aborted',
+        turnId: 'turn-aborted-owner',
+        source: 'test',
+      });
+      await recordActorLifecycleEvent({
+        cwd,
+        sessionId: 'omx-active-again-no-rebind',
+        actorIds: ['codex-native-active-again-owner'],
+        event: 'task_started',
+        turnId: 'turn-active-again-owner',
+        source: 'test',
+      });
+
+      const reconciled = await reconcileNativeSessionStart(cwd, 'codex-native-active-again-replacement', {
+        pid: process.pid,
+        platform: 'win32',
+      });
+
+      assert.equal(reconciled.session_id, 'omx-active-again-no-rebind');
+      assert.equal(reconciled.native_session_id, 'codex-native-active-again-owner');
+
+      const registry = await readSessionActors(cwd, 'omx-active-again-no-rebind');
+      assert.equal(registry.ownerActorId, 'codex-native-active-again-owner');
+      assert.equal(registry.actors['codex-native-active-again-replacement']?.quarantined, true);
+      assert.equal(
+        registry.actors['codex-native-active-again-replacement']?.quarantineReason,
+        'unknown_actor_with_owner',
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps replacement native session quarantined when runtime pid evidence differs', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-native-runtime-mismatch-no-rebind-'));
+    try {
+      await writeSessionStart(cwd, 'omx-runtime-mismatch-no-rebind', {
+        nativeSessionId: 'codex-native-runtime-owner',
+        pid: process.pid,
+      });
+      await recordActorLifecycleEvent({
+        cwd,
+        sessionId: 'omx-runtime-mismatch-no-rebind',
+        actorIds: ['codex-native-runtime-owner'],
+        event: 'task_started',
+        turnId: 'turn-runtime-owner',
+        source: 'test',
+      });
+      await recordActorLifecycleEvent({
+        cwd,
+        sessionId: 'omx-runtime-mismatch-no-rebind',
+        actorIds: ['codex-native-runtime-owner'],
+        event: 'turn_aborted',
+        turnId: 'turn-runtime-owner',
+        source: 'test',
+      });
+
+      const reconciled = await reconcileNativeSessionStart(cwd, 'codex-native-runtime-replacement', {
+        pid: process.pid + 10_000,
+        platform: 'win32',
+      });
+
+      assert.equal(reconciled.session_id, 'omx-runtime-mismatch-no-rebind');
+      assert.equal(reconciled.native_session_id, 'codex-native-runtime-owner');
+
+      const registry = await readSessionActors(cwd, 'omx-runtime-mismatch-no-rebind');
+      assert.equal(registry.ownerActorId, 'codex-native-runtime-owner');
+      assert.equal(registry.actors['codex-native-runtime-replacement']?.quarantined, true);
+      assert.equal(
+        registry.actors['codex-native-runtime-replacement']?.quarantineReason,
+        'owner_rebind_denied_context_mismatch',
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps replacement native session quarantined when the prior owner completed', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-native-completed-no-rebind-'));
+    try {
+      await writeSessionStart(cwd, 'omx-completed-no-rebind', {
+        nativeSessionId: 'codex-native-completed-owner',
+      });
+      await recordActorLifecycleEvent({
+        cwd,
+        sessionId: 'omx-completed-no-rebind',
+        actorIds: ['codex-native-completed-owner'],
+        event: 'task_started',
+        turnId: 'turn-completed-owner',
+        source: 'test',
+      });
+      await recordActorLifecycleEvent({
+        cwd,
+        sessionId: 'omx-completed-no-rebind',
+        actorIds: ['codex-native-completed-owner'],
+        event: 'task_complete',
+        turnId: 'turn-completed-owner',
+        source: 'test',
+      });
+
+      const reconciled = await reconcileNativeSessionStart(cwd, 'codex-native-after-completed-owner', {
+        pid: process.pid,
+        platform: 'win32',
+      });
+
+      assert.equal(reconciled.session_id, 'omx-completed-no-rebind');
+      assert.equal(reconciled.native_session_id, 'codex-native-completed-owner');
+
+      const registry = await readSessionActors(cwd, 'omx-completed-no-rebind');
+      assert.equal(registry.ownerActorId, 'codex-native-completed-owner');
+      assert.equal(registry.actors['codex-native-after-completed-owner']?.quarantined, true);
+      assert.equal(
+        registry.actors['codex-native-after-completed-owner']?.quarantineReason,
+        'owner_rebind_denied_completed_owner',
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

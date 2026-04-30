@@ -7,6 +7,7 @@ const HELP = [
   'Usage: omx cleanup [--dry-run]',
   '',
   'Kill orphaned OMX MCP server processes and remove stale OMX /tmp directories left behind by previous Codex App sessions.',
+  'This is process/tmp cleanup only: it does not reset active session state, actor registries, pending routes, or workflow mode files.',
   '',
   'Options:',
   '  --dry-run  List matching orphaned processes and stale /tmp directories without removing them',

@@ -9,6 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { initTeamState, enqueueDispatchRequest, readDispatchRequest } from '../../team/state.js';
 import { buildTmuxSessionName, buildWindowsMsysBackgroundHelperBootstrapScript } from '../../cli/index.js';
 import { writeSessionStart } from '../session.js';
+import { readSessionActors, recordActorLifecycleEvent } from '../../runtime/session-actors.js';
 
 const DEFAULT_AUTO_NUDGE_RESPONSE = 'continue with the current task only if it is already authorized';
 
@@ -650,6 +651,96 @@ describe('notify-fallback watcher', () => {
       assert.equal(suppressed?.origin_kind, 'unknown');
       assert.equal(suppressed?.audience, 'unknown-non-owner');
       assert.equal(suppressed?.reason, 'unknown_without_current_owner_fail_closed');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(tempHome, { recursive: true, force: true });
+      await rm(rolloutPath, { force: true });
+    }
+  });
+
+  it('one-shot mode does not promote fallback-only replacement evidence after an owner abort', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-aborted-owner-replacement-'));
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-fallback-home-'));
+    const codexHome = join(tempHome, 'codex-home');
+    const capturePath = join(tempHome, 'captures.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempHome);
+    const sid = `test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const sessionDir = todaySessionDir(tempHome);
+    const rolloutPath = join(sessionDir, `rollout-test-fallback-aborted-replacement-${sid}.jsonl`);
+
+    try {
+      await mkdir(join(wd, '.omx', 'logs'), { recursive: true });
+      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+      await writeNotificationConfig(codexHome);
+
+      const sessionId = 'omx-fallback-aborted-owner';
+      const ownerThreadId = 'thread-fallback-aborted-owner';
+      const replacementThreadId = `thread-fallback-replacement-${sid}`;
+      await writeSessionStart(wd, sessionId, { nativeSessionId: ownerThreadId });
+      await recordActorLifecycleEvent({
+        cwd: wd,
+        sessionId,
+        actorIds: [ownerThreadId],
+        event: 'task_started',
+        turnId: 'turn-fallback-owner-started',
+        source: 'test',
+      });
+      await recordActorLifecycleEvent({
+        cwd: wd,
+        sessionId,
+        actorIds: [ownerThreadId],
+        event: 'turn_aborted',
+        turnId: 'turn-fallback-owner-started',
+        source: 'test',
+      });
+
+      const nowIso = new Date(Date.now() + 2_000).toISOString();
+      const turnId = `turn-fallback-replacement-${sid}`;
+      await writeFile(rolloutPath, `${[
+        {
+          timestamp: nowIso,
+          type: 'session_meta',
+          payload: { id: replacementThreadId, cwd: wd },
+        },
+        {
+          timestamp: nowIso,
+          type: 'event_msg',
+          payload: {
+            type: 'task_complete',
+            turn_id: turnId,
+            last_agent_message: 'Fallback-only replacement should not promote ownership.',
+          },
+        },
+      ].map(v => JSON.stringify(v)).join('\n')}\n`);
+
+      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const result = spawnSync(
+        process.execPath,
+        [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
+        {
+          encoding: 'utf-8',
+          env: buildCleanNotifyEnv({
+            HOME: tempHome,
+            USERPROFILE: tempHome,
+            CODEX_HOME: codexHome,
+            OMX_FETCH_CAPTURE_PATH: capturePath,
+            NODE_OPTIONS: `--import=${preloadPath}`,
+          }),
+        },
+      );
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      assert.equal((await readCapturedRequests(capturePath)).length, 0);
+      const registry = await readSessionActors(wd, sessionId);
+      assert.equal(registry.ownerActorId, ownerThreadId);
+      assert.notEqual(registry.actors[replacementThreadId]?.claimStrength, 'completion-validated');
+
+      const notifyLog = join(wd, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const notifyEntries = await readJsonLines(notifyLog);
+      const suppressed = notifyEntries.find((entry) => entry.type === 'completed_turn_delivery_suppressed');
+      assert.equal(suppressed?.reason, 'unknown_actor_with_owner');
     } finally {
       await rm(wd, { recursive: true, force: true });
       await rm(tempHome, { recursive: true, force: true });

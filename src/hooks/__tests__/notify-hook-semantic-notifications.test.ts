@@ -11,6 +11,9 @@ import { buildInjectedReplyInput } from '../../notifications/reply-listener.js';
 import { recordPendingReplyOrigin } from '../../notifications/reply-origin-state.js';
 import { pendingRoutesStatePath } from '../../notifications/pending-routes.js';
 import { dispatchCodexNativeHook } from '../../scripts/codex-native-hook.js';
+import { writeSessionStart } from '../session.js';
+import { readSessionActors } from '../../runtime/session-actors.js';
+import { reconcileRalphTerminalStateScope } from '../../runtime/ralph-state-scope.js';
 import { sanitizeLiveNotificationEnv } from '../../utils/test-env.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -527,6 +530,41 @@ async function writeRolloutRecords(
   );
 }
 
+async function writeTranscriptRecords(
+  path: string,
+  records: Array<Record<string, unknown>>,
+): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${records.map((record) => JSON.stringify(record)).join('\n')}\n`);
+}
+
+function transcriptSessionMeta(
+  id: string,
+  cwd: string,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    type: 'session_meta',
+    payload: {
+      id,
+      cwd,
+      ...extra,
+    },
+  };
+}
+
+function transcriptTaskStarted(turnId: string): Record<string, unknown> {
+  return { type: 'task_started', payload: { turn_id: turnId } };
+}
+
+function transcriptTurnAborted(turnId: string): Record<string, unknown> {
+  return { type: 'turn_aborted', payload: { turn_id: turnId, reason: 'interrupted' } };
+}
+
+function transcriptTaskComplete(turnId: string): Record<string, unknown> {
+  return { type: 'task_complete', payload: { turn_id: turnId } };
+}
+
 function parseLinuxProcStartTicks(statContent: string): number | undefined {
   const commandEnd = statContent.lastIndexOf(')');
   if (commandEnd === -1) return undefined;
@@ -597,6 +635,8 @@ function buildOwnerActorsState(cwd: string, sessionId: string, nativeSessionId: 
         source: 'test-owner',
         firstSeenAt: now,
         lastSeenAt: now,
+        lifecycleStatus: 'active',
+        claimStrength: 'native-start',
       },
     },
     aliases: {
@@ -3298,6 +3338,463 @@ describe('notify-hook semantic notifications', () => {
       assert.ok(Array.isArray(suppressed?.origin_evidence));
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('delivers a replacement root final turn after aborted owner rebinding', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-aborted-owner-rebind-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const stateDir = join(workdir, '.omx', 'state');
+    const canonicalSessionId = 'omx-notify-aborted-owner-rebind';
+    const firstOwnerNativeSessionId = 'codex-notify-owner-aborted';
+    const replacementNativeSessionId = 'codex-notify-owner-replacement';
+    const firstOwnerTranscript = join(workdir, 'notify-owner-aborted-rollout.jsonl');
+    const replacementTranscript = join(workdir, 'notify-owner-replacement-rollout.jsonl');
+    const rawMessage = 'Replacement root completed after the first owner was interrupted.';
+
+    try {
+      await mkdir(workdir, { recursive: true });
+      await writeNotificationConfig(codexHome);
+      await writeSessionStart(workdir, canonicalSessionId);
+      await writeTranscriptRecords(firstOwnerTranscript, [
+        transcriptSessionMeta(firstOwnerNativeSessionId, workdir),
+        transcriptTaskStarted('turn-notify-owner-started'),
+      ]);
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: 'SessionStart',
+          cwd: workdir,
+          session_id: firstOwnerNativeSessionId,
+          transcript_path: firstOwnerTranscript,
+        },
+        { cwd: workdir, sessionOwnerPid: process.pid },
+      );
+
+      await writeTranscriptRecords(firstOwnerTranscript, [
+        transcriptSessionMeta(firstOwnerNativeSessionId, workdir),
+        transcriptTaskStarted('turn-notify-owner-started'),
+        transcriptTurnAborted('turn-notify-owner-started'),
+      ]);
+      await writeTranscriptRecords(replacementTranscript, [
+        transcriptSessionMeta(replacementNativeSessionId, workdir),
+        transcriptTaskStarted('turn-notify-replacement-started'),
+        transcriptTaskComplete('turn-notify-replacement-started'),
+      ]);
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: 'SessionStart',
+          cwd: workdir,
+          session_id: replacementNativeSessionId,
+          transcript_path: replacementTranscript,
+        },
+        { cwd: workdir, sessionOwnerPid: process.pid },
+      );
+
+      const registry = await readSessionActors(workdir, canonicalSessionId);
+      assert.equal(registry.ownerActorId, replacementNativeSessionId);
+      assert.equal(registry.actors[firstOwnerNativeSessionId]?.lifecycleStatus, 'superseded');
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: replacementNativeSessionId,
+        thread_id: replacementNativeSessionId,
+        turn_id: 'turn-notify-replacement-final',
+        input_messages: [],
+        last_assistant_message: rawMessage,
+      }, {
+        CODEX_HOME: codexHome,
+        HOME: tempRoot,
+        USERPROFILE: tempRoot,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const persistedSession = JSON.parse(
+        await readFile(join(stateDir, 'session.json'), 'utf-8'),
+      ) as { session_id?: string; native_session_id?: string };
+      assert.equal(persistedSession.session_id, canonicalSessionId);
+      assert.equal(persistedSession.native_session_id, replacementNativeSessionId);
+
+      const requests = await readCapturedRequests(capturePath);
+      assert.equal(requests.length, 1);
+      const body = JSON.parse(requests[0].body) as { event: string; message: string };
+      assert.equal(body.event, 'result-ready');
+      assert.equal(body.message, rawMessage);
+
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      assert.ok(entries.some((entry) =>
+        entry.type === 'completed_turn_delivery_allowed'
+        && entry.reason === 'owner_actor_completed'
+        && entry.actor_id === replacementNativeSessionId
+      ));
+      assert.equal(
+        entries.some((entry) =>
+          entry.type === 'completed_turn_delivery_suppressed'
+          && entry.reason === 'unknown_actor_with_owner'
+          && entry.thread_id === replacementNativeSessionId
+        ),
+        false,
+      );
+
+      const completedRegistry = await readSessionActors(workdir, canonicalSessionId);
+      assert.equal(completedRegistry.actors[replacementNativeSessionId]?.lifecycleStatus, 'completed');
+      assert.equal(completedRegistry.actors[replacementNativeSessionId]?.claimStrength, 'completion-validated');
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('suppresses late completed turns from a superseded owner actor', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-superseded-owner-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const stateDir = join(workdir, '.omx', 'state');
+    const sessionId = 'omx-superseded-owner';
+    const oldOwnerThreadId = 'thread-superseded-owner';
+    const replacementThreadId = 'thread-current-replacement-owner';
+
+    try {
+      await mkdir(join(stateDir, 'sessions', sessionId), { recursive: true });
+      await writeNotificationConfig(codexHome);
+      await writeFile(
+        join(stateDir, 'session.json'),
+        JSON.stringify(buildOwnerSessionState(workdir, sessionId, replacementThreadId), null, 2),
+      );
+      const now = new Date().toISOString();
+      await writeFile(join(stateDir, 'sessions', sessionId, 'actors.json'), JSON.stringify({
+        schemaVersion: 1,
+        sessionId,
+        cwd: workdir,
+        ownerActorId: replacementThreadId,
+        actors: {
+          [oldOwnerThreadId]: {
+            actorId: oldOwnerThreadId,
+            kind: 'leader',
+            audience: 'external-owner',
+            threadId: oldOwnerThreadId,
+            nativeSessionId: oldOwnerThreadId,
+            source: 'test-owner',
+            firstSeenAt: now,
+            lastSeenAt: now,
+            lifecycleStatus: 'superseded',
+            claimStrength: 'turn-started',
+            startedTurnCount: 1,
+            abortedTurnCount: 1,
+            lastTurnStatus: 'aborted',
+            supersededByActorId: replacementThreadId,
+            supersededReason: 'owner_rebound_after_aborted_candidate',
+          },
+          [replacementThreadId]: {
+            actorId: replacementThreadId,
+            kind: 'leader',
+            audience: 'external-owner',
+            threadId: replacementThreadId,
+            nativeSessionId: replacementThreadId,
+            source: 'test-owner',
+            firstSeenAt: now,
+            lastSeenAt: now,
+            lifecycleStatus: 'active',
+            claimStrength: 'turn-started',
+            startedTurnCount: 1,
+            lastTurnStatus: 'started',
+          },
+        },
+        aliases: {
+          [oldOwnerThreadId]: oldOwnerThreadId,
+          [replacementThreadId]: replacementThreadId,
+        },
+        updatedAt: now,
+      }, null, 2));
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: oldOwnerThreadId,
+        thread_id: oldOwnerThreadId,
+        turn_id: 'turn-late-superseded-owner',
+        input_messages: [],
+        last_assistant_message: 'Late output from the old owner must not notify.',
+      }, {
+        CODEX_HOME: codexHome,
+        HOME: tempRoot,
+        USERPROFILE: tempRoot,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      assert.equal((await readCapturedRequests(capturePath)).length, 0);
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      assert.ok(entries.some((entry) =>
+        entry.type === 'completed_turn_delivery_suppressed'
+        && entry.reason === 'superseded_owner_actor'
+        && entry.actor_id === oldOwnerThreadId
+      ));
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not completion-validate an owner until completed-turn dispatch succeeds', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-owner-completion-failed-dispatch-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const preloadPath = await writeFetchFailureCapturePreload(tempRoot, 'Dispatch timeout');
+    const workdir = join(tempRoot, 'repo');
+    const sessionId = 'omx-owner-completion-failed-dispatch';
+    const ownerThreadId = 'thread-owner-completion-failed-dispatch';
+
+    try {
+      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
+      await writeNotificationConfig(codexHome);
+      await writeOwnerSessionState(workdir, sessionId, ownerThreadId);
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: ownerThreadId,
+        thread_id: ownerThreadId,
+        turn_id: 'turn-owner-completion-failed-dispatch',
+        input_messages: [],
+        last_assistant_message: 'This final would be valid, but dispatch fails.',
+      }, {
+        CODEX_HOME: codexHome,
+        HOME: tempRoot,
+        USERPROFILE: tempRoot,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const registry = await readSessionActors(workdir, sessionId);
+      assert.equal(registry.actors[ownerThreadId]?.lifecycleStatus, 'active');
+      assert.equal(registry.actors[ownerThreadId]?.claimStrength, 'native-start');
+      assert.equal(registry.actors[ownerThreadId]?.completedTurnCount ?? 0, 0);
+
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      assert.ok(entries.some((entry) =>
+        entry.type === 'completed_turn_delivery_allowed'
+        && entry.reason === 'owner_actor_completed'
+      ));
+      assert.ok(entries.some((entry) => entry.type === 'completed_turn_delivery_failed'));
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('syncs terminal root Ralph state into the active session scope during final owner turns', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-ralph-scope-terminal-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const stateDir = join(workdir, '.omx', 'state');
+    const sessionId = 'omx-ralph-terminal-scope';
+    const ownerThreadId = 'thread-ralph-terminal-scope';
+
+    try {
+      await mkdir(join(stateDir, 'sessions', sessionId), { recursive: true });
+      await writeNotificationConfig(codexHome);
+      await writeOwnerSessionState(workdir, sessionId, ownerThreadId);
+      await writeFile(join(stateDir, 'ralph-state.json'), JSON.stringify({
+        active: false,
+        mode: 'ralph',
+        current_phase: 'complete',
+        completed_at: '2026-04-30T18:00:00.000Z',
+        owner_omx_session_id: sessionId,
+      }, null, 2));
+      await writeFile(join(stateDir, 'sessions', sessionId, 'ralph-state.json'), JSON.stringify({
+        active: true,
+        mode: 'ralph',
+        current_phase: 'starting',
+        iteration: 1,
+        owner_omx_session_id: sessionId,
+      }, null, 2));
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: ownerThreadId,
+        thread_id: ownerThreadId,
+        turn_id: 'turn-ralph-terminal-scope',
+        input_messages: [],
+        last_assistant_message: 'Ralph completed and should not stay active in the session scope.',
+      }, {
+        CODEX_HOME: codexHome,
+        HOME: tempRoot,
+        USERPROFILE: tempRoot,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const scopedRalph = JSON.parse(
+        await readFile(join(stateDir, 'sessions', sessionId, 'ralph-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(scopedRalph.active, false);
+      assert.equal(scopedRalph.current_phase, 'complete');
+      assert.equal(scopedRalph.session_scope_reconciled_from, 'root-terminal');
+
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      assert.ok(entries.some((entry) => entry.type === 'ralph_session_scope_terminal_reconciled'));
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not sync terminal root Ralph state from a different owner session', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-ralph-scope-mismatch-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const stateDir = join(workdir, '.omx', 'state');
+    const sessionId = 'omx-ralph-terminal-scope-current';
+    const ownerThreadId = 'thread-ralph-terminal-scope-current';
+
+    try {
+      await mkdir(join(stateDir, 'sessions', sessionId), { recursive: true });
+      await writeNotificationConfig(codexHome);
+      await writeOwnerSessionState(workdir, sessionId, ownerThreadId);
+      await writeFile(join(stateDir, 'ralph-state.json'), JSON.stringify({
+        active: false,
+        mode: 'ralph',
+        current_phase: 'complete',
+        completed_at: '2026-04-30T18:00:00.000Z',
+        owner_omx_session_id: 'omx-different-ralph-owner',
+      }, null, 2));
+      await writeFile(join(stateDir, 'sessions', sessionId, 'ralph-state.json'), JSON.stringify({
+        active: true,
+        mode: 'ralph',
+        current_phase: 'starting',
+        iteration: 1,
+        owner_omx_session_id: sessionId,
+      }, null, 2));
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: ownerThreadId,
+        thread_id: ownerThreadId,
+        turn_id: 'turn-ralph-terminal-scope-mismatch',
+        input_messages: [],
+        last_assistant_message: 'Ralph completed elsewhere and should not rewrite this session.',
+      }, {
+        CODEX_HOME: codexHome,
+        HOME: tempRoot,
+        USERPROFILE: tempRoot,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const scopedRalph = JSON.parse(
+        await readFile(join(stateDir, 'sessions', sessionId, 'ralph-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(scopedRalph.active, true);
+      assert.equal(scopedRalph.current_phase, 'starting');
+      assert.equal(scopedRalph.session_scope_reconciled_from, undefined);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not sync terminal root Ralph state when root affinity is missing', async () => {
+    const workdir = await mkdtemp(join(tmpdir(), 'omx-notify-hook-ralph-scope-missing-root-affinity-'));
+    try {
+      const stateDir = join(workdir, '.omx', 'state');
+      const sessionId = 'omx-ralph-missing-root-affinity';
+      await mkdir(join(stateDir, 'sessions', sessionId), { recursive: true });
+      await writeFile(join(stateDir, 'ralph-state.json'), JSON.stringify({
+        active: false,
+        mode: 'ralph',
+        current_phase: 'complete',
+      }, null, 2));
+      await writeFile(join(stateDir, 'sessions', sessionId, 'ralph-state.json'), JSON.stringify({
+        active: true,
+        mode: 'ralph',
+        current_phase: 'starting',
+        owner_omx_session_id: sessionId,
+      }, null, 2));
+
+      const result = await reconcileRalphTerminalStateScope(workdir, sessionId);
+      assert.equal(result.reconciled, false);
+      assert.equal(result.reason, 'root_ralph_session_affinity_missing');
+
+      const scopedRalph = JSON.parse(
+        await readFile(join(stateDir, 'sessions', sessionId, 'ralph-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(scopedRalph.active, true);
+      assert.equal(scopedRalph.current_phase, 'starting');
+      assert.equal(scopedRalph.session_scope_reconciled_from, undefined);
+    } finally {
+      await rm(workdir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not sync terminal root Ralph state when session affinity points elsewhere', async () => {
+    const workdir = await mkdtemp(join(tmpdir(), 'omx-notify-hook-ralph-scope-session-affinity-mismatch-'));
+    try {
+      const stateDir = join(workdir, '.omx', 'state');
+      const sessionId = 'omx-ralph-session-affinity-current';
+      await mkdir(join(stateDir, 'sessions', sessionId), { recursive: true });
+      await writeFile(join(stateDir, 'ralph-state.json'), JSON.stringify({
+        active: false,
+        mode: 'ralph',
+        current_phase: 'complete',
+        owner_omx_session_id: sessionId,
+      }, null, 2));
+      await writeFile(join(stateDir, 'sessions', sessionId, 'ralph-state.json'), JSON.stringify({
+        active: true,
+        mode: 'ralph',
+        current_phase: 'starting',
+        owner_omx_session_id: 'omx-other-session',
+      }, null, 2));
+
+      const result = await reconcileRalphTerminalStateScope(workdir, sessionId);
+      assert.equal(result.reconciled, false);
+      assert.equal(result.reason, 'session_ralph_session_affinity_mismatch');
+
+      const scopedRalph = JSON.parse(
+        await readFile(join(stateDir, 'sessions', sessionId, 'ralph-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(scopedRalph.active, true);
+      assert.equal(scopedRalph.current_phase, 'starting');
+      assert.equal(scopedRalph.session_scope_reconciled_from, undefined);
+    } finally {
+      await rm(workdir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects unsafe Ralph session ids before building session-scoped paths', async () => {
+    const workdir = await mkdtemp(join(tmpdir(), 'omx-notify-hook-ralph-scope-invalid-session-id-'));
+    try {
+      const stateDir = join(workdir, '.omx', 'state');
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(join(stateDir, 'ralph-state.json'), JSON.stringify({
+        active: false,
+        mode: 'ralph',
+        current_phase: 'complete',
+        owner_omx_session_id: '../escape',
+      }, null, 2));
+
+      const result = await reconcileRalphTerminalStateScope(workdir, '../escape');
+      assert.equal(result.reconciled, false);
+      assert.equal(result.reason, 'session_id_invalid');
+      assert.equal(existsSync(join(workdir, '.omx', 'state', 'escape', 'ralph-state.json')), false);
+    } finally {
+      await rm(workdir, { recursive: true, force: true });
     }
   });
 

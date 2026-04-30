@@ -15,6 +15,7 @@ import {
   registerActorSessionStart,
   registerExternalOwnerActor,
 } from '../runtime/session-actors.js';
+import type { CodexTranscriptLifecycleSummary } from '../runtime/codex-transcript-lifecycle.js';
 
 export interface SessionState {
   session_id: string;
@@ -167,6 +168,8 @@ interface SessionStartOptions {
   ownerKind?: 'external-owner' | 'child' | 'internal-helper' | 'team-worker' | 'unknown-non-owner';
   parentThreadId?: string;
   tmuxSessionName?: string;
+  transcriptPath?: string;
+  lifecycle?: CodexTranscriptLifecycleSummary | null;
 }
 
 function defaultIsPidAlive(pid: number): boolean {
@@ -318,6 +321,9 @@ export async function writeSessionStart(
     pid,
     source: 'external-launch',
     evidence: [{ source: 'session-start', detail: 'writeSessionStart' }],
+    transcriptPath: options.transcriptPath,
+    lifecycle: options.lifecycle,
+    contextCwd: options.lifecycle?.contextCwd,
   }).catch(() => {});
   await appendToLog(cwd, {
     event: 'session_start',
@@ -393,23 +399,61 @@ export async function reconcileNativeSessionStart(
     ? existing.native_session_id.trim()
     : '';
   if (existingNativeSessionId && existingNativeSessionId !== nativeSessionId) {
-    await registerActorSessionStart({
+    const registration = await registerActorSessionStart({
       cwd,
       sessionId: existing.session_id,
       classification: classifySessionStartActor({
         payload: {
           session_id: nativeSessionId,
           thread_id: nativeSessionId,
+          omx_session_id: existing.session_id,
+          cwd,
         },
+        transcriptSessionMeta: options.lifecycle?.sessionMeta ?? null,
         hasCurrentOwner: true,
       }),
-      pid: options.pid,
+      pid: Number.isInteger(options.pid) && options.pid && options.pid > 0
+        ? options.pid
+        : process.pid,
+      transcriptPath: options.transcriptPath,
+      lifecycle: options.lifecycle,
     }).catch(() => null);
+    if (
+      registration?.outcome === 'owner-registered'
+      && registration.registry.ownerActorId === nativeSessionId
+    ) {
+      const pid = Number.isInteger(options.pid) && options.pid && options.pid > 0
+        ? options.pid
+        : process.pid;
+      const platform = options.platform ?? process.platform;
+      const linuxIdentity = platform === 'linux'
+        ? readLinuxProcessIdentity(pid)
+        : null;
+      const nowIso = new Date().toISOString();
+      const state = createSessionState(cwd, existing.session_id, pid, platform, linuxIdentity, {
+        nowIso,
+        nativeSessionId,
+        startedAt: existing.started_at,
+        tmuxSessionName: existing.tmux_session_name,
+      });
+      await writeFile(sessionPath(cwd), JSON.stringify(state, null, 2));
+      await appendToLog(cwd, {
+        event: 'session_start_external_owner_rebound',
+        session_id: existing.session_id,
+        previous_native_session_id: existingNativeSessionId,
+        native_session_id: nativeSessionId,
+        reason: registration.reason,
+        pid,
+        timestamp: nowIso,
+      });
+      return state;
+    }
     await appendToLog(cwd, {
       event: 'session_start_external_owner_mismatch_quarantined',
       session_id: existing.session_id,
       owner_native_session_id: existingNativeSessionId,
       native_session_id: nativeSessionId,
+      ...(registration?.reason ? { reason: registration.reason } : {}),
       pid: options.pid ?? process.pid,
       timestamp: new Date().toISOString(),
     });
@@ -439,6 +483,9 @@ export async function reconcileNativeSessionStart(
     pid,
     source: 'native-session-start',
     evidence: [{ source: 'session-start', detail: 'reconcileNativeSessionStart' }],
+    transcriptPath: options.transcriptPath,
+    lifecycle: options.lifecycle,
+    contextCwd: options.lifecycle?.contextCwd,
   }).catch(() => {});
   await appendToLog(cwd, {
     event: 'session_start_reconciled',

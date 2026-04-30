@@ -58,6 +58,45 @@ async function writeJson(path: string, value: unknown): Promise<void> {
   await writeFile(path, JSON.stringify(value, null, 2));
 }
 
+async function writeTranscriptRecords(
+  path: string,
+  records: Array<Record<string, unknown>>,
+): Promise<void> {
+  await mkdir(dirname(path), { recursive: true }).catch(() => {});
+  await writeFile(path, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+}
+
+function transcriptSessionMeta(
+  id: string,
+  cwd: string,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    type: "session_meta",
+    payload: {
+      id,
+      cwd,
+      ...extra,
+    },
+  };
+}
+
+function transcriptTaskStarted(turnId: string): Record<string, unknown> {
+  return { type: "task_started", payload: { turn_id: turnId } };
+}
+
+function transcriptTurnAborted(turnId: string): Record<string, unknown> {
+  return { type: "turn_aborted", payload: { turn_id: turnId, reason: "interrupted" } };
+}
+
+function transcriptTaskComplete(turnId: string): Record<string, unknown> {
+  return { type: "task_complete", payload: { turn_id: turnId } };
+}
+
+function transcriptEventMsg(record: Record<string, unknown>): Record<string, unknown> {
+  return { type: "event_msg", payload: record };
+}
+
 async function writeActiveAutopilotSession(cwd: string, sessionId: string): Promise<void> {
   await writeJson(join(cwd, ".omx", "state", "session.json"), {
     session_id: sessionId,
@@ -1097,6 +1136,478 @@ describe("codex native hook dispatch", () => {
       const registry = await readSessionActors(cwd, priorSessionId);
       assert.equal(registry.actors["codex-native-new"]?.quarantined, true);
       assert.equal(registry.actors["codex-native-new"]?.quarantineReason, "unknown_actor_with_owner");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("rebinds the owner when the first native owner aborted before any completed turn", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-owner-abort-rebind-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const canonicalSessionId = "omx-abort-rebind-session";
+      const firstOwnerNativeSessionId = "codex-owner-aborted";
+      const replacementNativeSessionId = "codex-owner-replacement";
+      const firstOwnerTranscript = join(cwd, "owner-aborted-rollout.jsonl");
+      const replacementTranscript = join(cwd, "owner-replacement-rollout.jsonl");
+
+      await writeSessionStart(cwd, canonicalSessionId);
+      await writeTranscriptRecords(firstOwnerTranscript, [
+        transcriptSessionMeta(firstOwnerNativeSessionId, cwd),
+        transcriptEventMsg(transcriptTaskStarted("turn-owner-started")),
+      ]);
+
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: firstOwnerNativeSessionId,
+          transcript_path: firstOwnerTranscript,
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+
+      await writeTranscriptRecords(firstOwnerTranscript, [
+        transcriptSessionMeta(firstOwnerNativeSessionId, cwd),
+        transcriptEventMsg(transcriptTaskStarted("turn-owner-started")),
+        transcriptEventMsg(transcriptTurnAborted("turn-owner-started")),
+      ]);
+      await writeTranscriptRecords(replacementTranscript, [
+        transcriptSessionMeta(replacementNativeSessionId, cwd),
+        transcriptEventMsg(transcriptTaskStarted("turn-replacement-started")),
+        transcriptEventMsg(transcriptTaskComplete("turn-replacement-started")),
+      ]);
+
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: replacementNativeSessionId,
+          transcript_path: replacementTranscript,
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+
+      const sessionState = JSON.parse(
+        await readFile(join(stateDir, "session.json"), "utf-8"),
+      ) as { session_id?: string; native_session_id?: string };
+      assert.equal(sessionState.session_id, canonicalSessionId);
+      assert.equal(sessionState.native_session_id, replacementNativeSessionId);
+
+      const registry = await readSessionActors(cwd, canonicalSessionId);
+      assert.equal(registry.ownerActorId, replacementNativeSessionId);
+      assert.equal(registry.actors[replacementNativeSessionId]?.kind, "leader");
+      assert.equal(registry.actors[replacementNativeSessionId]?.audience, "external-owner");
+      assert.equal(registry.actors[firstOwnerNativeSessionId]?.lifecycleStatus, "superseded");
+      assert.equal(registry.actors[firstOwnerNativeSessionId]?.abortedTurnCount, 1);
+      assert.equal(registry.actors[firstOwnerNativeSessionId]?.completedTurnCount ?? 0, 0);
+      assert.equal(
+        registry.actors[firstOwnerNativeSessionId]?.supersededReason,
+        "owner_rebound_after_aborted_candidate",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves cold-start transcript lifecycle so an aborted first owner can rebound", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-cold-owner-abort-rebind-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const firstOwnerNativeSessionId = "codex-cold-owner-aborted";
+      const replacementNativeSessionId = "codex-cold-owner-replacement";
+      const firstOwnerTranscript = join(cwd, "cold-owner-aborted-rollout.jsonl");
+      const replacementTranscript = join(cwd, "cold-owner-replacement-rollout.jsonl");
+
+      await writeTranscriptRecords(firstOwnerTranscript, [
+        transcriptSessionMeta(firstOwnerNativeSessionId, cwd),
+        transcriptEventMsg(transcriptTaskStarted("turn-cold-owner-started")),
+      ]);
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: firstOwnerNativeSessionId,
+          transcript_path: firstOwnerTranscript,
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+
+      await writeTranscriptRecords(firstOwnerTranscript, [
+        transcriptSessionMeta(firstOwnerNativeSessionId, cwd),
+        transcriptEventMsg(transcriptTaskStarted("turn-cold-owner-started")),
+        transcriptEventMsg(transcriptTurnAborted("turn-cold-owner-started")),
+      ]);
+      await writeTranscriptRecords(replacementTranscript, [
+        transcriptSessionMeta(replacementNativeSessionId, cwd),
+        transcriptEventMsg(transcriptTaskStarted("turn-cold-replacement-started")),
+      ]);
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: replacementNativeSessionId,
+          transcript_path: replacementTranscript,
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+
+      const sessionState = JSON.parse(
+        await readFile(join(stateDir, "session.json"), "utf-8"),
+      ) as { session_id?: string; native_session_id?: string };
+      assert.equal(sessionState.session_id, firstOwnerNativeSessionId);
+      assert.equal(sessionState.native_session_id, replacementNativeSessionId);
+
+      const registry = await readSessionActors(cwd, firstOwnerNativeSessionId);
+      assert.equal(registry.ownerActorId, replacementNativeSessionId);
+      assert.equal(registry.actors[firstOwnerNativeSessionId]?.lifecycleStatus, "superseded");
+      assert.equal(registry.actors[firstOwnerNativeSessionId]?.abortedTurnCount, 1);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("quarantines aborted-owner replacements without authoritative transcript start evidence", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-owner-aborted-no-replacement-evidence-"));
+    try {
+      const canonicalSessionId = "omx-abort-no-replacement-evidence";
+      const firstOwnerNativeSessionId = "codex-owner-aborted-no-evidence-test";
+      const replacementNativeSessionId = "codex-replacement-no-authority";
+      const firstOwnerTranscript = join(cwd, "owner-aborted-no-evidence-rollout.jsonl");
+
+      await writeSessionStart(cwd, canonicalSessionId);
+      await writeTranscriptRecords(firstOwnerTranscript, [
+        transcriptSessionMeta(firstOwnerNativeSessionId, cwd),
+        transcriptEventMsg(transcriptTaskStarted("turn-owner-no-evidence-test")),
+      ]);
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: firstOwnerNativeSessionId,
+          transcript_path: firstOwnerTranscript,
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+      await writeTranscriptRecords(firstOwnerTranscript, [
+        transcriptSessionMeta(firstOwnerNativeSessionId, cwd),
+        transcriptEventMsg(transcriptTaskStarted("turn-owner-no-evidence-test")),
+        transcriptEventMsg(transcriptTurnAborted("turn-owner-no-evidence-test")),
+      ]);
+
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: replacementNativeSessionId,
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+
+      const registry = await readSessionActors(cwd, canonicalSessionId);
+      assert.equal(registry.ownerActorId, firstOwnerNativeSessionId);
+      assert.equal(registry.actors[replacementNativeSessionId]?.quarantined, true);
+      assert.equal(
+        registry.actors[replacementNativeSessionId]?.quarantineReason,
+        "owner_rebind_denied_missing_replacement_evidence",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("quarantines aborted-owner replacements that spoof the canonical OMX session id", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-owner-aborted-canonical-spoof-"));
+    try {
+      const canonicalSessionId = "omx-abort-canonical-spoof";
+      const firstOwnerNativeSessionId = "codex-owner-aborted-canonical-spoof";
+      const firstOwnerTranscript = join(cwd, "owner-aborted-canonical-spoof-rollout.jsonl");
+      const spoofTranscript = join(cwd, "canonical-spoof-rollout.jsonl");
+
+      await writeSessionStart(cwd, canonicalSessionId);
+      await writeTranscriptRecords(firstOwnerTranscript, [
+        transcriptSessionMeta(firstOwnerNativeSessionId, cwd),
+        transcriptEventMsg(transcriptTaskStarted("turn-owner-canonical-spoof")),
+      ]);
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: firstOwnerNativeSessionId,
+          transcript_path: firstOwnerTranscript,
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+      await writeTranscriptRecords(firstOwnerTranscript, [
+        transcriptSessionMeta(firstOwnerNativeSessionId, cwd),
+        transcriptEventMsg(transcriptTaskStarted("turn-owner-canonical-spoof")),
+        transcriptEventMsg(transcriptTurnAborted("turn-owner-canonical-spoof")),
+      ]);
+      await writeTranscriptRecords(spoofTranscript, [
+        transcriptSessionMeta(canonicalSessionId, cwd),
+        transcriptEventMsg(transcriptTaskStarted("turn-canonical-spoof")),
+      ]);
+
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: canonicalSessionId,
+          transcript_path: spoofTranscript,
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+
+      const sessionState = JSON.parse(
+        await readFile(join(cwd, ".omx", "state", "session.json"), "utf-8"),
+      ) as { native_session_id?: string };
+      assert.equal(sessionState.native_session_id, firstOwnerNativeSessionId);
+
+      const registry = await readSessionActors(cwd, canonicalSessionId);
+      assert.equal(registry.ownerActorId, firstOwnerNativeSessionId);
+      assert.equal(registry.actors[canonicalSessionId]?.quarantined, true);
+      assert.equal(registry.actors[canonicalSessionId]?.quarantineReason, "owner_rebind_denied_context_mismatch");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a replacement root quarantined after the previous owner completed", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-owner-completed-no-rebind-"));
+    try {
+      const canonicalSessionId = "omx-completed-owner-session";
+      const firstOwnerNativeSessionId = "codex-owner-completed";
+      const replacementNativeSessionId = "codex-replacement-after-complete";
+      const firstOwnerTranscript = join(cwd, "owner-completed-rollout.jsonl");
+      const replacementTranscript = join(cwd, "replacement-after-complete-rollout.jsonl");
+
+      await writeSessionStart(cwd, canonicalSessionId);
+      await writeTranscriptRecords(firstOwnerTranscript, [
+        transcriptSessionMeta(firstOwnerNativeSessionId, cwd),
+        transcriptEventMsg(transcriptTaskStarted("turn-owner-completed")),
+        transcriptEventMsg(transcriptTaskComplete("turn-owner-completed")),
+      ]);
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: firstOwnerNativeSessionId,
+          transcript_path: firstOwnerTranscript,
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+
+      await writeTranscriptRecords(replacementTranscript, [
+        transcriptSessionMeta(replacementNativeSessionId, cwd),
+        transcriptEventMsg(transcriptTaskStarted("turn-replacement-after-complete")),
+      ]);
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: replacementNativeSessionId,
+          transcript_path: replacementTranscript,
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+
+      const registry = await readSessionActors(cwd, canonicalSessionId);
+      assert.equal(registry.ownerActorId, firstOwnerNativeSessionId);
+      assert.equal(registry.actors[replacementNativeSessionId]?.quarantined, true);
+      assert.equal(
+        registry.actors[replacementNativeSessionId]?.quarantineReason,
+        "owner_rebind_denied_completed_owner",
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a child replacement non-owner even when the previous owner aborted", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-owner-aborted-child-no-rebind-"));
+    try {
+      const canonicalSessionId = "omx-aborted-child-session";
+      const firstOwnerNativeSessionId = "codex-owner-aborted-child-test";
+      const childNativeSessionId = "codex-child-after-owner-abort";
+      const firstOwnerTranscript = join(cwd, "owner-aborted-child-test-rollout.jsonl");
+      const childTranscript = join(cwd, "child-after-abort-rollout.jsonl");
+
+      await writeSessionStart(cwd, canonicalSessionId);
+      await writeTranscriptRecords(firstOwnerTranscript, [
+        transcriptSessionMeta(firstOwnerNativeSessionId, cwd),
+        transcriptTaskStarted("turn-owner-aborted-child-test"),
+      ]);
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: firstOwnerNativeSessionId,
+          transcript_path: firstOwnerTranscript,
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+      await writeTranscriptRecords(firstOwnerTranscript, [
+        transcriptSessionMeta(firstOwnerNativeSessionId, cwd),
+        transcriptTaskStarted("turn-owner-aborted-child-test"),
+        transcriptTurnAborted("turn-owner-aborted-child-test"),
+      ]);
+      await writeTranscriptRecords(childTranscript, [
+        transcriptSessionMeta(childNativeSessionId, cwd, {
+          source: {
+            subagent: {
+              thread_spawn: {
+                parent_thread_id: firstOwnerNativeSessionId,
+                agent_nickname: "Noether",
+                agent_role: "verifier",
+              },
+            },
+          },
+          agent_nickname: "Noether",
+          agent_role: "verifier",
+        }),
+        transcriptTaskStarted("turn-child-after-abort"),
+      ]);
+
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: childNativeSessionId,
+          transcript_path: childTranscript,
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+
+      const registry = await readSessionActors(cwd, canonicalSessionId);
+      assert.equal(registry.ownerActorId, firstOwnerNativeSessionId);
+      assert.equal(registry.actors[childNativeSessionId]?.kind, "native-subagent");
+      assert.equal(registry.actors[childNativeSessionId]?.audience, "child");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps helper and team-worker replacements non-owner even when the previous owner aborted", async () => {
+    const cases = [
+      {
+        label: "helper",
+        replacementNativeSessionId: "codex-helper-after-owner-abort",
+        origin: { kind: "internal-helper", source: "omx-helper" },
+        expectedKind: "internal-helper",
+        expectedAudience: "internal-helper",
+      },
+      {
+        label: "team-worker",
+        replacementNativeSessionId: "codex-team-worker-after-owner-abort",
+        origin: { kind: "team-worker", teamName: "review-team", workerName: "worker-1" },
+        expectedKind: "team-worker",
+        expectedAudience: "team-worker",
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-owner-aborted-${testCase.label}-no-rebind-`));
+      try {
+        const canonicalSessionId = `omx-aborted-${testCase.label}-session`;
+        const firstOwnerNativeSessionId = `codex-owner-aborted-${testCase.label}-test`;
+        const replacementTranscript = join(cwd, `${testCase.label}-after-abort-rollout.jsonl`);
+        const firstOwnerTranscript = join(cwd, `owner-aborted-${testCase.label}-test-rollout.jsonl`);
+
+        await writeSessionStart(cwd, canonicalSessionId);
+        await writeTranscriptRecords(firstOwnerTranscript, [
+          transcriptSessionMeta(firstOwnerNativeSessionId, cwd),
+          transcriptEventMsg(transcriptTaskStarted(`turn-owner-aborted-${testCase.label}`)),
+        ]);
+        await dispatchCodexNativeHook(
+          {
+            hook_event_name: "SessionStart",
+            cwd,
+            session_id: firstOwnerNativeSessionId,
+            transcript_path: firstOwnerTranscript,
+          },
+          { cwd, sessionOwnerPid: process.pid },
+        );
+        await writeTranscriptRecords(firstOwnerTranscript, [
+          transcriptSessionMeta(firstOwnerNativeSessionId, cwd),
+          transcriptEventMsg(transcriptTaskStarted(`turn-owner-aborted-${testCase.label}`)),
+          transcriptEventMsg(transcriptTurnAborted(`turn-owner-aborted-${testCase.label}`)),
+        ]);
+        await writeTranscriptRecords(replacementTranscript, [
+          transcriptSessionMeta(testCase.replacementNativeSessionId, cwd),
+          transcriptEventMsg(transcriptTaskStarted(`turn-${testCase.label}-after-abort`)),
+        ]);
+
+        await dispatchCodexNativeHook(
+          {
+            hook_event_name: "SessionStart",
+            cwd,
+            session_id: testCase.replacementNativeSessionId,
+            transcript_path: replacementTranscript,
+            origin: testCase.origin,
+          },
+          { cwd, sessionOwnerPid: process.pid },
+        );
+
+        const registry = await readSessionActors(cwd, canonicalSessionId);
+        assert.equal(registry.ownerActorId, firstOwnerNativeSessionId);
+        assert.equal(registry.actors[testCase.replacementNativeSessionId]?.kind, testCase.expectedKind);
+        assert.equal(registry.actors[testCase.replacementNativeSessionId]?.audience, testCase.expectedAudience);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("keeps an aborted-owner replacement quarantined when rollout cwd evidence differs", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-owner-aborted-cwd-mismatch-"));
+    try {
+      const canonicalSessionId = "omx-aborted-cwd-mismatch-session";
+      const firstOwnerNativeSessionId = "codex-owner-aborted-cwd";
+      const replacementNativeSessionId = "codex-replacement-different-cwd";
+      const firstOwnerTranscript = join(cwd, "owner-aborted-cwd-rollout.jsonl");
+      const replacementTranscript = join(cwd, "replacement-different-cwd-rollout.jsonl");
+
+      await writeSessionStart(cwd, canonicalSessionId);
+      await writeTranscriptRecords(firstOwnerTranscript, [
+        transcriptSessionMeta(firstOwnerNativeSessionId, cwd),
+        transcriptTaskStarted("turn-owner-aborted-cwd"),
+      ]);
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: firstOwnerNativeSessionId,
+          transcript_path: firstOwnerTranscript,
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+      await writeTranscriptRecords(firstOwnerTranscript, [
+        transcriptSessionMeta(firstOwnerNativeSessionId, cwd),
+        transcriptTaskStarted("turn-owner-aborted-cwd"),
+        transcriptTurnAborted("turn-owner-aborted-cwd"),
+      ]);
+      await writeTranscriptRecords(replacementTranscript, [
+        transcriptSessionMeta(replacementNativeSessionId, join(cwd, "other-worktree")),
+        transcriptTaskStarted("turn-replacement-different-cwd"),
+      ]);
+
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: replacementNativeSessionId,
+          transcript_path: replacementTranscript,
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+
+      const registry = await readSessionActors(cwd, canonicalSessionId);
+      assert.equal(registry.ownerActorId, firstOwnerNativeSessionId);
+      assert.equal(registry.actors[replacementNativeSessionId]?.quarantined, true);
+      assert.equal(
+        registry.actors[replacementNativeSessionId]?.quarantineReason,
+        "owner_rebind_denied_context_mismatch",
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

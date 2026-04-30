@@ -46,9 +46,11 @@ import {
 	resolvePackagedOmxMarketplace,
 } from "./plugin-marketplace.js";
 import {
+	isOwnerClaimReplaceable,
 	readSessionActors,
 	sessionActorsPath,
 } from "../runtime/session-actors.js";
+import { isTerminalRalphState } from "../runtime/ralph-state-scope.js";
 import { pendingRoutesStatePath } from "../notifications/pending-routes.js";
 
 interface DoctorOptions {
@@ -797,6 +799,7 @@ async function checkSessionActorRouting(cwd: string): Promise<Check> {
 		actor.kind === "leader"
 		&& actor.audience === "external-owner"
 		&& actor.quarantined !== true
+		&& actor.lifecycleStatus !== "superseded"
 	).length;
 	if (!registry.ownerActorId) {
 		issues.push("registry has no ownerActorId");
@@ -811,6 +814,40 @@ async function checkSessionActorRouting(cwd: string): Promise<Check> {
 		if (actor.kind !== "native-subagent") continue;
 		if (!actor.parentActorId || !registry.actors[actor.parentActorId]) {
 			issues.push(`child actor ${actor.actorId} has no known parent actor`);
+		}
+	}
+	if (owner && isOwnerClaimReplaceable(owner)) {
+		const quarantinedReplacement = actors.find((actor) =>
+			actor.quarantined === true
+			&& (
+				actor.quarantineReason === "unknown_actor_with_owner"
+				|| actor.quarantineReason === "owner_rebind_denied_active_owner"
+				|| actor.quarantineReason === "external_owner_mismatch_with_active_owner"
+			)
+			&& actor.kind !== "native-subagent"
+			&& actor.kind !== "team-worker"
+			&& actor.kind !== "internal-helper"
+		);
+		if (quarantinedReplacement) {
+			issues.push(
+				`owner ${owner.actorId} has abort-only lifecycle evidence while replacement ${quarantinedReplacement.actorId} is quarantined as ${quarantinedReplacement.quarantineReason}; rerun SessionStart or inspect actor lifecycle rebinding`,
+			);
+		}
+	}
+
+	const rootRalphPath = join(stateDir, "ralph-state.json");
+	const sessionRalphPath = join(stateDir, "sessions", sessionId, "ralph-state.json");
+	if (existsSync(rootRalphPath) && existsSync(sessionRalphPath)) {
+		const rootRalph = await readJsonRecordFile(rootRalphPath);
+		const sessionRalph = await readJsonRecordFile(sessionRalphPath);
+		if (
+			isTerminalRalphState(rootRalph)
+			&& sessionRalph?.active === true
+			&& !isTerminalRalphState(sessionRalph)
+		) {
+			issues.push(
+				`root Ralph state is terminal (${jsonString(rootRalph?.current_phase) || "unknown"}) but active session ${sessionId} Ralph state remains ${jsonString(sessionRalph.current_phase) || "active"}`,
+			);
 		}
 	}
 

@@ -15,6 +15,11 @@ import {
   type ActorEvidence,
   type SessionActorAudience,
 } from "./session-actors.js";
+import {
+  isOwnerClaimDeliverable,
+  isOwnerClaimReplaceable,
+  isSupersededOwner,
+} from "./session-ownership.js";
 
 export type TurnAudience = SessionActorAudience;
 export type ExternalDeliveryDecision = "allow" | "suppress";
@@ -35,6 +40,11 @@ export interface NotificationOriginResolution {
   sessionMeta?: Record<string, unknown>;
   actorId?: string;
   ownerActorId?: string;
+  actorLifecycleStatus?: string;
+  actorClaimStrength?: string;
+  ownerLifecycleStatus?: string;
+  ownerClaimStrength?: string;
+  replaceableOwner?: boolean;
 }
 
 export interface ResolveTurnOriginForNotificationInput {
@@ -385,8 +395,20 @@ export async function resolveTurnOriginForNotification(
     ? await readSessionActors(input.cwd, effectiveSessionId).catch(() => null)
     : null;
   const ownerActorId = registry?.ownerActorId;
+  const ownerActor = ownerActorId ? registry?.actors[ownerActorId] : undefined;
+  const ownerLifecycleFields = {
+    ...(ownerActor?.lifecycleStatus ? { ownerLifecycleStatus: ownerActor.lifecycleStatus } : {}),
+    ...(ownerActor?.claimStrength ? { ownerClaimStrength: ownerActor.claimStrength } : {}),
+    ...(ownerActor ? { replaceableOwner: isOwnerClaimReplaceable(ownerActor) } : {}),
+  };
   if (registry) {
     appendEvidence(evidence, seenEvidence, "actor-registry", `owner_actor_id=${ownerActorId || "none"}`);
+    if (ownerActor?.lifecycleStatus) {
+      appendEvidence(evidence, seenEvidence, "actor-registry", `owner_lifecycle=${ownerActor.lifecycleStatus}`);
+    }
+    if (ownerActor?.claimStrength) {
+      appendEvidence(evidence, seenEvidence, "actor-registry", `owner_claim=${ownerActor.claimStrength}`);
+    }
   }
 
   const originAudience = actorAudienceFromKind(origin.kind);
@@ -415,6 +437,24 @@ export async function resolveTurnOriginForNotification(
       ...(actor.agentRole ? { agentRole: actor.agentRole } : {}),
       source: actor.source,
     };
+    const actorLifecycleFields = {
+      ...(actor.lifecycleStatus ? { actorLifecycleStatus: actor.lifecycleStatus } : {}),
+      ...(actor.claimStrength ? { actorClaimStrength: actor.claimStrength } : {}),
+      ...ownerLifecycleFields,
+    };
+    if (isSupersededOwner(actor)) {
+      return {
+        origin: resolvedOrigin,
+        audience: "unknown-non-owner",
+        delivery: "suppress",
+        reason: "superseded_owner_actor",
+        evidence,
+        actorId: actor.actorId,
+        ...(ownerActorId ? { ownerActorId } : {}),
+        ...(sessionMeta ? { sessionMeta } : {}),
+        ...actorLifecycleFields,
+      };
+    }
     if (originAudience !== "unknown-non-owner" && originAudience !== "external-owner") {
       return {
         origin: {
@@ -432,9 +472,15 @@ export async function resolveTurnOriginForNotification(
         actorId: actor.actorId,
         ...(ownerActorId ? { ownerActorId } : {}),
         ...(sessionMeta ? { sessionMeta } : {}),
+        ...actorLifecycleFields,
       };
     }
-    if (actor.actorId === ownerActorId && actor.kind === "leader" && actor.audience === "external-owner") {
+    if (
+      actor.actorId === ownerActorId
+      && actor.kind === "leader"
+      && actor.audience === "external-owner"
+      && isOwnerClaimDeliverable(actor)
+    ) {
       return {
         origin: resolvedOrigin,
         audience: "external-owner",
@@ -444,6 +490,20 @@ export async function resolveTurnOriginForNotification(
         actorId: actor.actorId,
         ownerActorId,
         ...(sessionMeta ? { sessionMeta } : {}),
+        ...actorLifecycleFields,
+      };
+    }
+    if (actor.actorId === ownerActorId && actor.kind === "leader" && actor.audience === "external-owner") {
+      return {
+        origin: resolvedOrigin,
+        audience: "unknown-non-owner",
+        delivery: "suppress",
+        reason: "owner_actor_lifecycle_not_deliverable",
+        evidence,
+        actorId: actor.actorId,
+        ownerActorId,
+        ...(sessionMeta ? { sessionMeta } : {}),
+        ...actorLifecycleFields,
       };
     }
     return {
@@ -455,6 +515,7 @@ export async function resolveTurnOriginForNotification(
       actorId: actor.actorId,
       ...(ownerActorId ? { ownerActorId } : {}),
       ...(sessionMeta ? { sessionMeta } : {}),
+      ...actorLifecycleFields,
     };
   }
 
@@ -466,6 +527,7 @@ export async function resolveTurnOriginForNotification(
       evidence,
       ...(ownerActorId ? { ownerActorId } : {}),
       ...(sessionMeta ? { sessionMeta } : {}),
+      ...ownerLifecycleFields,
     };
   }
 
@@ -491,6 +553,7 @@ export async function resolveTurnOriginForNotification(
       evidence,
       ownerActorId: registry.ownerActorId,
       ...(sessionMeta ? { sessionMeta } : {}),
+      ...ownerLifecycleFields,
     };
   }
 
@@ -503,6 +566,7 @@ export async function resolveTurnOriginForNotification(
       reason: "unknown_without_current_owner_fail_closed",
       evidence,
       ...(sessionMeta ? { sessionMeta } : {}),
+      ...ownerLifecycleFields,
     };
   }
 
@@ -514,5 +578,6 @@ export async function resolveTurnOriginForNotification(
     reason: "missing_actor_registry_owner",
     evidence,
     ...(sessionMeta ? { sessionMeta } : {}),
+    ...ownerLifecycleFields,
   };
 }

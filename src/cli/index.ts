@@ -173,7 +173,7 @@ Usage:
   omx uninstall Remove OMX configuration and clean up installed artifacts
   omx doctor    Check installation health
   omx list      List packaged OMX skills and native agent prompts (--json)
-  omx cleanup   Kill orphaned OMX MCP server processes and remove stale OMX /tmp directories
+  omx cleanup   Kill orphaned OMX MCP server processes and stale /tmp dirs (does not reset session/actor state)
   omx doctor --team  Check team/swarm runtime health diagnostics
   omx ask       Ask local provider CLI (claude|gemini) and write artifact output
   omx question  OMX-owned blocking question UI entrypoint for agent-invoked user questions

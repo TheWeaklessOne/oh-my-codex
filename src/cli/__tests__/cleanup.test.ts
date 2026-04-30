@@ -10,6 +10,7 @@ import {
   listOmxProcesses,
   type ProcessEntry,
 } from '../cleanup.js';
+import { HELP as CLI_HELP } from '../index.js';
 
 const CURRENT_SESSION_PROCESSES: ProcessEntry[] = [
   { pid: 700, ppid: 500, command: 'codex' },
@@ -422,6 +423,10 @@ describe('cleanupStaleTmpDirectories', () => {
 });
 
 describe('cleanupCommand', () => {
+  it('documents cleanup as process/tmp cleanup rather than actor/session reset', async () => {
+    assert.match(CLI_HELP, /does not reset session\/actor state/);
+  });
+
   it('runs tmp cleanup after orphaned MCP cleanup', async () => {
     const calls: string[] = [];
 
