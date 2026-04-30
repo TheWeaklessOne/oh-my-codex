@@ -136,6 +136,31 @@ export function extractRalphTaskDescription(args: readonly string[], fallbackTas
   return words.join(' ') || fallbackTask || 'ralph-cli-launch';
 }
 
+export function resolveApprovedRalphExecutionHint(
+  candidate: ApprovedExecutionLaunchHint | null,
+  explicitTask: string,
+): ApprovedExecutionLaunchHint | null {
+  if (!candidate) return null;
+  if (explicitTask === 'ralph-cli-launch') {
+    return candidate;
+  }
+  return candidate.task.trim() === explicitTask.trim() ? candidate : null;
+}
+
+export function readMatchedApprovedRalphExecutionHint(
+  cwd: string,
+  explicitTask: string,
+): ApprovedExecutionLaunchHint | null {
+  return resolveApprovedRalphExecutionHint(
+    readApprovedExecutionLaunchHint(
+      cwd,
+      'ralph',
+      explicitTask === 'ralph-cli-launch' ? {} : { task: explicitTask },
+    ),
+    explicitTask,
+  );
+}
+
 function buildRalphApprovedContextLines(approvedHint: ApprovedExecutionLaunchHint | null): string[] {
   if (!approvedHint) return [];
   const lines = [
@@ -260,12 +285,9 @@ export async function ralphCommand(args: string[]): Promise<void> {
   }
   assertRequiredRalphPrdJson(cwd, args);
   const artifacts = await ensureCanonicalRalphArtifacts(cwd);
-  const rawApprovedHint = readApprovedExecutionLaunchHint(cwd, 'ralph');
   const explicitTask = extractRalphTaskDescription(normalizedArgs);
-  const task = explicitTask === 'ralph-cli-launch' ? rawApprovedHint?.task ?? explicitTask : explicitTask;
-  const approvedHint = rawApprovedHint && (explicitTask === 'ralph-cli-launch' || rawApprovedHint.task.trim() === task.trim())
-    ? rawApprovedHint
-    : null;
+  const approvedHint = readMatchedApprovedRalphExecutionHint(cwd, explicitTask);
+  const task = explicitTask === 'ralph-cli-launch' ? approvedHint?.task ?? explicitTask : explicitTask;
   const noDeslop = normalizedArgs.some((arg) => arg.toLowerCase() === '--no-deslop');
   const availableAgentTypes = await resolveAvailableAgentTypes(cwd);
   const staffingPlan = buildFollowupStaffingPlan('ralph', task, availableAgentTypes);

@@ -245,6 +245,33 @@ describe('parseTeamStartArgs', () => {
     }
   });
 
+  it('fails closed for a short team follow-up when the selected PRD lists multiple team launch hints', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-team-followup-ambiguous-'));
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(wd);
+      await mkdir(join(wd, '.omx', 'plans'), { recursive: true });
+      await writeFile(
+        join(wd, '.omx', 'plans', 'prd-issue-831-ambiguous.md'),
+        [
+          '# Approved plan',
+          '',
+          'Launch via omx team 3:executor "Execute approved issue 831 plan"',
+          'Launch via omx team 5:debugger "Execute alternate issue 831 plan"',
+        ].join('\n'),
+      );
+      await writeFile(join(wd, '.omx', 'plans', 'test-spec-issue-831-ambiguous.md'), '# Test spec\n');
+
+      assert.throws(
+        () => parseTeamStartArgs(['team']),
+        /approved_execution_hint_ambiguous:team/,
+      );
+    } finally {
+      process.chdir(previousCwd);
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
 
   it('does not opt normal team startup into repo-aware DAG handoff even when a stale sidecar exists', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-team-dag-normal-'));
