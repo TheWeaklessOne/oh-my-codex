@@ -117,8 +117,60 @@ describe('omx question CLI', () => {
     const payload = JSON.parse(stdout);
     assert.equal(payload.ok, true);
     assert.equal(payload.answer.value, 'free text answer');
+    assert.equal(payload.answers[0].answer.value, 'free text answer');
+    assert.equal(payload.questions[0].question, 'Pick one');
     assert.equal(payload.prompt.source, 'deep-interview');
     assert.equal(payload.prompt.type, 'multi-answerable');
+  });
+
+  it('omits legacy prompt and answer projections for batch payloads', async () => {
+    const cwd = await makeRepo();
+    const input = JSON.stringify({
+      header: 'Batch prompt',
+      questions: [
+        { id: 'first', question: 'First?', options: [{ label: 'A', value: 'a' }, { label: 'B', value: 'b' }], allow_other: false },
+        { id: 'second', question: 'Second?', options: [{ label: 'C', value: 'c' }, { label: 'D', value: 'd' }], allow_other: false },
+      ],
+      session_id: 'sess-q',
+    });
+
+    const child = spawn(process.execPath, [omxBin, 'question', '--input', input, '--json'], {
+      cwd,
+      env: { ...process.env, OMX_AUTO_UPDATE: '0', OMX_NOTIFY_FALLBACK: '0', OMX_HOOK_DERIVED_SIGNALS: '0', OMX_QUESTION_TEST_RENDERER: 'noop' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += String(chunk); });
+    child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+    const closePromise = new Promise<number | null>((resolve) => child.on('close', resolve));
+
+    const questionsDir = join(cwd, '.omx', 'state', 'sessions', 'sess-q', 'questions');
+    let recordFile = '';
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      try {
+        const entries = await readdir(questionsDir);
+        recordFile = entries.find((entry) => entry.endsWith('.json')) || '';
+        if (recordFile) break;
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    assert.notEqual(recordFile, '', `expected batch question record file, stderr=${stderr}`);
+    const recordPath = join(questionsDir, recordFile);
+    await markQuestionAnswered(recordPath, [
+      { question_id: 'first', index: 0, answer: { kind: 'option', value: 'a', selected_labels: ['A'], selected_values: ['a'] } },
+      { question_id: 'second', index: 1, answer: { kind: 'option', value: 'd', selected_labels: ['D'], selected_values: ['d'] } },
+    ]);
+
+    const exitCode = await closePromise;
+    assert.equal(exitCode, 0, stderr || stdout);
+    const payload = JSON.parse(stdout);
+    assert.equal(payload.ok, true);
+    assert.deepEqual(payload.answers.map((entry: any) => entry.answer.value), ['a', 'd']);
+    assert.equal(Object.prototype.hasOwnProperty.call(payload, 'answer'), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(payload, 'prompt'), false);
   });
 
   it('fails closed when tmux reports a split pane that does not actually exist', async () => {
@@ -163,6 +215,8 @@ esac
           PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
           TMUX: '/tmp/fake',
           TMUX_PANE: '%0',
+          OMX_QUESTION_RETURN_PANE: '',
+          OMX_LEADER_PANE_ID: '',
           OMX_AUTO_UPDATE: '0',
           OMX_NOTIFY_FALLBACK: '0',
           OMX_HOOK_DERIVED_SIGNALS: '0',
@@ -236,6 +290,8 @@ esac
           PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
           TMUX: '/tmp/fake',
           TMUX_PANE: '%0',
+          OMX_QUESTION_RETURN_PANE: '',
+          OMX_LEADER_PANE_ID: '',
           OMX_AUTO_UPDATE: '0',
           OMX_NOTIFY_FALLBACK: '0',
           OMX_HOOK_DERIVED_SIGNALS: '0',
@@ -327,6 +383,8 @@ exit 0
     };
     delete childEnv.TMUX;
     delete childEnv.TMUX_PANE;
+    delete childEnv.OMX_QUESTION_RETURN_PANE;
+    delete childEnv.OMX_LEADER_PANE_ID;
     delete childEnv.OMX_QUESTION_TEST_RENDERER;
 
     const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
@@ -401,6 +459,8 @@ exit 0
           PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
           TMUX: '/tmp/fake',
           TMUX_PANE: '%0',
+          OMX_QUESTION_RETURN_PANE: '',
+          OMX_LEADER_PANE_ID: '',
           OMX_AUTO_UPDATE: '0',
           OMX_NOTIFY_FALLBACK: '0',
           OMX_HOOK_DERIVED_SIGNALS: '0',
@@ -444,11 +504,14 @@ exit 0
     await writeFile(join(fakeBinDir, 'tmux'), `#!/bin/sh
 printf '%s\n' "$*" >> "${tmuxLogPath}"
 case "$1" in
+  display-message)
+    printf '40\n'
+    ;;
   split-window)
     printf '%%45\n'
     ;;
   list-panes)
-    printf '0\t%%45\n'
+    printf '0	%%45\n'
     ;;
 esac
 `, { mode: 0o755 });
@@ -470,6 +533,7 @@ esac
     };
     delete childEnv.TMUX;
     delete childEnv.TMUX_PANE;
+    delete childEnv.OMX_LEADER_PANE_ID;
     delete childEnv.OMX_QUESTION_TEST_RENDERER;
 
     const child = spawn(process.execPath, [omxBin, 'question', '--input', input, '--json'], {
@@ -494,13 +558,11 @@ esac
     assert.notEqual(recordFile, '', `expected question record file, stderr=${stderr}`);
     const recordPath = join(questionsDir, recordFile);
 
-    let record = null;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      record = await readQuestionRecord(recordPath);
-      if (record?.status === 'prompting') break;
+    let record = await readQuestionRecord(recordPath);
+    for (let attempt = 0; attempt < 100 && !record?.renderer; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 20));
+      record = await readQuestionRecord(recordPath);
     }
-    assert.equal(record?.status, 'prompting', `expected prompting question record, stderr=${stderr}`);
     assert.equal(record?.renderer?.renderer, 'tmux-pane');
     assert.equal(record?.renderer?.target, '%45');
     assert.equal(record?.renderer?.return_target, '%44');
@@ -519,7 +581,7 @@ esac
     assert.equal(payload.answer.value, 'a');
 
     const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-    assert.match(tmuxLog, /split-window -v -l 12 -t %44 -P -F #\{pane_id\}/);
+    assert.match(tmuxLog, /split-window -v -l 24 -t %44 -P -F #\{pane_id\}/);
     assert.doesNotMatch(tmuxLog, /new-session/);
   });
 

@@ -28,6 +28,7 @@ const AUTO_COMPLETE_TRANSITIONS = new Set([
   'ralplan->ralph',
   'ralplan->autopilot',
   'ralplan->autoresearch',
+  'autopilot->ralplan',
 ]);
 
 const PLANNING_LIKE_MODES = new Set<TrackedWorkflowMode>([

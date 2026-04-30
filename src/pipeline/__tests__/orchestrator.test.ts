@@ -10,6 +10,7 @@ import {
   readPipelineState,
   cancelPipeline,
   createAutopilotPipelineConfig,
+  createStrictAutopilotStages,
 } from '../orchestrator.js';
 import type { PipelineConfig, PipelineStage, StageContext, StageResult } from '../types.js';
 
@@ -127,6 +128,97 @@ describe('Pipeline Orchestrator', () => {
       assert.equal(result.status, 'completed');
       assert.deepEqual(order, ['stage-a', 'stage-b', 'stage-c']);
       assert.equal(Object.keys(result.stageResults).length, 3);
+    });
+
+
+
+    it('returns to ralplan when code-review is not clean', async () => {
+      const order: string[] = [];
+      let reviewRuns = 0;
+      const stages: PipelineStage[] = [
+        {
+          name: 'ralplan',
+          async run(): Promise<StageResult> {
+            order.push('ralplan');
+            return { status: 'completed', artifacts: { plan: `cycle-${order.length}` }, duration_ms: 0 };
+          },
+        },
+        {
+          name: 'ralph',
+          async run(): Promise<StageResult> {
+            order.push('ralph');
+            return { status: 'completed', artifacts: { implemented: true }, duration_ms: 0 };
+          },
+        },
+        {
+          name: 'code-review',
+          async run(): Promise<StageResult> {
+            order.push('code-review');
+            reviewRuns += 1;
+            const clean = reviewRuns > 1;
+            return {
+              status: 'completed',
+              artifacts: {
+                review_verdict: {
+                  recommendation: clean ? 'APPROVE' : 'REQUEST CHANGES',
+                  architectural_status: 'CLEAR',
+                  clean,
+                },
+                return_to_ralplan_reason: clean ? null : 'Review requested a plan update.',
+              },
+              duration_ms: 0,
+            };
+          },
+        },
+      ];
+
+      const result = await runPipeline({
+        name: 'review-loop-test',
+        task: 'loop until review clean',
+        stages,
+        cwd: tempDir,
+        maxRalphIterations: 3,
+      });
+
+      assert.equal(result.status, 'completed');
+      assert.deepEqual(order, ['ralplan', 'ralph', 'code-review', 'ralplan', 'ralph', 'code-review']);
+
+      const ext = await readPipelineState(tempDir);
+      assert.equal(ext?.review_cycle, 1);
+      assert.equal((ext?.review_verdict as { clean?: boolean } | undefined)?.clean, true);
+      assert.equal(ext?.return_to_ralplan_reason, null);
+      assert.ok(ext?.handoff_artifacts?.code_review);
+      assert.equal(Object.prototype.hasOwnProperty.call(ext?.handoff_artifacts ?? {}, 'code-review'), false);
+      assert.equal(Object.prototype.hasOwnProperty.call(ext?.handoff_artifacts ?? {}, 'review_verdict'), false);
+    });
+
+    it('fails after bounded non-clean code-review cycles', async () => {
+      const stages: PipelineStage[] = [
+        makeStage('ralplan'),
+        makeStage('ralph'),
+        makeStage('code-review', {
+          artifacts: {
+            review_verdict: {
+              recommendation: 'REQUEST CHANGES',
+              architectural_status: 'WATCH',
+              clean: false,
+            },
+            return_to_ralplan_reason: 'Review still has findings.',
+          },
+        }),
+      ];
+
+      const result = await runPipeline({
+        name: 'review-loop-fail-test',
+        task: 'loop until bounded failure',
+        stages,
+        cwd: tempDir,
+        maxRalphIterations: 2,
+      });
+
+      assert.equal(result.status, 'failed');
+      assert.equal(result.failedStage, 'code-review');
+      assert.match(result.error ?? '', /Code review was not clean after 2 cycle/);
     });
 
     it('passes artifacts between stages', async () => {
@@ -441,7 +533,7 @@ describe('Pipeline Orchestrator', () => {
           mode: 'autopilot',
           iteration: 1,
           max_iterations: 3,
-          current_phase: 'stage:team-exec',
+          current_phase: 'ralph',
           pipeline_name: 'resume-test',
           started_at: new Date().toISOString(),
         }),
@@ -484,15 +576,20 @@ describe('Pipeline Orchestrator', () => {
 
   describe('createAutopilotPipelineConfig', () => {
     it('creates config with default values', () => {
-      const stages = [makeStage('a')];
-      const config = createAutopilotPipelineConfig('build feature X', { stages });
+      const config = createAutopilotPipelineConfig('build feature X', {});
 
       assert.equal(config.name, 'autopilot');
       assert.equal(config.task, 'build feature X');
       assert.equal(config.maxRalphIterations, 10);
       assert.equal(config.workerCount, 2);
       assert.equal(config.agentType, 'executor');
-      assert.equal(config.stages.length, 1);
+      assert.deepEqual(config.stages.map((stage) => stage.name), ['ralplan', 'ralph', 'code-review']);
+    });
+
+
+
+    it('exposes strict default autopilot stages', () => {
+      assert.deepEqual(createStrictAutopilotStages().map((stage) => stage.name), ['ralplan', 'ralph', 'code-review']);
     });
 
     it('accepts custom overrides', () => {

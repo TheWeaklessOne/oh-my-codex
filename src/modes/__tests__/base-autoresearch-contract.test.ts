@@ -84,7 +84,7 @@ describe('modes/base autoresearch contract integration', () => {
   it('startMode blocks execution-to-planning rollback auto-complete', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-mode-rollback-deny-'));
     try {
-      await startMode('autopilot', 'demo', 5, wd);
+      await startMode('ralph', 'demo', 5, wd);
       await assert.rejects(
         () => startMode('ralplan', 'plan again', 5, wd),
         /Execution-to-planning rollback auto-complete is not allowed/i,

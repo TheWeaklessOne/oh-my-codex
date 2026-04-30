@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { getInstallableNativeAgentNames } from '../../agents/policy.js';
 import { getSetupInstallableSkillNames } from '../../catalog/installable.js';
 import { readCatalogManifest } from '../../catalog/reader.js';
+import { OMX_FIRST_PARTY_MCP_PLUGIN_TARGETS } from '../../config/omx-first-party-mcp.js';
 
 type PackageJson = {
   files?: string[];
@@ -101,6 +102,46 @@ describe('package bin contract', () => {
     const binSource = readFileSync(binPath, 'utf-8');
     const compiledCliSource = readFileSync(compiledCliPath, 'utf-8');
     assert.match(binSource, /^#!\/usr\/bin\/env node/);
+    const mcpInitialize = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'package-bin-contract', version: '0' },
+      },
+    }) + '\n';
+    for (const target of OMX_FIRST_PARTY_MCP_PLUGIN_TARGETS) {
+      const mcpServe = spawnSync(
+        process.execPath,
+        [binPath, 'mcp-serve', target],
+        {
+          cwd: process.cwd(),
+          encoding: 'utf-8',
+          input: mcpInitialize,
+          timeout: 5_000,
+        },
+      );
+      assert.equal(
+        mcpServe.status,
+        0,
+        `${target} stderr=${mcpServe.stderr} stdout=${mcpServe.stdout}`,
+      );
+      assert.notEqual(
+        mcpServe.stdout.trim(),
+        '',
+        `omx bin wrapper must keep mcp-serve ${target} alive long enough to complete stdio initialization`,
+      );
+      const mcpResponse = JSON.parse(mcpServe.stdout) as {
+        result?: { serverInfo?: { name?: string; version?: string } };
+      };
+      assert.match(
+        mcpResponse.result?.serverInfo?.name ?? '',
+        /^omx-/,
+        `${target} initialize response should include serverInfo`,
+      );
+    }
     assert.match(compiledCliSource, /omx update\s+Check npm now, update the global install immediately, then refresh setup/);
     assert.match(compiledCliSource, /case "update"/);
 

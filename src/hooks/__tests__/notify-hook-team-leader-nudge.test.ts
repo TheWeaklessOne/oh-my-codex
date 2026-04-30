@@ -2069,7 +2069,7 @@ exit 0
       assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(tmuxLog, /Team stalled-progress: leader stale, no progress 3m\./);
+      assert.match(tmuxLog, /Team stalled-progress: leader stale, no progress 3m(?:\d+s)?\./);
       assert.match(tmuxLog, /Next: omx team status stalled-progress; read worker messages; unblock\/reassign or shutdown\./);
       assert.doesNotMatch(tmuxLog, /keep polling/);
       assert.doesNotMatch(tmuxLog, /\[OMX_INTENT:/);
@@ -2197,7 +2197,7 @@ exit 0
       assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(tmuxLog, /Team stalled-before-stale: worker panes stalled, no progress 3m\./);
+      assert.match(tmuxLog, /Team stalled-before-stale: worker panes stalled, no progress 3m(?:\d+s)?\./);
       assert.match(tmuxLog, /Next: omx team status stalled-before-stale; read worker messages; unblock\/reassign or shutdown\./);
       assert.doesNotMatch(tmuxLog, /keep polling/);
       assert.doesNotMatch(tmuxLog, /leader stale/);

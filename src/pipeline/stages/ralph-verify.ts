@@ -1,9 +1,9 @@
 /**
- * Ralph bounded follow-up stage adapter for pipeline orchestrator.
+ * Ralph bounded follow-up and strict Autopilot stage adapter for the pipeline orchestrator.
  *
- * Wraps the Ralph persistence loop into a PipelineStage only for
- * narrow stubborn follow-up slices after the main execution path.
- * Uses configurable iteration count.
+ * Wraps the Ralph persistence loop into a PipelineStage for either the
+ * strict Autopilot execution/verification phase or a bounded legacy follow-up
+ * after coordinated team execution.
  */
 
 import type { PipelineStage, StageContext, StageResult } from '../types.js';
@@ -13,6 +13,16 @@ import {
 } from '../../team/followup-planner.js';
 
 export interface RalphVerifyStageOptions {
+  /** Stage name. Strict Autopilot uses 'ralph'; legacy pipeline adapters use 'ralph-verify'. */
+  stageName?: string;
+
+  /**
+   * Ordered artifact keys used as Ralph execution input.
+   * Legacy ralph-verify keeps reading prior ralph/team-exec output; strict Autopilot
+   * Ralph reads ralplan first so implementation starts from approved planning.
+   */
+  executionArtifactKeys?: readonly string[];
+
   /**
    * Maximum number of ralph verification iterations.
    * Defaults to 10.
@@ -38,40 +48,39 @@ function shouldRunRalphFollowup(
 /**
  * Create a ralph-verify pipeline stage.
  *
- * This stage wraps the Ralph persistence loop only as a bounded fallback
- * after the coordinated execution path. It takes the execution results
- * from team-exec and emits a constrained follow-up descriptor instead of
- * treating Ralph as the primary execution owner.
+ * This stage wraps the Ralph persistence loop as a bounded fallback for
+ * legacy/coordinated team pipelines. Strict Autopilot uses `createRalphStage()`
+ * for the primary implementation/verification phase before code-review.
  *
  * The iteration count is configurable, addressing issue #396 requirement
  * for configurable ralph iteration count.
  */
 export function createRalphVerifyStage(options: RalphVerifyStageOptions = {}): PipelineStage {
   const maxIterations = options.maxIterations ?? 10;
+  const stageName = options.stageName ?? 'ralph-verify';
+  const useFollowupGate = stageName === 'ralph-verify' || typeof options.shouldRun === 'function';
 
-  return {
-    name: 'ralph-verify',
-    canSkip(ctx) {
-      return !shouldRunRalphFollowup(ctx, options);
-    },
+  const stage: PipelineStage = {
+    name: stageName,
 
     async run(ctx: StageContext): Promise<StageResult> {
       const startTime = Date.now();
 
       try {
-        if (!shouldRunRalphFollowup(ctx, options)) {
+        if (useFollowupGate && !shouldRunRalphFollowup(ctx, options)) {
           return {
             status: 'skipped',
             artifacts: {
-              stage: 'ralph-verify',
+              stage: stageName,
               reason: 'no residual follow-up requested after team execution',
             },
             duration_ms: Date.now() - startTime,
           };
         }
 
-        // Extract execution context from previous stage
-        const teamArtifacts = ctx.artifacts['team-exec'] as Record<string, unknown> | undefined;
+        // Extract execution context from previous stage.
+        const executionArtifactKeys = options.executionArtifactKeys ?? ['ralph', 'team-exec'];
+        const executionArtifacts = pickFirstArtifact(ctx.artifacts, executionArtifactKeys);
         const availableAgentTypes = await resolveAvailableAgentTypes(ctx.cwd);
         const staffingPlan = buildFollowupStaffingPlan('ralph', ctx.task, availableAgentTypes, {
           workerCount: Math.min(maxIterations, 3),
@@ -85,7 +94,7 @@ export function createRalphVerifyStage(options: RalphVerifyStageOptions = {}): P
           sessionId: ctx.sessionId,
           availableAgentTypes,
           staffingPlan,
-          executionArtifacts: teamArtifacts ?? {},
+          executionArtifacts: executionArtifacts ?? {},
         };
 
         return {
@@ -95,7 +104,7 @@ export function createRalphVerifyStage(options: RalphVerifyStageOptions = {}): P
             maxIterations,
             availableAgentTypes,
             staffingPlan,
-            stage: 'ralph-verify',
+            stage: stageName,
             instruction: buildRalphInstruction(verifyDescriptor),
           },
           duration_ms: Date.now() - startTime,
@@ -110,6 +119,12 @@ export function createRalphVerifyStage(options: RalphVerifyStageOptions = {}): P
       }
     },
   };
+
+  if (useFollowupGate) {
+    stage.canSkip = (ctx) => !shouldRunRalphFollowup(ctx, options);
+  }
+
+  return stage;
 }
 
 // ---------------------------------------------------------------------------
@@ -134,4 +149,26 @@ export interface RalphVerifyDescriptor {
  */
 export function buildRalphInstruction(descriptor: RalphVerifyDescriptor): string {
   return `${descriptor.staffingPlan.launchHints.shellCommand} # policy=${descriptor.staffingPlan.constraints.policy} # hardening=${descriptor.staffingPlan.constraints.hardening} # max_iterations=${descriptor.maxIterations} # staffing=${descriptor.staffingPlan.staffingSummary} # verify=${descriptor.staffingPlan.verificationPlan.summary}`;
+}
+
+function pickFirstArtifact(
+  artifacts: Record<string, unknown>,
+  keys: readonly string[],
+): Record<string, unknown> | undefined {
+  for (const key of keys) {
+    const artifact = artifacts[key];
+    if (artifact && typeof artifact === 'object') {
+      return artifact as Record<string, unknown>;
+    }
+  }
+  return undefined;
+}
+
+/** Create the strict Autopilot Ralph phase adapter. */
+export function createRalphStage(options: RalphVerifyStageOptions = {}): PipelineStage {
+  return createRalphVerifyStage({
+    ...options,
+    stageName: 'ralph',
+    executionArtifactKeys: options.executionArtifactKeys ?? ['ralplan', 'team-exec'],
+  });
 }

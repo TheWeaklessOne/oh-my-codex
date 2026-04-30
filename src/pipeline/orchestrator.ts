@@ -1,17 +1,21 @@
 /**
  * Pipeline Orchestrator for oh-my-codex
  *
- * Sequences configurable stages (for example: RALPLAN -> team execution ->
- * bounded Ralph follow-up when needed)
+ * Sequences configurable stages (default: ralplan -> ralph -> code-review;
+ * legacy adapters may use team execution with bounded Ralph follow-up)
  * and persists state through the ModeState system.
  *
  * Mirrors OMC #1130 pipeline design with OMX-specific adaptations:
- * - Execution backend is always teams (Codex CLI workers)
  * - Ralph iteration count is configurable
- * - Integrates with existing team mode infrastructure
+ * - Code review is the merge-readiness gate
+ * - Non-clean review artifacts can drive a return to ralplan
  */
 
 import { startMode, readModeState, updateModeState, cancelMode } from '../modes/base.js';
+import { createRalplanStage } from './stages/ralplan.js';
+import { createRalphStage } from './stages/ralph-verify.js';
+import { createCodeReviewStage } from './stages/code-review.js';
+import { isNonCleanReviewVerdict } from './review-verdict.js';
 import type {
   PipelineConfig,
   PipelineResult,
@@ -52,19 +56,25 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
     pipeline_max_ralph_iterations: maxRalphIterations,
     pipeline_worker_count: workerCount,
     pipeline_agent_type: agentType,
+    review_cycle: 0,
+    review_verdict: null,
+    return_to_ralplan_reason: null,
+    handoff_artifacts: {},
   };
 
   await updateModeState(MODE_NAME, {
     ...modeState,
     ...pipelineExtension,
-    current_phase: `stage:${config.stages[0].name}`,
+    current_phase: config.stages[0].name,
   }, cwd);
 
   // Execute stages sequentially
   const stageResults: Record<string, StageResult> = {};
   const artifacts: Record<string, unknown> = {};
+  const handoffArtifactsByStage: Record<string, unknown> = {};
   let previousResult: StageResult | undefined;
   let lastStageName: string | undefined;
+  let reviewCycle = 0;
 
   for (let i = 0; i < config.stages.length; i++) {
     const stage = config.stages[i];
@@ -93,7 +103,7 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
       stageResults[stage.name] = skippedResult;
 
       await updateModeState(MODE_NAME, {
-        current_phase: `stage:${stage.name}:skipped`,
+        current_phase: `${stage.name}:skipped`,
         pipeline_stage_index: i,
         pipeline_stage_results: { ...stageResults },
       } as Partial<PipelineModeStateExtension>, cwd);
@@ -105,7 +115,7 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
 
     // Update state to running
     await updateModeState(MODE_NAME, {
-      current_phase: `stage:${stage.name}`,
+      current_phase: stage.name,
       pipeline_stage_index: i,
       iteration: i + 1,
     } as Partial<PipelineModeStateExtension>, cwd);
@@ -129,12 +139,39 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
     // Merge artifacts
     if (result.artifacts) {
       Object.assign(artifacts, { [stage.name]: result.artifacts });
+      Object.assign(handoffArtifactsByStage, { [stage.name]: result.artifacts });
     }
+
+    const resultArtifacts = result.artifacts as Record<string, unknown>;
+    const reviewVerdict = stage.name === 'code-review' ? resultArtifacts.review_verdict : undefined;
+    const returnToRalplanReason = stage.name === 'code-review'
+      ? resultArtifacts.return_to_ralplan_reason as string | null | undefined
+      : undefined;
+    const reviewIsNotClean = stage.name === 'code-review'
+      && result.status === 'completed'
+      && isNonCleanReviewVerdict(reviewVerdict);
+
+    if (stage.name === 'code-review') {
+      artifacts.review_verdict = reviewVerdict ?? null;
+      artifacts.return_to_ralplan_reason = returnToRalplanReason ?? null;
+    }
+
+    if (reviewIsNotClean) {
+      reviewCycle += 1;
+    }
+
+    const handoffArtifacts = normalizeHandoffArtifactKeys(handoffArtifactsByStage);
 
     // Persist stage result
     await updateModeState(MODE_NAME, {
-      current_phase: `stage:${stage.name}:${result.status}`,
-      pipeline_stage_index: i,
+      current_phase: reviewIsNotClean ? 'ralplan' : (result.status === 'completed' ? stage.name : `${stage.name}:${result.status}`),
+      handoff_artifacts: handoffArtifacts,
+      ...(stage.name === 'code-review' ? {
+        review_verdict: reviewVerdict,
+        return_to_ralplan_reason: returnToRalplanReason ?? null,
+        review_cycle: reviewCycle,
+      } : {}),
+      pipeline_stage_index: reviewIsNotClean ? 0 : i,
       pipeline_stage_results: { ...stageResults },
     } as Partial<PipelineModeStateExtension>, cwd);
 
@@ -157,6 +194,39 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
         error: result.error,
         failedStage: stage.name,
       };
+    }
+
+    if (reviewIsNotClean) {
+      if (reviewCycle >= maxRalphIterations) {
+        const error = returnToRalplanReason
+          ? `Code review was not clean after ${reviewCycle} cycle(s): ${returnToRalplanReason}`
+          : `Code review was not clean after ${reviewCycle} cycle(s).`;
+        const duration_ms = Date.now() - startTime;
+
+        await updateModeState(MODE_NAME, {
+          active: false,
+          current_phase: 'failed',
+          completed_at: new Date().toISOString(),
+          error,
+        }, cwd);
+
+        return {
+          status: 'failed',
+          stageResults,
+          duration_ms,
+          artifacts,
+          error,
+          failedStage: stage.name,
+        };
+      }
+
+      if (config.onStageTransition) {
+        config.onStageTransition(stage.name, 'ralplan');
+      }
+      lastStageName = undefined;
+      previousResult = result;
+      i = -1;
+      continue;
     }
 
     lastStageName = stage.name;
@@ -214,6 +284,10 @@ export async function readPipelineState(
     pipeline_max_ralph_iterations: state.pipeline_max_ralph_iterations as number,
     pipeline_worker_count: state.pipeline_worker_count as number,
     pipeline_agent_type: state.pipeline_agent_type as string,
+    review_cycle: state.review_cycle as number | undefined,
+    review_verdict: state.review_verdict,
+    return_to_ralplan_reason: state.return_to_ralplan_reason as string | null | undefined,
+    handoff_artifacts: state.handoff_artifacts as Record<string, unknown> | undefined,
   };
 }
 
@@ -227,6 +301,18 @@ export async function cancelPipeline(cwd?: string): Promise<void> {
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
+
+function normalizeHandoffArtifactKeys(artifacts: Record<string, unknown>): Record<string, unknown> {
+  const normalized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(artifacts)) {
+    normalized[toHandoffArtifactKey(key)] = value;
+  }
+  return normalized;
+}
+
+function toHandoffArtifactKey(stageName: string): string {
+  return stageName === 'code-review' ? 'code_review' : stageName;
+}
 
 function validateConfig(config: PipelineConfig): void {
   if (!config.name || config.name.trim() === '') {
@@ -271,9 +357,9 @@ function validateConfig(config: PipelineConfig): void {
 /**
  * Create the default autopilot pipeline configuration.
  *
- * The caller provides the ordered stages. Typical OMX usage keeps team as
- * the primary coordinated executor and uses ralph-verify only as a bounded
- * fallback stage for narrow stubborn follow-up slices.
+ * Defaults to the strict Autopilot loop: ralplan -> ralph -> code-review.
+ * Callers may still provide ordered legacy stages that use team execution
+ * plus ralph-verify as a bounded fallback for stubborn follow-up slices.
  */
 export function createAutopilotPipelineConfig(
   task: string,
@@ -283,14 +369,14 @@ export function createAutopilotPipelineConfig(
     maxRalphIterations?: number;
     workerCount?: number;
     agentType?: string;
-    stages: PipelineConfig['stages'];
+    stages?: PipelineConfig['stages'];
     onStageTransition?: PipelineConfig['onStageTransition'];
   },
 ): PipelineConfig {
   return {
     name: 'autopilot',
     task,
-    stages: options.stages,
+    stages: options.stages ?? createStrictAutopilotStages(),
     cwd: options.cwd,
     sessionId: options.sessionId,
     maxRalphIterations: options.maxRalphIterations ?? 10,
@@ -298,4 +384,8 @@ export function createAutopilotPipelineConfig(
     agentType: options.agentType ?? 'executor',
     onStageTransition: options.onStageTransition,
   };
+}
+
+export function createStrictAutopilotStages(): PipelineConfig['stages'] {
+  return [createRalplanStage(), createRalphStage(), createCodeReviewStage()];
 }

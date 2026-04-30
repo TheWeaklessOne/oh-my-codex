@@ -7,6 +7,7 @@
 
 import type { PipelineStage, StageContext, StageResult } from '../types.js';
 import { isPlanningComplete, readPlanningArtifacts } from '../../planning/artifacts.js';
+import { isNonCleanReviewVerdict } from '../review-verdict.js';
 import {
   runRalplanConsensus,
   type RalplanConsensusExecutor,
@@ -22,7 +23,7 @@ export interface CreateRalplanStageOptions {
  *
  * The RALPLAN stage performs consensus planning by coordinating planner,
  * architect, and critic agents. It outputs a plan file that downstream
- * stages (team-exec) consume.
+ * stages consume.
  *
  * By default this remains a structural adapter — actual agent orchestration
  * happens at the skill layer. When an executor is provided, the stage can
@@ -33,6 +34,9 @@ export function createRalplanStage(options: CreateRalplanStageOptions = {}): Pip
     name: 'ralplan',
 
     canSkip(ctx: StageContext): boolean {
+      if (hasReviewLoopContext(ctx.artifacts)) {
+        return false;
+      }
       return isPlanningComplete(readPlanningArtifacts(ctx.cwd));
     },
 
@@ -98,4 +102,25 @@ export function createRalplanStage(options: CreateRalplanStageOptions = {}): Pip
       }
     },
   };
+}
+
+function hasReviewLoopContext(artifacts: Record<string, unknown>): boolean {
+  if (typeof artifacts.return_to_ralplan_reason === 'string' && artifacts.return_to_ralplan_reason.trim() !== '') {
+    return true;
+  }
+  if (isNonCleanReviewVerdict(artifacts.review_verdict)) {
+    return true;
+  }
+
+  const codeReviewArtifacts = artifacts['code-review'];
+  if (!codeReviewArtifacts || typeof codeReviewArtifacts !== 'object') {
+    return false;
+  }
+
+  const reviewArtifacts = codeReviewArtifacts as Record<string, unknown>;
+  return (
+    (typeof reviewArtifacts.return_to_ralplan_reason === 'string'
+      && reviewArtifacts.return_to_ralplan_reason.trim() !== '')
+    || isNonCleanReviewVerdict(reviewArtifacts.review_verdict)
+  );
 }

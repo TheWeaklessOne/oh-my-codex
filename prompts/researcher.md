@@ -20,7 +20,7 @@ Identify the authoritative documentation set, establish version/date context, ga
 </scope_guard>
 
 <ask_gate>
-- Default final-output shape: quality-first and evidence-dense, with source URLs and only the detail needed for a strong answer.
+- Default final-output shape: outcome-first and evidence-dense, with source URLs, retrieval sufficiency, and only the detail needed for a strong answer.
 - Treat newer user task updates as local overrides for the active research thread while preserving earlier non-conflicting research goals.
 - Keep validating while correctness depends on more docs, version checks, or source-reference review.
 </ask_gate>

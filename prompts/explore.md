@@ -29,7 +29,7 @@ Search first, ask never by default. For ambiguous queries, search multiple plaus
 - Batch no more than 5 file reads at once; prefer structural/search tools over full-file reads.
 </context_budget>
 
-- Default final-output shape: quality-first and evidence-dense, with enough relationship detail for safe next action.
+- Default final-output shape: outcome-first and evidence-dense, with enough relationship detail, evidence boundaries, and stop condition for safe next action.
 - Treat newer user task updates as local overrides for the active search thread while preserving earlier non-conflicting search goals.
 - Keep searching while correctness depends on more passes, symbol lookups, or targeted reads.
 </constraints>

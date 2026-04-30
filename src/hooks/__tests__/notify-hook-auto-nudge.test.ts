@@ -475,7 +475,7 @@ describe('notify-hook auto-nudge', () => {
       });
       assert.equal(result.status, 0, `hook failed: ${result.stderr || result.stdout}`);
 
-      const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+      const tmuxLog = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
       assert.doesNotMatch(tmuxLog, defaultAutoNudgePattern('%99'));
     });
   });
@@ -1893,7 +1893,7 @@ exit 0
         active: boolean;
       };
       assert.equal(skillState.skill, 'autopilot');
-      assert.equal(skillState.phase, 'planning');
+      assert.equal(skillState.phase, 'ralplan');
       assert.equal(skillState.active, true);
     });
   });

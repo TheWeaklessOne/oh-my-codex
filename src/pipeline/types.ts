@@ -1,9 +1,9 @@
 /**
  * Pipeline stage interfaces for oh-my-codex
  *
- * Shared stage contracts that align with OMC pipeline design (#1130).
- * The pipeline sequences a primary planning/execution path and may add
- * a bounded Ralph follow-up stage only for narrow stubborn residual work.
+ * Shared stage contracts for strict Autopilot and legacy coordinated pipelines.
+ * The default pipeline sequences ralplan -> ralph -> code-review, while
+ * legacy adapters may insert team execution with bounded Ralph follow-up.
  */
 
 // ---------------------------------------------------------------------------
@@ -53,10 +53,10 @@ export interface StageResult {
 
 /**
  * A single stage in the pipeline. Implementations wrap concrete execution
- * backends (ralplan, team, ralph) behind this uniform interface.
+ * backends (ralplan, ralph, code-review, and legacy team adapters) behind this uniform interface.
  */
 export interface PipelineStage {
-  /** Unique name for this stage (e.g. 'ralplan', 'team-exec', 'ralph-verify'). */
+  /** Unique name for this stage (e.g. 'ralplan', 'ralph', 'code-review'). */
   readonly name: string;
 
   /** Execute the stage. Must return a StageResult. */
@@ -93,15 +93,13 @@ export interface PipelineConfig {
   sessionId?: string;
 
   /**
-   * Maximum Ralph bounded-follow-up iterations.
-   * Passed through to the ralph-verify stage when that fallback is used.
-   * Defaults to 10.
+   * Maximum Ralph verification or bounded follow-up iterations.
+   * Passed through to the ralph stage or ralph-verify fallback. Defaults to 10.
    */
   maxRalphIterations?: number;
 
   /**
-   * Number of team workers for the execution stage.
-   * Passed through to the team-exec stage. Defaults to 2.
+   * Legacy worker count for adapters that still launch team execution. Defaults to 2.
    */
   workerCount?: number;
 
@@ -159,7 +157,19 @@ export interface PipelineModeStateExtension {
   /** Per-stage results collected so far. */
   pipeline_stage_results: Record<string, StageResult>;
 
-  /** Ralph iteration ceiling for the bounded follow-up stage. */
+  /** Current review cycle count; increments when code-review is not clean. */
+  review_cycle?: number;
+
+  /** Latest code-review verdict artifact. */
+  review_verdict?: unknown;
+
+  /** Reason Autopilot returned to ralplan after a non-clean review. */
+  return_to_ralplan_reason?: string | null;
+
+  /** Phase handoff artifacts keyed by contract names: ralplan, ralph, and code_review. */
+  handoff_artifacts?: Record<string, unknown>;
+
+  /** Ralph iteration ceiling for strict verification or bounded follow-up stages. */
   pipeline_max_ralph_iterations: number;
 
   /** Worker count for team execution. */

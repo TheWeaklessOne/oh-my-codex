@@ -34,7 +34,7 @@
         <li><code>$mission</code> - thin-supervisor mission workflow with authoritative state under <code>.omx/missions/</code></li>
         <li><code>$team</code> - coordinated multi-agent execution for the approved plan</li>
         <li><code>$ralph</code> - persistence loop until completion</li>
-        <li><code>$autopilot</code> - full autonomous execution when you intentionally skip the standard workflow</li>
+        <li><code>$autopilot</code> - strict autonomous loop over <code>$ralplan -> $ralph -> $code-review</code>, returning to planning when review is not clean</li>
         <li><code>$ultrawork</code> - max parallel execution</li>
         <li><code>$visual-verdict</code> - structured visual QA loop for screenshot/reference matching</li>
         <li><code>$ecomode</code> - token-efficient model routing</li>

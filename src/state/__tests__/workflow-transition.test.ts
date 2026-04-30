@@ -74,10 +74,20 @@ describe('workflow transition rules', () => {
   });
 
   it('builds rollback denial guidance for execution-to-planning transitions', () => {
-    const error = buildWorkflowTransitionError(['autopilot'], 'ralplan', 'start');
+    const error = buildWorkflowTransitionError(['ralph'], 'ralplan', 'start');
     assert.match(error, /Execution-to-planning rollback auto-complete is not allowed\./);
     assert.match(error, /First clear current state first and retry if this action is intended\./);
     assert.match(error, /Clear incompatible workflow state yourself via/);
+  });
+
+
+  it('allows autopilot to return to ralplan for non-clean code-review cycles', () => {
+    const decision = evaluateWorkflowTransition(['autopilot'], 'ralplan');
+    assert.equal(decision.allowed, true);
+    assert.equal(decision.kind, 'auto-complete');
+    assert.deepEqual(decision.autoCompleteModes, ['autopilot']);
+    assert.deepEqual(decision.resultingModes, ['ralplan']);
+    assert.equal(decision.transitionMessage, 'mode transiting: autopilot -> ralplan');
   });
 
   it('formats transition audit messages', () => {

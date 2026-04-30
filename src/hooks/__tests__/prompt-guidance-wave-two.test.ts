@@ -55,6 +55,17 @@ describe('prompt guidance wave two contract', () => {
     assert.match(explore, /dependency recommendation.*report that handoff upward|report that handoff upward/i);
   });
 
+  it('code-reviewer rejects masking fallback and workaround patches unless narrowly justified', () => {
+    const codeReviewer = loadSurface('prompts/code-reviewer.md');
+
+    assert.match(codeReviewer, /Root-cause guard/i);
+    assert.match(codeReviewer, /fallback\/workaround code when it masks failures/i);
+    assert.match(codeReviewer, /REQUEST CHANGES even if tests pass/i);
+    assert.match(codeReviewer, /preserves or reports failure evidence/i);
+    assert.match(codeReviewer, /narrow compatibility fallback can be acceptable/i);
+    assert.match(codeReviewer, /fixing a controllable primary contract/i);
+  });
+
   it('security and verifier-adjacent prompts preserve merge-if-green as downstream context', () => {
     assert.match(loadSurface('prompts/security-reviewer.md'), /merge if CI green/i);
     assert.match(loadSurface('prompts/critic.md'), /later workflow condition|downstream context/i);

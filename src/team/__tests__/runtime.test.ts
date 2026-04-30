@@ -133,6 +133,29 @@ async function markPendingInboxDispatchesDelivered(
   }
 }
 
+async function markPendingInboxDispatchesNotified(
+  teamName: string,
+  cwd: string,
+  opts: {
+    toWorker?: string;
+    lastReason?: string;
+  } = {},
+): Promise<void> {
+  const requests = await listDispatchRequests(teamName, cwd, { kind: 'inbox' }).catch(() => []);
+  for (const request of requests) {
+    if (request.status !== 'pending') continue;
+    if (opts.toWorker && request.to_worker !== opts.toWorker) continue;
+    await transitionDispatchRequest(
+      teamName,
+      request.request_id,
+      'pending',
+      'notified',
+      { last_reason: opts.lastReason ?? 'test_notified_receipt' },
+      cwd,
+    ).catch(() => {});
+  }
+}
+
 function withEmptyPath<T>(fn: () => T): T {
   const prev = process.env.PATH;
   process.env.PATH = '';
@@ -761,6 +784,167 @@ describe('runtime', () => {
       });
       assert.equal(progress, 'worker_progress');
     } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('uses a production startup evidence window that can tolerate slow Codex startup', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-startup-window-'));
+    const prevTmux = process.env.TMUX;
+    const prevTmuxPane = process.env.TMUX_PANE;
+    const prevLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const prevSkipReadyWait = process.env.OMX_TEAM_SKIP_READY_WAIT;
+    const prevStartupEvidenceTimeout = process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+    const prevStartupDispatchRetries = process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+    const prevStartupDispatchRetryDelay = process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS;
+    let receiptNotifier: NodeJS.Timeout | null = null;
+    let progressWriter: NodeJS.Timeout | null = null;
+
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-startup-window-bin-',
+          tmuxScript: (tmuxLogPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+case "$1" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*)
+        echo "120"
+        ;;
+      *)
+        echo "leader:0 %1"
+        ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"-F #{pane_id}"*"#{pane_current_command}"*)
+        printf "%%1\\tzsh\\tzsh\\n"
+        exit 0
+        ;;
+      *"#{pane_pid}"*)
+        echo "4321"
+        exit 0
+        ;;
+      *"#{pane_dead} #{pane_pid}"*)
+        echo "0 4321"
+        exit 0
+        ;;
+      *)
+        exit 0
+        ;;
+    esac
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*)
+        echo "%2"
+        ;;
+      *)
+        echo "%3"
+        ;;
+    esac
+    exit 0
+    ;;
+  capture-pane)
+    printf 'OpenAI Codex\\n> '
+    exit 0
+    ;;
+  send-keys|resize-pane|select-layout|set-window-option|select-pane|set-hook|run-shell|kill-pane|kill-session)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+          binaries: [
+            {
+              name: 'codex',
+              content: '#!/bin/sh\nsleep 30\n',
+            },
+          ],
+        },
+        async () => {
+          process.env.TMUX = 'leader-session';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'interactive';
+          process.env.OMX_TEAM_WORKER_CLI = 'codex';
+          process.env.OMX_TEAM_SKIP_READY_WAIT = '1';
+          delete process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+          process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = '1';
+          process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS = '50';
+
+          receiptNotifier = setInterval(() => {
+            void markPendingInboxDispatchesNotified('team-startup-window', cwd, {
+              toWorker: 'worker-1',
+              lastReason: 'test_notified_receipt',
+            }).catch(() => {});
+          }, 20);
+
+          progressWriter = setTimeout(() => {
+            void writeWorkerStatus(
+              'team-startup-window',
+              'worker-1',
+              {
+                state: 'working',
+                current_task_id: '1',
+                updated_at: new Date().toISOString(),
+              },
+              cwd,
+            ).catch(() => {});
+          }, 6_000);
+
+          const runtime = await withoutTeamWorkerEnv(() =>
+            startTeam(
+              'team-startup-window',
+              'interactive startup should wait for slow Codex evidence',
+              'executor',
+              1,
+              [{ subject: 's', description: 'd', owner: 'worker-1' }],
+              cwd,
+            ));
+
+          assert.equal(runtime.teamName, 'team-startup-window');
+          assert.ok(await readTeamConfig('team-startup-window', cwd));
+        },
+      );
+    } finally {
+      if (receiptNotifier) clearInterval(receiptNotifier);
+      if (progressWriter) clearTimeout(progressWriter);
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevTmuxPane === 'string') process.env.TMUX_PANE = prevTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof prevLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = prevLaunchMode;
+      else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      if (typeof prevSkipReadyWait === 'string') process.env.OMX_TEAM_SKIP_READY_WAIT = prevSkipReadyWait;
+      else delete process.env.OMX_TEAM_SKIP_READY_WAIT;
+      if (typeof prevStartupEvidenceTimeout === 'string') {
+        process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = prevStartupEvidenceTimeout;
+      } else {
+        delete process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
+      }
+      if (typeof prevStartupDispatchRetries === 'string') {
+        process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = prevStartupDispatchRetries;
+      } else {
+        delete process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES;
+      }
+      if (typeof prevStartupDispatchRetryDelay === 'string') {
+        process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS = prevStartupDispatchRetryDelay;
+      } else {
+        delete process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS;
+      }
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -1580,6 +1764,7 @@ case "$1" in
     case "$*" in
       *"pane_current_command"*) printf "%%1\tnode\t'codex'\n" ;;
       *"#{pane_dead} #{pane_pid}"*) echo "0 4242" ;;
+      *"#{pane_dead}"*) echo "0" ;;
       *"-t %2"*"#{pane_pid}"*) echo "4242" ;;
       *"-t %3"*"#{pane_pid}"*) echo "4343" ;;
       *"#{pane_pid}"*) echo "4141" ;;

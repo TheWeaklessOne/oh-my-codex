@@ -272,6 +272,7 @@ const TEAM_WORKER_LAUNCH_ARGS_ENV = "OMX_TEAM_WORKER_LAUNCH_ARGS";
 const TEAM_INHERIT_LEADER_FLAGS_ENV = "OMX_TEAM_INHERIT_LEADER_FLAGS";
 const OMX_BYPASS_DEFAULT_SYSTEM_PROMPT_ENV = "OMX_BYPASS_DEFAULT_SYSTEM_PROMPT";
 const OMX_MODEL_INSTRUCTIONS_FILE_ENV = "OMX_MODEL_INSTRUCTIONS_FILE";
+const OMX_INSTANCE_OPTION = "@omx_instance_id";
 const OMX_RALPH_APPEND_INSTRUCTIONS_FILE_ENV =
   "OMX_RALPH_APPEND_INSTRUCTIONS_FILE";
 const OMX_MISSION_APPEND_INSTRUCTIONS_FILE_ENV =
@@ -1544,6 +1545,34 @@ export function resolveNativeSessionName(
   return buildTmuxSessionName(cwd, sessionId);
 }
 
+function tagTmuxSessionWithInstance(sessionName: string, sessionId: string): void {
+  const target = sessionName.trim();
+  const instanceId = sessionId.trim();
+  if (!target || !instanceId) return;
+  execFileSync("tmux", ["set-option", "-t", target, OMX_INSTANCE_OPTION, instanceId], {
+    stdio: ["ignore", "ignore", "ignore"],
+    timeout: 2000,
+  });
+}
+
+function tagCurrentTmuxSessionWithInstance(sessionId: string): void {
+  if (!process.env.TMUX) return;
+  try {
+    const tmuxPaneTarget = process.env.TMUX_PANE;
+    const displayArgs = tmuxPaneTarget
+      ? ["display-message", "-p", "-t", tmuxPaneTarget, "#S"]
+      : ["display-message", "-p", "#S"];
+    const sessionName = execFileSync("tmux", displayArgs, {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2000,
+    }).trim();
+    if (sessionName) tagTmuxSessionWithInstance(sessionName, sessionId);
+  } catch {
+    // Best effort only: launch should not fail just because tmux tagging failed.
+  }
+}
+
 function buildNativeHookBaseContext(
   cwd: string,
   sessionId: string,
@@ -2281,6 +2310,14 @@ export function buildDetachedSessionBootstrapSteps(
   return [
     { name: "new-session", args: newSessionArgs },
     ...markerSteps,
+    ...(sessionId
+      ? [
+          {
+            name: "tag-session",
+            args: ["set-option", "-t", sessionName, OMX_INSTANCE_OPTION, sessionId],
+          },
+        ]
+      : []),
     { name: "split-and-capture-hud-pane", args: splitCaptureArgs },
   ];
 }
@@ -2762,6 +2799,7 @@ ${launchAppendix}${dirtyWorktreeGuidance}`
   // 3. Write session state
   await resetSessionMetrics(cwd, sessionId);
   await writeSessionStart(cwd, sessionId);
+  tagCurrentTmuxSessionWithInstance(sessionId);
 
   // 3.5. Sync Warp tab title on session start (best effort)
   try {

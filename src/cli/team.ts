@@ -145,7 +145,7 @@ function isTerminalModePhase(phase: string): boolean {
 
 const TEAM_HELP = `
 Usage: omx team [N:agent-type] "<task description>"
-       omx team status <team-name> [--json] [--tail-lines <100-1000>]
+       omx team status <team-name> [--json] [--tail-lines <100-1000>] [--model-inspect]
        omx team await <team-name> [--timeout-ms <ms>] [--after-event-id <id>] [--json]
        omx team resume <team-name>
        omx team shutdown <team-name> [--force] [--confirm-issues]
@@ -163,7 +163,7 @@ Examples:
   omx team 3:executor "fix failing tests"
   omx team status my-team
   omx team status my-team --json
-  omx team status my-team --tail-lines 600
+  omx team status my-team --model-inspect --tail-lines 600
   omx team api send-message --input '{"team_name":"my-team","from_worker":"worker-1","to_worker":"leader-fixed","body":"ACK"}' --json
 `;
 
@@ -177,6 +177,10 @@ Supported operations:
 Examples:
   omx team api list-tasks --input '{"team_name":"my-team"}' --json
   omx team api claim-task --input '{"team_name":"my-team","task_id":"1","worker":"worker-1","expected_version":1}' --json
+
+Safety:
+  team status prints raw tmux capture commands by default so inspect hints do not spend Spark/model quota.
+  pass --model-inspect to print omx sparkshell summary commands intentionally.
 `;
 
 const HELP_TOKENS = new Set(['--help', '-h', 'help']);
@@ -357,6 +361,14 @@ function parseStatusTailLines(args: string[]): number {
     }
   }
   return DEFAULT_SPARKSHELL_TAIL_LINES;
+}
+
+function parseStatusModelInspect(args: string[]): boolean {
+  return args.includes('--model-inspect');
+}
+
+function rawTmuxCaptureCommand(paneId: string, tailLines: number): string {
+  return `tmux capture-pane -p -t ${paneId} -S -${tailLines}`;
 }
 
 export interface ParsedTeamStartArgs {
@@ -553,7 +565,8 @@ function inspectEntryDescriptors(paneStatus: TeamPaneStatus): InspectEntryDescri
   ];
 }
 
-function formatInspectItemLine(index: number, item: TeamInspectItem): string {
+function formatInspectItemLine(index: number, item: TeamInspectItem, modelInspect = false, tailLines = DEFAULT_SPARKSHELL_TAIL_LINES): string {
+  const command = modelInspect ? item.command : rawTmuxCaptureCommand(item.pane_id, tailLines);
   const parts = [
     `inspect_item_${index + 1}:`,
     `target=${item.target}`,
@@ -621,13 +634,23 @@ function formatInspectItemLine(index: number, item: TeamInspectItem): string {
     item.team_summary_snapshot_path ? `team_summary_snapshot_path=${item.team_summary_snapshot_path}` : '',
     `reason=${item.reason}`,
     item.state ? `state=${item.state}` : '',
-    `command=${item.command}`,
+    `command=${command}`,
   ];
   return parts.filter(Boolean).join(' ');
 }
 
+function renderInspectSummary(summary: string, command: string | null): string {
+  if (!command) return summary;
+  if (/(^| )command=/.test(summary)) {
+    return summary.replace(/(^| )command=.*$/, `$1command=${command}`);
+  }
+  return `${summary} command=${command}`;
+}
+
 function renderTeamPaneStatus(
   paneStatus: TeamPaneStatus,
+  modelInspect = false,
+  tailLines = DEFAULT_SPARKSHELL_TAIL_LINES,
 ): void {
   if (paneStatus.leader_pane_id || paneStatus.hud_pane_id) {
     console.log(`panes: leader=${paneStatus.leader_pane_id || '-'} hud=${paneStatus.hud_pane_id || '-'}`);
@@ -639,7 +662,7 @@ function renderTeamPaneStatus(
   }
 
   if (paneStatus.sparkshell_hint) {
-    console.log('sparkshell_hint: omx sparkshell --tmux-pane <pane-id> --tail-lines 400');
+    console.log('inspect_hint: raw tmux capture commands are quota-free; rerun status with --model-inspect for omx sparkshell summaries');
   }
 
   if (paneStatus.recommended_inspect_targets.length > 0) {
@@ -649,19 +672,35 @@ function renderTeamPaneStatus(
   logInspectEntryDescriptors(inspectEntryDescriptors(paneStatus));
 
   if (paneStatus.recommended_inspect_command) {
-    console.log(`inspect_next: ${paneStatus.recommended_inspect_command}`);
+    const inspectCommand = modelInspect
+      ? paneStatus.recommended_inspect_command
+      : rawTmuxCaptureCommand(paneStatus.recommended_inspect_items[0]?.pane_id ?? '', tailLines);
+    if (inspectCommand.trim().length > 0) console.log(`inspect_next: ${inspectCommand}`);
   }
   if (paneStatus.recommended_inspect_summary) {
-    console.log(`inspect_summary: ${paneStatus.recommended_inspect_summary}`);
+    const summaryCommand = paneStatus.recommended_inspect_command
+      ? modelInspect
+        ? paneStatus.recommended_inspect_command
+        : rawTmuxCaptureCommand(paneStatus.recommended_inspect_items[0]?.pane_id ?? '', tailLines)
+      : null;
+    const summary = renderInspectSummary(paneStatus.recommended_inspect_summary, summaryCommand);
+    console.log(`inspect_summary: ${summary}`);
   }
-  for (const [index, command] of paneStatus.recommended_inspect_commands.entries()) {
+  for (const [index, item] of paneStatus.recommended_inspect_items.entries()) {
+    const command = modelInspect ? item.command : rawTmuxCaptureCommand(item.pane_id, tailLines);
     console.log(`inspect_priority_${index + 1}: ${command}`);
   }
   for (const [index, item] of paneStatus.recommended_inspect_items.entries()) {
-    console.log(formatInspectItemLine(index, item));
+    console.log(formatInspectItemLine(index, item, modelInspect, tailLines));
   }
 
-  for (const [target, command] of Object.entries(paneStatus.sparkshell_commands)) {
+  for (const [target, paneId] of Object.entries({
+    ...(paneStatus.leader_pane_id ? { leader: paneStatus.leader_pane_id } : {}),
+    ...(paneStatus.hud_pane_id ? { hud: paneStatus.hud_pane_id } : {}),
+    ...paneStatus.worker_panes,
+  })) {
+    const modelCommand = paneStatus.sparkshell_commands[target];
+    const command = modelInspect && modelCommand ? modelCommand : rawTmuxCaptureCommand(paneId, tailLines);
     console.log(`inspect_${target}: ${command}`);
   }
 }
@@ -1250,6 +1289,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
       return;
     }
     const tailLines = parseStatusTailLines(teamArgs.slice(2));
+    const modelInspect = parseStatusModelInspect(teamArgs.slice(2));
     const config = await readTeamConfig(name, cwd);
     const paneStatus = await readTeamPaneStatus(config, cwd, snapshot, tailLines);
     if (wantsJson) {
@@ -1298,7 +1338,7 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
         `monitor_perf_ms: total=${snapshot.performance.total_ms} list=${snapshot.performance.list_tasks_ms} workers=${snapshot.performance.worker_scan_ms} mailbox=${snapshot.performance.mailbox_delivery_ms}`
       );
     }
-    renderTeamPaneStatus(paneStatus);
+    renderTeamPaneStatus(paneStatus, modelInspect, tailLines);
     return;
   }
 

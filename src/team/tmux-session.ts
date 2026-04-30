@@ -36,6 +36,9 @@ import { resolveOmxCliEntryPath } from '../utils/paths.js';
 const execFileAsync = promisify(execFile);
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_TEAM_HEIGHT_LINES } from '../hud/constants.js';
 
+const OMX_INSTANCE_OPTION = '@omx_instance_id';
+const OMX_PANE_INSTANCE_OPTION = '@omx_pane_instance_id';
+
 export interface TeamSession {
   name: string; // tmux target in "session:window" form
   workerCount: number;
@@ -154,6 +157,16 @@ function sanitizeTmuxStyleOption(sessionTarget: string, optionName: string): boo
 
   const result = runTmux(['set-option', '-t', sessionTarget, optionName, sanitized]);
   return result.ok;
+}
+
+function tagPaneInstance(paneTarget: string, instanceId: string): void {
+  const target = paneTarget.trim();
+  const sanitized = instanceId.trim();
+  if (!target || !sanitized) return;
+  const result = runTmux(['set-option', '-p', '-t', target, OMX_PANE_INSTANCE_OPTION, sanitized]);
+  if (!result.ok) {
+    throw new Error(`failed to tag tmux pane ${target}: ${result.stderr}`);
+  }
 }
 
 export function mitigateCopyModeUnderlineArtifacts(sessionTarget: string): boolean {
@@ -1063,7 +1076,9 @@ export function createTeamSession(
       throw new Error(`failed to parse current tmux target: ${context.stdout}`);
     }
     const teamTarget = `${sessionName}:${windowIndex}`;
+    const instanceId = (process.env.OMX_SESSION_ID || '').trim();
     for (const markerArgs of buildSetOmxTmuxSessionMarkerArgs(sessionName, {
+      sessionId: instanceId,
       projectPath: cwd,
       kind: 'team',
       teamName: safeTeamName,
@@ -1071,8 +1086,15 @@ export function createTeamSession(
       const marker = runTmux(markerArgs);
       if (!marker.ok) throw new Error(`failed to mark OMX tmux session ${sessionName}: ${marker.stderr}`);
     }
+    if (instanceId) {
+      const tagResult = runTmux(['set-option', '-t', sessionName, OMX_INSTANCE_OPTION, instanceId]);
+      if (!tagResult.ok) {
+        throw new Error(`failed to tag tmux session ${sessionName}: ${tagResult.stderr}`);
+      }
+    }
     const panes = listPanes(teamTarget);
     const leaderPaneId = chooseTeamLeaderPaneId(panes, detectedLeaderPaneId);
+    tagPaneInstance(leaderPaneId, instanceId);
     const initialHudPaneIds = findHudPaneIds(teamTarget, leaderPaneId);
     // Team mode prioritizes leader + worker visibility. Remove HUD panes in this window
     // to keep a clean "leader left / workers right" layout.
@@ -1125,6 +1147,7 @@ export function createTeamSession(
       if (isNativeWindows() && !waitForPaneToRemainPresent(teamTarget, paneId)) {
         throw new Error(`worker pane ${i} did not remain present after tmux split-window returned ${paneId}`);
       }
+      tagPaneInstance(paneId, instanceId);
       workerPaneIds.push(paneId);
       if (i === 1) rightStackRootPaneId = paneId;
     }
@@ -1164,6 +1187,7 @@ export function createTeamSession(
           if (isNativeWindows() && !waitForPaneToRemainPresent(teamTarget, id)) {
             throw new Error(`HUD pane did not remain present after tmux split-window returned ${id}`);
           }
+          tagPaneInstance(id, instanceId);
           hudPaneId = id;
 
           if (isNativeWindows()) {

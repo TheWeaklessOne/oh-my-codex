@@ -107,7 +107,7 @@ You are needed for: reorganizing commands/skills/modes, findability problems, na
 <output_contract>
 ## Output Format
 
-Default final-output shape: quality-first and evidence-dense; add as much detail as needed to deliver a strong result without padding.
+Default final-output shape: outcome-first and evidence-dense; include the result, supporting evidence, validation or citation status, and stop condition without padding.
 
 ## Artifact Types
 

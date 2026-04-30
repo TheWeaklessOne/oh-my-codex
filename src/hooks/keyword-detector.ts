@@ -51,7 +51,7 @@ function safeString(value: unknown): string {
   return typeof value === 'string' ? value : '';
 }
 
-export type SkillActivePhase = 'planning' | 'executing' | 'reviewing' | 'completing';
+export type SkillActivePhase = 'planning' | 'executing' | 'reviewing' | 'completing' | 'ralplan';
 
 export interface DeepInterviewInputLock {
   active: boolean;
@@ -131,7 +131,7 @@ const EXECUTION_LIKE_WORKFLOW_SKILLS = new Set<TrackedWorkflowMode>([
 
 const STATEFUL_SKILL_SEED_CONFIG: Record<StatefulSkillMode, StatefulSkillSeedConfig> = {
   'deep-interview': { mode: 'deep-interview', initialPhase: 'intent-first' },
-  autopilot: { mode: 'autopilot', initialPhase: 'planning' },
+  autopilot: { mode: 'autopilot', initialPhase: 'ralplan', includeIteration: true },
   autoresearch: { mode: 'autoresearch', initialPhase: 'executing' },
   ralph: { mode: 'ralph', initialPhase: 'starting', includeIteration: true },
   ralplan: { mode: 'ralplan', initialPhase: 'planning' },
@@ -378,8 +378,36 @@ async function persistStatefulSkillSeedState(
   );
 
   if (config.includeIteration) {
-    baseState.iteration = typeof existingModeState?.iteration === 'number' ? existingModeState.iteration : 0;
-    baseState.max_iterations = typeof existingModeState?.max_iterations === 'number' ? existingModeState.max_iterations : 50;
+    const defaultIteration = config.mode === 'autopilot' ? 1 : 0;
+    const defaultMaxIterations = config.mode === 'autopilot' ? 10 : 50;
+    baseState.iteration = typeof existingModeState?.iteration === 'number' ? existingModeState.iteration : defaultIteration;
+    baseState.max_iterations = typeof existingModeState?.max_iterations === 'number' ? existingModeState.max_iterations : defaultMaxIterations;
+  }
+
+  if (config.mode === 'autopilot') {
+    const existingState = (existingModeState?.state && typeof existingModeState.state === 'object')
+      ? existingModeState.state as Record<string, unknown>
+      : {};
+    const existingHandoffs = (existingState.handoff_artifacts && typeof existingState.handoff_artifacts === 'object')
+      ? existingState.handoff_artifacts as Record<string, unknown>
+      : {};
+    baseState.review_cycle = typeof existingModeState?.review_cycle === 'number' ? existingModeState.review_cycle : 0;
+    baseState.state = {
+      ...existingState,
+      phase_cycle: Array.isArray(existingState.phase_cycle) ? existingState.phase_cycle : ['ralplan', 'ralph', 'code-review'],
+      handoff_artifacts: {
+        ralplan: null,
+        ralph: null,
+        code_review: null,
+        ...existingHandoffs,
+      },
+      review_verdict: Object.prototype.hasOwnProperty.call(existingState, 'review_verdict')
+        ? existingState.review_verdict
+        : null,
+      return_to_ralplan_reason: Object.prototype.hasOwnProperty.call(existingState, 'return_to_ralplan_reason')
+        ? existingState.return_to_ralplan_reason
+        : null,
+    };
   }
 
   await mkdir(dirname(absolutePath), { recursive: true });
@@ -675,7 +703,9 @@ function resolveContinuationKeywordMatch(
 }
 
 function initialWorkflowPhaseForMode(mode: TrackedWorkflowMode): SkillActivePhase {
-  return mode === 'autoresearch' ? 'executing' : 'planning';
+  if (mode === 'autoresearch') return 'executing';
+  if (mode === 'autopilot') return 'ralplan';
+  return 'planning';
 }
 
 function resolveRequestedWorkflowSkills(requestedWorkflowSkills: TrackedWorkflowMode[]): {

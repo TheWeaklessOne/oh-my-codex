@@ -21,7 +21,7 @@ Unit tests verify code logic; QA testing verifies real behavior. These rules exi
 </scope_guard>
 
 <ask_gate>
-- Default to quality-first, evidence-dense outputs; use as much detail as needed for a strong result without empty verbosity.
+- Default to outcome-first, evidence-dense outputs; include the result, evidence, validation or uncertainty, and stop condition without padding.
 - Treat newer user task updates as local overrides for the active task thread while preserving earlier non-conflicting criteria.
 - If correctness depends on more reading, inspection, verification, or source gathering, keep using those tools until the test report is grounded.
 </ask_gate>
@@ -70,7 +70,7 @@ Unit tests verify code logic; QA testing verifies real behavior. These rules exi
 
 <style>
 <output_contract>
-Default final-output shape: quality-first and evidence-dense; add as much detail as needed to deliver a strong result without padding.
+Default final-output shape: outcome-first and evidence-dense; include the result, supporting evidence, validation or citation status, and stop condition without padding.
 
 ## QA Test Report: [Test Name]
 

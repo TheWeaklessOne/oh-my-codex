@@ -1,7 +1,9 @@
+import { emitKeypressEvents } from 'node:readline';
 import { createInterface as createPromptInterface } from 'node:readline/promises';
 import { stdin as defaultInput, stdout as defaultOutput } from 'node:process';
 import {
   applyInteractiveSelectionKey as applyGenericInteractiveSelectionKey,
+  createInitialInteractiveSelectionState,
   promptForSelectionsWithArrows as promptForGenericSelectionsWithArrows,
   supportsInteractiveSelectUi,
   type InteractiveSelectionState,
@@ -10,10 +12,10 @@ import {
   type SelectUiInput,
   type SelectUiOutput,
 } from '../ui/select.js';
-import { injectQuestionAnswerToPane } from './renderer.js';
+import { injectQuestionAnswersToPane } from './renderer.js';
 import { markQuestionAnswered, markQuestionTerminalError, readQuestionRecord } from './state.js';
 import { isMultiAnswerableQuestion } from './types.js';
-import type { QuestionAnswer, QuestionRecord } from './types.js';
+import type { NormalizedQuestionItem, QuestionAnswer, QuestionAnswerEntry, QuestionRecord } from './types.js';
 
 type QuestionUiInput = SelectUiInput;
 
@@ -23,7 +25,7 @@ interface QuestionUiDeps {
   input?: QuestionUiInput;
   output?: QuestionUiOutput;
   env?: NodeJS.ProcessEnv;
-  injectAnswerToPane?: (paneId: string, answer: QuestionAnswer) => boolean;
+  injectAnswersToPane?: (paneId: string, answers: QuestionAnswerEntry[]) => boolean;
 }
 
 interface QuestionOptionEntry {
@@ -31,32 +33,58 @@ interface QuestionOptionEntry {
   description?: string;
 }
 
-function getOptionEntries(record: QuestionRecord): QuestionOptionEntry[] {
-  const entries = record.options.map((option, index) => ({
+interface WizardState {
+  currentQuestionIndex: number;
+  selections: InteractiveSelectionState[];
+  mode: 'answering' | 'review';
+  error?: string;
+}
+
+interface WizardUpdate {
+  state: WizardState;
+  submit: boolean;
+}
+
+export { createInitialInteractiveSelectionState };
+
+function recordQuestions(record: QuestionRecord): NormalizedQuestionItem[] {
+  if (record.questions?.length) return record.questions;
+  return [{
+    id: 'q-1',
+    ...(record.header ? { header: record.header } : {}),
+    question: record.question,
+    options: record.options,
+    allow_other: record.allow_other,
+    other_label: record.other_label,
+    multi_select: record.multi_select,
+    type: record.type ?? (record.multi_select ? 'multi-answerable' : 'single-answerable'),
+  }];
+}
+
+function getOptionEntries(question: Pick<NormalizedQuestionItem, 'options' | 'allow_other' | 'other_label'>): QuestionOptionEntry[] {
+  const entries = question.options.map((option, index) => ({
     label: `${index + 1}. ${option.label}`,
     description: typeof option.description === 'string' && option.description.trim()
       ? option.description.trim()
       : undefined,
   }));
-  if (record.allow_other) {
+  if (question.allow_other) {
     entries.push({
-      label: `${record.options.length + 1}. ${record.other_label}`,
+      label: `${question.options.length + 1}. ${question.other_label}`,
       description: undefined,
     });
   }
   return entries;
 }
 
-function getOptionLabels(record: QuestionRecord): string[] {
-  return getOptionEntries(record).map((entry) => entry.label);
+function getOptionLabels(question: Pick<NormalizedQuestionItem, 'options' | 'allow_other' | 'other_label'>): string[] {
+  return getOptionEntries(question).map((entry) => entry.label);
 }
 
-function renderOptions(record: QuestionRecord): string[] {
-  return getOptionEntries(record).flatMap((entry) => {
+function renderOptions(question: Pick<NormalizedQuestionItem, 'options' | 'allow_other' | 'other_label'>): string[] {
+  return getOptionEntries(question).flatMap((entry) => {
     const lines = [`  [ ] ${entry.label}`];
-    if (entry.description) {
-      lines.push(`      ${entry.description}`);
-    }
+    if (entry.description) lines.push(`      ${entry.description}`);
     return lines;
   });
 }
@@ -74,81 +102,59 @@ function parseSelection(raw: string, optionCount: number, multiSelect: boolean):
   return [...new Set(values)];
 }
 
-function buildAnswer(record: QuestionRecord, selections: number[], otherText?: string): QuestionAnswer {
-  const optionCount = record.options.length;
+function buildAnswer(question: NormalizedQuestionItem, selections: number[], otherText?: string): QuestionAnswer {
+  const optionCount = question.options.length;
   const otherIndex = optionCount + 1;
   const selectedOptions = selections
     .filter((value) => value <= optionCount)
-    .map((value) => record.options[value - 1]);
+    .map((value) => question.options[value - 1]);
   const selected_labels = selectedOptions.map((option) => option.label);
   const selected_values = selectedOptions.map((option) => option.value);
-  const includesOther = record.allow_other && selections.includes(otherIndex);
+  const includesOther = question.allow_other && selections.includes(otherIndex);
 
-  if (isMultiAnswerableQuestion(record)) {
-    const values = includesOther && otherText ? [...selected_values, otherText] : selected_values;
-    const labels = includesOther && otherText ? [...selected_labels, record.other_label] : selected_labels;
-    return {
-      kind: 'multi',
-      value: values,
-      selected_labels: labels,
-      selected_values: values,
-      ...(includesOther && otherText ? { other_text: otherText } : {}),
-    };
+  if (includesOther && !otherText) throw new Error('Other response text is required.');
+  const resolvedOtherText = includesOther ? otherText as string : undefined;
+
+  if (isMultiAnswerableQuestion(question)) {
+    const values = resolvedOtherText ? [...selected_values, resolvedOtherText] : selected_values;
+    const labels = includesOther ? [...selected_labels, question.other_label] : selected_labels;
+    return { kind: 'multi', value: values, selected_labels: labels, selected_values: values, ...(resolvedOtherText ? { other_text: resolvedOtherText } : {}) };
   }
 
   if (includesOther) {
-    if (!otherText) throw new Error('Other response text is required.');
-    return {
-      kind: 'other',
-      value: otherText,
-      selected_labels: [record.other_label],
-      selected_values: [otherText],
-      other_text: otherText,
-    };
+    return { kind: 'other', value: resolvedOtherText!, selected_labels: [question.other_label], selected_values: [resolvedOtherText!], other_text: resolvedOtherText! };
   }
 
   const selected = selectedOptions[0];
   if (!selected) throw new Error('No option selected.');
-  return {
-    kind: 'option',
-    value: selected.value,
-    selected_labels: [selected.label],
-    selected_values: [selected.value],
-  };
+  return { kind: 'option', value: selected.value, selected_labels: [selected.label], selected_values: [selected.value] };
 }
 
 function safeString(value: unknown): string {
   return typeof value === 'string' ? value : '';
 }
 
-function maybeInjectAnswer(
-  record: QuestionRecord,
-  answer: QuestionAnswer,
-  deps: Pick<QuestionUiDeps, 'env' | 'injectAnswerToPane'> = {},
-): void {
+function maybeInjectAnswers(record: QuestionRecord, answers: QuestionAnswerEntry[], deps: Pick<QuestionUiDeps, 'env' | 'injectAnswersToPane'> = {}): void {
   const env = deps.env ?? process.env;
   const envTransport = safeString(env.OMX_QUESTION_RETURN_TRANSPORT).trim();
   const target = record.renderer?.return_target ?? safeString(env.OMX_QUESTION_RETURN_TARGET).trim();
   const transport = record.renderer?.return_transport ?? (envTransport === 'tmux-send-keys' ? envTransport : undefined);
   if (!target || transport !== 'tmux-send-keys') return;
   try {
-    (deps.injectAnswerToPane ?? injectQuestionAnswerToPane)(target, answer);
-  } catch {
-    // Best-effort continuation nudge only; stdout return path remains canonical.
-  }
+    (deps.injectAnswersToPane ?? injectQuestionAnswersToPane)(target, answers);
+  } catch {}
 }
 
-export { createInitialInteractiveSelectionState } from '../ui/select.js';
+function supportsInteractiveArrowUi(input: QuestionUiInput, output: QuestionUiOutput): boolean {
+  return supportsInteractiveSelectUi(input, output);
+}
 
-export function applyInteractiveSelectionKey(
-  record: QuestionRecord,
-  state: InteractiveSelectionState,
-  key: KeyLike,
-): SelectionUpdate {
+export function applyInteractiveSelectionKey(record: QuestionRecord, state: InteractiveSelectionState, key: KeyLike): SelectionUpdate {
+  const question = recordQuestions(record)[0]!;
   return applyGenericInteractiveSelectionKey(
     {
-      itemCount: getOptionLabels(record).length,
-      multiSelect: isMultiAnswerableQuestion(record),
+      itemCount: getOptionLabels(question).length,
+      multiSelect: isMultiAnswerableQuestion(question),
       emptySelectionError: 'Select one or more options with Space before pressing Enter.',
     },
     state,
@@ -156,28 +162,24 @@ export function applyInteractiveSelectionKey(
   );
 }
 
-export function renderInteractiveQuestionFrame(
-  record: QuestionRecord,
-  state: InteractiveSelectionState,
-): string {
-  const optionEntries = getOptionEntries(record);
+export function renderInteractiveQuestionFrame(record: QuestionRecord, state: InteractiveSelectionState): string {
+  const question = recordQuestions(record)[0]!;
+  const optionEntries = getOptionEntries(question);
   const lines: string[] = [];
 
-  if (record.header) lines.push(record.header);
-  lines.push(record.question, '');
+  if (record.header || question.header) lines.push(record.header ?? question.header ?? '');
+  lines.push(question.question, '');
 
   optionEntries.forEach((entry, index) => {
     const isActive = state.cursorIndex === index;
-    const isChecked = isMultiAnswerableQuestion(record) ? state.selectedIndices.includes(index) : isActive;
+    const isChecked = isMultiAnswerableQuestion(question) ? state.selectedIndices.includes(index) : isActive;
     lines.push(`${isActive ? '›' : ' '} [${isChecked ? 'x' : ' '}] ${entry.label}`);
-    if (entry.description) {
-      lines.push(`      ${entry.description}`);
-    }
+    if (entry.description) lines.push(`      ${entry.description}`);
   });
 
   lines.push('');
   lines.push(
-    isMultiAnswerableQuestion(record)
+    isMultiAnswerableQuestion(question)
       ? 'Use ↑/↓ to move, Space to toggle, Enter to submit.'
       : 'Use ↑/↓ to move, Enter to select.',
   );
@@ -185,16 +187,107 @@ export function renderInteractiveQuestionFrame(
   return `${lines.join('\n')}\n`;
 }
 
-export async function promptForSelectionsWithArrows(
-  record: QuestionRecord,
-  deps: QuestionUiDeps = {},
-): Promise<number[]> {
+export function createInitialQuestionWizardState(record: QuestionRecord): WizardState {
+  return { currentQuestionIndex: 0, selections: recordQuestions(record).map(() => createInitialInteractiveSelectionState()), mode: 'answering' };
+}
+
+function isQuestionSelectionValid(question: NormalizedQuestionItem, state: InteractiveSelectionState): boolean {
+  return !isMultiAnswerableQuestion(question) || state.selectedIndices.length > 0;
+}
+
+function advanceWizard(record: QuestionRecord, state: WizardState): WizardState {
+  const questions = recordQuestions(record);
+  const current = questions[state.currentQuestionIndex]!;
+  if (!isQuestionSelectionValid(current, state.selections[state.currentQuestionIndex]!)) {
+    const selections = state.selections.map((item, index) => index === state.currentQuestionIndex ? { ...item, error: 'Select one or more options with Space before continuing.' } : item);
+    return { ...state, selections };
+  }
+  if (state.currentQuestionIndex >= questions.length - 1) return { ...state, mode: 'review', error: undefined };
+  return { ...state, currentQuestionIndex: state.currentQuestionIndex + 1, error: undefined };
+}
+
+export function applyQuestionWizardKey(record: QuestionRecord, state: WizardState, key: KeyLike): WizardUpdate {
+  if (state.mode === 'review') {
+    if (key.name === 'left' || key.name === 'backspace') return { submit: false, state: { ...state, mode: 'answering', currentQuestionIndex: recordQuestions(record).length - 1 } };
+    if (key.name === 'return' || key.name === 'enter') return { submit: true, state };
+    return { submit: false, state };
+  }
+
+  if (key.name === 'left' || key.name === 'backspace') {
+    return { submit: false, state: { ...state, currentQuestionIndex: Math.max(0, state.currentQuestionIndex - 1), error: undefined } };
+  }
+
+  const questions = recordQuestions(record);
+  const current = questions[state.currentQuestionIndex]!;
+  const currentSelection = state.selections[state.currentQuestionIndex]!;
+  if (key.name === 'right') return { submit: false, state: advanceWizard(record, state) };
+
+  const update = applyInteractiveSelectionKey({ ...record, ...current, questions: [current] }, currentSelection, key);
+  const nextSelections = state.selections.map((item, index) => index === state.currentQuestionIndex ? update.state : item);
+  const nextState = { ...state, selections: nextSelections };
+  if (!update.submit) return { submit: false, state: nextState };
+  return { submit: false, state: advanceWizard(record, nextState) };
+}
+
+function selectedNumbersForQuestion(question: NormalizedQuestionItem, state: InteractiveSelectionState): number[] {
+  if (isMultiAnswerableQuestion(question)) return state.selectedIndices.map((index) => index + 1);
+  return [state.cursorIndex + 1];
+}
+
+function buildAnswerEntries(record: QuestionRecord, state: WizardState, otherTexts: Array<string | undefined> = []): QuestionAnswerEntry[] {
+  return recordQuestions(record).map((question, index) => ({
+    question_id: question.id,
+    index,
+    answer: buildAnswer(question, selectedNumbersForQuestion(question, state.selections[index]!), otherTexts[index]),
+  }));
+}
+
+function formatSelectedLabels(question: NormalizedQuestionItem, state: InteractiveSelectionState): string {
+  const selections = selectedNumbersForQuestion(question, state);
+  return selections
+    .map((selection) => question.options[selection - 1]?.label ?? question.other_label)
+    .join(', ');
+}
+
+export function renderQuestionWizardFrame(record: QuestionRecord, state: WizardState): string {
+  const questions = recordQuestions(record);
+  if (state.mode === 'review') {
+    const lines = [record.header ?? 'Review answers', ''];
+    questions.forEach((question, index) => {
+      lines.push(`${index + 1}. ${questions[index]!.question}`);
+      lines.push(`   ${formatSelectedLabels(question, state.selections[index]!)}`);
+    });
+    lines.push('', 'Press Enter to submit, ←/Backspace to edit.');
+    return `${lines.join('\n')}\n`;
+  }
+
+  const question = questions[state.currentQuestionIndex]!;
+  const selection = state.selections[state.currentQuestionIndex]!;
+  const optionEntries = getOptionEntries(question);
+  const lines: string[] = [];
+  if (record.header) lines.push(record.header);
+  if (question.header && question.header !== record.header) lines.push(question.header);
+  lines.push(`Question ${state.currentQuestionIndex + 1} of ${questions.length}`);
+  lines.push(question.question, '');
+  optionEntries.forEach((entry, index) => {
+    const isActive = selection.cursorIndex === index;
+    const isChecked = isMultiAnswerableQuestion(question) ? selection.selectedIndices.includes(index) : isActive;
+    lines.push(`${isActive ? '›' : ' '} [${isChecked ? 'x' : ' '}] ${entry.label}`);
+    if (entry.description) lines.push(`      ${entry.description}`);
+  });
+  lines.push('', isMultiAnswerableQuestion(question) ? 'Use ↑/↓ to move, Space to toggle, Enter/→ to continue, ← to go back.' : 'Use ↑/↓ to move, Enter/→ to continue, ← to go back.');
+  if (selection.error || state.error) lines.push(selection.error ?? state.error ?? '');
+  return `${lines.join('\n')}\n`;
+}
+
+export async function promptForSelectionsWithArrows(record: QuestionRecord, deps: QuestionUiDeps = {}): Promise<number[]> {
+  const question = recordQuestions(record)[0]!;
   const selections = await promptForGenericSelectionsWithArrows(
     {
-      header: record.header,
-      question: record.question,
-      labels: getOptionLabels(record),
-      multiSelect: isMultiAnswerableQuestion(record),
+      header: record.header ?? question.header,
+      question: question.question,
+      labels: getOptionLabels(question),
+      multiSelect: isMultiAnswerableQuestion(question),
       renderFrame: (state) => renderInteractiveQuestionFrame(record, state),
       cancelMessage: 'Question UI cancelled by user.',
       emptySelectionError: 'Select one or more options with Space before pressing Enter.',
@@ -205,27 +298,69 @@ export async function promptForSelectionsWithArrows(
   return selections;
 }
 
-async function promptForSelectionsWithNumbers(
-  record: QuestionRecord,
-  deps: QuestionUiDeps = {},
-): Promise<number[]> {
+async function promptForAnswersWithArrows(record: QuestionRecord, deps: QuestionUiDeps = {}): Promise<QuestionAnswerEntry[]> {
+  const input = deps.input ?? defaultInput;
+  const output = deps.output ?? defaultOutput;
+  if (!supportsInteractiveArrowUi(input, output)) throw new Error('Interactive arrow UI requires TTY stdin/stdout with raw-mode support.');
+  return new Promise<QuestionAnswerEntry[]>((resolve, reject) => {
+    let state = createInitialQuestionWizardState(record);
+    let finished = false;
+    const cleanup = () => { input.off('keypress', onKeypress); input.setRawMode?.(false); input.pause?.(); output.write('\u001b[?25h'); };
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      output.write('\n');
+      void (async () => {
+        try {
+          const otherTexts = await promptForWizardOtherTexts(record, state, { input, output });
+          resolve(buildAnswerEntries(record, state, otherTexts));
+        } catch (error) {
+          reject(error);
+        }
+      })();
+    };
+    const fail = (error: Error) => { if (finished) return; finished = true; cleanup(); output.write('\n'); reject(error); };
+    const render = () => { output.write('\u001b[H\u001b[J'); output.write('\u001b[?25l'); output.write(renderQuestionWizardFrame(record, state)); };
+    const onKeypress = (_: string, key: KeyLike) => {
+      if (key.ctrl && key.name === 'c') { fail(new Error('Question UI cancelled by user.')); return; }
+      const update = applyQuestionWizardKey(record, state, key);
+      state = update.state;
+      render();
+      if (update.submit) finish();
+    };
+    emitKeypressEvents(input as NodeJS.ReadableStream);
+    input.setRawMode?.(true);
+    input.resume?.();
+    input.on('keypress', onKeypress);
+    render();
+  });
+}
+
+async function promptForWizardOtherTexts(record: QuestionRecord, state: WizardState, deps: QuestionUiDeps = {}): Promise<Array<string | undefined>> {
+  const otherTexts: Array<string | undefined> = [];
+  for (const [index, question] of recordQuestions(record).entries()) {
+    const selectedNumbers = selectedNumbersForQuestion(question, state.selections[index]!);
+    if (!question.allow_other || !selectedNumbers.includes(question.options.length + 1)) continue;
+    otherTexts[index] = await promptForOtherText(question.other_label, deps);
+  }
+  return otherTexts;
+}
+
+async function promptForQuestionWithNumbers(question: NormalizedQuestionItem, deps: QuestionUiDeps = {}): Promise<number[]> {
   const input = deps.input ?? defaultInput;
   const output = deps.output ?? defaultOutput;
   const rl = createPromptInterface({ input: input as NodeJS.ReadableStream, output: output as NodeJS.WritableStream });
   try {
     output.write('\n');
-    if (record.header) output.write(`${record.header}\n`);
-    output.write(`${record.question}\n\n`);
-    output.write(`${renderOptions(record).join('\n')}\n\n`);
-
-    const optionCount = record.options.length + (record.allow_other ? 1 : 0);
-    const prompt = isMultiAnswerableQuestion(record)
-      ? 'Choose one or more options by number (comma-separated): '
-      : 'Choose an option by number: ';
-
+    if (question.header) output.write(`${question.header}\n`);
+    output.write(`${question.question}\n\n`);
+    output.write(`${renderOptions(question).join('\n')}\n\n`);
+    const optionCount = question.options.length + (question.allow_other ? 1 : 0);
+    const prompt = isMultiAnswerableQuestion(question) ? 'Choose one or more options by number (comma-separated): ' : 'Choose an option by number: ';
     let selections: number[] | null = null;
     while (!selections) {
-      selections = parseSelection(await rl.question(prompt), optionCount, isMultiAnswerableQuestion(record));
+      selections = parseSelection(await rl.question(prompt), optionCount, isMultiAnswerableQuestion(question));
       if (!selections) output.write('Invalid selection. Please try again.\n');
     }
     return selections;
@@ -234,10 +369,7 @@ async function promptForSelectionsWithNumbers(
   }
 }
 
-async function promptForOtherText(
-  label: string,
-  deps: QuestionUiDeps = {},
-): Promise<string> {
+async function promptForOtherText(label: string, deps: QuestionUiDeps = {}): Promise<string> {
   const input = deps.input ?? defaultInput;
   const output = deps.output ?? defaultOutput;
   const rl = createPromptInterface({ input: input as NodeJS.ReadableStream, output: output as NodeJS.WritableStream });
@@ -252,36 +384,45 @@ async function promptForOtherText(
   }
 }
 
+async function promptForAnswersWithNumbers(record: QuestionRecord, deps: QuestionUiDeps = {}): Promise<QuestionAnswerEntry[]> {
+  const entries: QuestionAnswerEntry[] = [];
+  for (const [index, question] of recordQuestions(record).entries()) {
+    const selections = await promptForQuestionWithNumbers(question, deps);
+    let otherText: string | undefined;
+    if (question.allow_other && selections.includes(question.options.length + 1)) otherText = await promptForOtherText(question.other_label, deps);
+    entries.push({ question_id: question.id, index, answer: buildAnswer(question, selections, otherText) });
+  }
+  return entries;
+}
+
 export async function runQuestionUi(recordPath: string, deps: QuestionUiDeps = {}): Promise<void> {
   const record = await readQuestionRecord(recordPath);
   if (!record) throw new Error(`Question record not found: ${recordPath}`);
-
   const input = deps.input ?? defaultInput;
   const output = deps.output ?? defaultOutput;
 
   try {
-    const selections = supportsInteractiveSelectUi(input, output)
-      ? await promptForSelectionsWithArrows(record, { input, output })
-      : await promptForSelectionsWithNumbers(record, { input, output });
-
-    let otherText: string | undefined;
-    if (record.allow_other && selections.includes(record.options.length + 1)) {
-      otherText = await promptForOtherText(record.other_label, { input, output });
+    const questions = recordQuestions(record);
+    let answers: QuestionAnswerEntry[];
+    if (questions.length === 1) {
+      const question = questions[0]!;
+      const selections = supportsInteractiveArrowUi(input, output)
+        ? await promptForSelectionsWithArrows(record, { input, output })
+        : await promptForQuestionWithNumbers(question, { input, output });
+      let otherText: string | undefined;
+      if (question.allow_other && selections.includes(question.options.length + 1)) {
+        otherText = await promptForOtherText(question.other_label, { input, output });
+      }
+      answers = [{ question_id: question.id, index: 0, answer: buildAnswer(question, selections, otherText) }];
+    } else {
+      answers = supportsInteractiveArrowUi(input, output)
+        ? await promptForAnswersWithArrows(record, { input, output })
+        : await promptForAnswersWithNumbers(record, { input, output });
     }
-
-    const answer = buildAnswer(record, selections, otherText);
-    const answeredRecord = await markQuestionAnswered(recordPath, answer);
-    maybeInjectAnswer(answeredRecord, answer, {
-      env: deps.env,
-      injectAnswerToPane: deps.injectAnswerToPane,
-    });
+    const answeredRecord = await markQuestionAnswered(recordPath, answers);
+    maybeInjectAnswers(answeredRecord, answers, { env: deps.env, injectAnswersToPane: deps.injectAnswersToPane });
   } catch (error) {
-    await markQuestionTerminalError(
-      recordPath,
-      'error',
-      'question_ui_failed',
-      error instanceof Error ? error.message : String(error),
-    );
+    await markQuestionTerminalError(recordPath, 'error', 'question_ui_failed', error instanceof Error ? error.message : String(error));
     throw error;
   }
 }

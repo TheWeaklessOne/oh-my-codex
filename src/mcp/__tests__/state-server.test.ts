@@ -679,7 +679,7 @@ describe('state-server directory initialization', () => {
             session_id: 'sess-deny',
             mode: 'autopilot',
             active: true,
-            current_phase: 'planning',
+            current_phase: 'ralplan',
           },
         },
       });
@@ -1036,9 +1036,9 @@ describe('state-server directory initialization', () => {
           arguments: {
             workingDirectory: wd,
             session_id: 'sess-rollback',
-            mode: 'autopilot',
+            mode: 'ralph',
             active: true,
-            current_phase: 'planning',
+            current_phase: 'executing',
           },
         },
       });

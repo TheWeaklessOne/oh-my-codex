@@ -397,7 +397,7 @@ describe('keyword registry coverage', () => {
 });
 
 describe('keyword detector skill-active-state lifecycle', () => {
-  it('writes skill-active-state.json with planning phase when keyword activates', async () => {
+  it('writes skill-active-state.json with ralplan phase when autopilot keyword activates', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-state-'));
     const stateDir = join(cwd, '.omx', 'state');
     try {
@@ -413,11 +413,11 @@ describe('keyword detector skill-active-state lifecycle', () => {
 
       assert.ok(result);
       assert.equal(result.skill, 'autopilot');
-      assert.equal(result.phase, 'planning');
+      assert.equal(result.phase, 'ralplan');
       assert.equal(result.active, true);
       assert.deepEqual(result.active_skills, [{
         skill: 'autopilot',
-        phase: 'planning',
+        phase: 'ralplan',
         active: true,
         activated_at: '2026-02-25T00:00:00.000Z',
         updated_at: '2026-02-25T00:00:00.000Z',
@@ -436,11 +436,11 @@ describe('keyword detector skill-active-state lifecycle', () => {
         initialized_mode?: string;
       };
       assert.equal(persisted.skill, 'autopilot');
-      assert.equal(persisted.phase, 'planning');
+      assert.equal(persisted.phase, 'ralplan');
       assert.equal(persisted.active, true);
       assert.deepEqual(persisted.active_skills, [{
         skill: 'autopilot',
-        phase: 'planning',
+        phase: 'ralplan',
         active: true,
         activated_at: '2026-02-25T00:00:00.000Z',
         updated_at: '2026-02-25T00:00:00.000Z',
@@ -459,10 +459,26 @@ describe('keyword detector skill-active-state lifecycle', () => {
         mode: string;
         active: boolean;
         current_phase: string;
+        iteration: number;
+        review_cycle: number;
+        max_iterations: number;
+        state: {
+          phase_cycle: string[];
+          handoff_artifacts: Record<string, unknown>;
+          review_verdict: unknown;
+          return_to_ralplan_reason: string | null;
+        };
       };
       assert.equal(modeState.mode, 'autopilot');
       assert.equal(modeState.active, true);
-      assert.equal(modeState.current_phase, 'planning');
+      assert.equal(modeState.current_phase, 'ralplan');
+      assert.equal(modeState.iteration, 1);
+      assert.equal(modeState.review_cycle, 0);
+      assert.equal(modeState.max_iterations, 10);
+      assert.deepEqual(modeState.state.phase_cycle, ['ralplan', 'ralph', 'code-review']);
+      assert.deepEqual(modeState.state.handoff_artifacts, { ralplan: null, ralph: null, code_review: null });
+      assert.equal(modeState.state.review_verdict, null);
+      assert.equal(modeState.state.return_to_ralplan_reason, null);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1169,7 +1185,7 @@ describe('keyword detector skill-active-state lifecycle', () => {
           active: true,
           skill: 'deep-interview',
           keyword: 'deep interview',
-          phase: 'planning',
+          phase: 'ralplan',
           activated_at: '2026-02-25T00:00:00.000Z',
           updated_at: '2026-02-25T00:00:00.000Z',
           source: 'keyword-detector',
@@ -1365,7 +1381,7 @@ describe('keyword detector skill-active-state lifecycle', () => {
           active: true,
           skill: 'autopilot',
           keyword: '$autopilot',
-          phase: 'planning',
+          phase: 'ralplan',
           activated_at: '2026-02-25T00:00:00.000Z',
           updated_at: '2026-02-25T00:10:00.000Z',
           source: 'keyword-detector',
@@ -1402,7 +1418,7 @@ describe('keyword detector skill-active-state lifecycle', () => {
           active: true,
           skill: 'autopilot',
           keyword: 'autopilot',
-          phase: 'planning',
+          phase: 'ralplan',
           activated_at: '2026-02-25T00:00:00.000Z',
           updated_at: '2026-02-25T00:10:00.000Z',
           source: 'keyword-detector',
@@ -1414,7 +1430,7 @@ describe('keyword detector skill-active-state lifecycle', () => {
         JSON.stringify({
           active: true,
           mode: 'autopilot',
-          current_phase: 'execution',
+          current_phase: 'code-review',
           started_at: '2026-02-25T00:00:00.000Z',
           updated_at: '2026-02-25T00:10:00.000Z',
           session_id: 'sess-autopilot',
@@ -1431,12 +1447,12 @@ describe('keyword detector skill-active-state lifecycle', () => {
 
       assert.ok(result);
       assert.equal(result.skill, 'autopilot');
-      assert.equal(result.phase, 'planning');
+      assert.equal(result.phase, 'ralplan');
       assert.equal(result.transition_error, undefined);
       const modeState = JSON.parse(
         await readFile(join(stateDir, 'sessions', 'sess-autopilot', 'autopilot-state.json'), 'utf-8'),
       ) as { current_phase: string; started_at: string; state?: { context_snapshot_path?: string } };
-      assert.equal(modeState.current_phase, 'execution');
+      assert.equal(modeState.current_phase, 'code-review');
       assert.equal(modeState.started_at, '2026-02-25T00:00:00.000Z');
       assert.equal(modeState.state?.context_snapshot_path, '.omx/context/existing.md');
     } finally {
@@ -1614,7 +1630,7 @@ describe('keyword detector skill-active-state lifecycle', () => {
           active: true,
           skill: 'autopilot',
           keyword: '$autopilot',
-          phase: 'planning',
+          phase: 'ralplan',
           activated_at: '2026-04-19T00:00:00.000Z',
           updated_at: '2026-04-19T00:10:00.000Z',
           source: 'keyword-detector',
@@ -1622,7 +1638,7 @@ describe('keyword detector skill-active-state lifecycle', () => {
           active_skills: [
             {
               skill: 'autopilot',
-              phase: 'planning',
+              phase: 'ralplan',
               active: true,
               activated_at: '2026-04-19T00:00:00.000Z',
               updated_at: '2026-04-19T00:10:00.000Z',
@@ -1636,7 +1652,7 @@ describe('keyword detector skill-active-state lifecycle', () => {
         JSON.stringify({
           active: true,
           mode: 'autopilot',
-          current_phase: 'execution',
+          current_phase: 'code-review',
           started_at: '2026-04-19T00:00:00.000Z',
           updated_at: '2026-04-19T00:10:00.000Z',
           session_id: 'sess-autopilot-bare',
@@ -1658,7 +1674,7 @@ describe('keyword detector skill-active-state lifecycle', () => {
       const modeState = JSON.parse(
         await readFile(join(stateDir, 'sessions', 'sess-autopilot-bare', 'autopilot-state.json'), 'utf-8'),
       ) as { current_phase: string; state?: { context_snapshot_path?: string } };
-      assert.equal(modeState.current_phase, 'execution');
+      assert.equal(modeState.current_phase, 'code-review');
       assert.equal(modeState.state?.context_snapshot_path, '.omx/context/autopilot.md');
       assert.equal(existsSync(join(stateDir, 'sessions', 'sess-autopilot-bare', 'ralph-state.json')), false);
     } finally {
@@ -1788,7 +1804,7 @@ describe('keyword detector skill-active-state lifecycle', () => {
           active: true,
           skill: 'autopilot',
           keyword: 'autopilot',
-          phase: 'planning',
+          phase: 'ralplan',
           activated_at: '2026-02-25T00:00:00.000Z',
           updated_at: '2026-02-25T00:10:00.000Z',
           source: 'keyword-detector',
@@ -1823,7 +1839,7 @@ describe('keyword detector skill-active-state lifecycle', () => {
           active: true,
           skill: 'autopilot',
           keyword: 'autopilot',
-          phase: 'planning',
+          phase: 'ralplan',
           activated_at: '2026-02-25T00:00:00.000Z',
           updated_at: '2026-02-25T00:10:00.000Z',
           source: 'keyword-detector',
