@@ -14,6 +14,8 @@ import {
   isSessionStale,
   type SessionState,
 } from '../session.js';
+import { readSessionActors, registerActorSessionStart } from '../../runtime/session-actors.js';
+import { writeSubagentTrackingState } from '../../subagents/tracker.js';
 
 interface SessionHistoryEntry {
   session_id: string;
@@ -79,6 +81,90 @@ describe('session lifecycle manager', () => {
         turn_count: number;
       };
       assert.equal(hud.turn_count, 0);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not let legacy subagent tracking projection replace a concrete owner actor', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-owner-projection-'));
+    const sessionId = 'sess-owner-projection';
+    try {
+      await writeSessionStart(cwd, sessionId, {
+        nativeSessionId: 'leader-current-owner',
+      });
+
+      await writeSubagentTrackingState(cwd, {
+        schemaVersion: 1,
+        sessions: {
+          [sessionId]: {
+            session_id: sessionId,
+            leader_thread_id: 'leader-stale-projection',
+            updated_at: '2026-04-30T00:00:01.000Z',
+            threads: {
+              'leader-stale-projection': {
+                thread_id: 'leader-stale-projection',
+                kind: 'leader',
+                first_seen_at: '2026-04-30T00:00:01.000Z',
+                last_seen_at: '2026-04-30T00:00:01.000Z',
+                turn_count: 1,
+              },
+            },
+          },
+        },
+      });
+
+      const registry = await readSessionActors(cwd, sessionId);
+      assert.equal(registry.ownerActorId, 'leader-current-owner');
+      assert.equal(registry.actors['leader-current-owner']?.kind, 'leader');
+      assert.equal(registry.actors['leader-current-owner']?.audience, 'external-owner');
+      assert.equal(registry.actors['leader-current-owner']?.nativeSessionId, 'leader-current-owner');
+      assert.equal(registry.actors['leader-stale-projection']?.quarantined, true);
+      assert.equal(
+        registry.actors['leader-stale-projection']?.quarantineReason,
+        'external_owner_mismatch_with_active_owner',
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves concurrent child actor registrations under the session actor lock', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-actor-lock-'));
+    const sessionId = 'sess-actor-lock';
+    try {
+      await writeSessionStart(cwd, sessionId, {
+        nativeSessionId: 'leader-actor-lock',
+      });
+
+      await Promise.all(['child-actor-lock-a', 'child-actor-lock-b'].map((childId) =>
+        registerActorSessionStart({
+          cwd,
+          sessionId,
+          classification: {
+            kind: 'native-subagent',
+            audience: 'child',
+            origin: {
+              kind: 'native-subagent',
+              threadId: childId,
+              nativeSessionId: childId,
+              parentThreadId: 'leader-actor-lock',
+            },
+            actorId: childId,
+            threadId: childId,
+            nativeSessionId: childId,
+            parentThreadId: 'leader-actor-lock',
+            source: 'test-concurrent-child',
+            reason: 'session_start_child',
+            evidence: [{ source: 'test', detail: childId }],
+          },
+        })
+      ));
+
+      const registry = await readSessionActors(cwd, sessionId);
+      assert.equal(registry.ownerActorId, 'leader-actor-lock');
+      assert.equal(registry.actors['child-actor-lock-a']?.parentActorId, 'leader-actor-lock');
+      assert.equal(registry.actors['child-actor-lock-b']?.parentActorId, 'leader-actor-lock');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -202,7 +288,7 @@ describe('session lifecycle manager', () => {
     }
   });
 
-  it('starts a fresh canonical session when a new native SessionStart arrives after an earlier native session', async () => {
+  it('quarantines a concurrent native SessionStart instead of replacing the active owner', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-native-fresh-'));
     try {
       await writeSessionStart(cwd, 'omx-old-session', {
@@ -214,13 +300,17 @@ describe('session lifecycle manager', () => {
         platform: 'win32',
       });
 
-      assert.equal(reconciled.session_id, 'codex-native-new');
-      assert.equal(reconciled.native_session_id, 'codex-native-new');
-      assert.equal(reconciled.pid, 54321);
+      assert.equal(reconciled.session_id, 'omx-old-session');
+      assert.equal(reconciled.native_session_id, 'codex-native-old');
 
       const persisted = await readSessionState(cwd);
-      assert.equal(persisted?.session_id, 'codex-native-new');
-      assert.equal(persisted?.native_session_id, 'codex-native-new');
+      assert.equal(persisted?.session_id, 'omx-old-session');
+      assert.equal(persisted?.native_session_id, 'codex-native-old');
+
+      const dailyLogPath = join(cwd, '.omx', 'logs', `omx-${todayIsoDate()}.jsonl`);
+      const dailyLog = await readFile(dailyLogPath, 'utf-8');
+      assert.match(dailyLog, /"event":"session_start_external_owner_mismatch_quarantined"/);
+      assert.match(dailyLog, /"native_session_id":"codex-native-new"/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

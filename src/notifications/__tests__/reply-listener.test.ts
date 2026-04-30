@@ -30,6 +30,7 @@ import type { SessionMapping } from '../session-registry.js';
 import { NO_TRACKED_SESSION_MESSAGE } from '../session-status.js';
 import { buildDiscordReplySource, buildTelegramReplySource } from '../reply-source.js';
 import { consumePendingReplyOrigin } from '../reply-origin-state.js';
+import { pendingRoutesStatePath } from '../pending-routes.js';
 import { markMockTelegramTransportForTests } from '../../utils/test-env.js';
 import { OMX_ENTRY_PATH_ENV, OMX_STARTUP_CWD_ENV } from '../../utils/paths.js';
 
@@ -1662,7 +1663,7 @@ describe('pollTelegramOnce', () => {
     assert.equal(sourceState?.failureCounts?.['poll-error'], 1);
   });
 
-  it('injects Telegram replies and sends a reply acknowledgement', async () => {
+  it('injects Telegram replies and sends a removable placeholder acknowledgement', async () => {
     resetReplyListenerTransientState();
     const config = createBaseConfig();
     const state = createBaseState();
@@ -1746,8 +1747,123 @@ describe('pollTelegramOnce', () => {
     assert.equal(parsedBody.message_thread_id, 9001);
     assert.equal(
       parsedBody.text,
-      'Injected into Codex CLI session.',
+      'Got it — sending your follow-up to Codex…',
     );
+  });
+
+  it('keeps Telegram replies silent when telegram ack mode is off', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig({ telegramAckMode: 'off' });
+    const state = createBaseState();
+    let injectedText = '';
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 145,
+                  message: {
+                    message_id: 432,
+                    message_thread_id: 9001,
+                    chat: { id: 777 },
+                    from: { id: 'telegram-user-1' },
+                    text: 'continue silently',
+                    reply_to_message: { message_id: 222 },
+                  },
+                },
+              ],
+            },
+          }),
+        }),
+        lookupByMessageIdImpl: () => createMapping('telegram'),
+        injectReplyImpl: (_paneId, text) => {
+          injectedText = text;
+          return true;
+        },
+      },
+    );
+
+    assert.equal(injectedText, 'continue silently');
+    assert.equal(state.messagesInjected, 1);
+    assert.equal(state.telegramLastUpdateId, 145);
+    assert.equal(state.errors, 0);
+  });
+
+  it('removes Telegram placeholders immediately when reply-origin metadata cannot be recorded', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig();
+    const state = createBaseState();
+    const requestOrder: string[] = [];
+    const sendBodies: Array<Record<string, unknown>> = [];
+    const deleteBodies: Array<Record<string, unknown>> = [];
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 148,
+                  message: {
+                    message_id: 435,
+                    message_thread_id: 9001,
+                    chat: { id: 777 },
+                    from: { id: 'telegram-user-1' },
+                    text: 'continue without project path',
+                    reply_to_message: { message_id: 222 },
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            requestOrder.push('sendMessage');
+            sendBodies.push(JSON.parse(body) as Record<string, unknown>);
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: sendBodies.length === 1 ? 702 : 703,
+                  message_thread_id: 9001,
+                },
+              },
+            };
+          },
+          [`POST /bot${config.telegramBotToken}/deleteMessage`]: (body) => {
+            requestOrder.push('deleteMessage');
+            deleteBodies.push(JSON.parse(body) as Record<string, unknown>);
+            return { statusCode: 200, body: { ok: true, result: true } };
+          },
+        }),
+        lookupByMessageIdImpl: () => ({
+          ...createMapping('telegram'),
+          projectPath: undefined,
+        }),
+        injectReplyImpl: () => true,
+      },
+    );
+
+    assert.deepEqual(requestOrder, ['sendMessage', 'deleteMessage', 'sendMessage']);
+    assert.equal(sendBodies[0]?.text, 'Got it — sending your follow-up to Codex…');
+    assert.deepEqual(deleteBodies[0], { chat_id: '777', message_id: '702' });
+    assert.equal(sendBodies[1]?.text, 'Injected into Codex CLI session.');
+    assert.equal(state.messagesInjected, 1);
+    assert.equal(state.telegramLastUpdateId, 148);
   });
 
   it('injects Telegram media reply captions and saves screenshots for Codex context', async () => {
@@ -1849,7 +1965,7 @@ describe('pollTelegramOnce', () => {
     }
   });
 
-  it('sends accepted Telegram ack before media download and records placeholder cleanup metadata', async () => {
+  it('sends Telegram placeholder before media download and records cleanup metadata', async () => {
     resetReplyListenerTransientState();
     const config = createBaseConfig({ telegramAckMode: 'accepted-final-message' });
     const state = createBaseState();
@@ -1930,7 +2046,7 @@ describe('pollTelegramOnce', () => {
 
       assert.deepEqual(requestOrder, ['accepted', 'typing', 'getFile', 'download']);
       const acceptedBody = acceptedBodies[0] ?? {};
-      assert.equal(acceptedBody.text, '✅ Принято, обрабатываю…');
+      assert.equal(acceptedBody.text, 'Got it — sending your follow-up to Codex…');
       assert.equal(acceptedBody.reply_to_message_id, 433);
       assert.equal(acceptedBody.message_thread_id, 9001);
       assert.equal('disable_notification' in acceptedBody, false);
@@ -1946,6 +2062,11 @@ describe('pollTelegramOnce', () => {
       assert.deepEqual(origin?.telegramAck, {
         chatId: '777',
         messageId: '701',
+        messageThreadId: '9001',
+      });
+      assert.deepEqual(origin?.telegramReplyTo, {
+        chatId: '777',
+        messageId: '433',
         messageThreadId: '9001',
       });
       assert.equal(state.messagesInjected, 1);
@@ -2341,6 +2462,7 @@ describe('pollTelegramOnce', () => {
     const config = createBaseConfig();
     const state = createBaseState();
     const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
+    const projectRoot = await mkdtemp(join(tmpdir(), 'omx-telegram-topic-launch-project-'));
     state.sourceStates[telegramSource.key] = {
       sourceKey: telegramSource.key,
       platform: 'telegram',
@@ -2359,116 +2481,135 @@ describe('pollTelegramOnce', () => {
     const launchedSessions: Array<{ cwd: string; codexHomeOverride?: string; notifyProfile?: string | null }> = [];
     const submittedPrompts: Array<{ paneId: string; text: string }> = [];
 
-    await pollTelegramOnce(
-      config,
-      state,
-      new RateLimiter(10),
-      {
-        httpsRequestImpl: createHttpsRequestMock({
-          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
-            statusCode: 200,
-            body: {
-              ok: true,
-              result: [
-                {
-                  update_id: 60,
-                  message: {
-                    message_id: 350,
-                    message_thread_id: 9001,
-                    chat: { id: 777, type: 'supergroup' },
-                    from: { id: 'telegram-user-1' },
-                    text: 'Investigate this topic from Telegram',
+    try {
+      await pollTelegramOnce(
+        config,
+        state,
+        new RateLimiter(10),
+        {
+          httpsRequestImpl: createHttpsRequestMock({
+            [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: [
+                  {
+                    update_id: 60,
+                    message: {
+                      message_id: 350,
+                      message_thread_id: 9001,
+                      chat: { id: 777, type: 'supergroup' },
+                      from: { id: 'telegram-user-1' },
+                      text: 'Investigate this topic from Telegram',
+                    },
                   },
-                },
-              ],
+                ],
+              },
+            }),
+            [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+              sentBodies.push(body);
+              return {
+                statusCode: 200,
+                body: { ok: true, result: { message_id: 551, message_thread_id: 9001 } },
+              };
             },
           }),
-          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
-            sentBodies.push(body);
+          getNotificationConfigImpl: () => ({
+            enabled: true,
+            telegram: {
+              enabled: true,
+              botToken: config.telegramBotToken,
+              chatId: config.telegramChatId,
+              projectTopics: { enabled: true },
+            },
+          }) as any,
+          findTopicRecordByThreadIdImpl: async (sourceKey, threadId) => {
+            assert.equal(sourceKey, telegramSource.key);
+            assert.equal(threadId, 9001);
             return {
-              statusCode: 200,
-              body: { ok: true, result: { message_id: 551, message_thread_id: 9001 } },
+              sourceChatKey: telegramSource.key,
+              projectKey: 'project-key-1',
+              canonicalProjectPath: projectRoot,
+              displayName: 'worktree-a',
+              topicName: 'worktree-a',
+              messageThreadId: '9001',
             };
           },
-        }),
-        getNotificationConfigImpl: () => ({
-          enabled: true,
-          telegram: {
-            enabled: true,
-            botToken: config.telegramBotToken,
-            chatId: config.telegramChatId,
-            projectTopics: { enabled: true },
+          launchDetachedManagedSessionImpl: async (options) => {
+            launchedSessions.push(options);
+            return {
+              sessionId: 'omx-topic-session-1',
+              tmuxSessionName: 'omx-worktree-a-main',
+              leaderPaneId: '%91',
+              cwd: projectRoot,
+            };
           },
-        }) as any,
-        findTopicRecordByThreadIdImpl: async (sourceKey, threadId) => {
-          assert.equal(sourceKey, telegramSource.key);
-          assert.equal(threadId, 9001);
-          return {
-            sourceChatKey: telegramSource.key,
-            projectKey: 'project-key-1',
-            canonicalProjectPath: '/repos/worktree-a',
-            displayName: 'worktree-a',
-            topicName: 'worktree-a',
-            messageThreadId: '9001',
-          };
+          waitForCodexPaneReadyImpl: (paneId, timeoutMs) => {
+            assert.equal(paneId, '%91');
+            assert.equal(timeoutMs, 30_000);
+            return true;
+          },
+          submitPromptToCodexPaneImpl: async (paneId, text) => {
+            submittedPrompts.push({ paneId, text });
+            return true;
+          },
+          registerMessageImpl: (mapping) => {
+            registeredMappings.push(mapping);
+            return true;
+          },
         },
-        launchDetachedManagedSessionImpl: async (options) => {
-          launchedSessions.push(options);
-          return {
-            sessionId: 'omx-topic-session-1',
-            tmuxSessionName: 'omx-worktree-a-main',
-            leaderPaneId: '%91',
-            cwd: '/repos/worktree-a',
-          };
-        },
-        waitForCodexPaneReadyImpl: (paneId, timeoutMs) => {
-          assert.equal(paneId, '%91');
-          assert.equal(timeoutMs, 30_000);
-          return true;
-        },
-        submitPromptToCodexPaneImpl: async (paneId, text) => {
-          submittedPrompts.push({ paneId, text });
-          return true;
-        },
-        registerMessageImpl: (mapping) => {
-          registeredMappings.push(mapping);
-          return true;
-        },
-      },
-    );
+      );
 
-    assert.equal(state.telegramLastUpdateId, 60);
-    assert.equal(state.messagesInjected, 1);
-    assert.equal(state.errors, 0);
-    assert.equal(state.sourceStates[telegramSource.key]?.lastFailureAt, null);
-    assert.equal(state.sourceStates[telegramSource.key]?.lastFailureCategory, null);
-    assert.equal(state.sourceStates[telegramSource.key]?.lastFailureMessage, null);
-    assert.deepEqual(launchedSessions, [
-      {
-        cwd: '/repos/worktree-a',
-        codexHomeOverride: undefined,
-        notifyProfile: null,
-      },
-    ]);
-    assert.deepEqual(submittedPrompts, [
-      { paneId: '%91', text: 'Investigate this topic from Telegram' },
-    ]);
-    assert.equal(registeredMappings.length, 1);
-    assert.equal(registeredMappings[0]?.messageId, '551');
-    assert.equal(registeredMappings[0]?.sessionId, 'omx-topic-session-1');
-    assert.equal(registeredMappings[0]?.tmuxPaneId, '%91');
-    assert.equal(registeredMappings[0]?.messageThreadId, '9001');
-    assert.equal(registeredMappings[0]?.topicName, 'worktree-a');
+      assert.equal(state.telegramLastUpdateId, 60);
+      assert.equal(state.messagesInjected, 1);
+      assert.equal(state.errors, 0);
+      assert.equal(state.sourceStates[telegramSource.key]?.lastFailureAt, null);
+      assert.equal(state.sourceStates[telegramSource.key]?.lastFailureCategory, null);
+      assert.equal(state.sourceStates[telegramSource.key]?.lastFailureMessage, null);
+      assert.deepEqual(launchedSessions, [
+        {
+          cwd: projectRoot,
+          codexHomeOverride: undefined,
+          notifyProfile: null,
+        },
+      ]);
+      assert.deepEqual(submittedPrompts, [
+        { paneId: '%91', text: 'Investigate this topic from Telegram' },
+      ]);
+      assert.equal(registeredMappings.length, 1);
+      assert.equal(registeredMappings[0]?.messageId, '551');
+      assert.equal(registeredMappings[0]?.sessionId, 'omx-topic-session-1');
+      assert.equal(registeredMappings[0]?.tmuxPaneId, '%91');
+      assert.equal(registeredMappings[0]?.messageThreadId, '9001');
+      assert.equal(registeredMappings[0]?.topicName, 'worktree-a');
 
-    const parsedBody = JSON.parse(sentBodies[0] ?? '{}') as {
-      text: string;
-      reply_to_message_id: number;
-      message_thread_id: number;
-    };
-    assert.equal(parsedBody.reply_to_message_id, 350);
-    assert.equal(parsedBody.message_thread_id, 9001);
-    assert.match(parsedBody.text, /started a new omx session/i);
-    assert.match(parsedBody.text, /omx-topic-session-1/);
+      const parsedBody = JSON.parse(sentBodies[0] ?? '{}') as {
+        text: string;
+        reply_to_message_id: number;
+        message_thread_id: number;
+      };
+      assert.equal(parsedBody.reply_to_message_id, 350);
+      assert.equal(parsedBody.message_thread_id, 9001);
+      assert.equal(parsedBody.text, 'Starting a new Codex chat — working on it…');
+
+      const origin = await consumePendingReplyOrigin(
+        projectRoot,
+        'omx-topic-session-1',
+        'Investigate this topic from Telegram',
+      );
+      assert.deepEqual(origin?.telegramAck, {
+        chatId: '777',
+        messageId: '551',
+        messageThreadId: '9001',
+      });
+      assert.deepEqual(origin?.telegramReplyTo, {
+        chatId: '777',
+        messageId: '350',
+        messageThreadId: '9001',
+      });
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
   });
 
   it('launches a Telegram project topic with captioned media and submits the rendered prompt', async () => {
@@ -2943,15 +3084,19 @@ describe('pollTelegramOnce', () => {
     const config = createBaseConfig();
     const state = createBaseState();
     const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
-    let sendMessageBody = '';
+    const projectRoot = await mkdtemp(join(tmpdir(), 'omx-telegram-topic-submit-failure-'));
+    const requestOrder: string[] = [];
+    const sendMessageBodies: Array<Record<string, unknown>> = [];
+    const deleteBodies: Array<Record<string, unknown>> = [];
     let registerCalled = false;
 
-    await pollTelegramOnce(
-      config,
-      state,
-      new RateLimiter(10),
-      {
-        httpsRequestImpl: createHttpsRequestMock({
+    try {
+      await pollTelegramOnce(
+        config,
+        state,
+        new RateLimiter(10),
+        {
+          httpsRequestImpl: createHttpsRequestMock({
           [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
             statusCode: 200,
             body: {
@@ -2971,49 +3116,73 @@ describe('pollTelegramOnce', () => {
             },
           }),
           [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
-            sendMessageBody = body;
-            return { statusCode: 200, body: { ok: true, result: { message_id: 554, message_thread_id: 9001 } } };
+            requestOrder.push('sendMessage');
+            sendMessageBodies.push(JSON.parse(body) as Record<string, unknown>);
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: sendMessageBodies.length === 1 ? 554 : 555,
+                  message_thread_id: 9001,
+                },
+              },
+            };
+          },
+          [`POST /bot${config.telegramBotToken}/deleteMessage`]: (body) => {
+            requestOrder.push('deleteMessage');
+            deleteBodies.push(JSON.parse(body) as Record<string, unknown>);
+            return {
+              statusCode: 200,
+              body: { ok: true, result: true },
+            };
           },
         }),
-        getNotificationConfigImpl: () => ({
-          enabled: true,
-          telegram: {
+          getNotificationConfigImpl: () => ({
             enabled: true,
-            botToken: config.telegramBotToken,
-            chatId: config.telegramChatId,
-            projectTopics: { enabled: true },
+            telegram: {
+              enabled: true,
+              botToken: config.telegramBotToken,
+              chatId: config.telegramChatId,
+              projectTopics: { enabled: true },
+            },
+          }) as any,
+          findTopicRecordByThreadIdImpl: async () => ({
+            sourceChatKey: telegramSource.key,
+            projectKey: 'project-key-1',
+            canonicalProjectPath: projectRoot,
+            displayName: 'worktree-a',
+            topicName: 'worktree-a',
+            messageThreadId: '9001',
+          }),
+          launchDetachedManagedSessionImpl: async () => ({
+            sessionId: 'omx-topic-session-3',
+            tmuxSessionName: 'omx-worktree-a-main',
+            leaderPaneId: '%93',
+            cwd: projectRoot,
+          }),
+          waitForCodexPaneReadyImpl: () => true,
+          submitPromptToCodexPaneImpl: async () => false,
+          registerMessageImpl: () => {
+            registerCalled = true;
+            return true;
           },
-        }) as any,
-        findTopicRecordByThreadIdImpl: async () => ({
-          sourceChatKey: telegramSource.key,
-          projectKey: 'project-key-1',
-          canonicalProjectPath: '/repos/worktree-a',
-          displayName: 'worktree-a',
-          topicName: 'worktree-a',
-          messageThreadId: '9001',
-        }),
-        launchDetachedManagedSessionImpl: async () => ({
-          sessionId: 'omx-topic-session-3',
-          tmuxSessionName: 'omx-worktree-a-main',
-          leaderPaneId: '%93',
-          cwd: '/repos/worktree-a',
-        }),
-        waitForCodexPaneReadyImpl: () => true,
-        submitPromptToCodexPaneImpl: async () => false,
-        registerMessageImpl: () => {
-          registerCalled = true;
-          return true;
         },
-      },
-    );
+      );
 
-    assert.equal(state.telegramLastUpdateId, 67);
-    assert.equal(state.messagesInjected, 0);
-    assert.equal(state.errors, 1);
-    assert.equal(registerCalled, false);
-    const parsedBody = JSON.parse(sendMessageBody) as { text: string; reply_to_message_id: number };
-    assert.equal(parsedBody.reply_to_message_id, 363);
-    assert.match(parsedBody.text, /failed to deliver the first prompt/i);
+      assert.equal(state.telegramLastUpdateId, 67);
+      assert.equal(state.messagesInjected, 0);
+      assert.equal(state.errors, 1);
+      assert.equal(registerCalled, true);
+      assert.deepEqual(requestOrder, ['sendMessage', 'deleteMessage', 'sendMessage']);
+      assert.deepEqual(deleteBodies[0], { chat_id: '777', message_id: '554' });
+      const parsedBody = sendMessageBodies[1] as { text: string; reply_to_message_id: number };
+      assert.equal(parsedBody.reply_to_message_id, 363);
+      assert.match(parsedBody.text, /failed to deliver the first prompt/i);
+      assert.equal(existsSync(pendingRoutesStatePath(projectRoot, 'omx-topic-session-3')), false);
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
   });
 
   it('returns a clear diagnostic for non-reply Telegram messages outside a project topic when topic entry is enabled', async () => {
@@ -3346,7 +3515,9 @@ describe('pollTelegramOnce', () => {
     const state = createBaseState();
     const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
     const killedSessions: string[] = [];
-    let sendMessageBody = '';
+    const requestOrder: string[] = [];
+    const sendMessageBodies: Array<Record<string, unknown>> = [];
+    const deleteBodies: Array<Record<string, unknown>> = [];
 
     await pollTelegramOnce(
       config,
@@ -3373,8 +3544,26 @@ describe('pollTelegramOnce', () => {
             },
           }),
           [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
-            sendMessageBody = body;
-            return { statusCode: 200, body: { ok: true, result: { message_id: 556, message_thread_id: 9001 } } };
+            requestOrder.push('sendMessage');
+            sendMessageBodies.push(JSON.parse(body) as Record<string, unknown>);
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: sendMessageBodies.length === 1 ? 556 : 557,
+                  message_thread_id: 9001,
+                },
+              },
+            };
+          },
+          [`POST /bot${config.telegramBotToken}/deleteMessage`]: (body) => {
+            requestOrder.push('deleteMessage');
+            deleteBodies.push(JSON.parse(body) as Record<string, unknown>);
+            return {
+              statusCode: 200,
+              body: { ok: true, result: true },
+            };
           },
         }),
         getNotificationConfigImpl: () => ({
@@ -3406,15 +3595,15 @@ describe('pollTelegramOnce', () => {
           killedSessions.push(sessionName);
           return true;
         },
-        registerMessageImpl: () => {
-          throw new Error('submit failure must not register a launch acknowledgement');
-        },
+        registerMessageImpl: () => true,
       },
     );
 
     assert.equal(state.errors, 1);
     assert.deepEqual(killedSessions, ['omx-worktree-a-submit-failure']);
-    const parsedBody = JSON.parse(sendMessageBody) as { text: string };
+    assert.deepEqual(requestOrder, ['sendMessage', 'deleteMessage', 'sendMessage']);
+    assert.deepEqual(deleteBodies[0], { chat_id: '777', message_id: '556' });
+    const parsedBody = sendMessageBodies[1] as { text: string };
     assert.match(parsedBody.text, /failed to deliver the first prompt/i);
   });
 
@@ -3423,7 +3612,9 @@ describe('pollTelegramOnce', () => {
     const config = createBaseConfig();
     const state = createBaseState();
     const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
-    let sendMessageBody = '';
+    const requestOrder: string[] = [];
+    const sendMessageBodies: Array<Record<string, unknown>> = [];
+    const deleteBodies: Array<Record<string, unknown>> = [];
 
     await pollTelegramOnce(
       config,
@@ -3450,8 +3641,26 @@ describe('pollTelegramOnce', () => {
             },
           }),
           [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
-            sendMessageBody = body;
-            return { statusCode: 200, body: { ok: true, result: { message_id: 558, message_thread_id: 9001 } } };
+            requestOrder.push('sendMessage');
+            sendMessageBodies.push(JSON.parse(body) as Record<string, unknown>);
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: sendMessageBodies.length === 1 ? 558 : 559,
+                  message_thread_id: 9001,
+                },
+              },
+            };
+          },
+          [`POST /bot${config.telegramBotToken}/deleteMessage`]: (body) => {
+            requestOrder.push('deleteMessage');
+            deleteBodies.push(JSON.parse(body) as Record<string, unknown>);
+            return {
+              statusCode: 200,
+              body: { ok: true, result: true },
+            };
           },
         }),
         getNotificationConfigImpl: () => ({
@@ -3481,10 +3690,13 @@ describe('pollTelegramOnce', () => {
         submitPromptToCodexPaneImpl: async () => false,
         detectCodexBlockingPanePromptImpl: () => 'bypass',
         killDetachedManagedSessionImpl: async () => true,
+        registerMessageImpl: () => true,
       },
     );
 
-    const parsedBody = JSON.parse(sendMessageBody) as { text: string };
+    assert.deepEqual(requestOrder, ['sendMessage', 'deleteMessage', 'sendMessage']);
+    assert.deepEqual(deleteBodies[0], { chat_id: '777', message_id: '558' });
+    const parsedBody = sendMessageBodies[1] as { text: string };
     assert.match(parsedBody.text, /permissions confirmation/i);
   });
 
@@ -3942,7 +4154,7 @@ describe('pollTelegramOnce', () => {
     };
     assert.equal(parsedBody.reply_to_message_id, 336);
     assert.equal(parsedBody.message_thread_id, 9001);
-    assert.equal(parsedBody.text, 'Injected into Codex CLI session.');
+    assert.equal(parsedBody.text, 'Got it — sending your follow-up to Codex…');
   });
 
   it('sends an explicit Telegram error reply when the original notification is no longer tracked', async () => {
@@ -4041,11 +4253,12 @@ describe('pollTelegramOnce', () => {
     assert.match(parsedBody.text, /target pane is no longer an omx session/i);
   });
 
-  it('records an error when Telegram injection fails and does not send an acknowledgement', async () => {
+  it('records an error when Telegram injection fails and removes the placeholder acknowledgement', async () => {
     resetReplyListenerTransientState();
     const config = createBaseConfig();
     const state = createBaseState();
-    let sendMessageAttempted = false;
+    const sendMessageBodies: Array<Record<string, unknown>> = [];
+    const deleteMessageBodies: Array<Record<string, unknown>> = [];
 
     await pollTelegramOnce(
       config,
@@ -4071,9 +4284,13 @@ describe('pollTelegramOnce', () => {
               ],
             },
           }),
-          [`POST /bot${config.telegramBotToken}/sendMessage`]: () => {
-            sendMessageAttempted = true;
+          [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+            sendMessageBodies.push(JSON.parse(body) as Record<string, unknown>);
             return { statusCode: 200, body: { ok: true, result: { message_id: 446 } } };
+          },
+          [`POST /bot${config.telegramBotToken}/deleteMessage`]: (body) => {
+            deleteMessageBodies.push(JSON.parse(body) as Record<string, unknown>);
+            return { statusCode: 200, body: { ok: true, result: true } };
           },
         }),
         lookupByMessageIdImpl: () => createMapping('telegram'),
@@ -4081,7 +4298,9 @@ describe('pollTelegramOnce', () => {
       },
     );
 
-    assert.equal(sendMessageAttempted, false);
+    assert.equal(sendMessageBodies.length, 1);
+    assert.equal(sendMessageBodies[0]?.text, 'Got it — sending your follow-up to Codex…');
+    assert.deepEqual(deleteMessageBodies, [{ chat_id: '777', message_id: '446' }]);
     assert.equal(state.messagesInjected, 0);
     assert.equal(state.errors, 1);
     assert.equal(state.telegramLastUpdateId, null);

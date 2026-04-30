@@ -105,11 +105,13 @@ export interface TelegramNotificationConfig {
   projectTopics?: TelegramProjectTopicsConfig;
 }
 
-export interface TelegramAcceptedAckCleanupTarget {
+export interface TelegramMessageReferenceTarget {
   chatId: string;
   messageId: string;
   messageThreadId?: string;
 }
+
+export interface TelegramAcceptedAckCleanupTarget extends TelegramMessageReferenceTarget {}
 
 /** Slack platform configuration */
 export interface SlackNotificationConfig {
@@ -323,6 +325,8 @@ export interface FullNotificationPayload {
   transportOverrides?: NotificationTransportOverrides;
   /** Accepted Telegram reply placeholder to delete after a successful fresh final sendMessage. */
   telegramAcceptedAck?: TelegramAcceptedAckCleanupTarget;
+  /** Telegram message that the final answer should reply to. */
+  telegramReplyTo?: TelegramMessageReferenceTarget;
   /** Agent name (populated by extensibility plugins, not set by core Codex CLI hooks) */
   agentName?: string;
   /** Agent type (populated by extensibility plugins, not set by core Codex CLI hooks) */

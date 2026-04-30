@@ -21,6 +21,7 @@ import {
   resolveSessionOwnerPidFromAncestry,
 } from "../codex-native-hook.js";
 import { writeSessionStart } from "../../hooks/session.js";
+import { readSessionActors } from "../../runtime/session-actors.js";
 import { resetTriageConfigCache } from "../../hooks/triage-config.js";
 import { executeStateOperation } from "../../state/operations.js";
 
@@ -524,18 +525,11 @@ describe("codex native hook dispatch", () => {
       assert.equal(sessionState.session_id, canonicalSessionId);
       assert.equal(sessionState.native_session_id, rootNativeSessionId);
 
-      const index = JSON.parse(
-        await readFile(join(stateDir, "codex-session-origin-index.json"), "utf-8"),
-      ) as {
-        sessions?: Record<string, {
-          origin_kind?: string;
-          audience?: string;
-          parent_thread_id?: string;
-        }>;
-      };
-      assert.equal(index.sessions?.[childNativeSessionId]?.origin_kind, "native-subagent");
-      assert.equal(index.sessions?.[childNativeSessionId]?.audience, "child");
-      assert.equal(index.sessions?.[childNativeSessionId]?.parent_thread_id, rootNativeSessionId);
+      const registry = await readSessionActors(cwd, canonicalSessionId);
+      assert.equal(registry.ownerActorId, rootNativeSessionId);
+      assert.equal(registry.actors[childNativeSessionId]?.kind, "native-subagent");
+      assert.equal(registry.actors[childNativeSessionId]?.audience, "child");
+      assert.equal(registry.actors[childNativeSessionId]?.parentThreadId, rootNativeSessionId);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -576,16 +570,10 @@ describe("codex native hook dispatch", () => {
       assert.equal(sessionState.session_id, canonicalSessionId);
       assert.equal(sessionState.native_session_id, rootNativeSessionId);
 
-      const index = JSON.parse(
-        await readFile(join(stateDir, "codex-session-origin-index.json"), "utf-8"),
-      ) as {
-        sessions?: Record<string, {
-          origin_kind?: string;
-          audience?: string;
-        }>;
-      };
-      assert.equal(index.sessions?.[helperNativeSessionId]?.origin_kind, "internal-helper");
-      assert.equal(index.sessions?.[helperNativeSessionId]?.audience, "internal-helper");
+      const registry = await readSessionActors(cwd, canonicalSessionId);
+      assert.equal(registry.ownerActorId, rootNativeSessionId);
+      assert.equal(registry.actors[helperNativeSessionId]?.kind, "internal-helper");
+      assert.equal(registry.actors[helperNativeSessionId]?.audience, "internal-helper");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -659,20 +647,84 @@ describe("codex native hook dispatch", () => {
       assert.equal(leaderRalph.active, true);
       assert.equal(leaderRalph.current_phase, "executing");
 
-      const tracking = JSON.parse(
-        await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"),
-      ) as {
-        sessions?: Record<string, {
-          leader_thread_id?: string;
-          threads?: Record<string, { kind?: string; mode?: string }>;
-        }>;
-      };
-      assert.equal(tracking.sessions?.[canonicalSessionId]?.leader_thread_id, leaderNativeSessionId);
-      assert.equal(tracking.sessions?.[canonicalSessionId]?.threads?.[childNativeSessionId]?.kind, "subagent");
-      assert.equal(tracking.sessions?.[canonicalSessionId]?.threads?.[childNativeSessionId]?.mode, "critic");
-      assert.equal(tracking.sessions?.[leaderNativeSessionId]?.leader_thread_id, leaderNativeSessionId);
-      assert.equal(tracking.sessions?.[leaderNativeSessionId]?.threads?.[childNativeSessionId]?.kind, "subagent");
-      assert.equal(tracking.sessions?.[leaderNativeSessionId]?.threads?.[childNativeSessionId]?.mode, "critic");
+      const registry = await readSessionActors(cwd, canonicalSessionId);
+      assert.equal(registry.ownerActorId, leaderNativeSessionId);
+      assert.equal(registry.actors[childNativeSessionId]?.kind, "native-subagent");
+      assert.equal(registry.actors[childNativeSessionId]?.audience, "child");
+      assert.equal(registry.actors[childNativeSessionId]?.parentThreadId, leaderNativeSessionId);
+      assert.equal(registry.actors[childNativeSessionId]?.agentRole, "critic");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies transcript-only native subagent SessionStart before owner/origin persistence", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-transcript-classify-before-persist-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const canonicalSessionId = "omx-leader-transcript-first";
+      const leaderNativeSessionId = "leader-thread-transcript-first";
+      const childNativeSessionId = "child-thread-transcript-first";
+      await mkdir(join(stateDir, "sessions", canonicalSessionId), { recursive: true });
+      await writeSessionStart(cwd, canonicalSessionId, {
+        nativeSessionId: leaderNativeSessionId,
+      });
+
+      const transcriptPath = join(cwd, "child-rollout.jsonl");
+      await writeFile(
+        transcriptPath,
+        `${JSON.stringify({
+          type: "session_meta",
+          payload: {
+            id: childNativeSessionId,
+            cwd,
+            source: {
+              subagent: {
+                thread_spawn: {
+                  parent_thread_id: leaderNativeSessionId,
+                  agent_nickname: "Curie",
+                  agent_role: "code-reviewer",
+                },
+              },
+            },
+            agent_nickname: "Curie",
+            agent_role: "code-reviewer",
+          },
+        })}\n`,
+      );
+
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: childNativeSessionId,
+          transcript_path: transcriptPath,
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+
+      const sessionState = JSON.parse(
+        await readFile(join(stateDir, "session.json"), "utf-8"),
+      ) as { session_id?: string; native_session_id?: string };
+      assert.equal(sessionState.session_id, canonicalSessionId);
+      assert.equal(sessionState.native_session_id, leaderNativeSessionId);
+
+      const registry = await readSessionActors(cwd, canonicalSessionId);
+      assert.equal(registry.ownerActorId, leaderNativeSessionId);
+      const childActorId = registry.aliases[childNativeSessionId];
+      assert.ok(childActorId);
+      assert.equal(registry.actors[childActorId]?.kind, "native-subagent");
+      assert.equal(registry.actors[childActorId]?.audience, "child");
+      assert.equal(registry.actors[childActorId]?.parentThreadId, leaderNativeSessionId);
+
+      const originIndexPath = join(stateDir, "codex-session-origin-index.json");
+      if (existsSync(originIndexPath)) {
+        const index = JSON.parse(await readFile(originIndexPath, "utf-8")) as {
+          sessions?: Record<string, { audience?: string; origin_kind?: string }>;
+        };
+        assert.notEqual(index.sessions?.[childNativeSessionId]?.audience, "external-owner");
+        assert.notEqual(index.sessions?.[childNativeSessionId]?.origin_kind, "leader");
+      }
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -964,7 +1016,7 @@ describe("codex native hook dispatch", () => {
     }
   });
 
-  it("starts a fresh native session without inheriting stale task-scoped context", async () => {
+  it("quarantines a concurrent native SessionStart without inheriting task-scoped context", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-session-isolation-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
@@ -1031,19 +1083,20 @@ describe("codex native hook dispatch", () => {
       const sessionState = JSON.parse(
         await readFile(join(stateDir, "session.json"), "utf-8"),
       ) as { session_id?: string; native_session_id?: string };
-      assert.equal(sessionState.session_id, "codex-native-new");
-      assert.equal(sessionState.native_session_id, "codex-native-new");
+      assert.equal(sessionState.session_id, priorSessionId);
+      assert.equal(sessionState.native_session_id, "codex-native-old");
 
       const additionalContext = String(
         (result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "",
       );
-      assert.match(additionalContext, /\[Execution environment\]/);
-      assert.match(additionalContext, /native-hook \/ Codex App outside tmux/);
-      assert.match(additionalContext, /\[Priority notes\]/);
-      assert.match(additionalContext, /Preserve durable project guidance/);
+      assert.equal(additionalContext, "");
       assert.doesNotMatch(additionalContext, /stale UI rework context snapshot/);
       assert.doesNotMatch(additionalContext, /\[Subagents\]/);
       assert.doesNotMatch(additionalContext, /ralph phase: executing/);
+
+      const registry = await readSessionActors(cwd, priorSessionId);
+      assert.equal(registry.actors["codex-native-new"]?.quarantined, true);
+      assert.equal(registry.actors["codex-native-new"]?.quarantineReason, "unknown_actor_with_owner");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -4770,30 +4823,41 @@ esac
         active: true,
         current_phase: "planning",
       });
-      await writeJson(join(stateDir, "subagent-tracking.json"), {
+      const now = new Date().toISOString();
+      await writeJson(join(stateDir, "sessions", "sess-stop-skill-subagent", "actors.json"), {
         schemaVersion: 1,
-        sessions: {
-          "sess-stop-skill-subagent": {
-            session_id: "sess-stop-skill-subagent",
-            leader_thread_id: "leader-1",
-            updated_at: new Date().toISOString(),
-            threads: {
-              "leader-1": {
-                thread_id: "leader-1",
-                kind: "leader",
-                first_seen_at: new Date().toISOString(),
-                last_seen_at: new Date().toISOString(),
-                turn_count: 1,
-              },
-              "sub-1": {
-                thread_id: "sub-1",
-                kind: "subagent",
-                first_seen_at: new Date().toISOString(),
-                last_seen_at: new Date().toISOString(),
-                turn_count: 1,
-              },
-            },
+        sessionId: "sess-stop-skill-subagent",
+        cwd,
+        ownerActorId: "leader-1",
+        actors: {
+          "leader-1": {
+            actorId: "leader-1",
+            kind: "leader",
+            audience: "external-owner",
+            threadId: "leader-1",
+            nativeSessionId: "leader-1",
+            source: "test-fixture",
+            firstSeenAt: now,
+            lastSeenAt: now,
+            turnCount: 1,
           },
+          "sub-1": {
+            actorId: "sub-1",
+            kind: "native-subagent",
+            audience: "child",
+            threadId: "sub-1",
+            nativeSessionId: "sub-1",
+            parentActorId: "leader-1",
+            parentThreadId: "leader-1",
+            source: "test-fixture",
+            firstSeenAt: now,
+            lastSeenAt: now,
+            turnCount: 1,
+          },
+        },
+        aliases: {
+          "leader-1": "leader-1",
+          "sub-1": "sub-1",
         },
       });
 

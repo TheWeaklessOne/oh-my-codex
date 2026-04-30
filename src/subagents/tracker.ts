@@ -1,6 +1,14 @@
-import { existsSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import {
+  actorAudienceFromKind,
+  readSessionActors,
+  recordActorTurnActivity,
+  registerExternalOwnerActor,
+  registerActorSessionStart,
+  type SessionActorRegistry,
+  summarizeSessionActors,
+} from '../runtime/session-actors.js';
 
 export const SUBAGENT_TRACKING_SCHEMA_VERSION = 1;
 export const DEFAULT_SUBAGENT_ACTIVE_WINDOW_MS = 120_000;
@@ -47,7 +55,7 @@ export interface SubagentSessionSummary {
 }
 
 export function subagentTrackingPath(cwd: string): string {
-  return join(cwd, '.omx', 'state', 'subagent-tracking.json');
+  return join(cwd, '.omx', 'state', 'sessions');
 }
 
 export function createSubagentTrackingState(): SubagentTrackingState {
@@ -119,22 +127,112 @@ export function normalizeSubagentTrackingState(input: unknown): SubagentTracking
   };
 }
 
-export async function readSubagentTrackingState(cwd: string): Promise<SubagentTrackingState> {
-  const path = subagentTrackingPath(cwd);
-  if (!existsSync(path)) return createSubagentTrackingState();
-  try {
-    return normalizeSubagentTrackingState(JSON.parse(await readFile(path, 'utf-8')));
-  } catch {
-    return createSubagentTrackingState();
+function registryToTrackedSession(registry: SessionActorRegistry): TrackedSubagentSession | null {
+  const actors = Object.values(registry.actors);
+  if (actors.length === 0) return null;
+  const threads: Record<string, TrackedSubagentThread> = {};
+  const owner = registry.ownerActorId ? registry.actors[registry.ownerActorId] : undefined;
+  for (const actor of actors) {
+    if (actor.quarantined === true) continue;
+    if (actor.kind !== 'leader' && actor.kind !== 'native-subagent') continue;
+    const threadId = (actor.threadId || actor.nativeSessionId || actor.actorId).trim();
+    if (!threadId) continue;
+    threads[threadId] = {
+      thread_id: threadId,
+      kind: actor.kind === 'leader' ? 'leader' : 'subagent',
+      first_seen_at: actor.firstSeenAt,
+      last_seen_at: actor.lastSeenAt,
+      ...(actor.lastTurnId ? { last_turn_id: actor.lastTurnId } : {}),
+      turn_count: actor.turnCount ?? 0,
+      ...(actor.mode || actor.agentRole ? { mode: actor.mode || actor.agentRole } : {}),
+    };
   }
+  if (Object.keys(threads).length === 0) return null;
+  const updatedAt = [registry.updatedAt, ...actors.map((actor) => actor.lastSeenAt)]
+    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    .sort((left, right) => Date.parse(right) - Date.parse(left))[0]
+    ?? new Date(0).toISOString();
+  return {
+    session_id: registry.sessionId,
+    ...(owner?.threadId || owner?.nativeSessionId ? { leader_thread_id: owner.threadId || owner.nativeSessionId } : {}),
+    updated_at: updatedAt,
+    threads,
+  };
+}
+
+function trackingStateFromRegistries(registries: SessionActorRegistry[]): SubagentTrackingState {
+  const state = createSubagentTrackingState();
+  for (const registry of registries) {
+    const session = registryToTrackedSession(registry);
+    if (session) state.sessions[session.session_id] = session;
+  }
+  return state;
+}
+
+export async function readSubagentTrackingState(cwd: string): Promise<SubagentTrackingState> {
+  const sessionsDir = subagentTrackingPath(cwd);
+  const sessionIds = await readdir(sessionsDir).catch(() => [] as string[]);
+  const registries = await Promise.all(
+    sessionIds
+      .filter((sessionId) => sessionId.trim().length > 0)
+      .map((sessionId) => readSessionActors(cwd, sessionId).catch(() => null)),
+  );
+  return trackingStateFromRegistries(
+    registries.filter((registry): registry is SessionActorRegistry => registry !== null),
+  );
 }
 
 export async function writeSubagentTrackingState(cwd: string, state: SubagentTrackingState): Promise<string> {
   const normalized = normalizeSubagentTrackingState(state);
-  const path = subagentTrackingPath(cwd);
-  await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
-  await writeFile(path, `${JSON.stringify(normalized, null, 2)}\n`);
-  return path;
+  for (const session of Object.values(normalized.sessions)) {
+    const leaderThreadId = session.leader_thread_id
+      || Object.values(session.threads).find((thread) => thread.kind === 'leader')?.thread_id;
+    if (leaderThreadId) {
+      await registerExternalOwnerActor({
+        cwd,
+        sessionId: session.session_id,
+        threadId: leaderThreadId,
+        nativeSessionId: leaderThreadId,
+        source: 'subagent-tracker-projection',
+        evidence: [{ source: 'subagent-tracker-projection', detail: 'legacy_state_projection' }],
+      });
+    }
+    for (const thread of Object.values(session.threads)) {
+      if (thread.kind === 'leader') continue;
+      await registerActorSessionStart({
+        cwd,
+        sessionId: session.session_id,
+        classification: {
+          kind: 'native-subagent',
+          audience: actorAudienceFromKind('native-subagent'),
+          origin: {
+            kind: 'native-subagent',
+            threadId: thread.thread_id,
+            nativeSessionId: thread.thread_id,
+            ...(leaderThreadId ? { parentThreadId: leaderThreadId } : {}),
+          },
+          actorId: thread.thread_id,
+          threadId: thread.thread_id,
+          nativeSessionId: thread.thread_id,
+          ...(leaderThreadId ? { parentThreadId: leaderThreadId } : {}),
+          ...(thread.mode ? { agentRole: thread.mode } : {}),
+          source: 'subagent-tracker-projection',
+          reason: 'legacy_state_projection',
+          evidence: [{ source: 'subagent-tracker-projection', detail: 'kind=native-subagent' }],
+        },
+        now: new Date(thread.last_seen_at),
+      });
+      await recordActorTurnActivity({
+        cwd,
+        sessionId: session.session_id,
+        actorIds: [thread.thread_id],
+        ...(thread.last_turn_id ? { turnId: thread.last_turn_id } : {}),
+        ...(thread.mode ? { mode: thread.mode } : {}),
+        timestamp: thread.last_seen_at,
+      }).catch(() => null);
+    }
+  }
+  return subagentTrackingPath(cwd);
 }
 
 export function recordSubagentTurn(
@@ -214,10 +312,46 @@ export function recordSubagentTurn(
 }
 
 export async function recordSubagentTurnForSession(cwd: string, input: RecordSubagentTurnInput): Promise<SubagentTrackingState> {
-  const current = await readSubagentTrackingState(cwd);
-  const next = recordSubagentTurn(current, input);
-  await writeSubagentTrackingState(cwd, next);
-  return next;
+  const sessionId = input.sessionId.trim();
+  const threadId = input.threadId.trim();
+  if (!sessionId || !threadId) return createSubagentTrackingState();
+
+  const kind = input.kind === 'leader' ? 'leader' : input.kind === 'subagent' ? 'native-subagent' : 'unknown';
+  const parentThreadId = input.parentThreadId?.trim() || '';
+  await registerActorSessionStart({
+    cwd,
+    sessionId,
+    classification: {
+      kind,
+      audience: actorAudienceFromKind(kind),
+      origin: {
+        kind,
+        threadId,
+        nativeSessionId: threadId,
+        ...(parentThreadId ? { parentThreadId } : {}),
+      },
+      actorId: threadId,
+      threadId,
+      nativeSessionId: threadId,
+      ...(parentThreadId ? { parentThreadId } : {}),
+      ...(input.mode?.trim() ? { agentRole: input.mode.trim() } : {}),
+      source: 'subagent-tracker-api',
+      reason: kind === 'leader' ? 'tracker_leader_activity' : 'tracker_subagent_activity',
+      evidence: [{ source: 'subagent-tracker-api', detail: `kind=${kind}` }],
+    },
+    now: input.timestamp ? new Date(input.timestamp) : undefined,
+  }).catch(() => null);
+  await recordActorTurnActivity({
+    cwd,
+    sessionId,
+    actorIds: [threadId],
+    ...(input.turnId ? { turnId: input.turnId } : {}),
+    ...(input.mode ? { mode: input.mode } : {}),
+    ...(input.timestamp ? { timestamp: input.timestamp } : {}),
+  }).catch(() => null);
+
+  const registry = await readSessionActors(cwd, sessionId);
+  return trackingStateFromRegistries([registry]);
 }
 
 export function summarizeSubagentSession(
@@ -261,5 +395,6 @@ export async function readSubagentSessionSummary(
   sessionId: string,
   options: { now?: string | Date; activeWindowMs?: number } = {},
 ): Promise<SubagentSessionSummary | null> {
-  return summarizeSubagentSession(await readSubagentTrackingState(cwd), sessionId, options);
+  const registry = await readSessionActors(cwd, sessionId);
+  return summarizeSessionActors(registry, options);
 }

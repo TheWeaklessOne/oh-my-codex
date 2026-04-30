@@ -5,7 +5,7 @@ import {
 } from '../telegram-topics.js';
 import type { TelegramAcceptedAckCleanupTarget } from '../types.js';
 
-export const TELEGRAM_ACCEPTED_ACK_TEXT = '✅ Принято, обрабатываю…';
+export const TELEGRAM_ACCEPTED_ACK_TEXT = 'Got it — working on it…';
 const TELEGRAM_ACK_TIMEOUT_MS = 5_000;
 
 export interface TelegramAckConfig {

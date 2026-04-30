@@ -448,6 +448,174 @@ describe('sendTelegram', () => {
     assert.deepEqual(deleteBodies[0], { chat_id: '777', message_id: '701' });
   });
 
+  it('sends Telegram topic final answers as replies before deleting launch placeholders', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true },
+    };
+    const requestOrder: string[] = [];
+    const sendBodies: Array<Record<string, unknown>> = [];
+    const deleteBodies: Array<Record<string, unknown>> = [];
+
+    const result = await sendTelegram(
+      config,
+      {
+        ...basePayload,
+        event: 'result-ready',
+        message: 'Final topic answer',
+        telegramReplyTo: {
+          chatId: '777',
+          messageId: '350',
+          messageThreadId: '9001',
+        },
+        telegramAcceptedAck: {
+          chatId: '777',
+          messageId: '551',
+          messageThreadId: '9001',
+        },
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+          messageThreadId: '9001',
+          projectKey: 'project-key-1',
+          topicName: 'project-a',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+            requestOrder.push('sendMessage');
+            sendBodies.push(JSON.parse(body) as Record<string, unknown>);
+            return {
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: {
+                  message_id: 702,
+                  message_thread_id: 9001,
+                  is_topic_message: true,
+                },
+              },
+            };
+          },
+          [`POST /bot${config.botToken}/deleteMessage`]: (body) => {
+            requestOrder.push('deleteMessage');
+            deleteBodies.push(JSON.parse(body) as Record<string, unknown>);
+            return {
+              statusCode: 200,
+              body: { ok: true, result: true },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, true);
+    assert.deepEqual(requestOrder, ['sendMessage', 'deleteMessage']);
+    const sendBody = sendBodies[0] ?? {};
+    assert.equal(sendBody.text, 'Final topic answer');
+    assert.equal(sendBody.message_thread_id, 9001);
+    assert.equal(sendBody.reply_to_message_id, 350);
+    assert.deepEqual(deleteBodies[0], { chat_id: '777', message_id: '551' });
+  });
+
+  it('omits Telegram final reply targets when chat or thread context does not match', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true },
+    };
+    const cases = [
+      {
+        name: 'chat mismatch',
+        replyTo: { chatId: '777', messageId: '350', messageThreadId: '9001' },
+        destination: {
+          chatId: '888',
+          sourceChatKey: 'telegram:123456:888',
+          messageThreadId: '9001',
+        },
+      },
+      {
+        name: 'target thread without destination thread',
+        replyTo: { chatId: '777', messageId: '351', messageThreadId: '9001' },
+        destination: {
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+        },
+      },
+      {
+        name: 'destination thread without target thread',
+        replyTo: { chatId: '777', messageId: '352' },
+        destination: {
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+          messageThreadId: '9001',
+        },
+      },
+      {
+        name: 'thread mismatch',
+        replyTo: { chatId: '777', messageId: '353', messageThreadId: '9001' },
+        destination: {
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+          messageThreadId: '9002',
+        },
+      },
+      {
+        name: 'fallback destination',
+        replyTo: { chatId: '777', messageId: '354' },
+        destination: {
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+          usedFallback: true,
+        },
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      let sendBody: Record<string, unknown> | null = null;
+      const result = await sendTelegram(
+        config,
+        {
+          ...basePayload,
+          event: 'result-ready',
+          message: `Final answer for ${testCase.name}`,
+          telegramReplyTo: testCase.replyTo,
+        },
+        {
+          resolveTelegramDestinationImpl: async () => testCase.destination,
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+              sendBody = JSON.parse(body) as Record<string, unknown>;
+              return {
+                statusCode: 200,
+                body: {
+                  ok: true,
+                  result: {
+                    message_id: 800,
+                    ...(sendBody.message_thread_id
+                      ? {
+                          message_thread_id: sendBody.message_thread_id,
+                          is_topic_message: true,
+                        }
+                      : {}),
+                  },
+                },
+              };
+            },
+          }),
+        },
+      );
+
+      assert.equal(result.success, true, testCase.name);
+      assert.ok(sendBody, testCase.name);
+      assert.equal('reply_to_message_id' in sendBody, false, testCase.name);
+    }
+  });
+
   it('keeps Telegram final delivery successful when accepted placeholder deletion fails', async () => {
     const config: TelegramNotificationConfig = {
       enabled: true,

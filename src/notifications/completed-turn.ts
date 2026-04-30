@@ -10,6 +10,7 @@ import type {
   NotificationTransportOverrides,
   TelegramCompletedTurnFormat,
   TelegramAcceptedAckCleanupTarget,
+  TelegramMessageReferenceTarget,
   TelegramMessageEntity,
 } from "./types.js";
 import type {
@@ -20,10 +21,12 @@ import type {
 export type ReplyOriginPlatform = "telegram" | "discord";
 
 export interface CompletedTurnReplyOrigin {
+  routeId?: string;
   platform: ReplyOriginPlatform;
   injectedInput: string;
   createdAt: string;
   telegramAck?: TelegramAcceptedAckCleanupTarget;
+  telegramReplyTo?: TelegramMessageReferenceTarget;
 }
 
 export interface CompletedTurnTransportRenderPolicy {

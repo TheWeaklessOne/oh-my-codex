@@ -45,6 +45,11 @@ import {
 	OMX_LOCAL_MARKETPLACE_NAME,
 	resolvePackagedOmxMarketplace,
 } from "./plugin-marketplace.js";
+import {
+	readSessionActors,
+	sessionActorsPath,
+} from "../runtime/session-actors.js";
+import { pendingRoutesStatePath } from "../notifications/pending-routes.js";
 
 interface DoctorOptions {
 	verbose?: boolean;
@@ -185,6 +190,9 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 
 	// Check 8: State directory
 	checks.push(checkDirectory("State dir", paths.stateDir));
+
+	// Check 8.5: active session actor/route invariants
+	checks.push(await checkSessionActorRouting(cwd));
 
 	// Check 9: MCP servers configured
 	checks.push(
@@ -708,6 +716,136 @@ function checkDirectory(name: string, path: string): Check {
 		return { name, status: "pass", message: path };
 	}
 	return { name, status: "warn", message: `${path} (not created yet)` };
+}
+
+function asJsonRecord(value: unknown): Record<string, unknown> | null {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? value as Record<string, unknown>
+		: null;
+}
+
+function jsonString(value: unknown): string {
+	return typeof value === "string" ? value.trim() : "";
+}
+
+async function readJsonRecordFile(path: string): Promise<Record<string, unknown> | null> {
+	try {
+		return asJsonRecord(JSON.parse(await readFile(path, "utf-8")));
+	} catch {
+		return null;
+	}
+}
+
+async function checkSessionActorRouting(cwd: string): Promise<Check> {
+	const stateDir = omxStateDir(cwd);
+	const activeSession = await readJsonRecordFile(join(stateDir, "session.json"));
+	const runtimeSourceIssues: string[] = [];
+	const packageRoot = getPackageRoot();
+	for (const relativePath of [
+		join("src", "runtime", "codex-session-origin.ts"),
+		join("src", "scripts", "notify-hook.ts"),
+	]) {
+		const sourcePath = join(packageRoot, relativePath);
+		if (!existsSync(sourcePath)) continue;
+		const content = await readFile(sourcePath, "utf-8").catch(() => "");
+		if (content.includes("codex-session-origin-index.json")) {
+			runtimeSourceIssues.push(`${relativePath} references codex-session-origin-index.json`);
+		}
+		if (content.includes("subagent-tracking.json")) {
+			runtimeSourceIssues.push(`${relativePath} references subagent-tracking.json`);
+		}
+	}
+	if (!activeSession) {
+		return runtimeSourceIssues.length > 0
+			? {
+				name: "Session actor routing",
+				status: "fail",
+				message: runtimeSourceIssues.join("; "),
+			}
+			: {
+				name: "Session actor routing",
+				status: "pass",
+				message: "no active session; runtime delivery code has no legacy origin-index authority",
+			};
+	}
+
+	const sessionId = jsonString(activeSession.session_id ?? activeSession.sessionId);
+	if (!sessionId) {
+		return {
+			name: "Session actor routing",
+			status: "warn",
+			message: "active session.json has no session_id; actor registry cannot be checked",
+		};
+	}
+
+	const actorPath = sessionActorsPath(cwd, sessionId);
+	if (!existsSync(actorPath)) {
+		return {
+			name: "Session actor routing",
+			status: "warn",
+			message: `active session ${sessionId} has no actor registry; restart the session to re-establish canonical ownership`,
+		};
+	}
+
+	const registry = await readSessionActors(cwd, sessionId);
+	const actors = Object.values(registry.actors);
+	const issues = [...runtimeSourceIssues];
+	const owner = registry.ownerActorId
+		? registry.actors[registry.ownerActorId]
+		: undefined;
+	const ownerActorCount = actors.filter((actor) =>
+		actor.kind === "leader"
+		&& actor.audience === "external-owner"
+		&& actor.quarantined !== true
+	).length;
+	if (!registry.ownerActorId) {
+		issues.push("registry has no ownerActorId");
+	} else if (!owner) {
+		issues.push(`ownerActorId ${registry.ownerActorId} does not point to an actor`);
+	}
+	if (ownerActorCount !== 1) {
+		issues.push(`expected exactly one non-quarantined owner actor, found ${ownerActorCount}`);
+	}
+	for (const actor of actors) {
+		if (actor.quarantined === true) continue;
+		if (actor.kind !== "native-subagent") continue;
+		if (!actor.parentActorId || !registry.actors[actor.parentActorId]) {
+			issues.push(`child actor ${actor.actorId} has no known parent actor`);
+		}
+	}
+
+	const pendingRoutesPath = pendingRoutesStatePath(cwd, sessionId);
+	if (existsSync(pendingRoutesPath) && registry.ownerActorId) {
+		const pendingState = await readJsonRecordFile(pendingRoutesPath);
+		const routes = Array.isArray(pendingState?.routes) ? pendingState.routes : [];
+		const ownerPlaceholderActorId = `owner:${sessionId}`;
+		for (const route of routes) {
+			const rawRoute = asJsonRecord(route);
+			const routeOwnerActorId = jsonString(rawRoute?.ownerActorId);
+			const routeId = jsonString(rawRoute?.routeId) || "unknown-route";
+			if (
+				routeOwnerActorId
+				&& routeOwnerActorId !== registry.ownerActorId
+				&& routeOwnerActorId !== ownerPlaceholderActorId
+			) {
+				issues.push(`pending route ${routeId} references ${routeOwnerActorId}, expected ${registry.ownerActorId}`);
+			}
+		}
+	}
+
+	if (issues.length > 0) {
+		return {
+			name: "Session actor routing",
+			status: "warn",
+			message: issues.join("; "),
+		};
+	}
+
+	return {
+		name: "Session actor routing",
+		status: "pass",
+		message: `active session ${sessionId} has one owner actor and valid pending routes`,
+	};
 }
 
 function validateToml(content: string): string | null {

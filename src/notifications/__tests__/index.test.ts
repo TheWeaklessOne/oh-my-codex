@@ -956,6 +956,11 @@ describe('notifyCompletedTurn transport override filtering', () => {
           messageId: '701',
           messageThreadId: '9001',
         },
+        telegramReplyTo: {
+          chatId: '777',
+          messageId: '350',
+          messageThreadId: '9001',
+        },
       },
       assistantText: 'Final answer',
       turnId: 'turn-telegram-ack',
@@ -970,7 +975,7 @@ describe('notifyCompletedTurn transport override filtering', () => {
         chatId: '777',
       },
     };
-    let capturedPayload: { telegramAcceptedAck?: unknown } | undefined;
+    let capturedPayload: { telegramAcceptedAck?: unknown; telegramReplyTo?: unknown } | undefined;
 
     const result = await notifyCompletedTurn(
       decision,
@@ -985,7 +990,7 @@ describe('notifyCompletedTurn transport override filtering', () => {
         isEventEnabledImpl: () => true,
         ensureReplyListenerForConfigImpl: () => {},
         dispatchNotificationsImpl: async (_config: FullNotificationConfig, event: string, payload: unknown) => {
-          capturedPayload = payload as { telegramAcceptedAck?: unknown };
+          capturedPayload = payload as { telegramAcceptedAck?: unknown; telegramReplyTo?: unknown };
           return {
             event: event as never,
             anySuccess: true,
@@ -999,6 +1004,11 @@ describe('notifyCompletedTurn transport override filtering', () => {
     assert.deepEqual(capturedPayload?.telegramAcceptedAck, {
       chatId: '777',
       messageId: '701',
+      messageThreadId: '9001',
+    });
+    assert.deepEqual(capturedPayload?.telegramReplyTo, {
+      chatId: '777',
+      messageId: '350',
       messageThreadId: '9001',
     });
   });

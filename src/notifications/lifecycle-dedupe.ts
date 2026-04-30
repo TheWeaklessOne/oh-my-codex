@@ -148,7 +148,6 @@ async function updateScopedLifecycleBroadcast<TResult>(
   stateDir: string,
   sessionId: string | undefined,
   bucket: LifecycleDedupeBucket,
-  eventKey: string,
   updateBucket: (bucketState: Record<string, LifecycleDedupeEntry>) => { result: TResult; write: boolean },
 ): Promise<TResult> {
   if (!sessionId || !stateDir) {
@@ -187,7 +186,6 @@ async function claimScopedLifecycleBroadcastPendingToken(
     stateDir,
     sessionId,
     bucket,
-    eventKey,
     (bucketState) => {
       if (!shouldSendFingerprint(bucketState[eventKey], fingerprint, nowMs)) {
         return { result: null, write: false };
@@ -215,7 +213,6 @@ async function recordScopedLifecycleBroadcastSentLocked(
     stateDir,
     sessionId,
     bucket,
-    eventKey,
     (bucketState) => {
       const previous = bucketState[eventKey];
       if (expectedPendingAt !== undefined) {
@@ -252,7 +249,6 @@ async function clearScopedLifecycleBroadcastPending(
     stateDir,
     sessionId,
     bucket,
-    eventKey,
     (bucketState) => {
       const previous = bucketState[eventKey];
       if (

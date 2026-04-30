@@ -69,6 +69,12 @@ import {
 } from '../notifications/completed-turn.js';
 import { resolveTurnOriginForNotification } from '../runtime/codex-session-origin.js';
 import { consumePendingReplyOrigin } from '../notifications/reply-origin-state.js';
+import {
+  expirePendingRoutes,
+  markPendingRouteTerminalFailure,
+  markPendingRoutesWaitingForOwner,
+} from '../notifications/pending-routes.js';
+import { deleteTelegramAcceptedAckBestEffort } from '../notifications/telegram-inbound/ack.js';
 import { readUsableSessionState } from '../hooks/session.js';
 import {
   parseTeamWorkerEnv,
@@ -454,6 +460,19 @@ function summarizeNotificationResultsForLog(results: unknown): Array<Record<stri
     });
   }
   return summarized;
+}
+
+function summarizeNotificationFailureReason(results: Array<Record<string, unknown>>): string {
+  const firstFailure = results.find((result) => result.success !== true);
+  if (!firstFailure) return 'notification delivery failed without a successful transport';
+  const platform = safeString(firstFailure.platform);
+  const error = safeString(firstFailure.error);
+  const statusCode = safeString(firstFailure.status_code);
+  return [
+    platform ? `${platform} delivery failed` : 'notification delivery failed',
+    error,
+    statusCode ? `status=${statusCode}` : '',
+  ].filter(Boolean).join(': ');
 }
 
 function collectDispatchResultsForLog(result: unknown): unknown[] {
@@ -1618,6 +1637,8 @@ async function main() {
     audience: originResolution.audience,
     delivery: originResolution.delivery,
     reason: originResolution.reason,
+    actor_id: originResolution.actorId || null,
+    owner_actor_id: originResolution.ownerActorId || null,
     origin_evidence: originResolution.evidence,
     evidence_sources: originResolution.evidence.map((entry) => entry.source),
   });
@@ -3030,6 +3051,22 @@ async function main() {
       const lastAssistantMessage = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '');
       const hasAssistantText = lastAssistantMessage.trim().length > 0;
       if (suppressCompletedTurnDelivery && hasAssistantText) {
+        if (suppressExternalCompletedTurn && notifySessionId) {
+          const waitingRoutes = await markPendingRoutesWaitingForOwner(cwd, notifySessionId, {
+            ownerActorId: originResolution.ownerActorId,
+            reason: completedTurnDeliverySuppressionReason,
+          }).catch(() => 0);
+          if (waitingRoutes > 0) {
+            await logNotifyHookEvent(logsDir, {
+              timestamp: new Date().toISOString(),
+              type: 'pending_route_waiting_for_owner',
+              omx_session_id: notifySessionId,
+              owner_actor_id: originResolution.ownerActorId || null,
+              waiting_routes: waitingRoutes,
+              reason: completedTurnDeliverySuppressionReason,
+            });
+          }
+        }
         const suppressionBase = {
           timestamp: new Date().toISOString(),
           origin_kind: turnOrigin.kind,
@@ -3040,6 +3077,8 @@ async function main() {
           turn_id: safeString(payload['turn-id'] || payload.turn_id || ''),
           native_session_id: payloadSessionId || turnOrigin.nativeSessionId || null,
           omx_session_id: notifySessionId || null,
+          actor_id: originResolution.actorId || null,
+          owner_actor_id: originResolution.ownerActorId || null,
           parent_thread_id: turnOrigin.parentThreadId || null,
           agent_nickname: turnOrigin.agentNickname || null,
           agent_role: turnOrigin.agentRole || null,
@@ -3116,6 +3155,8 @@ async function main() {
           turn_id: safeString(payload['turn-id'] || payload.turn_id || ''),
           native_session_id: payloadSessionId || turnOrigin.nativeSessionId || null,
           omx_session_id: notifySessionId || null,
+          actor_id: originResolution.actorId || null,
+          owner_actor_id: originResolution.ownerActorId || null,
           parent_thread_id: turnOrigin.parentThreadId || null,
           agent_nickname: turnOrigin.agentNickname || null,
           agent_role: turnOrigin.agentRole || null,
@@ -3124,9 +3165,47 @@ async function main() {
         });
       }
       const replyOrigin = canNotifyExternalCompletedTurn && notifySessionId
-        ? await consumePendingReplyOrigin(cwd, notifySessionId, latestUserInput)
+        ? await consumePendingReplyOrigin(cwd, notifySessionId, latestUserInput, originResolution.ownerActorId)
         : null;
+      if (replyOrigin?.routeId && notifySessionId) {
+        await logNotifyHookEvent(logsDir, {
+          timestamp: new Date().toISOString(),
+          type: 'pending_route_completed',
+          omx_session_id: notifySessionId,
+          route_id: replyOrigin.routeId,
+          owner_actor_id: originResolution.ownerActorId || null,
+          platform: replyOrigin.platform,
+        });
+      }
       const notificationConfig = getNotificationConfig();
+      if (notifySessionId) {
+        const expiredRoutes = await expirePendingRoutes(cwd, notifySessionId).catch(() => []);
+        for (const route of expiredRoutes) {
+          let telegramAckCleanupSucceeded: boolean | null = null;
+          if (
+            route.platform === 'telegram'
+            && route.telegramAck
+            && notificationConfig?.telegram?.enabled
+            && notificationConfig.telegram.botToken
+          ) {
+            telegramAckCleanupSucceeded = await deleteTelegramAcceptedAckBestEffort(
+              { botToken: notificationConfig.telegram.botToken },
+              route.telegramAck,
+            ).catch(() => false);
+          }
+          await logNotifyHookEvent(logsDir, {
+            timestamp: new Date().toISOString(),
+            type: 'pending_route_expired',
+            omx_session_id: notifySessionId,
+            route_id: route.routeId,
+            owner_actor_id: route.ownerActorId,
+            platform: route.platform,
+            ...(telegramAckCleanupSucceeded !== null
+              ? { telegram_ack_cleanup_succeeded: telegramAckCleanupSucceeded }
+              : {}),
+          });
+        }
+      }
       const decision = planCompletedTurnNotification({
         semanticOutcome,
         replyOrigin,
@@ -3183,6 +3262,12 @@ async function main() {
               completedTurnNotificationFailed = true;
               if (deliveryFailureKind === 'ambiguous_timeout') {
                 completedTurnDeliveryStatus = 'delivery_unknown';
+              }
+              if (decision?.replyOrigin?.routeId) {
+                await markPendingRouteTerminalFailure(cwd, notifySessionId, decision.replyOrigin.routeId, {
+                  status: 'failed',
+                  reason: error instanceof Error ? error.message : String(error),
+                }).catch(() => false);
               }
               await logNotifyHookEvent(logsDir, {
                 timestamp: new Date().toISOString(),
@@ -3247,6 +3332,12 @@ async function main() {
               : 'definitive';
             if (deliveryFailureKind === 'ambiguous_timeout') {
               completedTurnDeliveryStatus = 'delivery_unknown';
+            }
+            if (decision?.replyOrigin?.routeId) {
+              await markPendingRouteTerminalFailure(cwd, notifySessionId, decision.replyOrigin.routeId, {
+                status: 'failed',
+                reason: summarizeNotificationFailureReason(notificationResults),
+              }).catch(() => false);
             }
             await logNotifyHookEvent(logsDir, {
               timestamp: new Date().toISOString(),

@@ -8,6 +8,7 @@ import {
   consumePendingReplyOrigin,
   recordPendingReplyOrigin,
 } from '../reply-origin-state.js';
+import { registerExternalOwnerActor } from '../../runtime/session-actors.js';
 
 let projectRoot = '';
 
@@ -22,11 +23,25 @@ describe('reply-origin-state', () => {
     }
   });
 
+  async function ensureOwner(sessionId: string): Promise<void> {
+    await registerExternalOwnerActor({
+      cwd: projectRoot,
+      sessionId,
+      nativeSessionId: `${sessionId}-leader`,
+      source: 'test-owner',
+    });
+  }
+
+  function recentIso(offsetMs = 0): string {
+    return new Date(Date.now() + offsetMs).toISOString();
+  }
+
   it('preserves unmatched pending provenance for a later matching turn', async () => {
+    await ensureOwner('sess-mismatch-preserve');
     await recordPendingReplyOrigin(projectRoot, 'sess-mismatch-preserve', {
       platform: 'telegram',
       injectedInput: 'second reply',
-      createdAt: '2026-04-23T00:00:00Z',
+      createdAt: recentIso(),
     });
 
     const mismatch = await consumePendingReplyOrigin(
@@ -47,15 +62,16 @@ describe('reply-origin-state', () => {
   });
 
   it('queues multiple pending replies for the same session instead of overwriting them', async () => {
+    await ensureOwner('sess-queue');
     await recordPendingReplyOrigin(projectRoot, 'sess-queue', {
       platform: 'telegram',
       injectedInput: 'first reply',
-      createdAt: '2026-04-23T00:00:00Z',
+      createdAt: recentIso(),
     });
     await recordPendingReplyOrigin(projectRoot, 'sess-queue', {
       platform: 'discord',
       injectedInput: 'second reply',
-      createdAt: '2026-04-23T00:00:01Z',
+      createdAt: recentIso(1000),
     });
 
     const first = await consumePendingReplyOrigin(projectRoot, 'sess-queue', 'first reply');
@@ -67,24 +83,63 @@ describe('reply-origin-state', () => {
     assert.equal(second.platform, 'discord');
   });
 
+  it('preserves Telegram placeholder cleanup and final reply targets', async () => {
+    await ensureOwner('sess-telegram-targets');
+    await recordPendingReplyOrigin(projectRoot, 'sess-telegram-targets', {
+      platform: 'telegram',
+      injectedInput: 'topic launch prompt',
+      createdAt: recentIso(),
+      telegramAck: {
+        chatId: '777',
+        messageId: '551',
+        messageThreadId: '9001',
+      },
+      telegramReplyTo: {
+        chatId: '777',
+        messageId: '350',
+        messageThreadId: '9001',
+      },
+    });
+
+    const origin = await consumePendingReplyOrigin(
+      projectRoot,
+      'sess-telegram-targets',
+      'topic launch prompt',
+    );
+
+    assert.deepEqual(origin?.telegramAck, {
+      chatId: '777',
+      messageId: '551',
+      messageThreadId: '9001',
+    });
+    assert.deepEqual(origin?.telegramReplyTo, {
+      chatId: '777',
+      messageId: '350',
+      messageThreadId: '9001',
+    });
+  });
+
   it('consumes repeated identical replies in FIFO order', async () => {
+    await ensureOwner('sess-fifo');
+    const firstCreatedAt = recentIso();
+    const secondCreatedAt = recentIso(1000);
     await recordPendingReplyOrigin(projectRoot, 'sess-fifo', {
       platform: 'telegram',
       injectedInput: 'same reply',
-      createdAt: '2026-04-23T00:00:00Z',
+      createdAt: firstCreatedAt,
     });
     await recordPendingReplyOrigin(projectRoot, 'sess-fifo', {
       platform: 'telegram',
       injectedInput: 'same reply',
-      createdAt: '2026-04-23T00:00:01Z',
+      createdAt: secondCreatedAt,
     });
 
     const first = await consumePendingReplyOrigin(projectRoot, 'sess-fifo', 'same reply');
     const second = await consumePendingReplyOrigin(projectRoot, 'sess-fifo', 'same reply');
 
     assert.ok(first);
-    assert.equal(first.createdAt, '2026-04-23T00:00:00Z');
+    assert.equal(first.createdAt, firstCreatedAt);
     assert.ok(second);
-    assert.equal(second.createdAt, '2026-04-23T00:00:01Z');
+    assert.equal(second.createdAt, secondCreatedAt);
   });
 });

@@ -705,6 +705,9 @@ export async function notifyCompletedTurn(
       ...(decision.replyOrigin?.platform === "telegram" && decision.replyOrigin.telegramAck
         ? { telegramAcceptedAck: decision.replyOrigin.telegramAck }
         : {}),
+      ...(decision.replyOrigin?.platform === "telegram" && decision.replyOrigin.telegramReplyTo
+        ? { telegramReplyTo: decision.replyOrigin.telegramReplyTo }
+        : {}),
     };
 
     const verbosity = getVerbosity(config);

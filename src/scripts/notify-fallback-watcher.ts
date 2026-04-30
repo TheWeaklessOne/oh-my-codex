@@ -869,9 +869,9 @@ async function readRalphProgressGate(
   activeRalphState: Record<string, unknown> | null,
   now: number,
 ): Promise<RalphProgressGateResult> {
-  const subagentSessionId = safeString(activeRalphState?.owner_codex_session_id).trim();
-  if (subagentSessionId) {
-    const summary = await readSubagentSessionSummary(cwd, subagentSessionId, {
+  const actorRegistrySessionId = safeString(activeRalphState?.owner_omx_session_id).trim();
+  if (actorRegistrySessionId) {
+    const summary = await readSubagentSessionSummary(cwd, actorRegistrySessionId, {
       now: new Date(now),
       activeWindowMs: DEFAULT_SUBAGENT_ACTIVE_WINDOW_MS,
     });
@@ -880,7 +880,7 @@ async function readRalphProgressGate(
         allow: false,
         reason: 'subagents_active',
         progress_at: '',
-        subagent_session_id: subagentSessionId,
+        subagent_session_id: actorRegistrySessionId,
         active_subagent_thread_ids: summary?.activeSubagentThreadIds ?? [],
       };
     }
@@ -888,24 +888,24 @@ async function readRalphProgressGate(
 
   const hudState = await readScopedJsonIfExists(stateDir, 'hud-state.json', undefined, null);
   if (!hudState || typeof hudState !== 'object') {
-    return { allow: false, reason: 'progress_missing', progress_at: '', subagent_session_id: subagentSessionId };
+    return { allow: false, reason: 'progress_missing', progress_at: '', subagent_session_id: actorRegistrySessionId };
   }
 
   const progressAt = safeString(hudState.last_progress_at).trim();
   if (!progressAt) {
-    return { allow: false, reason: 'progress_missing', progress_at: '', subagent_session_id: subagentSessionId };
+    return { allow: false, reason: 'progress_missing', progress_at: '', subagent_session_id: actorRegistrySessionId };
   }
 
   const progressMs = parseIsoMillis(progressAt);
   if (progressMs === null) {
-    return { allow: false, reason: 'progress_invalid', progress_at: progressAt, subagent_session_id: subagentSessionId };
+    return { allow: false, reason: 'progress_invalid', progress_at: progressAt, subagent_session_id: actorRegistrySessionId };
   }
 
   if (now - progressMs < RALPH_CONTINUE_CADENCE_MS) {
-    return { allow: false, reason: 'progress_fresh', progress_at: progressAt, subagent_session_id: subagentSessionId };
+    return { allow: false, reason: 'progress_fresh', progress_at: progressAt, subagent_session_id: actorRegistrySessionId };
   }
 
-  return { allow: true, reason: 'progress_stale', progress_at: progressAt, subagent_session_id: subagentSessionId };
+  return { allow: true, reason: 'progress_stale', progress_at: progressAt, subagent_session_id: actorRegistrySessionId };
 }
 
 function shouldSkipRalphContinue(now: number, candidateIso: string): { skip: boolean; reason: string; anchorMs: number; anchorIso: string } {
@@ -1161,7 +1161,7 @@ async function runRalphContinueSteerTick(): Promise<void> {
     state_path: activeRalph.path,
     pane_id: activePaneId,
     pane_current_command: '',
-    subagent_session_id: safeString(activeRalph.state?.owner_codex_session_id).trim(),
+    subagent_session_id: safeString(activeRalph.state?.owner_omx_session_id).trim(),
     active_subagent_thread_ids: [],
     shared_timestamp_path: ralphSteerTimestampPath,
     singleton_lock_path: ralphSteerLockPath,

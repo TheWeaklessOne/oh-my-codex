@@ -10,7 +10,6 @@ import {
 } from "../state/skill-active.js";
 import {
   readSubagentSessionSummary,
-  recordSubagentTurnForSession,
 } from "../subagents/tracker.js";
 import { resolveCanonicalTeamStateRoot, resolveWorkerNotifyTeamStateRootPath } from "../team/state-root.js";
 import {
@@ -19,7 +18,6 @@ import {
   readSessionState,
   readUsableSessionState,
   reconcileNativeSessionStart,
-  type SessionState,
 } from "../hooks/session.js";
 import {
   appendTeamEvent,
@@ -66,9 +64,9 @@ import { readAutoresearchCompletionStatus, readAutoresearchModeState } from "../
 import { readRunState } from "../runtime/run-state.js";
 import { getRunContinuationSnapshot, shouldContinueRun } from "../runtime/run-loop.js";
 import {
-  recordCodexSessionOrigin,
-  resolveSessionStartOrigin,
-} from "../runtime/codex-session-origin.js";
+  classifySessionStartActor,
+  registerActorSessionStart,
+} from "../runtime/session-actors.js";
 import { triagePrompt } from "../hooks/triage-heuristic.js";
 import { readTriageConfig } from "../hooks/triage-config.js";
 import {
@@ -208,6 +206,21 @@ function readNativeSubagentSessionStartMetadata(transcriptPath: string): NativeS
   }
 }
 
+function readTranscriptSessionMetaPayload(transcriptPath: string): Record<string, unknown> | null {
+  const normalizedPath = transcriptPath.trim();
+  if (!normalizedPath) return null;
+
+  try {
+    const firstLine = readBoundedFirstLineSync(normalizedPath).trim();
+    if (!firstLine) return null;
+    const firstRecord = safeObject(JSON.parse(firstLine));
+    if (safeString(firstRecord.type) !== "session_meta") return null;
+    return safeObject(firstRecord.payload);
+  } catch {
+    return null;
+  }
+}
+
 async function recordNativeSubagentSessionStart(
   cwd: string,
   canonicalSessionId: string,
@@ -215,21 +228,6 @@ async function recordNativeSubagentSessionStart(
   metadata: NativeSubagentSessionStartMetadata,
   transcriptPath: string,
 ): Promise<void> {
-  const trackingSessionIds = [...new Set([
-    canonicalSessionId.trim(),
-    metadata.parentThreadId.trim(),
-  ].filter(Boolean))];
-  for (const sessionId of trackingSessionIds) {
-    await recordSubagentTurnForSession(cwd, {
-      sessionId,
-      threadId: metadata.parentThreadId,
-    }).catch(() => {});
-    await recordSubagentTurnForSession(cwd, {
-      sessionId,
-      threadId: childSessionId,
-      mode: metadata.agentRole,
-    }).catch(() => {});
-  }
   await appendToLog(cwd, {
     event: "subagent_session_start",
     session_id: canonicalSessionId,
@@ -241,26 +239,6 @@ async function recordNativeSubagentSessionStart(
     ...(transcriptPath ? { transcript_path: transcriptPath } : {}),
     timestamp: new Date().toISOString(),
   }).catch(() => {});
-}
-
-async function nativeSubagentSessionStartBelongsToCanonicalSession(
-  cwd: string,
-  canonicalSessionId: string,
-  currentSessionState: SessionState | null,
-  metadata: NativeSubagentSessionStartMetadata,
-): Promise<boolean> {
-  const parentThreadId = metadata.parentThreadId.trim();
-  if (!parentThreadId) return false;
-
-  const currentNativeSessionId = safeString(currentSessionState?.native_session_id).trim();
-  if (currentNativeSessionId && currentNativeSessionId === parentThreadId) {
-    return true;
-  }
-
-  const summary = await readSubagentSessionSummary(cwd, canonicalSessionId).catch(() => null);
-  if (!summary) return false;
-  if (summary.leaderThreadId === parentThreadId) return true;
-  return summary.allThreadIds.includes(parentThreadId);
 }
 
 async function recordIgnoredNativeSubagentSessionStart(
@@ -2105,34 +2083,27 @@ export async function dispatchCodexNativeHook(
   let resolvedNativeSessionId = nativeSessionId;
   let skipCanonicalSessionStartContext = false;
 
-  if (hookEventName === "SessionStart" && nativeSessionId) {
-    const sessionOrigin = resolveSessionStartOrigin({
-      ...payload,
-      thread_id: threadId || nativeSessionId,
-    });
-    const indexedOrigin = {
-      ...sessionOrigin.origin,
-      threadId: sessionOrigin.origin.threadId || threadId || nativeSessionId,
-      nativeSessionId: sessionOrigin.origin.nativeSessionId || nativeSessionId,
-    };
-    await recordCodexSessionOrigin({
-      cwd,
-      stateDir,
-      origin: indexedOrigin,
-      audience: sessionOrigin.audience,
-      evidence: sessionOrigin.evidence,
-    }).catch(() => null);
-
+if (hookEventName === "SessionStart" && nativeSessionId) {
     const transcriptPath = safeString(payload.transcript_path ?? payload.transcriptPath).trim();
+    const transcriptSessionMeta = readTranscriptSessionMetaPayload(transcriptPath);
+    const actorClassification = classifySessionStartActor({
+      payload: {
+        ...payload,
+        thread_id: threadId || nativeSessionId,
+      },
+      transcriptSessionMeta,
+      env: process.env,
+      hasCurrentOwner: Boolean(safeString(currentSessionState?.native_session_id).trim()),
+    });
     const subagentSessionStart = readNativeSubagentSessionStartMetadata(transcriptPath);
-    if (subagentSessionStart && canonicalSessionId) {
-      const belongsToCanonicalSession = await nativeSubagentSessionStartBelongsToCanonicalSession(
+    if (canonicalSessionId) {
+      const registration = await registerActorSessionStart({
         cwd,
-        canonicalSessionId,
-        currentSessionState,
-        subagentSessionStart,
-      );
-      if (belongsToCanonicalSession) {
+        sessionId: canonicalSessionId,
+        classification: actorClassification,
+        pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
+      }).catch(() => null);
+      if (registration?.outcome === "actor-registered" && subagentSessionStart) {
         resolvedNativeSessionId = nativeSessionId;
         await recordNativeSubagentSessionStart(
           cwd,
@@ -2141,7 +2112,7 @@ export async function dispatchCodexNativeHook(
           subagentSessionStart,
           transcriptPath,
         );
-      } else {
+      } else if (registration?.outcome === "actor-quarantined" && subagentSessionStart) {
         skipCanonicalSessionStartContext = true;
         resolvedNativeSessionId =
           safeString(currentSessionState?.native_session_id).trim() || nativeSessionId;
@@ -2152,14 +2123,30 @@ export async function dispatchCodexNativeHook(
           subagentSessionStart,
           transcriptPath,
         );
+      } else if (registration?.outcome === "owner-registered") {
+        canonicalSessionId = safeString(registration.registry.sessionId).trim();
+        const sessionState = await reconcileNativeSessionStart(cwd, nativeSessionId, {
+          pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
+          ownerKind: "external-owner",
+        });
+        canonicalSessionId = safeString(sessionState.session_id).trim() || canonicalSessionId;
+        resolvedNativeSessionId = safeString(sessionState.native_session_id).trim()
+          || safeString(registration.actor.nativeSessionId).trim()
+          || nativeSessionId;
+      } else if (registration?.outcome === "actor-quarantined") {
+        skipCanonicalSessionStartContext = true;
+        resolvedNativeSessionId =
+          safeString(currentSessionState?.native_session_id).trim() || nativeSessionId;
+      } else if (!registration) {
+        skipCanonicalSessionStartContext = true;
       }
     } else {
       const sessionState = await reconcileNativeSessionStart(cwd, nativeSessionId, {
         pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
-        ownerKind: sessionOrigin.ownerKind,
-        parentThreadId: sessionOrigin.origin.parentThreadId,
+        ownerKind: actorClassification.audience,
+        parentThreadId: actorClassification.parentThreadId,
       });
-      canonicalSessionId = sessionOrigin.ownerKind === "external-owner" || currentSessionState
+      canonicalSessionId = actorClassification.audience === "external-owner" || currentSessionState
         ? safeString(sessionState.session_id).trim()
         : "";
       resolvedNativeSessionId = safeString(sessionState.native_session_id).trim() || nativeSessionId;

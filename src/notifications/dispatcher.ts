@@ -552,6 +552,7 @@ async function sendTelegramMessageToDestination(
   try {
     return await sendPreparedTelegramChunks(
       config,
+      payload,
       preparedMessage,
       preparedMessage.chunks,
       destination,
@@ -565,6 +566,7 @@ async function sendTelegramMessageToDestination(
     logTelegramRichFallbackIfEnabled(error, preparedMessage.rawFallbackChunks.length);
     return sendPreparedTelegramChunks(
       config,
+      payload,
       {},
       preparedMessage.rawFallbackChunks,
       destination,
@@ -575,18 +577,21 @@ async function sendTelegramMessageToDestination(
 
 async function sendPreparedTelegramChunks(
   config: TelegramNotificationConfig,
+  payload: FullNotificationPayload,
   preparedMessage: Pick<TelegramPreparedMessage, "parseMode">,
   chunks: readonly TelegramPreparedMessageChunk[],
   destination: TelegramResolvedDestination,
   deps: TelegramTopicResolutionDeps,
 ): Promise<TelegramDestinationSendResult> {
   const chunkResults: TelegramSendMessageResult[] = [];
+  const replyToMessageId = resolveTelegramReplyToMessageId(payload, destination);
 
-  for (const chunk of chunks) {
+  for (const [index, chunk] of chunks.entries()) {
     const body = buildTelegramSendMessageBody(
       preparedMessage,
       chunk,
       destination,
+      index === 0 ? replyToMessageId : undefined,
     );
     try {
       const result = await sendTelegramMessageChunk(
@@ -675,6 +680,7 @@ function buildTelegramSendMessageBody(
   preparedMessage: Pick<TelegramPreparedMessage, "parseMode">,
   chunk: TelegramPreparedMessageChunk,
   destination: TelegramResolvedDestination,
+  replyToMessageId?: string | number,
 ): Record<string, unknown> {
   return {
     ...(chunk.entities?.length
@@ -684,6 +690,9 @@ function buildTelegramSendMessageBody(
         : {}),
     chat_id: destination.chatId,
     text: chunk.text,
+    ...(replyToMessageId !== undefined
+      ? { reply_to_message_id: replyToMessageId }
+      : {}),
     ...(destination.messageThreadId
         ? {
             message_thread_id: coerceTelegramMessageThreadId(
@@ -936,6 +945,44 @@ export async function sendSlack(
       error: error instanceof Error ? error.message : "Unknown error",
     };
   }
+}
+
+function resolveTelegramReplyToMessageId(
+  payload: FullNotificationPayload,
+  destination: TelegramResolvedDestination,
+): string | number | undefined {
+  const target = payload.telegramReplyTo;
+  if (!target?.messageId) {
+    return undefined;
+  }
+
+  if (!telegramIdsMatch(target.chatId, destination.chatId)) {
+    return undefined;
+  }
+
+  if (destination.usedFallback) {
+    return undefined;
+  }
+
+  const targetThreadId = coerceTelegramMessageThreadId(target.messageThreadId);
+  const destinationThreadId = coerceTelegramMessageThreadId(destination.messageThreadId);
+  if (targetThreadId || destinationThreadId) {
+    if (!targetThreadId || !destinationThreadId) {
+      return undefined;
+    }
+    if (!telegramIdsMatch(targetThreadId, destinationThreadId)) {
+      return undefined;
+    }
+  }
+
+  return coerceTelegramMessageThreadId(target.messageId);
+}
+
+function telegramIdsMatch(
+  left: string | number | undefined,
+  right: string | number | undefined,
+): boolean {
+  return String(coerceTelegramMessageThreadId(left)) === String(coerceTelegramMessageThreadId(right));
 }
 
 export async function sendWebhook(

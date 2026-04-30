@@ -674,6 +674,7 @@ describe('notify-fallback watcher', () => {
       const leaderThreadId = `leader-${sid}`;
       const subagentThreadId = `subagent-${sid}`;
       const subagentTurnId = `turn-subagent-${sid}`;
+      await writeSessionStart(wd, sessionId, { nativeSessionId: leaderThreadId });
 
       const lines = [
         {
@@ -716,13 +717,14 @@ describe('notify-fallback watcher', () => {
       );
       assert.equal(result.status, 0, result.stderr || result.stdout);
 
-      const tracking = JSON.parse(await readFile(join(wd, '.omx', 'state', 'subagent-tracking.json'), 'utf-8'));
-      const session = tracking.sessions[sessionId];
-      assert.equal(session.leader_thread_id, leaderThreadId);
-      assert.equal(session.threads[leaderThreadId].kind, 'leader');
-      assert.equal(session.threads[leaderThreadId].turn_count, 0);
-      assert.equal(session.threads[subagentThreadId].kind, 'subagent');
-      assert.equal(session.threads[subagentThreadId].last_turn_id, subagentTurnId);
+      const registry = JSON.parse(
+        await readFile(join(wd, '.omx', 'state', 'sessions', sessionId, 'actors.json'), 'utf-8')
+      );
+      assert.equal(registry.ownerActorId, leaderThreadId);
+      assert.equal(registry.actors[leaderThreadId].kind, 'leader');
+      assert.equal(registry.actors[subagentThreadId].kind, 'native-subagent');
+      assert.equal(registry.actors[subagentThreadId].parentActorId, leaderThreadId);
+      assert.equal(registry.actors[subagentThreadId].lastTurnId, subagentTurnId);
 
       const turnLog = join(wd, '.omx', 'logs', `turns-${new Date().toISOString().split('T')[0]}.jsonl`);
       const turnEntries = await readJsonLines(turnLog);
@@ -933,8 +935,9 @@ describe('notify-fallback watcher', () => {
             cwd: wd,
             originator: 'codex_exec',
             source: 'exec',
-            base_instructions: {
-              text: '# OMX Explore Lightweight Instructions\n\nYou are executing the `omx explore` command path.',
+            origin: {
+              kind: 'internal-helper',
+              source: 'omx-explore',
             },
           },
         },
@@ -1078,8 +1081,9 @@ describe('notify-fallback watcher', () => {
             cwd: wd,
             originator: 'codex_exec',
             source: 'exec',
-            base_instructions: {
-              text: '# OMX Explore Lightweight Instructions\n\nYou are executing the `omx explore` command path.',
+            origin: {
+              kind: 'internal-helper',
+              source: 'omx-explore',
             },
           },
         },
@@ -2928,7 +2932,9 @@ exit 0
       await mkdir(fakeBinDir, { recursive: true });
       await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
-      await writeSessionStart(wd, omxSessionId);
+      const nowMinus15s = new Date(Date.now() - 15_000).toISOString();
+      const nowMinus30s = new Date(Date.now() - 30_000).toISOString();
+      await writeSessionStart(wd, omxSessionId, { nativeSessionId: codexSessionId });
       await writeFile(join(stateDir, 'sessions', omxSessionId, 'ralph-state.json'), JSON.stringify({
         active: true,
         current_phase: 'executing',
@@ -2944,32 +2950,43 @@ exit 0
           last_sent_at: new Date(Date.now() - 61_000).toISOString(),
         },
       }, null, 2));
-      await writeFile(join(stateDir, 'subagent-tracking.json'), JSON.stringify({
+      await writeFile(join(stateDir, 'sessions', omxSessionId, 'actors.json'), JSON.stringify({
         schemaVersion: 1,
-        sessions: {
+        sessionId: omxSessionId,
+        cwd: wd,
+        ownerActorId: codexSessionId,
+        actors: {
           [codexSessionId]: {
-            session_id: codexSessionId,
-            leader_thread_id: 'leader-thread',
-            updated_at: new Date(Date.now() - 15_000).toISOString(),
-            threads: {
-              'leader-thread': {
-                thread_id: 'leader-thread',
-                kind: 'leader',
-                first_seen_at: new Date(Date.now() - 30_000).toISOString(),
-                last_seen_at: new Date(Date.now() - 15_000).toISOString(),
-                turn_count: 1,
-                mode: 'ralph',
-              },
-              'sub-thread-1': {
-                thread_id: 'sub-thread-1',
-                kind: 'subagent',
-                first_seen_at: new Date(Date.now() - 30_000).toISOString(),
-                last_seen_at: new Date(Date.now() - 15_000).toISOString(),
-                turn_count: 1,
-                mode: 'ralph',
-              },
-            },
+            actorId: codexSessionId,
+            kind: 'leader',
+            audience: 'external-owner',
+            threadId: 'leader-thread',
+            nativeSessionId: codexSessionId,
+            source: 'external-launch',
+            firstSeenAt: nowMinus30s,
+            lastSeenAt: nowMinus15s,
+            turnCount: 1,
+            mode: 'ralph',
           },
+          'sub-thread-1': {
+            actorId: 'sub-thread-1',
+            kind: 'native-subagent',
+            audience: 'child',
+            threadId: 'sub-thread-1',
+            nativeSessionId: 'sub-thread-1',
+            parentActorId: codexSessionId,
+            parentThreadId: 'leader-thread',
+            source: 'test-fixture',
+            firstSeenAt: nowMinus30s,
+            lastSeenAt: nowMinus15s,
+            turnCount: 1,
+            mode: 'ralph',
+          },
+        },
+        aliases: {
+          [codexSessionId]: codexSessionId,
+          'leader-thread': codexSessionId,
+          'sub-thread-1': 'sub-thread-1',
         },
       }, null, 2));
 
@@ -2993,7 +3010,7 @@ exit 0
 
       const watcherState = JSON.parse(await readFile(statePath, 'utf-8'));
       assert.equal(watcherState.ralph_continue_steer?.last_reason, 'subagents_active');
-      assert.equal(watcherState.ralph_continue_steer?.subagent_session_id, codexSessionId);
+      assert.equal(watcherState.ralph_continue_steer?.subagent_session_id, omxSessionId);
       assert.deepEqual(watcherState.ralph_continue_steer?.active_subagent_thread_ids, ['sub-thread-1']);
     } finally {
       await rm(wd, { recursive: true, force: true });

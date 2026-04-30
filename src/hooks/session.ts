@@ -10,6 +10,11 @@ import { dirname, join } from 'path';
 import { existsSync, readFileSync } from 'fs';
 import { omxStateDir, omxLogsDir, sameFilePath } from '../utils/paths.js';
 import { getStateFilePath } from '../mcp/state-paths.js';
+import {
+  classifySessionStartActor,
+  registerActorSessionStart,
+  registerExternalOwnerActor,
+} from '../runtime/session-actors.js';
 
 export interface SessionState {
   session_id: string;
@@ -306,6 +311,14 @@ export async function writeSessionStart(
   });
 
   await writeFile(sessionPath(cwd), JSON.stringify(state, null, 2));
+  await registerExternalOwnerActor({
+    cwd,
+    sessionId,
+    nativeSessionId: state.native_session_id,
+    pid,
+    source: 'external-launch',
+    evidence: [{ source: 'session-start', detail: 'writeSessionStart' }],
+  }).catch(() => {});
   await appendToLog(cwd, {
     event: 'session_start',
     session_id: sessionId,
@@ -380,10 +393,27 @@ export async function reconcileNativeSessionStart(
     ? existing.native_session_id.trim()
     : '';
   if (existingNativeSessionId && existingNativeSessionId !== nativeSessionId) {
-    return await writeSessionStart(cwd, nativeSessionId, {
-      ...options,
-      nativeSessionId,
+    await registerActorSessionStart({
+      cwd,
+      sessionId: existing.session_id,
+      classification: classifySessionStartActor({
+        payload: {
+          session_id: nativeSessionId,
+          thread_id: nativeSessionId,
+        },
+        hasCurrentOwner: true,
+      }),
+      pid: options.pid,
+    }).catch(() => null);
+    await appendToLog(cwd, {
+      event: 'session_start_external_owner_mismatch_quarantined',
+      session_id: existing.session_id,
+      owner_native_session_id: existingNativeSessionId,
+      native_session_id: nativeSessionId,
+      pid: options.pid ?? process.pid,
+      timestamp: new Date().toISOString(),
     });
+    return existing;
   }
 
   const pid = Number.isInteger(options.pid) && options.pid && options.pid > 0
@@ -402,6 +432,14 @@ export async function reconcileNativeSessionStart(
   });
 
   await writeFile(sessionPath(cwd), JSON.stringify(state, null, 2));
+  await registerExternalOwnerActor({
+    cwd,
+    sessionId: state.session_id,
+    nativeSessionId,
+    pid,
+    source: 'native-session-start',
+    evidence: [{ source: 'session-start', detail: 'reconcileNativeSessionStart' }],
+  }).catch(() => {});
   await appendToLog(cwd, {
     event: 'session_start_reconciled',
     session_id: state.session_id,

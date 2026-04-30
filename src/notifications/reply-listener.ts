@@ -15,7 +15,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, chmodSync, statSync, appendFileSync, renameSync } from 'fs';
-import { basename, join } from 'path';
+import { join } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir } from 'os';
 import { spawn, spawnSync } from 'child_process';
@@ -54,6 +54,7 @@ import {
 } from './config.js';
 import { parseTmuxTail } from './formatter.js';
 import { recordPendingReplyOrigin } from './reply-origin-state.js';
+import { registerExternalOwnerActor } from '../runtime/session-actors.js';
 import {
   killDetachedManagedSession,
   launchDetachedManagedSession,
@@ -78,7 +79,6 @@ import {
   getTelegramInboundText,
   hasTelegramInboundContent,
   normalizeTelegramUpdate,
-  trySendTelegramAcceptedAck,
   trySendTelegramProcessingAction,
 } from './telegram-inbound/index.js';
 import type {
@@ -90,6 +90,7 @@ import type {
   ReplyAcknowledgementMode,
   ReplyConfig,
   TelegramAcceptedAckCleanupTarget,
+  TelegramMessageReferenceTarget,
   TelegramReplyAcknowledgementMode,
   TelegramStartupBacklogPolicy,
 } from './types.js';
@@ -146,6 +147,8 @@ const REPLY_ACK_FALLBACK = 'Recent output summary unavailable.';
 const TELEGRAM_UNAUTHORIZED_REPLY_MESSAGE = 'This Telegram sender is not authorized to control OMX replies for this source.';
 const TELEGRAM_REPLY_USAGE_MESSAGE = 'Reply to a tracked OMX notification message, or reply "status" to inspect the tracked OMX session.';
 const TELEGRAM_TOPIC_ENTRY_USAGE_MESSAGE = 'Start a new OMX session from a known project topic, or reply to a tracked OMX notification message.';
+const TELEGRAM_TOPIC_LAUNCH_PLACEHOLDER_MESSAGE = 'Starting a new Codex chat — working on it…';
+const TELEGRAM_REPLY_INJECTION_PLACEHOLDER_MESSAGE = 'Got it — sending your follow-up to Codex…';
 const TELEGRAM_UNKNOWN_TOPIC_MESSAGE = 'This Telegram topic is not bound to an OMX project yet. Send a notification from OMX first, or reply to a tracked OMX message.';
 const TELEGRAM_TOPIC_TRUST_PROMPT_MESSAGE = 'Started a new OMX session for this topic, but Codex is waiting for a local trust confirmation. Trust the project locally, then retry the topic message.';
 const TELEGRAM_TOPIC_BYPASS_PROMPT_MESSAGE = 'Started a new OMX session for this topic, but Codex is waiting at a local permissions confirmation. Approve it locally or change the local permissions mode, then retry the topic message.';
@@ -420,18 +423,10 @@ function getTelegramPostInjectionAckMode(
   return mode === 'accepted' || mode === 'accepted-final-message' ? 'off' : mode;
 }
 
-function shouldSendTelegramAcceptedAck(
+function shouldSendTelegramInjectionPlaceholder(
   config: Pick<ReplyListenerDaemonConfig, 'ackMode' | 'telegramAckMode'>,
 ): boolean {
-  const mode = getEffectiveTelegramAckMode(config);
-  return mode === 'accepted' || mode === 'accepted-final-message';
-}
-
-function shouldRecordTelegramAcceptedAckForFinalCleanup(
-  config: Pick<ReplyListenerDaemonConfig, 'ackMode' | 'telegramAckMode'>,
-  ack: TelegramAcceptedAckCleanupTarget | null,
-): ack is TelegramAcceptedAckCleanupTarget {
-  return getEffectiveTelegramAckMode(config) === 'accepted-final-message' && ack !== null;
+  return getEffectiveTelegramAckMode(config) !== 'off';
 }
 
 function normalizeTelegramStartupBacklogPolicy(value: unknown): TelegramStartupBacklogPolicy {
@@ -1527,6 +1522,14 @@ export async function pollDiscordOnce(
       );
       if (injectionResult.outcome === 'success') {
         state.messagesInjected++;
+        if (mapping.projectPath) {
+          await registerExternalOwnerActor({
+            cwd: mapping.projectPath,
+            sessionId: mapping.sessionId,
+            source: 'reply-listener-mapping',
+            evidence: [{ source: 'reply-listener', detail: 'discord-reply-route' }],
+          }).catch(() => null);
+        }
         await recordPendingReplyOrigin(mapping.projectPath, mapping.sessionId, {
           platform: 'discord',
           injectedInput: buildInjectedReplyInput(msg.content, 'discord', config),
@@ -1826,12 +1829,12 @@ function isTelegramProjectTopicEntryEnabled(
   return telegramConfig.projectTopics?.enabled === true;
 }
 
-function formatTelegramLaunchAcknowledgement(
-  record: TelegramTopicRegistryRecord,
-  sessionId: string,
-): string {
-  const scopeLabel = record.topicName || record.displayName || basename(record.canonicalProjectPath);
-  return `Started a new OMX session for ${scopeLabel}.\nSession: ${sessionId}`;
+function formatTelegramLaunchAcknowledgement(): string {
+  return TELEGRAM_TOPIC_LAUNCH_PLACEHOLDER_MESSAGE;
+}
+
+function formatTelegramReplyInjectionPlaceholder(): string {
+  return TELEGRAM_REPLY_INJECTION_PLACEHOLDER_MESSAGE;
 }
 
 function formatTelegramTopicLaunchFailure(prefix: string, error: unknown): string {
@@ -1847,6 +1850,57 @@ function formatTelegramTopicPromptBlockMessage(blockingPrompt: ReturnType<typeof
     return TELEGRAM_TOPIC_BYPASS_PROMPT_MESSAGE;
   }
   return null;
+}
+
+function buildTelegramMessageReference(
+  chatId: string | undefined,
+  messageId: string | number | undefined,
+  messageThreadId: string | number | undefined,
+): TelegramMessageReferenceTarget | null {
+  const normalizedMessageId = normalizeTelegramNumericId(messageId);
+  if (!chatId || !normalizedMessageId) {
+    return null;
+  }
+
+  const normalizedThreadId = normalizeTelegramNumericId(messageThreadId);
+  return {
+    chatId,
+    messageId: normalizedMessageId,
+    ...(normalizedThreadId ? { messageThreadId: normalizedThreadId } : {}),
+  };
+}
+
+async function trySendTelegramPlaceholderReply(
+  config: ReplyListenerDaemonConfig,
+  httpsRequestImpl: typeof httpsRequest,
+  target: {
+    replyToMessageId?: number | string;
+    messageThreadId?: number | string;
+  },
+  text: string,
+  logImpl: typeof log,
+  context: string,
+): Promise<TelegramAcceptedAckCleanupTarget | null> {
+  try {
+    const sent = await sendTelegramTextReply(
+      config,
+      httpsRequestImpl,
+      target,
+      text,
+    );
+    const reference = buildTelegramMessageReference(
+      config.telegramChatId,
+      sent?.messageId,
+      sent?.messageThreadId ?? target.messageThreadId,
+    );
+    if (!reference) {
+      logImpl(`WARN: Telegram placeholder reply (${context}) did not return a message id`);
+    }
+    return reference;
+  } catch (error) {
+    logImpl(`WARN: Failed to send Telegram placeholder reply (${context}): ${error}`);
+    return null;
+  }
 }
 
 async function handleTelegramTopicSessionLaunch(
@@ -1871,6 +1925,11 @@ async function handleTelegramTopicSessionLaunch(
 ): Promise<boolean> {
   const inboundThreadId = message.messageThreadId ?? sourceRecord.messageThreadId;
   const replyToMessageId = message.messageId;
+  const finalReplyTarget = buildTelegramMessageReference(
+    config.telegramChatId,
+    replyToMessageId,
+    inboundThreadId,
+  );
 
   if (!hasTelegramInboundContent(message)) {
     return true;
@@ -1887,21 +1946,7 @@ async function handleTelegramTopicSessionLaunch(
     return false;
   }
 
-  const acceptedAck = shouldSendTelegramAcceptedAck(config)
-    ? await trySendTelegramAcceptedAck(
-        { botToken: config.telegramBotToken!, chatId: config.telegramChatId! },
-        {
-          replyToMessageId,
-          messageThreadId: inboundThreadId,
-        },
-        {
-          httpsRequestImpl: deps.httpsRequestImpl,
-          logImpl: deps.logImpl,
-          context: 'topic-launch-accepted',
-        },
-      )
-    : null;
-  if (message.mediaParts.length > 0 && shouldSendTelegramAcceptedAck(config)) {
+  if (message.mediaParts.length > 0) {
     await trySendTelegramProcessingAction(
       { botToken: config.telegramBotToken!, chatId: config.telegramChatId! },
       { messageThreadId: inboundThreadId },
@@ -1953,6 +1998,7 @@ async function handleTelegramTopicSessionLaunch(
 
   const cleanupFailedLaunch = async (reason: string): Promise<void> => {
     try {
+      removeMessagesByPane(launchResult.leaderPaneId);
       const cleaned = await deps.killDetachedManagedSessionImpl(launchResult.tmuxSessionName);
       if (!cleaned) {
         deps.logImpl(
@@ -1992,6 +2038,70 @@ async function handleTelegramTopicSessionLaunch(
     return true;
   }
 
+  let launchPlaceholder: TelegramAcceptedAckCleanupTarget | null = null;
+  let acknowledgementRegistrationFailed = false;
+  try {
+    const acknowledgement = await sendTelegramTextReply(
+      config,
+      deps.httpsRequestImpl,
+      {
+        replyToMessageId,
+        messageThreadId: inboundThreadId,
+      },
+      formatTelegramLaunchAcknowledgement(),
+    );
+
+    launchPlaceholder = buildTelegramMessageReference(
+      config.telegramChatId,
+      acknowledgement?.messageId,
+      acknowledgement?.messageThreadId ?? inboundThreadId,
+    );
+
+    if (!launchPlaceholder) {
+      state.errors++;
+      acknowledgementRegistrationFailed = true;
+      recordSourceFailure(
+        state,
+        source,
+        'topic-launch-acknowledgement-failure',
+        `Telegram launch acknowledgement for session ${launchResult.sessionId} did not return a message id`,
+      );
+      deps.logImpl(`WARN: Telegram launch acknowledgement for session ${launchResult.sessionId} did not return a message id`);
+    } else {
+      const registered = deps.registerMessageImpl({
+        platform: 'telegram',
+        messageId: launchPlaceholder.messageId,
+        source,
+        sessionId: launchResult.sessionId,
+        tmuxPaneId: launchResult.leaderPaneId,
+        tmuxSessionName: launchResult.tmuxSessionName,
+        event: 'session-start',
+        createdAt: new Date().toISOString(),
+        projectPath: sourceRecord.canonicalProjectPath,
+        projectKey: sourceRecord.projectKey,
+        messageThreadId: launchPlaceholder.messageThreadId ?? normalizeTelegramNumericId(inboundThreadId),
+        topicName: sourceRecord.topicName,
+      });
+      if (!registered) {
+        state.errors++;
+        acknowledgementRegistrationFailed = true;
+        recordSourceFailure(
+          state,
+          source,
+          'topic-launch-ack-registration-failure',
+          `Failed to register Telegram launch acknowledgement ${launchPlaceholder.messageId} for session ${launchResult.sessionId}`,
+        );
+        deps.logImpl(`WARN: Failed to register Telegram launch acknowledgement ${launchPlaceholder.messageId} for session ${launchResult.sessionId}`);
+      }
+    }
+  } catch (error) {
+    state.errors++;
+    acknowledgementRegistrationFailed = true;
+    recordSourceFailure(state, source, 'topic-launch-acknowledgement-failure', String(error));
+    deps.logImpl(`WARN: Failed to send Telegram reply (topic-launch-acknowledgement): ${error}`);
+  }
+
+  let pendingReplyOriginRecorded = false;
   try {
     const submitted = await deps.submitPromptToCodexPaneImpl(
       launchResult.leaderPaneId,
@@ -2000,19 +2110,14 @@ async function handleTelegramTopicSessionLaunch(
     if (!submitted) {
       throw new Error('tmux prompt submission did not complete successfully');
     }
-    await recordPendingReplyOrigin(sourceRecord.canonicalProjectPath, launchResult.sessionId, {
-      platform: 'telegram',
-      injectedInput: normalizedText,
-      ...(shouldRecordTelegramAcceptedAckForFinalCleanup(config, acceptedAck)
-        ? { telegramAck: acceptedAck }
-        : {}),
-    }).catch((error) => {
-      deps.logImpl(
-        `WARN: Failed to record Telegram topic reply origin${acceptedAck ? ' and accepted acknowledgement cleanup metadata' : ''}: ${formatUnknownError(error)}`,
-      );
-    });
   } catch (error) {
     await cleanupFailedLaunch('topic-launch-submit-failure');
+    await deleteTelegramAcceptedAckAfterDeferredIntake(
+      config,
+      launchPlaceholder,
+      deps.httpsRequestImpl,
+      deps.logImpl,
+    );
     state.errors++;
     recordSourceFailure(state, source, 'topic-launch-submit-failure', String(error));
     const blockedPromptMessage = formatTelegramTopicPromptBlockMessage(
@@ -2035,62 +2140,36 @@ async function handleTelegramTopicSessionLaunch(
     return true;
   }
 
-  state.messagesInjected++;
-
   try {
-    const acknowledgement = await sendTelegramTextReply(
-      config,
-      deps.httpsRequestImpl,
-      {
-        replyToMessageId,
-        messageThreadId: inboundThreadId,
-      },
-      formatTelegramLaunchAcknowledgement(sourceRecord, launchResult.sessionId),
-    );
-
-    if (!acknowledgement?.messageId) {
-      state.errors++;
-      recordSourceFailure(
-        state,
-        source,
-        'topic-launch-acknowledgement-failure',
-        `Telegram launch acknowledgement for session ${launchResult.sessionId} did not return a message id`,
-      );
-      deps.logImpl(`WARN: Telegram launch acknowledgement for session ${launchResult.sessionId} did not return a message id`);
-      return true;
-    }
-
-    const registered = deps.registerMessageImpl({
-      platform: 'telegram',
-      messageId: acknowledgement.messageId,
-      source,
+    await registerExternalOwnerActor({
+      cwd: sourceRecord.canonicalProjectPath,
       sessionId: launchResult.sessionId,
-      tmuxPaneId: launchResult.leaderPaneId,
-      tmuxSessionName: launchResult.tmuxSessionName,
-      event: 'session-start',
-      createdAt: new Date().toISOString(),
-      projectPath: sourceRecord.canonicalProjectPath,
-      projectKey: sourceRecord.projectKey,
-      messageThreadId: acknowledgement.messageThreadId ?? normalizeTelegramNumericId(inboundThreadId),
-      topicName: sourceRecord.topicName,
+      source: 'telegram-topic-launch',
+      evidence: [{ source: 'reply-listener', detail: 'topic-launch' }],
+    }).catch(() => null);
+    pendingReplyOriginRecorded = await recordPendingReplyOrigin(sourceRecord.canonicalProjectPath, launchResult.sessionId, {
+      platform: 'telegram',
+      injectedInput: normalizedText,
+      ...(launchPlaceholder ? { telegramAck: launchPlaceholder } : {}),
+      ...(finalReplyTarget ? { telegramReplyTo: finalReplyTarget } : {}),
     });
-    if (!registered) {
-      state.errors++;
-      recordSourceFailure(
-        state,
-        source,
-        'topic-launch-ack-registration-failure',
-        `Failed to register Telegram launch acknowledgement ${acknowledgement.messageId} for session ${launchResult.sessionId}`,
-      );
-      deps.logImpl(`WARN: Failed to register Telegram launch acknowledgement ${acknowledgement.messageId} for session ${launchResult.sessionId}`);
-      return true;
-    }
-
-    clearSourceFailure(state, source);
   } catch (error) {
-    state.errors++;
-    recordSourceFailure(state, source, 'topic-launch-acknowledgement-failure', String(error));
-    deps.logImpl(`WARN: Failed to send Telegram reply (topic-launch-acknowledgement): ${error}`);
+    deps.logImpl(
+      `WARN: Failed to record Telegram topic reply origin${launchPlaceholder ? ' and launch placeholder cleanup metadata' : ''}: ${formatUnknownError(error)}`,
+    );
+  }
+
+  state.messagesInjected++;
+  if (launchPlaceholder && !pendingReplyOriginRecorded) {
+    await deleteTelegramAcceptedAckAfterDeferredIntake(
+      config,
+      launchPlaceholder,
+      deps.httpsRequestImpl,
+      deps.logImpl,
+    );
+  }
+  if (!acknowledgementRegistrationFailed) {
+    clearSourceFailure(state, source);
   }
 
   return true;
@@ -2391,24 +2470,29 @@ export async function pollTelegramOnce(
         break;
       }
 
-      const acceptedAck = shouldSendTelegramAcceptedAck(config)
-        ? await trySendTelegramAcceptedAck(
-            { botToken: config.telegramBotToken, chatId: config.telegramChatId },
+      const replyMessageThreadId = inboundThreadId ?? mapping.messageThreadId;
+      const finalReplyTarget = buildTelegramMessageReference(
+        config.telegramChatId,
+        inbound.messageId,
+        replyMessageThreadId,
+      );
+      const acceptedAck = shouldSendTelegramInjectionPlaceholder(config)
+        ? await trySendTelegramPlaceholderReply(
+            config,
+            httpsRequestImpl,
             {
               replyToMessageId: inbound.messageId,
-              messageThreadId: inboundThreadId ?? mapping.messageThreadId,
+              messageThreadId: replyMessageThreadId,
             },
-            {
-              httpsRequestImpl,
-              logImpl,
-              context: 'accepted',
-            },
+            formatTelegramReplyInjectionPlaceholder(),
+            logImpl,
+            'reply-injection-placeholder',
           )
         : null;
-      if (inbound.mediaParts.length > 0 && shouldSendTelegramAcceptedAck(config)) {
+      if (inbound.mediaParts.length > 0) {
         await trySendTelegramProcessingAction(
-          { botToken: config.telegramBotToken, chatId: config.telegramChatId },
-          { messageThreadId: inboundThreadId ?? mapping.messageThreadId },
+          { botToken: config.telegramBotToken!, chatId: config.telegramChatId! },
+          { messageThreadId: replyMessageThreadId },
           {
             httpsRequestImpl,
             logImpl,
@@ -2417,20 +2501,37 @@ export async function pollTelegramOnce(
         );
       }
 
-      const inboundInput = await buildTelegramInboundInput(
-        config,
-        source,
-        inbound,
-        httpsRequestImpl,
-        logImpl,
-      );
+      let inboundInput: string | null;
+      try {
+        inboundInput = await buildTelegramInboundInput(
+          config,
+          source,
+          inbound,
+          httpsRequestImpl,
+          logImpl,
+        );
+      } catch (error) {
+        await deleteTelegramAcceptedAckAfterDeferredIntake(
+          config,
+          acceptedAck,
+          httpsRequestImpl,
+          logImpl,
+        );
+        throw error;
+      }
       if (!inboundInput) {
+        await deleteTelegramAcceptedAckAfterDeferredIntake(
+          config,
+          acceptedAck,
+          httpsRequestImpl,
+          logImpl,
+        );
         await trySendTelegramTextReply(
           config,
           httpsRequestImpl,
           {
             replyToMessageId: inbound.messageId,
-            messageThreadId: inboundThreadId ?? mapping.messageThreadId,
+            messageThreadId: replyMessageThreadId,
           },
           TELEGRAM_REPLY_USAGE_MESSAGE,
           logImpl,
@@ -2448,17 +2549,35 @@ export async function pollTelegramOnce(
       if (injectionResult.outcome === 'success') {
         state.messagesInjected++;
         clearSourceFailure(state, source);
-        await recordPendingReplyOrigin(mapping.projectPath, mapping.sessionId, {
-          platform: 'telegram',
-          injectedInput: buildInjectedReplyInput(inboundInput, 'telegram', config),
-          ...(shouldRecordTelegramAcceptedAckForFinalCleanup(config, acceptedAck)
-            ? { telegramAck: acceptedAck }
-            : {}),
-        }).catch((error) => {
+        let pendingReplyOriginRecorded = false;
+        try {
+          if (mapping.projectPath) {
+            await registerExternalOwnerActor({
+              cwd: mapping.projectPath,
+              sessionId: mapping.sessionId,
+              source: 'reply-listener-mapping',
+              evidence: [{ source: 'reply-listener', detail: 'telegram-reply-route' }],
+            });
+          }
+          pendingReplyOriginRecorded = await recordPendingReplyOrigin(mapping.projectPath, mapping.sessionId, {
+            platform: 'telegram',
+            injectedInput: buildInjectedReplyInput(inboundInput, 'telegram', config),
+            ...(acceptedAck ? { telegramAck: acceptedAck } : {}),
+            ...(finalReplyTarget ? { telegramReplyTo: finalReplyTarget } : {}),
+          });
+        } catch (error) {
           logImpl(
-            `WARN: Failed to record Telegram reply origin${acceptedAck ? ' and accepted acknowledgement cleanup metadata' : ''}: ${formatUnknownError(error)}`,
+            `WARN: Failed to record Telegram reply origin${acceptedAck ? ' and placeholder cleanup metadata' : ''}${finalReplyTarget ? ' and final reply metadata' : ''}: ${formatUnknownError(error)}`,
           );
-        });
+        }
+        if (acceptedAck && !pendingReplyOriginRecorded) {
+          await deleteTelegramAcceptedAckAfterDeferredIntake(
+            config,
+            acceptedAck,
+            httpsRequestImpl,
+            logImpl,
+          );
+        }
         commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
 
         const acknowledgement = buildReplyAcknowledgement(
@@ -2466,7 +2585,7 @@ export async function pollTelegramOnce(
           config,
           captureReplyAcknowledgementSummaryImpl,
           formatReplyAcknowledgementImpl,
-          getTelegramPostInjectionAckMode(config),
+          acceptedAck && pendingReplyOriginRecorded ? 'off' : getTelegramPostInjectionAckMode(config),
         );
         if (acknowledgement !== null) {
           await trySendTelegramTextReply(
@@ -2474,7 +2593,7 @@ export async function pollTelegramOnce(
             httpsRequestImpl,
             {
               replyToMessageId: inbound.messageId,
-              messageThreadId: inboundThreadId ?? mapping.messageThreadId,
+              messageThreadId: replyMessageThreadId,
             },
             acknowledgement,
             logImpl,
@@ -2482,12 +2601,18 @@ export async function pollTelegramOnce(
           );
         }
       } else if (injectionResult.outcome === 'terminal-ignore') {
+        await deleteTelegramAcceptedAckAfterDeferredIntake(
+          config,
+          acceptedAck,
+          httpsRequestImpl,
+          logImpl,
+        );
         await trySendTelegramTextReply(
           config,
           httpsRequestImpl,
           {
             replyToMessageId: inbound.messageId,
-            messageThreadId: inboundThreadId ?? mapping.messageThreadId,
+            messageThreadId: replyMessageThreadId,
           },
           injectionResult.reason || 'The target OMX pane is no longer available for replies.',
           logImpl,
