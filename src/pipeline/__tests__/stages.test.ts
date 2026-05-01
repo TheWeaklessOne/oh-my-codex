@@ -282,6 +282,40 @@ describe('Team Exec Stage', () => {
     }
   });
 
+  it('derives the team-exec task when latestPlanPath resolves through equivalent relative segments', async () => {
+    const plansDir = join(tempDir, '.omx', 'plans');
+    await mkdir(plansDir, { recursive: true });
+    await writeFile(
+      join(plansDir, 'prd-zeta.md'),
+      '# Zeta plan\n\nLaunch via omx team 5:debugger "Execute zeta handoff"\n',
+    );
+    await writeFile(join(plansDir, 'test-spec-zeta.md'), '# Zeta test spec\n');
+
+    const relativeCwd = basename(tempDir);
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(dirname(tempDir));
+      const stage = createTeamExecStage();
+      const result = await stage.run(makeCtx({
+        cwd: relativeCwd,
+        task: 'original request task',
+        artifacts: {
+          ralplan: {
+            task: 'original request task',
+            stage: 'ralplan',
+            latestPlanPath: join('..', relativeCwd, '.omx', 'plans', 'prd-zeta.md'),
+          },
+        },
+      }));
+
+      assert.equal(result.status, 'completed');
+      const descriptor = (result.artifacts as Record<string, unknown>).teamDescriptor as Record<string, unknown>;
+      assert.equal(descriptor.task, 'Execute zeta handoff');
+    } finally {
+      process.chdir(previousCwd);
+    }
+  });
+
   it('derives the team-exec task from single-quoted approved handoff text with escapes', async () => {
     const plansDir = join(tempDir, '.omx', 'plans');
     await mkdir(plansDir, { recursive: true });

@@ -74,6 +74,7 @@ function resolvePlanningPrdPath(
 
   const repoRoot = dirname(dirname(artifacts.plansDir));
   const normalizedPath = normalizePlanningRelativePath(normalizedRawPath);
+  const resolvedPath = resolve(cwd, normalizedPath);
   const matchedPath = artifacts.prdPaths.find((candidatePath) => {
     const artifactPath = normalizePlanningRelativePath(candidatePath);
     const repoRelativePath = normalizePlanningRelativePath(relative(repoRoot, candidatePath));
@@ -81,10 +82,10 @@ function resolvePlanningPrdPath(
     return normalizedPath === artifactPath
       || normalizedPath === repoRelativePath
       || normalizedPath === plansRelativePath;
-  }) ?? null;
+  }) ?? artifacts.prdPaths.find((candidatePath) => sameFilePath(candidatePath, resolvedPath)) ?? null;
   return {
     matchedPath,
-    fallbackPath: resolve(cwd, normalizedPath),
+    fallbackPath: resolvedPath,
   };
 }
 
