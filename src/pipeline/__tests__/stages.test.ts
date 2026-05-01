@@ -311,6 +311,38 @@ describe('Team Exec Stage', () => {
     assert.doesNotMatch(instruction, /Fix Bob\\'s regression/);
   });
 
+  it('preserves literal backslashes in single-quoted approved handoff text', async () => {
+    const plansDir = join(tempDir, '.omx', 'plans');
+    await mkdir(plansDir, { recursive: true });
+    await writeFile(
+      join(plansDir, 'prd-zeta.md'),
+      String.raw`# Zeta plan
+
+Launch via $team 2:executor 'Fix C:\\tmp and keep \n literal'
+`,
+    );
+    await writeFile(join(plansDir, 'test-spec-zeta.md'), '# Zeta test spec\n');
+
+    const stage = createTeamExecStage();
+    const result = await stage.run(makeCtx({
+      task: 'original request task',
+      artifacts: {
+        ralplan: {
+          task: 'original request task',
+          stage: 'ralplan',
+          latestPlanPath: join('.omx', 'plans', 'prd-zeta.md'),
+        },
+      },
+    }));
+
+    assert.equal(result.status, 'completed');
+    const descriptor = (result.artifacts as Record<string, unknown>).teamDescriptor as Record<string, unknown>;
+    const instruction = (result.artifacts as Record<string, unknown>).instruction as string;
+    const expectedTask = String.raw`Fix C:\\tmp and keep \n literal`;
+    assert.equal(descriptor.task, expectedTask);
+    assert.ok(instruction.includes(JSON.stringify(expectedTask)));
+  });
+
   it('fails closed when latestPlanPath is not the selected latest approved PRD', async () => {
     const plansDir = join(tempDir, '.omx', 'plans');
     await mkdir(plansDir, { recursive: true });

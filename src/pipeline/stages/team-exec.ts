@@ -43,7 +43,7 @@ function decodeQuotedValue(raw: string): string | null {
       return normalized.slice(1, -1);
     }
     if (normalized.startsWith("'") && normalized.endsWith("'")) {
-      return normalized.slice(1, -1).replace(/\\(.)/g, '$1');
+      return normalized.slice(1, -1).replace(/\\'/g, "'");
     }
     return null;
   }
