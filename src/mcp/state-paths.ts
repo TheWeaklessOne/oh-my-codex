@@ -281,6 +281,16 @@ export async function getAuthoritativeActiveStateDirs(
   return [scope.stateDir];
 }
 
+export async function getAuthoritativeActiveStatePaths(
+  mode: string,
+  workingDirectory?: string,
+  explicitSessionId?: string,
+): Promise<string[]> {
+  const dirs = await getAuthoritativeActiveStateDirs(workingDirectory, explicitSessionId);
+  const fileName = getStateFilename(mode);
+  return dirs.map((dir) => join(dir, fileName));
+}
+
 export async function getReadScopedStatePaths(
   mode: string,
   workingDirectory?: string,

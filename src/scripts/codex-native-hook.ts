@@ -3,7 +3,7 @@ import { closeSync, existsSync, openSync, readFileSync, readSync } from "fs";
 import { mkdir, readFile, readdir, writeFile } from "fs/promises";
 import { join, relative, resolve } from "path";
 import { pathToFileURL } from "url";
-import { readModeState, readModeStateForSession, updateModeState } from "../modes/base.js";
+import { readModeState, readModeStateForActiveDecision, readModeStateForSession, updateModeState } from "../modes/base.js";
 import {
   listActiveSkills,
   readVisibleSkillActiveState,
@@ -62,7 +62,7 @@ import type { HookEventEnvelope } from "../hooks/extensibility/types.js";
 import { dispatchHookEvent } from "../hooks/extensibility/dispatcher.js";
 import { reconcileHudForPromptSubmit } from "../hud/reconcile.js";
 import { onSessionStart as buildWikiSessionStartContext } from "../wiki/lifecycle.js";
-import { readAutoresearchCompletionStatus, readAutoresearchModeState } from "../autoresearch/skill-validation.js";
+import { readAutoresearchCompletionStatus, readAutoresearchModeStateForActiveDecision } from "../autoresearch/skill-validation.js";
 import { readRunState } from "../runtime/run-state.js";
 import { getRunContinuationSnapshot, shouldContinueRun } from "../runtime/run-loop.js";
 import { triagePrompt } from "../hooks/triage-heuristic.js";
@@ -453,7 +453,7 @@ async function readActiveAutoresearchState(
 ): Promise<Record<string, unknown> | null> {
   const normalizedSessionId = sessionId?.trim() || undefined;
   if (!normalizedSessionId) return null;
-  const state = await readAutoresearchModeState(cwd, normalizedSessionId);
+  const state = await readAutoresearchModeStateForActiveDecision(cwd, normalizedSessionId);
   if (state?.active !== true) return null;
   if (!isNonTerminalPhase(state.current_phase ?? state.currentPhase ?? 'executing')) return null;
   return state;
@@ -1283,9 +1283,7 @@ async function buildModeBasedStopOutput(
   cwd: string,
   sessionId?: string,
 ): Promise<Record<string, unknown> | null> {
-  const state = sessionId
-    ? await readModeStateForSession(mode, sessionId, cwd)
-    : await readModeState(mode, cwd);
+  const state = await readModeStateForActiveDecision(mode, sessionId?.trim() || undefined, cwd);
   if (!state || !shouldContinueRun(state)) return null;
   const phase = formatPhase(state.current_phase);
   return {

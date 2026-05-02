@@ -3902,12 +3902,49 @@ esac
     }
   });
 
+  for (const rootActiveCase of [
+    { mode: "autopilot", phase: "execution" },
+    { mode: "ultrawork", phase: "executing" },
+    { mode: "ultraqa", phase: "diagnose" },
+  ] as const) {
+    it(`returns Stop continuation output from root ${rootActiveCase.mode} state when no session is active`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-stop-root-${rootActiveCase.mode}-`));
+      try {
+        const stateDir = join(cwd, ".omx", "state");
+        await mkdir(stateDir, { recursive: true });
+        await writeJson(join(stateDir, `${rootActiveCase.mode}-state.json`), {
+          active: true,
+          mode: rootActiveCase.mode,
+          current_phase: rootActiveCase.phase,
+        });
+
+        const result = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "Stop",
+            cwd,
+          },
+          { cwd },
+        );
+
+        assert.equal(result.omxEventName, "stop");
+        assert.deepEqual(result.outputJson, {
+          decision: "block",
+          reason: `OMX ${rootActiveCase.mode} is still active (phase: ${rootActiveCase.phase}); continue the task and gather fresh verification evidence before stopping.`,
+          stopReason: `${rootActiveCase.mode}_${rootActiveCase.phase}`,
+          systemMessage: `OMX ${rootActiveCase.mode} is still active (phase: ${rootActiveCase.phase}).`,
+        });
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
   it("returns Stop continuation output while Autopilot is active", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-autopilot-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
-      await mkdir(stateDir, { recursive: true });
-      await writeJson(join(stateDir, "autopilot-state.json"), {
+      await mkdir(join(stateDir, "sessions", "sess-stop-autopilot"), { recursive: true });
+      await writeJson(join(stateDir, "sessions", "sess-stop-autopilot", "autopilot-state.json"), {
         active: true,
         current_phase: "execution",
       });
@@ -3938,8 +3975,8 @@ esac
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-autopilot-planning-replay-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
-      await mkdir(stateDir, { recursive: true });
-      await writeJson(join(stateDir, "autopilot-state.json"), {
+      await mkdir(join(stateDir, "sessions", "sess-stop-autopilot-planning-replay"), { recursive: true });
+      await writeJson(join(stateDir, "sessions", "sess-stop-autopilot-planning-replay", "autopilot-state.json"), {
         active: true,
         current_phase: "planning",
       });
@@ -4004,12 +4041,45 @@ esac
     }
   });
 
+  for (const staleRootCase of [
+    { mode: "autopilot", phase: "execution" },
+    { mode: "ultrawork", phase: "executing" },
+    { mode: "ultraqa", phase: "diagnose" },
+  ] as const) {
+    it(`does not block Stop from stale root ${staleRootCase.mode} state when the explicit session directory is missing`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-stop-missing-session-${staleRootCase.mode}-`));
+      try {
+        const stateDir = join(cwd, ".omx", "state");
+        await mkdir(stateDir, { recursive: true });
+        await writeJson(join(stateDir, `${staleRootCase.mode}-state.json`), {
+          active: true,
+          mode: staleRootCase.mode,
+          current_phase: staleRootCase.phase,
+        });
+
+        const result = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "Stop",
+            cwd,
+            session_id: "missing-session",
+          },
+          { cwd },
+        );
+
+        assert.equal(result.omxEventName, "stop");
+        assert.equal(result.outputJson, null);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
   it("does not block Stop when an explicit blocked_on_user run_outcome is present on a mode state", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-autopilot-blocked-outcome-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
-      await mkdir(stateDir, { recursive: true });
-      await writeJson(join(stateDir, "autopilot-state.json"), {
+      await mkdir(join(stateDir, "sessions", "sess-stop-autopilot-blocked-outcome"), { recursive: true });
+      await writeJson(join(stateDir, "sessions", "sess-stop-autopilot-blocked-outcome", "autopilot-state.json"), {
         active: true,
         current_phase: "execution",
         run_outcome: "blocked_on_user",
@@ -4035,8 +4105,8 @@ esac
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-ultrawork-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
-      await mkdir(stateDir, { recursive: true });
-      await writeJson(join(stateDir, "ultrawork-state.json"), {
+      await mkdir(join(stateDir, "sessions", "sess-stop-ultrawork"), { recursive: true });
+      await writeJson(join(stateDir, "sessions", "sess-stop-ultrawork", "ultrawork-state.json"), {
         active: true,
         current_phase: "executing",
       });
@@ -4062,8 +4132,8 @@ esac
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-ultraqa-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
-      await mkdir(stateDir, { recursive: true });
-      await writeJson(join(stateDir, "ultraqa-state.json"), {
+      await mkdir(join(stateDir, "sessions", "sess-stop-ultraqa"), { recursive: true });
+      await writeJson(join(stateDir, "sessions", "sess-stop-ultraqa", "ultraqa-state.json"), {
         active: true,
         current_phase: "diagnose",
       });
@@ -5133,6 +5203,36 @@ esac
       );
 
       assert.equal(result.omxEventName, 'stop');
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not block Stop from stale root autoresearch state when the explicit session directory is missing", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-missing-session-autoresearch-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      await mkdir(stateDir, { recursive: true });
+      await writeJson(join(stateDir, "autoresearch-state.json"), {
+        active: true,
+        mode: "autoresearch",
+        current_phase: "executing",
+        validation_mode: "mission-validator-script",
+        mission_validator_command: "node scripts/validate.js",
+        completion_artifact_path: ".omx/specs/autoresearch-demo/completion.json",
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "missing-session",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
       assert.equal(result.outputJson, null);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -7092,8 +7192,8 @@ esac
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-ultrawork-repeat-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
-      await mkdir(stateDir, { recursive: true });
-      await writeJson(join(stateDir, "ultrawork-state.json"), {
+      await mkdir(join(stateDir, "sessions", "sess-stop-ultrawork-repeat"), { recursive: true });
+      await writeJson(join(stateDir, "sessions", "sess-stop-ultrawork-repeat", "ultrawork-state.json"), {
         active: true,
         current_phase: "executing",
       });
