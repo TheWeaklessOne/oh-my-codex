@@ -4,11 +4,14 @@ export * from './media-handlers.js';
 export * from './files.js';
 export * from './storage.js';
 export * from './prompt-renderer.js';
+export * from './transcription.js';
 export * from './ack.js';
 
 import { TELEGRAM_BOT_API_MAX_DOWNLOAD_BYTES, fetchTelegramFile } from './files.js';
 import { renderTelegramPromptInput } from './prompt-renderer.js';
 import { saveTelegramMedia } from './storage.js';
+import { attachTelegramTranscriptions } from './transcription.js';
+import type { AudioTranscriptionProvider, TelegramVoiceTranscriptionConfig } from '../transcription/types.js';
 import type {
   FailedTelegramMedia,
   SavedTelegramMedia,
@@ -23,6 +26,9 @@ export interface BuildTelegramPromptInputOptions {
   attachmentRoot?: string;
   maxDownloadBytes?: number;
   maxPromptChars?: number;
+  transcriptionConfig?: TelegramVoiceTranscriptionConfig;
+  transcriptionProvider?: AudioTranscriptionProvider;
+  transcriptionCacheRoot?: string;
   logImpl?: (message: string) => void;
 }
 
@@ -61,8 +67,31 @@ export async function buildTelegramPromptInput(
     }
   }
 
+  const transcriptionConfig = options.transcriptionConfig;
+  const enrichedSavedMedia = transcriptionConfig?.enabled
+    ? await attachTelegramTranscriptions({
+        message,
+        savedMedia,
+        config: transcriptionConfig,
+        deps: {
+          ...(options.transcriptionProvider ? { provider: options.transcriptionProvider } : {}),
+          ...(options.transcriptionCacheRoot || options.attachmentRoot
+            ? { cacheRoot: options.transcriptionCacheRoot ?? options.attachmentRoot }
+            : {}),
+          logImpl: options.logImpl,
+        },
+      })
+    : savedMedia;
+
   return renderTelegramPromptInput(
-    { message, savedMedia, failedMedia },
-    options.maxPromptChars !== undefined ? { maxPromptChars: options.maxPromptChars } : {},
+    { message, savedMedia: enrichedSavedMedia, failedMedia },
+    {
+      ...(options.maxPromptChars !== undefined ? { maxPromptChars: options.maxPromptChars } : {}),
+      ...(transcriptionConfig ? {
+        transcriptionInjectMode: transcriptionConfig.injectMode,
+        transcriptionFallbackMode: transcriptionConfig.fallbackMode,
+        maxTranscriptChars: transcriptionConfig.maxTranscriptChars,
+      } : {}),
+    },
   );
 }

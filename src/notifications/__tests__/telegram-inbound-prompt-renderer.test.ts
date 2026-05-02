@@ -141,4 +141,187 @@ describe('telegram inbound prompt renderer', () => {
     assert.match(injected, /\\\$\(whoami\)/);
     assert.match(injected, /\/tmp\/voice\.ogg/);
   });
+
+  it('renders successful voice transcription as transcript-only by default', () => {
+    const rendered = renderTelegramPromptInput(input({
+      message: {
+        messageId: 333,
+        chatId: 777,
+        mediaParts: [],
+        rawMessage: {},
+      },
+      savedMedia: [{
+        kind: 'voice',
+        index: 1,
+        path: '/tmp/voice.ogg',
+        metadataPath: '/tmp/voice.ogg.metadata.json',
+        bytes: 3,
+        sourceKey: 'telegram',
+        mimeType: 'audio/ogg',
+        transcription: {
+          status: 'success',
+          providerId: 'fake-local',
+          transcript: 'transcribed speech',
+        },
+      }],
+    }));
+
+    assert.equal(rendered, 'transcribed speech');
+    assert.doesNotMatch(rendered, /\/tmp\/voice\.ogg/);
+  });
+
+  it('renders caption before transcript block and can include the attachment path when requested', () => {
+    const rendered = renderTelegramPromptInput(input({
+      savedMedia: [{
+        kind: 'voice',
+        index: 1,
+        path: '/tmp/voice.ogg',
+        metadataPath: '/tmp/voice.ogg.metadata.json',
+        bytes: 3,
+        sourceKey: 'telegram',
+        mimeType: 'audio/ogg',
+        transcription: {
+          status: 'success',
+          providerId: 'fake-local',
+          transcript: 'captioned speech',
+        },
+      }],
+    }), {
+      transcriptionInjectMode: 'transcript-with-attachment',
+    });
+
+    assert.match(rendered, /^caption first\n\nTelegram voice transcript:\n- voice#1: captioned speech/);
+    assert.match(rendered, /Telegram attachment saved locally:/);
+    assert.match(rendered, /\/tmp\/voice\.ogg/);
+  });
+
+  it('renders transcription failure as saved path plus bounded diagnostic', () => {
+    const rendered = renderTelegramPromptInput(input({
+      savedMedia: [{
+        kind: 'voice',
+        index: 1,
+        path: '/tmp/voice.ogg',
+        metadataPath: '/tmp/voice.ogg.metadata.json',
+        bytes: 3,
+        sourceKey: 'telegram',
+        mimeType: 'audio/ogg',
+        transcription: {
+          status: 'failed',
+          providerId: 'fake-local',
+          code: 'process-failed',
+          message: 'local binary failed',
+        },
+      }],
+    }));
+
+    assert.match(rendered, /Telegram attachment saved locally:/);
+    assert.match(rendered, /\/tmp\/voice\.ogg/);
+    assert.match(rendered, /Telegram voice transcription failed:/);
+    assert.match(rendered, /voice#1: local binary failed/);
+  });
+
+  it('supports attachment-on-failure and attachment-only transcription rendering modes', () => {
+    const success = renderTelegramPromptInput(input({
+      savedMedia: [{
+        kind: 'voice',
+        index: 1,
+        path: '/tmp/success.ogg',
+        metadataPath: '/tmp/success.ogg.metadata.json',
+        bytes: 3,
+        sourceKey: 'telegram',
+        mimeType: 'audio/ogg',
+        transcription: {
+          status: 'success',
+          providerId: 'fake-local',
+          transcript: 'success speech',
+        },
+      }],
+    }), { transcriptionInjectMode: 'attachment-on-failure' });
+
+    assert.match(success, /success speech/);
+    assert.doesNotMatch(success, /\/tmp\/success\.ogg/);
+
+    const failure = renderTelegramPromptInput(input({
+      savedMedia: [{
+        kind: 'voice',
+        index: 1,
+        path: '/tmp/failure.ogg',
+        metadataPath: '/tmp/failure.ogg.metadata.json',
+        bytes: 3,
+        sourceKey: 'telegram',
+        mimeType: 'audio/ogg',
+        transcription: {
+          status: 'failed',
+          providerId: 'fake-local',
+          code: 'process-failed',
+          message: 'diagnostic should be hidden',
+        },
+      }],
+    }), {
+      transcriptionInjectMode: 'attachment-on-failure',
+      transcriptionFallbackMode: 'attachment-only',
+    });
+
+    assert.match(failure, /\/tmp\/failure\.ogg/);
+    assert.doesNotMatch(failure, /diagnostic should be hidden/);
+    assert.doesNotMatch(failure, /Telegram voice transcription failed:/);
+  });
+
+  it('preserves failed transcription attachment and diagnostic when final prompt limiting is tight', () => {
+    const rendered = renderTelegramPromptInput(input({
+      message: {
+        messageId: 333,
+        chatId: 777,
+        textPart: { kind: 'text', source: 'caption', text: 'x'.repeat(1000) },
+        mediaParts: [],
+        rawMessage: {},
+      },
+      savedMedia: [{
+        kind: 'voice',
+        index: 1,
+        path: '/tmp/telegram-attachment/voice.ogg',
+        metadataPath: '/tmp/telegram-attachment/voice.ogg.metadata.json',
+        bytes: 3,
+        sourceKey: 'telegram',
+        mimeType: 'audio/ogg',
+        transcription: {
+          status: 'failed',
+          providerId: 'fake-local',
+          code: 'process-failed',
+          message: 'local binary failed after timeout',
+        },
+      }],
+    }), { maxPromptChars: 180 });
+
+    assert.match(rendered, /\/tmp\/telegram-attachment\/voice\.ogg/);
+    assert.match(rendered, /local binary failed after timeout/);
+  });
+
+  it('truncates long transcripts with a visible marker before final prompt limiting', () => {
+    const rendered = renderTelegramPromptInput(input({
+      message: {
+        messageId: 333,
+        chatId: 777,
+        mediaParts: [],
+        rawMessage: {},
+      },
+      savedMedia: [{
+        kind: 'voice',
+        index: 1,
+        path: '/tmp/voice.ogg',
+        metadataPath: '/tmp/voice.ogg.metadata.json',
+        bytes: 3,
+        sourceKey: 'telegram',
+        mimeType: 'audio/ogg',
+        transcription: {
+          status: 'success',
+          providerId: 'fake-local',
+          transcript: 'x'.repeat(220),
+        },
+      }],
+    }), { maxTranscriptChars: 120, maxPromptChars: 160 });
+
+    assert.match(rendered, /\[transcript truncated; original 220 chars\]/);
+    assert.ok(rendered.length <= 160);
+  });
 });

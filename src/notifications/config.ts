@@ -6,7 +6,8 @@
  */
 
 import { readFileSync, existsSync } from "fs";
-import { join } from "path";
+import { isAbsolute, join } from "path";
+import { homedir } from "os";
 import { codexHome, defaultCodexHome } from "../utils/paths.js";
 import type {
   CompletedTurnPlatformPresentationConfig,
@@ -23,6 +24,12 @@ import type {
   TelegramNotificationConfig,
   VerbosityLevel,
 } from "./types.js";
+import type {
+  AudioTranscriptionPreprocessMode,
+  TelegramVoiceTranscriptionConfig,
+  TelegramVoiceTranscriptionFallbackMode,
+  TelegramVoiceTranscriptionInjectMode,
+} from "./transcription/types.js";
 import { getHookConfig, mergeHookConfigIntoNotificationConfig } from "./hook-config.js";
 import {
   getTempBuiltinSelectors,
@@ -985,6 +992,47 @@ const REPLY_TELEGRAM_STARTUP_BACKLOG_POLICIES = new Set([
   "drop_pending",
   "replay_once",
 ]);
+const REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROVIDERS = new Set(["whisper-cpp"]);
+const REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MEDIA_KINDS = new Set(["voice", "audio"]);
+const REPLY_TELEGRAM_VOICE_TRANSCRIPTION_INJECT_MODES = new Set([
+  "transcript-only",
+  "transcript-with-attachment",
+  "attachment-on-failure",
+]);
+const REPLY_TELEGRAM_VOICE_TRANSCRIPTION_FALLBACK_MODES = new Set([
+  "attachment-with-diagnostic",
+  "attachment-only",
+]);
+const REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PREPROCESS_MODES = new Set([
+  "off",
+  "ffmpeg-wav-auto",
+  "ffmpeg-wav-required",
+]);
+const DEFAULT_TELEGRAM_VOICE_TRANSCRIPTION_PROMPT =
+  "Transcribe exactly. The speaker may mix Russian, English, and French. Preserve original languages. Do not translate.";
+const DEFAULT_TELEGRAM_VOICE_TRANSCRIPTION_CONFIG: TelegramVoiceTranscriptionConfig = {
+  enabled: false,
+  provider: "whisper-cpp",
+  mediaKinds: ["voice"],
+  injectMode: "transcript-only",
+  fallbackMode: "attachment-with-diagnostic",
+  timeoutMs: 120_000,
+  maxDurationSeconds: 300,
+  maxTranscriptChars: 3_500,
+  language: "auto",
+  prompt: DEFAULT_TELEGRAM_VOICE_TRANSCRIPTION_PROMPT,
+  preprocess: {
+    mode: "ffmpeg-wav-auto",
+    binaryPath: "ffmpeg",
+  },
+  whisperCpp: {
+    binaryPath: "whisper-cli",
+    threads: 0,
+    processors: 1,
+    temperature: 0,
+    outputJsonFull: false,
+  },
+};
 
 interface ReplySettingsRaw {
   enabled?: unknown;
@@ -999,6 +1047,7 @@ interface ReplySettingsRaw {
   telegramPollTimeoutSeconds?: unknown;
   telegramAllowedUpdates?: unknown;
   telegramStartupBacklogPolicy?: unknown;
+  telegramVoiceTranscription?: unknown;
 }
 
 interface NotificationsConfigRaw {
@@ -1046,6 +1095,193 @@ function parseStringList(
   }
 
   return [];
+}
+
+function parseBooleanInput(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim().toLowerCase();
+  if (["true", "1", "yes", "on"].includes(trimmed)) return true;
+  if (["false", "0", "no", "off"].includes(trimmed)) return false;
+  return undefined;
+}
+
+function parseTrimmedString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+}
+
+function readObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function parseEnumValue<T extends string>(
+  envValue: string | undefined,
+  configValue: unknown,
+  allowed: ReadonlySet<string>,
+  fallback: T,
+): T {
+  const candidate = parseTrimmedString(envValue)?.toLowerCase()
+    ?? parseTrimmedString(configValue)?.toLowerCase()
+    ?? fallback;
+  return allowed.has(candidate) ? candidate as T : fallback;
+}
+
+function parseOptionalNumber(value: unknown): number | undefined {
+  const parsed = parseIntegerInput(value);
+  return parsed !== undefined && Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function parseOptionalFloat(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string" || value.trim() === "") return undefined;
+  const parsed = Number.parseFloat(value.trim());
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function expandHomeShorthand(pathValue: string): string {
+  if (pathValue === "~") return homedir();
+  if (pathValue.startsWith("~/")) return join(homedir(), pathValue.slice(2));
+  return pathValue;
+}
+
+function isExplicitLocalExecutablePath(pathValue: string | undefined): boolean {
+  if (!pathValue?.trim()) return false;
+  return isAbsolute(expandHomeShorthand(pathValue.trim()));
+}
+
+function normalizeTranscriptionMediaKinds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [...DEFAULT_TELEGRAM_VOICE_TRANSCRIPTION_CONFIG.mediaKinds];
+  const normalized = value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim().toLowerCase())
+    .filter((item) => REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MEDIA_KINDS.has(item));
+  return normalized.length > 0
+    ? [...new Set(normalized)]
+    : [...DEFAULT_TELEGRAM_VOICE_TRANSCRIPTION_CONFIG.mediaKinds];
+}
+
+export function getDefaultTelegramVoiceTranscriptionConfig(): TelegramVoiceTranscriptionConfig {
+  return {
+    ...DEFAULT_TELEGRAM_VOICE_TRANSCRIPTION_CONFIG,
+    mediaKinds: [...DEFAULT_TELEGRAM_VOICE_TRANSCRIPTION_CONFIG.mediaKinds],
+    preprocess: { ...DEFAULT_TELEGRAM_VOICE_TRANSCRIPTION_CONFIG.preprocess },
+    whisperCpp: { ...DEFAULT_TELEGRAM_VOICE_TRANSCRIPTION_CONFIG.whisperCpp },
+  };
+}
+
+export function normalizeTelegramVoiceTranscriptionConfig(
+  configValue: unknown,
+  env: NodeJS.ProcessEnv = process.env,
+): TelegramVoiceTranscriptionConfig {
+  const defaults = getDefaultTelegramVoiceTranscriptionConfig();
+  const raw = readObject(configValue);
+  const preprocessRaw = readObject(raw.preprocess);
+  const whisperCppRaw = readObject(raw.whisperCpp);
+  const envEnabled = parseBooleanInput(env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_ENABLED);
+  const enabled = envEnabled ?? parseBooleanInput(raw.enabled) ?? defaults.enabled;
+  const timeoutMs = normalizeInteger(
+    parseIntegerInput(env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_TIMEOUT_MS)
+      ?? parseIntegerInput(raw.timeoutMs),
+    defaults.timeoutMs,
+    1_000,
+  );
+  const maxDurationSeconds = normalizeInteger(
+    parseIntegerInput(env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MAX_DURATION_SECONDS)
+      ?? parseIntegerInput(raw.maxDurationSeconds),
+    defaults.maxDurationSeconds,
+    1,
+  );
+  const maxTranscriptChars = normalizeInteger(
+    parseIntegerInput(raw.maxTranscriptChars),
+    defaults.maxTranscriptChars,
+    64,
+    100_000,
+  );
+  const provider = parseEnumValue(
+    env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROVIDER,
+    raw.provider,
+    REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROVIDERS,
+    defaults.provider,
+  );
+  const injectMode = parseEnumValue<TelegramVoiceTranscriptionInjectMode>(
+    env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_INJECT_MODE,
+    raw.injectMode,
+    REPLY_TELEGRAM_VOICE_TRANSCRIPTION_INJECT_MODES,
+    defaults.injectMode,
+  );
+  const fallbackMode = parseEnumValue<TelegramVoiceTranscriptionFallbackMode>(
+    undefined,
+    raw.fallbackMode,
+    REPLY_TELEGRAM_VOICE_TRANSCRIPTION_FALLBACK_MODES,
+    defaults.fallbackMode,
+  );
+  const preprocessMode = parseEnumValue<AudioTranscriptionPreprocessMode>(
+    undefined,
+    preprocessRaw.mode,
+    REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PREPROCESS_MODES,
+    defaults.preprocess.mode,
+  );
+  const prompt = parseTrimmedString(env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROMPT)
+    ?? parseTrimmedString(raw.prompt)
+    ?? defaults.prompt;
+  const modelPath = parseTrimmedString(env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MODEL)
+    ?? parseTrimmedString(whisperCppRaw.modelPath);
+  const preprocessBinaryPath = parseTrimmedString(env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_FFMPEG_BINARY)
+    ?? parseTrimmedString(preprocessRaw.binaryPath)
+    ?? defaults.preprocess.binaryPath;
+  const whisperCppBinaryPath = parseTrimmedString(env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_BINARY)
+    ?? parseTrimmedString(whisperCppRaw.binaryPath)
+    ?? defaults.whisperCpp.binaryPath;
+  const warnings: string[] = [];
+  if (enabled && provider === "whisper-cpp") {
+    if (!modelPath) {
+      warnings.push("telegramVoiceTranscription.whisperCpp.modelPath is required when Telegram voice transcription is enabled");
+    }
+    if (!isExplicitLocalExecutablePath(whisperCppBinaryPath)) {
+      warnings.push("telegramVoiceTranscription.whisperCpp.binaryPath must be an absolute local path when Telegram voice transcription is enabled");
+    }
+    if (preprocessMode !== "off" && !isExplicitLocalExecutablePath(preprocessBinaryPath)) {
+      warnings.push("telegramVoiceTranscription.preprocess.binaryPath must be an absolute local path when Telegram voice transcription preprocessing is enabled");
+    }
+  }
+
+  return {
+    enabled,
+    provider,
+    mediaKinds: normalizeTranscriptionMediaKinds(raw.mediaKinds),
+    injectMode,
+    fallbackMode,
+    timeoutMs,
+    maxDurationSeconds,
+    maxTranscriptChars,
+    language: parseTrimmedString(env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_LANGUAGE)
+      ?? parseTrimmedString(raw.language)
+      ?? defaults.language,
+    ...(prompt ? { prompt } : {}),
+    preprocess: {
+      mode: preprocessMode,
+      binaryPath: preprocessBinaryPath,
+    },
+    whisperCpp: {
+      binaryPath: whisperCppBinaryPath,
+      ...(modelPath ? { modelPath } : {}),
+      threads: normalizeInteger(
+        parseOptionalNumber(whisperCppRaw.threads),
+        defaults.whisperCpp.threads ?? 0,
+        0,
+      ),
+      processors: normalizeInteger(
+        parseOptionalNumber(whisperCppRaw.processors),
+        defaults.whisperCpp.processors ?? 1,
+        0,
+      ),
+      temperature: Math.max(0, parseOptionalFloat(whisperCppRaw.temperature) ?? defaults.whisperCpp.temperature ?? 0),
+      outputJsonFull: parseBooleanInput(whisperCppRaw.outputJsonFull) ?? defaults.whisperCpp.outputJsonFull,
+    },
+    ...(warnings.length > 0 ? { warnings } : {}),
+  };
 }
 
 function parseReplyAckMode(
@@ -1176,6 +1412,15 @@ export function getReplyConfig(
     process.env.OMX_REPLY_TELEGRAM_ALLOWED_UPDATES,
     replyRaw?.telegramAllowedUpdates,
   );
+  const telegramVoiceTranscription = normalizeTelegramVoiceTranscriptionConfig(
+    replyRaw?.telegramVoiceTranscription,
+    process.env,
+  );
+  if (telegramVoiceTranscription.enabled) {
+    for (const warning of telegramVoiceTranscription.warnings ?? []) {
+      console.warn(`[notifications] Telegram voice transcription configuration warning: ${warning}`);
+    }
+  }
 
   const ackMode = parseReplyAckMode(process.env.OMX_REPLY_ACK_MODE, replyRaw?.ackMode);
   return {
@@ -1201,5 +1446,6 @@ export function getReplyConfig(
       process.env.OMX_REPLY_TELEGRAM_STARTUP_BACKLOG,
       replyRaw?.telegramStartupBacklogPolicy,
     ),
+    telegramVoiceTranscription,
   };
 }

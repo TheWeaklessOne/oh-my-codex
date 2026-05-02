@@ -398,6 +398,97 @@ If you enable inbound notification replies, OMX now keeps Telegram on polling-on
 - Reply-listener source diagnostics are filtered to the currently active sources, while historical source state remains available internally for compatibility-safe resume/reconciliation.
 - Reply-listener secrets are only duplicated into the fallback secret file when OMX cannot re-derive the active transport tokens from the canonical notification config or environment.
 
+#### Local Telegram voice transcription
+
+Telegram voice transcription is opt-in and local-only. OMX does **not** install,
+download, vendor, or manage `whisper.cpp`, `ffmpeg`, or model files; it only uses
+the executable/model paths you provide in config or environment. There is no
+cloud STT fallback.
+
+On macOS, install external prerequisites yourself:
+
+```bash
+HOMEBREW_NO_AUTO_UPDATE=1 brew install whisper-cpp ffmpeg
+WHISPER_CLI="$(command -v whisper-cli)"
+FFMPEG_BIN="$(command -v ffmpeg)"
+printf 'whisper=%s\nffmpeg=%s\n' "$WHISPER_CLI" "$FFMPEG_BIN"
+```
+
+Download a model manually, for example quality-first:
+
+```bash
+mkdir -p ~/.local/share/whisper.cpp/models
+curl -L -C - \
+  -o ~/.local/share/whisper.cpp/models/ggml-large-v3.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin
+```
+
+Optional speed-first model:
+
+```bash
+curl -L -C - \
+  -o ~/.local/share/whisper.cpp/models/ggml-large-v3-turbo-q8_0.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin
+```
+
+Then point OMX at existing local paths:
+
+Use absolute executable paths (for example, the `command -v` output above);
+OMX rejects PATH-resolved transcription binaries when transcription is enabled.
+
+```json
+{
+  "notifications": {
+    "reply": {
+      "enabled": true,
+      "telegramVoiceTranscription": {
+        "enabled": true,
+        "provider": "whisper-cpp",
+        "mediaKinds": ["voice"],
+        "injectMode": "transcript-only",
+        "fallbackMode": "attachment-with-diagnostic",
+        "timeoutMs": 120000,
+        "maxDurationSeconds": 300,
+        "maxTranscriptChars": 3500,
+        "language": "auto",
+        "prompt": "Transcribe exactly. The speaker may mix Russian, English, and French. Preserve original languages. Do not translate.",
+        "preprocess": {
+          "mode": "ffmpeg-wav-auto",
+          "binaryPath": "/opt/homebrew/bin/ffmpeg"
+        },
+        "whisperCpp": {
+          "binaryPath": "/opt/homebrew/bin/whisper-cli",
+          "modelPath": "~/.local/share/whisper.cpp/models/ggml-large-v3.bin",
+          "threads": 0,
+          "processors": 1,
+          "temperature": 0,
+          "outputJsonFull": false
+        }
+      }
+    }
+  }
+}
+```
+
+Useful explicit env overrides for daemon launches:
+
+- `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_ENABLED`
+- `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROVIDER`
+- `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MODEL`
+- `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_BINARY`
+- `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_LANGUAGE`
+- `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROMPT`
+- `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_TIMEOUT_MS`
+- `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MAX_DURATION_SECONDS`
+- `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_INJECT_MODE`
+- `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_FFMPEG_BINARY`
+
+Switch models by changing only `telegramVoiceTranscription.whisperCpp.modelPath`
+or `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MODEL`. Transcript cache keys include
+provider, model path/mtime/size fingerprint, language, prompt hash, and
+transcription options such as preprocess mode/binary and whisper decoding
+settings, so model/config changes invalidate cached transcripts automatically.
+
 
 ### Troubleshooting false-green readiness
 

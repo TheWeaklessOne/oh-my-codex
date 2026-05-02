@@ -6,6 +6,8 @@
  * lifecycle events plus semantic turn-complete events.
  */
 
+import type { TelegramVoiceTranscriptionConfig } from "./transcription/types.js";
+
 /** Events that can trigger notifications */
 export type NotificationEvent =
   | "session-start"
@@ -428,4 +430,6 @@ export interface ReplyConfig {
   telegramAllowedUpdates: string[];
   /** Startup backlog handling policy for Telegram intake (default: resume) */
   telegramStartupBacklogPolicy: TelegramStartupBacklogPolicy;
+  /** Optional local STT for Telegram voice/audio inbound messages. */
+  telegramVoiceTranscription?: TelegramVoiceTranscriptionConfig;
 }

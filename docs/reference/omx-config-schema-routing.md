@@ -42,10 +42,95 @@ Current code recognizes these top-level `.omx-config.json` keys:
 - OpenClaw/custom transport fields: `openclaw`, `custom_webhook_command`, and `custom_cli_command`.
 - Event keys under `events`: `session-start`, `session-stop`, `session-end`, `session-idle`, and `ask-user-question`. Each event can set `enabled`, `messageTemplate`, and platform overrides.
 - `hookTemplates` supports `version`, `enabled`, `events`, and `defaultTemplate`; per-event template config supports `enabled`, `template`, and platform template overrides.
-- `reply` supports `enabled`, `authorizedDiscordUserIds`, `pollIntervalMs`, `rateLimitPerMinute`, `maxMessageLength`, and `includePrefix`.
+- `reply` supports `enabled`, `authorizedDiscordUserIds`, `authorizedTelegramUserIds`, `pollIntervalMs`, `rateLimitPerMinute`, `maxMessageLength`, `includePrefix`, Telegram polling/ack fields, and `telegramVoiceTranscription`.
 - `notifications.openclaw` supports `enabled`, `gateways`, and `hooks`. Gateway entries are HTTP (`type`, `url`, `headers`, `method`, `timeout`) or command (`type`, `command`, `timeout`). Hook entries use `gateway`, `instruction`, and `enabled`.
 
 Use [`docs/openclaw-integration.md`](../openclaw-integration.md) for full notification/OpenClaw examples. Keep credentials in environment variables where possible.
+
+#### `notifications.reply.telegramVoiceTranscription`
+
+`telegramVoiceTranscription` enables local Telegram voice-message STT for the
+reply listener. It is intentionally a local executable integration:
+
+- OMX does **not** install or manage `whisper.cpp`, `ffmpeg`, or model files.
+- No npm dependency, postinstall, `omx setup`, vendored binary, or cloud STT
+  fallback is involved.
+- `modelPath` is required when enabled with the `whisper-cpp` provider.
+- Telegram intake depends on a provider interface; `whisper-cpp` is only the
+  first provider implementation.
+
+macOS external setup example:
+
+```bash
+HOMEBREW_NO_AUTO_UPDATE=1 brew install whisper-cpp ffmpeg
+WHISPER_CLI="$(command -v whisper-cli)"
+FFMPEG_BIN="$(command -v ffmpeg)"
+printf 'whisper=%s\nffmpeg=%s\n' "$WHISPER_CLI" "$FFMPEG_BIN"
+mkdir -p ~/.local/share/whisper.cpp/models
+curl -L -C - \
+  -o ~/.local/share/whisper.cpp/models/ggml-large-v3.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin
+```
+
+Config shape:
+
+`preprocess.binaryPath` and `whisperCpp.binaryPath` must be absolute local paths
+when transcription is enabled; use the `command -v` output from setup.
+
+```jsonc
+{
+  "notifications": {
+    "reply": {
+      "telegramVoiceTranscription": {
+        "enabled": true,
+        "provider": "whisper-cpp",
+        "mediaKinds": ["voice"],
+        "injectMode": "transcript-only",
+        "fallbackMode": "attachment-with-diagnostic",
+        "timeoutMs": 120000,
+        "maxDurationSeconds": 300,
+        "maxTranscriptChars": 3500,
+        "language": "auto",
+        "prompt": "Transcribe exactly. The speaker may mix Russian, English, and French. Preserve original languages. Do not translate.",
+        "preprocess": {
+          "mode": "ffmpeg-wav-auto",
+          "binaryPath": "/opt/homebrew/bin/ffmpeg"
+        },
+        "whisperCpp": {
+          "binaryPath": "/opt/homebrew/bin/whisper-cli",
+          "modelPath": "~/.local/share/whisper.cpp/models/ggml-large-v3.bin",
+          "threads": 0,
+          "processors": 1,
+          "temperature": 0,
+          "outputJsonFull": false
+        }
+      }
+    }
+  }
+}
+```
+
+Supported explicit daemon env overrides:
+
+| Env var | Overrides |
+| --- | --- |
+| `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_ENABLED` | `enabled` |
+| `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROVIDER` | `provider` |
+| `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MODEL` | `whisperCpp.modelPath` |
+| `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_BINARY` | `whisperCpp.binaryPath` |
+| `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_LANGUAGE` | `language` |
+| `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROMPT` | `prompt` |
+| `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_TIMEOUT_MS` | `timeoutMs` |
+| `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MAX_DURATION_SECONDS` | `maxDurationSeconds` |
+| `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_INJECT_MODE` | `injectMode` |
+| `OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_FFMPEG_BINARY` | `preprocess.binaryPath` |
+
+Switching model is config-only: change `whisperCpp.modelPath` or
+`OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MODEL`. The transcript cache key includes
+Telegram `file_unique_id` (or saved-file hash fallback), provider id, model
+path/mtime/size fingerprint, language, prompt hash, and transcription options
+such as preprocess mode/binary and whisper decoding settings, so model/config
+changes invalidate cached transcripts automatically.
 
 ## Supported model/env keys
 

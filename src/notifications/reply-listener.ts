@@ -50,6 +50,7 @@ import {
 import {
   getNotificationConfig,
   getReplyListenerPlatformConfig,
+  normalizeTelegramVoiceTranscriptionConfig,
   parseMentionAllowedMentions,
 } from './config.js';
 import { parseTmuxTail } from './formatter.js';
@@ -86,6 +87,7 @@ import type {
   TelegramRawMessage as TelegramMessage,
   TelegramRawUpdate as TelegramUpdate,
 } from './telegram-inbound/index.js';
+import type { AudioTranscriptionProvider } from './transcription/types.js';
 import type {
   ReplyAcknowledgementMode,
   ReplyConfig,
@@ -118,6 +120,16 @@ const DAEMON_ENV_ALLOWLIST = [
   'CODEX_HOME',
   'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY', 'no_proxy',
   'SystemRoot', 'SYSTEMROOT', 'windir', 'COMSPEC',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_ENABLED',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROVIDER',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MODEL',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_BINARY',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_LANGUAGE',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROMPT',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_TIMEOUT_MS',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MAX_DURATION_SECONDS',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_INJECT_MODE',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_FFMPEG_BINARY',
 ] as const;
 
 const DEFAULT_STATE_DIR = join(homedir(), '.omx', 'state');
@@ -620,6 +632,10 @@ export function normalizeReplyListenerConfig(config: ReplyListenerDaemonConfig):
     telegramStartupBacklogPolicy: normalizeTelegramStartupBacklogPolicy(
       config.telegramStartupBacklogPolicy,
     ),
+    telegramVoiceTranscription: normalizeTelegramVoiceTranscriptionConfig(
+      config.telegramVoiceTranscription,
+      process.env,
+    ),
   };
 }
 
@@ -856,6 +872,7 @@ async function buildTelegramInboundInput(
   message: TelegramInboundMessage,
   httpsRequestImpl: typeof httpsRequest,
   logImpl: typeof log,
+  options: Pick<ReplyListenerPollDeps, 'telegramTranscriptionProvider' | 'telegramTranscriptionCacheRoot'> = {},
 ): Promise<string> {
   if (!config.telegramBotToken) {
     throw new Error('Telegram bot token is required to build inbound Telegram input');
@@ -867,6 +884,12 @@ async function buildTelegramInboundInput(
     httpsRequestImpl,
     maxDownloadBytes: TELEGRAM_BOT_API_MAX_DOWNLOAD_BYTES,
     maxPromptChars: getRawReplyInputMaxLength('telegram', config),
+    transcriptionConfig: normalizeTelegramVoiceTranscriptionConfig(
+      config.telegramVoiceTranscription,
+      process.env,
+    ),
+    ...(options.telegramTranscriptionProvider ? { transcriptionProvider: options.telegramTranscriptionProvider } : {}),
+    ...(options.telegramTranscriptionCacheRoot ? { transcriptionCacheRoot: options.telegramTranscriptionCacheRoot } : {}),
     logImpl,
   });
 }
@@ -1170,6 +1193,8 @@ export interface ReplyListenerPollDeps {
   registerMessageImpl?: typeof registerMessage;
   writeDaemonStateImpl?: typeof writeDaemonState;
   parseMentionAllowedMentionsImpl?: typeof parseMentionAllowedMentions;
+  telegramTranscriptionProvider?: AudioTranscriptionProvider;
+  telegramTranscriptionCacheRoot?: string;
   logImpl?: typeof log;
 }
 
@@ -1921,7 +1946,7 @@ async function handleTelegramTopicSessionLaunch(
     | 'registerMessageImpl'
     | 'writeDaemonStateImpl'
     | 'logImpl'
-  >>,
+  >> & Pick<ReplyListenerPollDeps, 'telegramTranscriptionProvider' | 'telegramTranscriptionCacheRoot'>,
 ): Promise<boolean> {
   const inboundThreadId = message.messageThreadId ?? sourceRecord.messageThreadId;
   const replyToMessageId = message.messageId;
@@ -1964,6 +1989,10 @@ async function handleTelegramTopicSessionLaunch(
     message,
     deps.httpsRequestImpl,
     deps.logImpl,
+    {
+      ...(deps.telegramTranscriptionProvider ? { telegramTranscriptionProvider: deps.telegramTranscriptionProvider } : {}),
+      ...(deps.telegramTranscriptionCacheRoot ? { telegramTranscriptionCacheRoot: deps.telegramTranscriptionCacheRoot } : {}),
+    },
   );
   if (!normalizedText) {
     return true;
@@ -2383,6 +2412,8 @@ export async function pollTelegramOnce(
             registerMessageImpl,
             writeDaemonStateImpl,
             logImpl,
+            ...(deps.telegramTranscriptionProvider ? { telegramTranscriptionProvider: deps.telegramTranscriptionProvider } : {}),
+            ...(deps.telegramTranscriptionCacheRoot ? { telegramTranscriptionCacheRoot: deps.telegramTranscriptionCacheRoot } : {}),
           },
         );
         if (handled) {
@@ -2509,6 +2540,10 @@ export async function pollTelegramOnce(
           inbound,
           httpsRequestImpl,
           logImpl,
+          {
+            ...(deps.telegramTranscriptionProvider ? { telegramTranscriptionProvider: deps.telegramTranscriptionProvider } : {}),
+            ...(deps.telegramTranscriptionCacheRoot ? { telegramTranscriptionCacheRoot: deps.telegramTranscriptionCacheRoot } : {}),
+          },
         );
       } catch (error) {
         await deleteTelegramAcceptedAckAfterDeferredIntake(

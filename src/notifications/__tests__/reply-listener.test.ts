@@ -26,6 +26,12 @@ import {
   startReplyListener,
 } from '../reply-listener.js';
 import type { ReplyListenerDaemonConfig, ReplyListenerRateLimiter, ReplyListenerState } from '../reply-listener.js';
+import type {
+  AudioTranscriptionInput,
+  AudioTranscriptionProvider,
+  AudioTranscriptionResult,
+  TelegramVoiceTranscriptionConfig,
+} from '../transcription/types.js';
 import type { SessionMapping } from '../session-registry.js';
 import { NO_TRACKED_SESSION_MESSAGE } from '../session-status.js';
 import { buildDiscordReplySource, buildTelegramReplySource } from '../reply-source.js';
@@ -33,6 +39,20 @@ import { consumePendingReplyOrigin } from '../reply-origin-state.js';
 import { pendingRoutesStatePath } from '../pending-routes.js';
 import { markMockTelegramTransportForTests } from '../../utils/test-env.js';
 import { OMX_ENTRY_PATH_ENV, OMX_STARTUP_CWD_ENV } from '../../utils/paths.js';
+
+const TELEGRAM_VOICE_TRANSCRIPTION_ENV_KEYS = [
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_ENABLED',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROVIDER',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MODEL',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_BINARY',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_LANGUAGE',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROMPT',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_TIMEOUT_MS',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MAX_DURATION_SECONDS',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_INJECT_MODE',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_FFMPEG_BINARY',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_COMMAND',
+] as const;
 
 function createBaseConfig(overrides: Partial<ReplyListenerDaemonConfig> = {}): ReplyListenerDaemonConfig {
   return {
@@ -117,6 +137,48 @@ function createMapping(platform: SessionMapping['platform']): SessionMapping {
     projectKey: platform === 'telegram' ? 'project-key-1' : undefined,
     messageThreadId: platform === 'telegram' ? '9001' : undefined,
     topicName: platform === 'telegram' ? 'project-a' : undefined,
+  };
+}
+
+class FakeTelegramTranscriptionProvider implements AudioTranscriptionProvider {
+  readonly id = 'fake-local';
+  calls: AudioTranscriptionInput[] = [];
+
+  constructor(private readonly result: AudioTranscriptionResult) {}
+
+  async transcribe(input: AudioTranscriptionInput): Promise<AudioTranscriptionResult> {
+    this.calls.push(input);
+    return this.result;
+  }
+}
+
+function createVoiceTranscriptionConfig(
+  overrides: Partial<TelegramVoiceTranscriptionConfig> = {},
+): TelegramVoiceTranscriptionConfig {
+  return {
+    enabled: true,
+    provider: 'whisper-cpp',
+    mediaKinds: ['voice'],
+    injectMode: 'transcript-only',
+    fallbackMode: 'attachment-with-diagnostic',
+    timeoutMs: 120000,
+    maxDurationSeconds: 300,
+    maxTranscriptChars: 3500,
+    language: 'auto',
+    prompt: 'preserve languages',
+    ...overrides,
+    preprocess: {
+      mode: overrides.preprocess?.mode ?? 'ffmpeg-wav-auto',
+      binaryPath: overrides.preprocess?.binaryPath ?? '/usr/bin/ffmpeg',
+    },
+    whisperCpp: {
+      binaryPath: overrides.whisperCpp?.binaryPath ?? '/usr/local/bin/whisper-cli',
+      modelPath: overrides.whisperCpp?.modelPath ?? '/models/model-a.bin',
+      threads: overrides.whisperCpp?.threads ?? 0,
+      processors: overrides.whisperCpp?.processors ?? 1,
+      temperature: overrides.whisperCpp?.temperature ?? 0,
+      outputJsonFull: overrides.whisperCpp?.outputJsonFull ?? false,
+    },
   };
 }
 
@@ -664,6 +726,7 @@ describe('startReplyListener', () => {
     const originalCodexHome = process.env.CODEX_HOME;
     const originalEntryPath = process.env[OMX_ENTRY_PATH_ENV];
     const originalStartupCwd = process.env[OMX_STARTUP_CWD_ENV];
+    const originalSttEnv = Object.fromEntries(TELEGRAM_VOICE_TRANSCRIPTION_ENV_KEYS.map((key) => [key, process.env[key]]));
     let spawnedEnv: NodeJS.ProcessEnv | undefined;
 
     try {
@@ -671,6 +734,17 @@ describe('startReplyListener', () => {
       process.env.CODEX_HOME = '/tmp/custom-codex-home';
       process.env[OMX_ENTRY_PATH_ENV] = '/tmp/codex-native-hook.js';
       delete process.env[OMX_STARTUP_CWD_ENV];
+      process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_ENABLED = 'true';
+      process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROVIDER = 'whisper-cpp';
+      process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MODEL = '/models/model.bin';
+      process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_BINARY = '/bin/whisper-cli';
+      process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_LANGUAGE = 'auto';
+      process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROMPT = 'prompt';
+      process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_TIMEOUT_MS = '120000';
+      process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MAX_DURATION_SECONDS = '300';
+      process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_INJECT_MODE = 'transcript-only';
+      process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_FFMPEG_BINARY = '/bin/ffmpeg';
+      process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_COMMAND = 'unsafe command string';
 
       const response = startReplyListener(createBaseConfig(), {
         ensureStateDirImpl: () => {},
@@ -694,6 +768,17 @@ describe('startReplyListener', () => {
       assert.match(spawnedEnv?.[OMX_ENTRY_PATH_ENV] ?? '', /dist\/cli\/omx\.js$/);
       assert.notEqual(spawnedEnv?.[OMX_ENTRY_PATH_ENV], '/tmp/codex-native-hook.js');
       assert.equal(spawnedEnv?.[OMX_STARTUP_CWD_ENV], process.cwd());
+      assert.equal(spawnedEnv?.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_ENABLED, 'true');
+      assert.equal(spawnedEnv?.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROVIDER, 'whisper-cpp');
+      assert.equal(spawnedEnv?.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MODEL, '/models/model.bin');
+      assert.equal(spawnedEnv?.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_BINARY, '/bin/whisper-cli');
+      assert.equal(spawnedEnv?.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_LANGUAGE, 'auto');
+      assert.equal(spawnedEnv?.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROMPT, 'prompt');
+      assert.equal(spawnedEnv?.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_TIMEOUT_MS, '120000');
+      assert.equal(spawnedEnv?.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MAX_DURATION_SECONDS, '300');
+      assert.equal(spawnedEnv?.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_INJECT_MODE, 'transcript-only');
+      assert.equal(spawnedEnv?.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_FFMPEG_BINARY, '/bin/ffmpeg');
+      assert.equal(spawnedEnv?.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_COMMAND, undefined);
     } finally {
       if (typeof originalNotifyProfile === 'string') process.env.OMX_NOTIFY_PROFILE = originalNotifyProfile;
       else delete process.env.OMX_NOTIFY_PROFILE;
@@ -703,6 +788,11 @@ describe('startReplyListener', () => {
       else delete process.env[OMX_ENTRY_PATH_ENV];
       if (typeof originalStartupCwd === 'string') process.env[OMX_STARTUP_CWD_ENV] = originalStartupCwd;
       else delete process.env[OMX_STARTUP_CWD_ENV];
+      for (const key of TELEGRAM_VOICE_TRANSCRIPTION_ENV_KEYS) {
+        const original = originalSttEnv[key];
+        if (typeof original === 'string') process.env[key] = original;
+        else delete process.env[key];
+      }
     }
   });
 
@@ -2144,7 +2234,11 @@ describe('pollTelegramOnce', () => {
     const state = createBaseState();
     const attachmentRoot = await mkdtemp(join(tmpdir(), 'omx-telegram-attachments-'));
     const previousAttachmentDir = process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
+    const originalSttEnv = Object.fromEntries(TELEGRAM_VOICE_TRANSCRIPTION_ENV_KEYS.map((key) => [key, process.env[key]]));
     process.env.OMX_TELEGRAM_ATTACHMENT_DIR = attachmentRoot;
+    for (const key of TELEGRAM_VOICE_TRANSCRIPTION_ENV_KEYS) {
+      delete process.env[key];
+    }
     let injectedText = '';
 
     try {
@@ -2229,6 +2323,176 @@ describe('pollTelegramOnce', () => {
       assert.match(injectedText, /777-334-2-audio\.mp3 \(audio, audio\/mpeg, 42s, 6 bytes, name=note\.mp3\)/);
       assert.match(injectedText, /777-334-3-voice\.ogg \(voice, audio\/ogg, 5s, 7 bytes\)/);
       assert.doesNotMatch(injectedText, /transcri/i);
+      assert.equal(state.messagesInjected, 1);
+    } finally {
+      if (previousAttachmentDir === undefined) {
+        delete process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
+      } else {
+        process.env.OMX_TELEGRAM_ATTACHMENT_DIR = previousAttachmentDir;
+      }
+      for (const key of TELEGRAM_VOICE_TRANSCRIPTION_ENV_KEYS) {
+        const original = originalSttEnv[key];
+        if (typeof original === 'string') process.env[key] = original;
+        else delete process.env[key];
+      }
+      await rm(attachmentRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('injects Telegram voice transcript text when local transcription is enabled', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig({
+      telegramVoiceTranscription: createVoiceTranscriptionConfig(),
+    });
+    const state = createBaseState();
+    const attachmentRoot = await mkdtemp(join(tmpdir(), 'omx-telegram-voice-transcript-'));
+    const previousAttachmentDir = process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
+    process.env.OMX_TELEGRAM_ATTACHMENT_DIR = attachmentRoot;
+    const provider = new FakeTelegramTranscriptionProvider({
+      ok: true,
+      providerId: 'fake-local',
+      transcript: 'привет hello bonjour',
+    });
+    let injectedText = '';
+
+    try {
+      await pollTelegramOnce(
+        config,
+        state,
+        new RateLimiter(10),
+        {
+          httpsRequestImpl: createHttpsRequestMock({
+            [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: [
+                  {
+                    update_id: 246,
+                    message: {
+                      message_id: 534,
+                      message_thread_id: 9001,
+                      chat: { id: 777 },
+                      from: { id: 'telegram-user-1' },
+                      voice: {
+                        file_id: 'voice-file',
+                        file_unique_id: 'voice-unique-transcript',
+                        mime_type: 'audio/ogg',
+                        duration: 5,
+                        file_size: 7,
+                      },
+                      reply_to_message: { message_id: 222 },
+                    },
+                  },
+                ],
+              },
+            }),
+            [`GET /bot${config.telegramBotToken}/getFile?file_id=voice-file`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: { file_path: 'voice/file.ogg', file_size: 7 } },
+            }),
+            [`GET /file/bot${config.telegramBotToken}/voice/file.ogg`]: () => ({ statusCode: 200, body: 'voice!!' }),
+            [`POST /bot${config.telegramBotToken}/sendMessage`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: { message_id: 546 } },
+            }),
+          }),
+          lookupByMessageIdImpl: () => createMapping('telegram'),
+          telegramTranscriptionProvider: provider,
+          injectReplyImpl: (_paneId, text, platform) => {
+            assert.equal(platform, 'telegram');
+            injectedText = text;
+            return true;
+          },
+        },
+      );
+
+      assert.equal(provider.calls.length, 1);
+      assert.match(injectedText, /привет hello bonjour/);
+      assert.doesNotMatch(injectedText, /777-534-1-voice\.ogg/);
+      assert.equal(state.messagesInjected, 1);
+    } finally {
+      if (previousAttachmentDir === undefined) {
+        delete process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
+      } else {
+        process.env.OMX_TELEGRAM_ATTACHMENT_DIR = previousAttachmentDir;
+      }
+      await rm(attachmentRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to Telegram voice attachment path and diagnostic when transcription fails', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig({
+      telegramVoiceTranscription: createVoiceTranscriptionConfig(),
+    });
+    const state = createBaseState();
+    const attachmentRoot = await mkdtemp(join(tmpdir(), 'omx-telegram-voice-transcript-failure-'));
+    const previousAttachmentDir = process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
+    process.env.OMX_TELEGRAM_ATTACHMENT_DIR = attachmentRoot;
+    const provider = new FakeTelegramTranscriptionProvider({
+      ok: false,
+      providerId: 'fake-local',
+      code: 'process-failed',
+      message: 'local whisper failed',
+    });
+    let injectedText = '';
+
+    try {
+      await pollTelegramOnce(
+        config,
+        state,
+        new RateLimiter(10),
+        {
+          httpsRequestImpl: createHttpsRequestMock({
+            [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: [
+                  {
+                    update_id: 247,
+                    message: {
+                      message_id: 535,
+                      message_thread_id: 9001,
+                      chat: { id: 777 },
+                      from: { id: 'telegram-user-1' },
+                      voice: {
+                        file_id: 'voice-file',
+                        file_unique_id: 'voice-unique-failure',
+                        mime_type: 'audio/ogg',
+                        duration: 5,
+                        file_size: 7,
+                      },
+                      reply_to_message: { message_id: 222 },
+                    },
+                  },
+                ],
+              },
+            }),
+            [`GET /bot${config.telegramBotToken}/getFile?file_id=voice-file`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: { file_path: 'voice/file.ogg', file_size: 7 } },
+            }),
+            [`GET /file/bot${config.telegramBotToken}/voice/file.ogg`]: () => ({ statusCode: 200, body: 'voice!!' }),
+            [`POST /bot${config.telegramBotToken}/sendMessage`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: { message_id: 547 } },
+            }),
+          }),
+          lookupByMessageIdImpl: () => createMapping('telegram'),
+          telegramTranscriptionProvider: provider,
+          injectReplyImpl: (_paneId, text, platform) => {
+            assert.equal(platform, 'telegram');
+            injectedText = text;
+            return true;
+          },
+        },
+      );
+
+      assert.match(injectedText, /777-535-1-voice\.ogg/);
+      assert.match(injectedText, /Telegram voice transcription failed:/);
+      assert.match(injectedText, /voice#1: local whisper failed/);
       assert.equal(state.messagesInjected, 1);
     } finally {
       if (previousAttachmentDir === undefined) {
@@ -2706,6 +2970,114 @@ describe('pollTelegramOnce', () => {
       assert.match(origin?.injectedInput ?? '', /777-351-1-photo\.jpg/);
       assert.equal(state.messagesInjected, 1);
       assert.equal(state.telegramLastUpdateId, 61);
+    } finally {
+      if (previousAttachmentDir === undefined) {
+        delete process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
+      } else {
+        process.env.OMX_TELEGRAM_ATTACHMENT_DIR = previousAttachmentDir;
+      }
+      await rm(attachmentRoot, { recursive: true, force: true });
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('launches a Telegram project topic with voice transcript text', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig({
+      telegramVoiceTranscription: createVoiceTranscriptionConfig(),
+    });
+    const state = createBaseState();
+    const telegramSource = buildTelegramReplySource(config.telegramBotToken!, config.telegramChatId!);
+    const attachmentRoot = await mkdtemp(join(tmpdir(), 'omx-telegram-topic-voice-attachments-'));
+    const projectRoot = await mkdtemp(join(tmpdir(), 'omx-telegram-topic-voice-project-'));
+    const previousAttachmentDir = process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
+    process.env.OMX_TELEGRAM_ATTACHMENT_DIR = attachmentRoot;
+    const submittedPrompts: Array<{ paneId: string; text: string }> = [];
+    const provider = new FakeTelegramTranscriptionProvider({
+      ok: true,
+      providerId: 'fake-local',
+      transcript: 'topic voice transcript',
+    });
+
+    try {
+      await pollTelegramOnce(
+        config,
+        state,
+        new RateLimiter(10),
+        {
+          httpsRequestImpl: createHttpsRequestMock({
+            [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%5D`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: [
+                  {
+                    update_id: 261,
+                    message: {
+                      message_id: 551,
+                      message_thread_id: 9001,
+                      chat: { id: 777, type: 'supergroup' },
+                      from: { id: 'telegram-user-1' },
+                      voice: {
+                        file_id: 'topic-voice',
+                        file_unique_id: 'topic-voice-unique',
+                        mime_type: 'audio/ogg',
+                        duration: 5,
+                        file_size: 8,
+                      },
+                    },
+                  },
+                ],
+              },
+            }),
+            [`GET /bot${config.telegramBotToken}/getFile?file_id=topic-voice`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: { file_path: 'voice/topic.ogg', file_size: 8 } },
+            }),
+            [`GET /file/bot${config.telegramBotToken}/voice/topic.ogg`]: () => ({ statusCode: 200, body: 'topicvox' }),
+            [`POST /bot${config.telegramBotToken}/sendMessage`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: { message_id: 652, message_thread_id: 9001 } },
+            }),
+          }),
+          getNotificationConfigImpl: () => ({
+            enabled: true,
+            telegram: {
+              enabled: true,
+              botToken: config.telegramBotToken,
+              chatId: config.telegramChatId,
+              projectTopics: { enabled: true },
+            },
+          }) as any,
+          findTopicRecordByThreadIdImpl: async () => ({
+            sourceChatKey: telegramSource.key,
+            projectKey: 'project-key-1',
+            canonicalProjectPath: projectRoot,
+            displayName: 'worktree-a',
+            topicName: 'worktree-a',
+            messageThreadId: '9001',
+          }),
+          launchDetachedManagedSessionImpl: async () => ({
+            sessionId: 'omx-topic-session-voice',
+            tmuxSessionName: 'omx-worktree-a-main',
+            leaderPaneId: '%91',
+            cwd: projectRoot,
+          }),
+          waitForCodexPaneReadyImpl: () => true,
+          submitPromptToCodexPaneImpl: async (paneId, text) => {
+            submittedPrompts.push({ paneId, text });
+            return true;
+          },
+          registerMessageImpl: () => true,
+          telegramTranscriptionProvider: provider,
+        },
+      );
+
+      assert.equal(provider.calls.length, 1);
+      assert.equal(submittedPrompts[0]?.text, 'topic voice transcript');
+      assert.doesNotMatch(submittedPrompts[0]?.text ?? '', /777-551-1-voice\.ogg/);
+      assert.equal(state.messagesInjected, 1);
+      assert.equal(state.telegramLastUpdateId, 261);
     } finally {
       if (previousAttachmentDir === undefined) {
         delete process.env.OMX_TELEGRAM_ATTACHMENT_DIR;
@@ -3751,8 +4123,15 @@ describe('pollTelegramOnce', () => {
 
   it('does not download media for rate-limited Telegram replies', async () => {
     resetReplyListenerTransientState();
-    const config = createBaseConfig();
+    const config = createBaseConfig({
+      telegramVoiceTranscription: createVoiceTranscriptionConfig(),
+    });
     const state = createBaseState();
+    const provider = new FakeTelegramTranscriptionProvider({
+      ok: true,
+      providerId: 'fake-local',
+      transcript: 'should not run',
+    });
     const blockedRateLimiter: ReplyListenerRateLimiter = {
       canProceed: () => false,
       reset: () => {},
@@ -3776,8 +4155,8 @@ describe('pollTelegramOnce', () => {
                     message_thread_id: 9001,
                     chat: { id: 777 },
                     from: { id: 'telegram-user-1' },
-                    caption: 'rate limited screenshot',
-                    photo: [{ file_id: 'must-not-download', width: 100, height: 100, file_size: 5 }],
+                    caption: 'rate limited voice',
+                    voice: { file_id: 'must-not-download', mime_type: 'audio/ogg', duration: 5, file_size: 5 },
                     reply_to_message: { message_id: 222 },
                   },
                 },
@@ -3786,6 +4165,7 @@ describe('pollTelegramOnce', () => {
           }),
         }),
         lookupByMessageIdImpl: () => createMapping('telegram'),
+        telegramTranscriptionProvider: provider,
         injectReplyImpl: () => {
           throw new Error('injectReply should not run when rate-limited');
         },
@@ -3795,6 +4175,7 @@ describe('pollTelegramOnce', () => {
     assert.equal(state.messagesInjected, 0);
     assert.equal(state.errors, 1);
     assert.equal(state.telegramLastUpdateId, null);
+    assert.equal(provider.calls.length, 0);
   });
 
   it('does not download media for Telegram status probes', async () => {

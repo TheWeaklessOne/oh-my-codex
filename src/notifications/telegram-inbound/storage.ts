@@ -76,6 +76,7 @@ export async function saveTelegramMedia(options: SaveTelegramMediaOptions): Prom
     metadataPath,
     bytes: options.bytes.length,
     sourceKey: options.sourceKey,
+    ...(options.part.fileUniqueId ? { fileUniqueId: options.part.fileUniqueId } : {}),
     ...(options.message.messageId !== undefined ? { messageId: options.message.messageId } : {}),
     ...(options.message.chatId !== undefined ? { chatId: options.message.chatId } : {}),
     ...(options.message.messageThreadId !== undefined ? { messageThreadId: options.message.messageThreadId } : {}),

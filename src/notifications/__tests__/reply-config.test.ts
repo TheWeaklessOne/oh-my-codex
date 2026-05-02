@@ -20,6 +20,16 @@ const ENV_KEYS = [
   'OMX_REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS',
   'OMX_REPLY_TELEGRAM_ALLOWED_UPDATES',
   'OMX_REPLY_TELEGRAM_STARTUP_BACKLOG',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_ENABLED',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROVIDER',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MODEL',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_BINARY',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_LANGUAGE',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROMPT',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_TIMEOUT_MS',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MAX_DURATION_SECONDS',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_INJECT_MODE',
+  'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_FFMPEG_BINARY',
 ] as const;
 
 let codexHomeDir = '';
@@ -148,5 +158,107 @@ describe('getReplyConfig validation', () => {
     assert.equal(config.telegramPollTimeoutSeconds, 30);
     assert.deepEqual(config.telegramAllowedUpdates, ['message']);
     assert.equal(config.telegramStartupBacklogPolicy, 'resume');
+    assert.equal(config.telegramVoiceTranscription?.enabled, false);
+    assert.equal(config.telegramVoiceTranscription?.provider, 'whisper-cpp');
+    assert.deepEqual(config.telegramVoiceTranscription?.mediaKinds, ['voice']);
+  });
+
+  it('parses Telegram voice transcription config and explicit env overrides', async () => {
+    const configFile = join(codexHomeDir, '.omx-config.json');
+    await writeFile(configFile, JSON.stringify({
+      notifications: {
+        enabled: true,
+        telegram: {
+          enabled: true,
+          botToken: '123456:telegram-token',
+          chatId: '777',
+        },
+        reply: {
+          enabled: true,
+          authorizedTelegramUserIds: ['4003'],
+          telegramVoiceTranscription: {
+            enabled: true,
+            provider: 'whisper-cpp',
+            mediaKinds: ['voice', 'document', 'audio'],
+            injectMode: 'transcript-with-attachment',
+            fallbackMode: 'attachment-with-diagnostic',
+            timeoutMs: 1000,
+            maxDurationSeconds: 10,
+            maxTranscriptChars: 900,
+            language: 'ru',
+            prompt: 'config prompt',
+            preprocess: {
+              mode: 'ffmpeg-wav-required',
+              binaryPath: 'cfg-ffmpeg',
+            },
+            whisperCpp: {
+              binaryPath: 'cfg-whisper',
+              modelPath: '/cfg/model.bin',
+              threads: 4,
+              processors: 2,
+              temperature: 0,
+              outputJsonFull: true,
+            },
+          },
+        },
+      },
+    }, null, 2));
+
+    process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MODEL = '/env/model.bin';
+    process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_BINARY = '/usr/local/bin/whisper-cli';
+    process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_LANGUAGE = 'auto';
+    process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_PROMPT = 'env prompt';
+    process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_TIMEOUT_MS = '120000';
+    process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MAX_DURATION_SECONDS = '300';
+    process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_INJECT_MODE = 'transcript-only';
+    process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_FFMPEG_BINARY = '/opt/homebrew/bin/ffmpeg';
+
+    const { getReplyConfig } = await importConfigFresh();
+    const config = getReplyConfig();
+    assert.ok(config);
+    assert.equal(config.telegramVoiceTranscription?.enabled, true);
+    assert.equal(config.telegramVoiceTranscription?.provider, 'whisper-cpp');
+    assert.deepEqual(config.telegramVoiceTranscription?.mediaKinds, ['voice', 'audio']);
+    assert.equal(config.telegramVoiceTranscription?.injectMode, 'transcript-only');
+    assert.equal(config.telegramVoiceTranscription?.timeoutMs, 120000);
+    assert.equal(config.telegramVoiceTranscription?.maxDurationSeconds, 300);
+    assert.equal(config.telegramVoiceTranscription?.maxTranscriptChars, 900);
+    assert.equal(config.telegramVoiceTranscription?.language, 'auto');
+    assert.equal(config.telegramVoiceTranscription?.prompt, 'env prompt');
+    assert.equal(config.telegramVoiceTranscription?.preprocess.mode, 'ffmpeg-wav-required');
+    assert.equal(config.telegramVoiceTranscription?.preprocess.binaryPath, '/opt/homebrew/bin/ffmpeg');
+    assert.equal(config.telegramVoiceTranscription?.whisperCpp.binaryPath, '/usr/local/bin/whisper-cli');
+    assert.equal(config.telegramVoiceTranscription?.whisperCpp.modelPath, '/env/model.bin');
+    assert.equal(config.telegramVoiceTranscription?.whisperCpp.threads, 4);
+    assert.equal(config.telegramVoiceTranscription?.whisperCpp.processors, 2);
+    assert.equal(config.telegramVoiceTranscription?.whisperCpp.outputJsonFull, true);
+  });
+
+  it('keeps enabled transcription soft-failing when whisper.cpp model path is missing', async () => {
+    const configFile = join(codexHomeDir, '.omx-config.json');
+    await writeFile(configFile, JSON.stringify({
+      notifications: {
+        enabled: true,
+        telegram: {
+          enabled: true,
+          botToken: '123456:telegram-token',
+          chatId: '777',
+        },
+        reply: {
+          enabled: true,
+          telegramVoiceTranscription: {
+            enabled: true,
+            provider: 'whisper-cpp',
+          },
+        },
+      },
+    }, null, 2));
+
+    const { getReplyConfig } = await importConfigFresh();
+    const config = getReplyConfig();
+    assert.ok(config);
+    assert.equal(config.telegramVoiceTranscription?.enabled, true);
+    assert.equal(config.telegramVoiceTranscription?.whisperCpp.modelPath, undefined);
+    assert.match(config.telegramVoiceTranscription?.warnings?.join('\n') ?? '', /modelPath is required/);
   });
 });

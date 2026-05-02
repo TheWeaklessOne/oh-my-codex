@@ -119,6 +119,7 @@ export interface SavedTelegramMedia {
   metadataPath: string;
   bytes: number;
   sourceKey: string;
+  fileUniqueId?: string;
   messageId?: number | string;
   chatId?: number | string;
   messageThreadId?: number | string;
@@ -130,12 +131,38 @@ export interface SavedTelegramMedia {
   title?: string;
   performer?: string;
   telegramFilePath?: string;
+  transcription?: SavedTelegramMediaTranscription;
 }
 
 export interface FailedTelegramMedia {
   part: TelegramMediaPart;
   reason: string;
 }
+
+export interface SavedTelegramMediaTranscriptionSuccess {
+  status: 'success';
+  providerId: string;
+  transcript: string;
+  language?: string;
+  durationMs?: number;
+  fromCache?: boolean;
+  cachePath?: string;
+  metadataPath?: string;
+}
+
+export interface SavedTelegramMediaTranscriptionFailure {
+  status: 'failed';
+  providerId: string;
+  code: string;
+  message: string;
+  durationMs?: number;
+  cachePath?: string;
+  metadataPath?: string;
+}
+
+export type SavedTelegramMediaTranscription =
+  | SavedTelegramMediaTranscriptionSuccess
+  | SavedTelegramMediaTranscriptionFailure;
 
 export interface TelegramPromptInput {
   message: TelegramInboundMessage;
