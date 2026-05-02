@@ -86,6 +86,7 @@ async function buildFilePart(boundary: string, upload: TelegramLocalFileUpload):
       `Content-Disposition: form-data; name="${upload.fieldName}"; filename="${filename}"`,
       `Content-Type: ${contentType}`,
       "",
+      "",
     ].join("\r\n"), "utf-8"),
     file,
     Buffer.from("\r\n", "utf-8"),

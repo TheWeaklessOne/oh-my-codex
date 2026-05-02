@@ -763,6 +763,7 @@ describe('sendTelegram', () => {
               assert.ok(body.includes('name="message_thread_id"\r\n\r\n9001'));
               assert.ok(body.includes('name="reply_to_message_id"\r\n\r\n42'));
               assert.match(body, /name="photo"; filename="preview\.png"/);
+              assert.ok(body.includes('Content-Type: image/png\r\n\r\npng\r\n'));
               return {
                 statusCode: 200,
                 body: { ok: true, result: { message_id: 1001, message_thread_id: 9001, is_topic_message: true } },
@@ -830,6 +831,7 @@ describe('sendTelegram', () => {
               assert.doesNotMatch(body, /\r\nX-Injected/);
               assert.match(body, /name="document"; filename="large\.png___X-Injected: 1"/);
               assert.match(body, /Content-Type: application\/octet-stream/);
+              assert.ok(body.includes('Content-Type: application/octet-stream\r\n\r\nlarge\r\n'));
               return {
                 statusCode: 200,
                 body: { ok: true, result: { message_id: 1002 } },
