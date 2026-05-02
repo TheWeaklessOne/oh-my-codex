@@ -197,6 +197,9 @@ Supported model-related keys:
 | `OMX_DEFAULT_SPARK_MODEL` | Spark/fast-lane default for low-cost exploration and low-complexity workers. |
 | `OMX_SPARK_MODEL` | Legacy spark fallback; prefer `OMX_DEFAULT_SPARK_MODEL` for new config. |
 | `OMX_TEAM_CHILD_MODEL` | Default child model for specific team-child paths that read this setting directly. |
+| `OMX_TMUX_SESSION_IDLE_CLEANUP` | Set to `0`, `false`, `no`, or `off` to disable automatic OMX-owned tmux idle cleanup. |
+| `OMX_TMUX_SESSION_IDLE_TTL_MS` | Idle threshold for automatic OMX-owned tmux cleanup. Default: `86400000` (24 hours). |
+| `OMX_TMUX_SESSION_IDLE_INCLUDE_ATTACHED` | Set to `1`, `true`, `yes`, or `on` to allow cleanup of attached sessions. Default cleanup skips attached/current sessions. |
 
 `readConfiguredEnvOverrides()` also passes through other non-empty string values from `env` for launch helpers such as `omx explore` and `omx sparkshell`. Treat those as advanced environment overrides, not a schema for per-role model routing.
 

@@ -423,11 +423,11 @@ describe('cleanupStaleTmpDirectories', () => {
 });
 
 describe('cleanupCommand', () => {
-  it('documents cleanup as process/tmp cleanup rather than actor/session reset', async () => {
-    assert.match(CLI_HELP, /does not reset session\/actor state/);
+  it('documents cleanup as runtime-resource cleanup rather than state reset', async () => {
+    assert.match(CLI_HELP, /does not reset state/);
   });
 
-  it('runs tmp cleanup after orphaned MCP cleanup', async () => {
+  it('runs tmp and tmux cleanup after orphaned MCP cleanup', async () => {
     const calls: string[] = [];
 
     await cleanupCommand(['--dry-run'], {
@@ -445,12 +445,15 @@ describe('cleanupCommand', () => {
         calls.push('tmp');
         return 0;
       },
+      cleanupTmuxSessions: async () => {
+        calls.push('tmux');
+      },
     });
 
-    assert.deepEqual(calls, ['processes', 'tmp']);
+    assert.deepEqual(calls, ['processes', 'tmp', 'tmux']);
   });
 
-  it('skips tmp cleanup when showing help', async () => {
+  it('skips tmp and tmux cleanup when showing help', async () => {
     const calls: string[] = [];
 
     await cleanupCommand(['--help'], {
@@ -467,6 +470,9 @@ describe('cleanupCommand', () => {
       cleanupTmpDirectories: async () => {
         calls.push('tmp');
         return 0;
+      },
+      cleanupTmuxSessions: async () => {
+        calls.push('tmux');
       },
     });
 

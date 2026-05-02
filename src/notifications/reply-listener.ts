@@ -60,6 +60,7 @@ import {
   killDetachedManagedSession,
   launchDetachedManagedSession,
 } from '../cli/managed-session-launch.js';
+import { cleanupStaleOmxTmuxSessions } from '../tmux/stale-session-cleanup.js';
 import {
   detectCodexBlockingPanePrompt,
   submitPromptToCodexPane,
@@ -2732,6 +2733,17 @@ async function pollLoop(): Promise<void> {
   } catch (e) {
     log(`WARN: Failed to prune stale entries: ${e}`);
   }
+  try {
+    const tmuxCleanup = await cleanupStaleOmxTmuxSessions(['--quiet']);
+    if (tmuxCleanup.killed.length > 0) {
+      log(`Closed ${tmuxCleanup.killed.length} idle OMX tmux session(s)`);
+    }
+    if (tmuxCleanup.failed.length > 0) {
+      log(`WARN: Failed to close ${tmuxCleanup.failed.length} idle OMX tmux session(s)`);
+    }
+  } catch (e) {
+    log(`WARN: Tmux idle cleanup failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
 
   while (state.isRunning) {
     try {
@@ -2776,10 +2788,17 @@ async function pollLoop(): Promise<void> {
       if (Date.now() - lastPruneAt > PRUNE_INTERVAL_MS) {
         try {
           pruneStale();
+          const tmuxCleanup = await cleanupStaleOmxTmuxSessions(['--quiet']);
           lastPruneAt = Date.now();
           log('Pruned stale registry entries');
+          if (tmuxCleanup.killed.length > 0) {
+            log(`Closed ${tmuxCleanup.killed.length} idle OMX tmux session(s)`);
+          }
+          if (tmuxCleanup.failed.length > 0) {
+            log(`WARN: Failed to close ${tmuxCleanup.failed.length} idle OMX tmux session(s)`);
+          }
         } catch (e) {
-          log(`WARN: Prune failed: ${e instanceof Error ? e.message : String(e)}`);
+          log(`WARN: Prune/tmux idle cleanup failed: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
 

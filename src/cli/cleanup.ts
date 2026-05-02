@@ -2,16 +2,23 @@ import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from 'child_
 import { readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { cleanupStaleOmxTmuxSessions } from '../tmux/stale-session-cleanup.js';
 
 const HELP = [
   'Usage: omx cleanup [--dry-run]',
   '',
-  'Kill orphaned OMX MCP server processes and remove stale OMX /tmp directories left behind by previous Codex App sessions.',
-  'This is process/tmp cleanup only: it does not reset active session state, actor registries, pending routes, or workflow mode files.',
+  'Kill orphaned OMX MCP server processes, remove stale OMX /tmp directories, and close OMX-owned tmux sessions idle for 24h.',
+  'This is runtime-resource cleanup only: it does not reset active session state, actor registries, pending routes, or workflow mode files.',
   '',
   'Options:',
   '  --dry-run  List matching orphaned processes and stale /tmp directories without removing them',
+  '  --quiet    Suppress no-op tmux idle cleanup status lines',
   '  --help     Show this help message',
+  '',
+  'Environment:',
+  '  OMX_TMUX_SESSION_IDLE_CLEANUP=0 disables tmux idle cleanup',
+  '  OMX_TMUX_SESSION_IDLE_TTL_MS overrides the default 24h idle threshold',
+  '  OMX_TMUX_SESSION_IDLE_INCLUDE_ATTACHED=1 also reaps attached sessions (default: detached only)',
 ].join('\n');
 
 const PROCESS_EXIT_POLL_MS = 100;
@@ -81,6 +88,7 @@ export interface TmpCleanupDependencies {
 export interface CleanupCommandDependencies {
   cleanupProcesses?: (args: readonly string[]) => Promise<CleanupResult>;
   cleanupTmpDirectories?: (args: readonly string[]) => Promise<number>;
+  cleanupTmuxSessions?: (args: readonly string[]) => Promise<unknown>;
 }
 
 type ProcessListCommandRunner = (
@@ -541,8 +549,10 @@ export async function cleanupCommand(
 ): Promise<void> {
   const cleanupProcesses = dependencies.cleanupProcesses ?? cleanupOmxMcpProcesses;
   const cleanupTmpDirectories = dependencies.cleanupTmpDirectories ?? cleanupStaleTmpDirectories;
+  const cleanupTmuxSessions = dependencies.cleanupTmuxSessions ?? cleanupStaleOmxTmuxSessions;
 
   await cleanupProcesses(args);
   if (args.includes('--help') || args.includes('-h')) return;
   await cleanupTmpDirectories(args);
+  await cleanupTmuxSessions(args);
 }

@@ -112,6 +112,7 @@ import {
   parsePaneIdFromTmuxOutput,
 } from "../hud/tmux.js";
 import { buildSetOmxTmuxSessionMarkerArgs } from "../tmux/omx-session-markers.js";
+import { cleanupStaleOmxTmuxSessions } from "../tmux/stale-session-cleanup.js";
 
 export { parseTmuxPaneSnapshot, isHudWatchPane, findHudWatchPaneIds } from "../hud/tmux.js";
 
@@ -174,7 +175,7 @@ Usage:
   omx uninstall Remove OMX configuration and clean up installed artifacts
   omx doctor    Check installation health
   omx list      List packaged OMX skills and native agent prompts (--json)
-  omx cleanup   Kill orphaned OMX MCP server processes and stale /tmp dirs (does not reset session/actor state)
+  omx cleanup   Kill orphaned MCPs, stale /tmp dirs, and idle OMX tmux sessions (does not reset state)
   omx doctor --team  Check team/swarm runtime health diagnostics
   omx ask       Ask local provider CLI (claude|gemini) and write artifact output
   omx question  OMX-owned blocking question UI entrypoint for agent-invoked user questions
@@ -2905,12 +2906,13 @@ export async function reapPostLaunchOrphanedMcpProcesses(
 /**
  * preLaunch: Prepare environment before Codex starts.
  * 1. Best-effort launch-safe orphan cleanup for detached OMX MCP processes
- * 2. Generate runtime overlay + write session-scoped model instructions file
- * 3. Write session.json
+ * 2. Best-effort stale tmux-session cleanup for OMX-owned sessions idle >= 24h
+ * 3. Generate runtime overlay + write session-scoped model instructions file
+ * 4. Write session.json
  *
- * Automatic broad stale-session cleanup remains disabled here. Only detached
- * OMX MCP processes without a live Codex ancestor are reaped so new launches
- * do not accumulate stale processes from prior crashed/closed sessions.
+ * Tmux cleanup is scoped to OMX-owned sessions and skips attached/current
+ * sessions by default, so launch startup can safely reap old detached panes
+ * without resetting active state files.
  */
 async function preLaunch(
   cwd: string,
@@ -2938,7 +2940,24 @@ async function preLaunch(
     // Non-fatal
   }
 
-  // 2. Generate runtime overlay + write session-scoped model instructions file
+  try {
+    const tmuxCleanup = await cleanupStaleOmxTmuxSessions(['--quiet'], { codexHomeOverride });
+    if (tmuxCleanup.killed.length > 0) {
+      console.log(
+        `[omx] Closed ${tmuxCleanup.killed.length} OMX tmux session(s) past the configured idle threshold.`,
+      );
+    }
+    if (tmuxCleanup.failed.length > 0) {
+      console.warn(
+        `[omx] Failed to close ${tmuxCleanup.failed.length} idle OMX tmux session(s); continuing launch.`,
+      );
+    }
+  } catch (err) {
+    logCliOperationFailure(err);
+    // Non-fatal
+  }
+
+  // 3. Generate runtime overlay + write session-scoped model instructions file
   const orchestrationMode = await resolveSessionOrchestrationMode(
     cwd,
     sessionId,
