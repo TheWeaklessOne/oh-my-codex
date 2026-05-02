@@ -324,6 +324,11 @@ async function maybeRegisterReplyMappings(
         r.messageId &&
         (r.platform === "discord-bot" || r.platform === "telegram")
       ) {
+        const messageIds = Array.from(new Set(
+          (r.platform === "telegram" ? [r.messageId, ...(r.messageIds ?? [])] : [r.messageId])
+            .map((messageId) => messageId.trim())
+            .filter(Boolean),
+        ));
         const source = r.platform === "discord-bot"
           ? (config["discord-bot"]?.enabled && config["discord-bot"]?.botToken && config["discord-bot"]?.channelId
               ? buildDiscordReplySource(config["discord-bot"].botToken, config["discord-bot"].channelId)
@@ -331,20 +336,22 @@ async function maybeRegisterReplyMappings(
           : (config.telegram?.enabled && config.telegram?.botToken && config.telegram?.chatId
               ? buildTelegramReplySource(config.telegram.botToken, config.telegram.chatId)
               : undefined);
-        registerMessage({
-          platform: r.platform,
-          messageId: r.messageId,
-          ...(source ? { source } : {}),
-          sessionId: payload.sessionId,
-          tmuxPaneId: payload.tmuxPaneId,
-          tmuxSessionName: payload.tmuxSession || "",
-          event: payload.event,
-          createdAt: new Date().toISOString(),
-          projectPath: payload.projectPath,
-          projectKey: r.projectKey,
-          messageThreadId: r.messageThreadId,
-          topicName: r.topicName,
-        });
+        for (const messageId of messageIds) {
+          registerMessage({
+            platform: r.platform,
+            messageId,
+            ...(source ? { source } : {}),
+            sessionId: payload.sessionId,
+            tmuxPaneId: payload.tmuxPaneId,
+            tmuxSessionName: payload.tmuxSession || "",
+            event: payload.event,
+            createdAt: new Date().toISOString(),
+            projectPath: payload.projectPath,
+            projectKey: r.projectKey,
+            messageThreadId: r.messageThreadId,
+            topicName: r.topicName,
+          });
+        }
       }
     }
   } catch {

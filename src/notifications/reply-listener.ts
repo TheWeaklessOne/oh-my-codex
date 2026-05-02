@@ -60,7 +60,12 @@ import {
   killDetachedManagedSession,
   launchDetachedManagedSession,
 } from '../cli/managed-session-launch.js';
-import { cleanupStaleOmxTmuxSessions } from '../tmux/stale-session-cleanup.js';
+import {
+  cleanupStaleOmxTmuxSessions,
+  OMX_TMUX_SESSION_IDLE_CLEANUP_ENV,
+  OMX_TMUX_SESSION_IDLE_INCLUDE_ATTACHED_ENV,
+  OMX_TMUX_SESSION_IDLE_TTL_MS_ENV,
+} from '../tmux/stale-session-cleanup.js';
 import {
   detectCodexBlockingPanePrompt,
   submitPromptToCodexPane,
@@ -131,6 +136,9 @@ const DAEMON_ENV_ALLOWLIST = [
   'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_MAX_DURATION_SECONDS',
   'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_INJECT_MODE',
   'OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_FFMPEG_BINARY',
+  OMX_TMUX_SESSION_IDLE_CLEANUP_ENV,
+  OMX_TMUX_SESSION_IDLE_TTL_MS_ENV,
+  OMX_TMUX_SESSION_IDLE_INCLUDE_ATTACHED_ENV,
 ] as const;
 
 const DEFAULT_STATE_DIR = join(homedir(), '.omx', 'state');

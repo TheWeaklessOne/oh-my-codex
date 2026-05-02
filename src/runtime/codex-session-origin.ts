@@ -385,7 +385,7 @@ export async function resolveTurnOriginForNotification(
       seenEvidence,
     }).catch(() => null);
     if (rollout) {
-      resolvedTranscriptPath = firstString(resolvedTranscriptPath, rollout.transcriptPath);
+      resolvedTranscriptPath = firstString(rollout.transcriptPath, resolvedTranscriptPath);
       if (rollout.origin.kind !== "unknown") {
         origin = { ...origin, ...rollout.origin };
         sessionMeta = rollout.sessionMeta;

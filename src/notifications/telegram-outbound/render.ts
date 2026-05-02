@@ -132,3 +132,21 @@ export function buildTelegramMediaRequest(
     },
   };
 }
+
+export function buildTelegramPhotoDocumentFallbackRequest(
+  request: TelegramMediaRequest,
+): TelegramMediaRequest | null {
+  if (request.methodName !== "sendPhoto" || !request.localFile) {
+    return null;
+  }
+
+  return {
+    ...request,
+    methodName: "sendDocument",
+    chatAction: "upload_document",
+    localFile: {
+      ...request.localFile,
+      fieldName: "document",
+    },
+  };
+}

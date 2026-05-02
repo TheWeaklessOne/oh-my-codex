@@ -291,6 +291,66 @@ syncBuiltinESMExports();
   return preloadPath;
 }
 
+async function writeTelegramFailingSendMessagePreload(dir: string): Promise<string> {
+  const preloadPath = join(dir, 'mock-telegram-send-message-failure.mjs');
+  await writeFile(preloadPath, `
+import { appendFileSync } from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { PassThrough } from 'node:stream';
+
+const capturePath = process.env.OMX_TELEGRAM_CAPTURE_PATH;
+globalThis.__OMX_TEST_MOCK_TELEGRAM_TRANSPORT__ = 'https-request-capture';
+const require = createRequire(import.meta.url);
+const https = require('node:https');
+
+https.request = (options, callback) => {
+  const listeners = new Map();
+  let requestBody = '';
+  const emit = (event, value) => {
+    for (const handler of listeners.get(event) ?? []) handler(value);
+  };
+  const request = {
+    on(event, handler) {
+      listeners.set(event, [...(listeners.get(event) ?? []), handler]);
+      return request;
+    },
+    write(chunk) {
+      requestBody += Buffer.isBuffer(chunk) ? chunk.toString('utf-8') : chunk;
+      return true;
+    },
+    end() {
+      queueMicrotask(() => {
+        const path = String(options?.path ?? '');
+        if (capturePath) appendFileSync(capturePath, JSON.stringify({ url: path, body: requestBody }) + '\\n');
+        const response = new PassThrough();
+        if (path.includes('/sendMessage')) {
+          response.statusCode = 500;
+          callback?.(response);
+          response.end(JSON.stringify({ ok: false, description: 'telegram send failed' }));
+          return;
+        }
+        response.statusCode = 200;
+        callback?.(response);
+        response.end(JSON.stringify({
+          ok: true,
+          result: { message_id: 321, message_thread_id: 9001, is_topic_message: true },
+        }));
+      });
+      return request;
+    },
+    destroy(error) {
+      if (error) emit('error', error);
+      return request;
+    },
+  };
+  return request;
+};
+
+syncBuiltinESMExports();
+`, 'utf-8');
+  return preloadPath;
+}
+
 async function readCapturedRequests(path: string): Promise<Array<{ url: string; body: string }>> {
   try {
     const raw = await readFile(path, 'utf-8');
@@ -964,6 +1024,86 @@ describe('notify-hook semantic notifications', () => {
       assert.equal(state.terminal?.length, 1);
       assert.equal(state.terminal?.[0]?.status, 'failed');
       assert.match(state.terminal?.[0]?.terminalReason ?? '', /delivery failed|HTTP 500/i);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('marks a Telegram pending route failed even when another enabled transport succeeds', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-pending-route-mixed-failed-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const fetchCapturePath = join(tempRoot, 'captures.ndjson');
+    const telegramCapturePath = join(tempRoot, 'telegram-captures.ndjson');
+    const fetchPreloadPath = await writeFetchCapturePreload(tempRoot);
+    const telegramPreloadPath = await writeTelegramFailingSendMessagePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const sessionId = 'sess-pending-route-mixed-failed';
+    const ownerThreadId = 'thread-pending-route-mixed-failed';
+    const followup = 'Please continue after the mixed failure.';
+
+    try {
+      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
+      await writeNotificationConfig(codexHome, {
+        webhook: { enabled: true },
+        telegram: {
+          enabled: true,
+          botToken: '123456:telegram-token',
+          chatId: '777',
+        },
+      });
+      await writeOwnerSessionState(workdir, sessionId, ownerThreadId);
+      const latestInput = buildExpectedReplyInput(followup, 'telegram');
+      await recordPendingReplyOrigin(workdir, sessionId, {
+        platform: 'telegram',
+        injectedInput: latestInput,
+        createdAt: new Date().toISOString(),
+        telegramReplyTo: { chatId: '777', messageId: '3759' },
+      });
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: sessionId,
+        thread_id: ownerThreadId,
+        turn_id: 'turn-pending-route-mixed-failed',
+        input_messages: [latestInput],
+        last_assistant_message: 'Webhook succeeded, but the Telegram route must fail.',
+      }, {
+        CODEX_HOME: codexHome,
+        HOME: tempRoot,
+        USERPROFILE: tempRoot,
+        OMX_FETCH_CAPTURE_PATH: fetchCapturePath,
+        OMX_TELEGRAM_CAPTURE_PATH: telegramCapturePath,
+        OMX_TEST_MOCK_TELEGRAM_TRANSPORT: '1',
+        NODE_OPTIONS: `--import=${fetchPreloadPath} --import=${telegramPreloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      assert.equal((await readCapturedRequests(fetchCapturePath)).length, 1);
+      assert.equal((await readCapturedRequests(telegramCapturePath)).filter((request) => /sendMessage/.test(request.url)).length, 1);
+      const state = JSON.parse(await readFile(pendingRoutesStatePath(workdir, sessionId), 'utf-8')) as {
+        routes?: Array<unknown>;
+        terminal?: Array<{ status?: string; terminalReason?: string }>;
+      };
+      assert.deepEqual(state.routes, []);
+      assert.equal(state.terminal?.length, 1);
+      assert.equal(state.terminal?.[0]?.status, 'failed');
+      assert.match(state.terminal?.[0]?.terminalReason ?? '', /telegram send failed|HTTP 500/i);
+
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      assert.ok(entries.some((entry) =>
+        entry.type === 'completed_turn_delivery_failed'
+        && entry.turn_id === 'turn-pending-route-mixed-failed'
+        && Array.isArray(entry.notification_results)
+        && entry.notification_results.some((transport: { platform?: string; success?: boolean }) =>
+          transport.platform === 'telegram' && transport.success === false
+        )
+      ));
+      assert.equal(entries.some((entry) =>
+        entry.type === 'completed_turn_delivery_sent'
+        && entry.turn_id === 'turn-pending-route-mixed-failed'
+      ), false);
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }

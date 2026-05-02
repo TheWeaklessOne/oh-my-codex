@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -204,7 +204,7 @@ describe('completed-turn rich delivery envelope', () => {
         JSON.stringify({
           parts: [
             { kind: 'photo', path: photoPath, caption: 'Preview' },
-            { kind: 'document', path: documentPath, filename: 'report.pdf', caption: 'Report' },
+            { kind: 'document', path: documentPath, filename: 'report.pdf', caption: 'Report', mimeType: 'application/pdf' },
           ],
         }),
         '```',
@@ -213,9 +213,47 @@ describe('completed-turn rich delivery envelope', () => {
 
     assert.equal(envelope.visibleText, 'Here are the deliverables.');
     assert.equal(envelope.parts.length, 3);
-    assert.equal(envelope.parts[0]?.kind, 'text');
-    assert.equal(envelope.parts[1]?.kind, 'photo');
-    assert.equal(envelope.parts[2]?.kind, 'document');
+    assert.deepEqual(envelope.parts[0], {
+      kind: 'text',
+      text: 'Here are the deliverables.',
+      format: 'markdown',
+    });
+    assert.deepEqual(envelope.parts[1], {
+      kind: 'photo',
+      source: { type: 'local_path', path: photoPath, trust: 'manifest' },
+      caption: 'Preview',
+    });
+    assert.deepEqual(envelope.parts[2], {
+      kind: 'document',
+      source: { type: 'local_path', path: documentPath, trust: 'manifest' },
+      filename: 'report.pdf',
+      caption: 'Report',
+      mimeType: 'application/pdf',
+    });
+  });
+
+  it('rejects explicit manifest paths when the default project artifact root is symlinked outside the project', async () => {
+    const projectPath = join(tempRoot, 'repo-symlink-root');
+    const omxDir = join(projectPath, '.omx');
+    const externalRoot = join(tempRoot, 'external-artifacts');
+    await mkdir(omxDir, { recursive: true });
+    await mkdir(externalRoot, { recursive: true });
+    await symlink(externalRoot, join(omxDir, 'artifacts'));
+    const externalPath = join(externalRoot, 'secret.txt');
+    await writeFile(externalPath, 'do not upload');
+
+    const envelope = await buildCompletedTurnDeliveryEnvelope({
+      projectPath,
+      assistantText: [
+        '```omx-delivery',
+        JSON.stringify({ parts: [{ kind: 'document', path: join(projectPath, '.omx', 'artifacts', 'secret.txt') }] }),
+        '```',
+      ].join('\n'),
+    });
+
+    assert.equal(hasDeliverableContent(envelope), false);
+    assert.deepEqual(envelope.parts, []);
+    assert.ok(envelope.warnings.includes('local-path-outside-trusted-artifact-roots'));
   });
 
   it('rejects explicit local manifest paths outside trusted artifact roots', async () => {

@@ -787,6 +787,130 @@ describe('sendTelegram', () => {
     }
   });
 
+  it('falls back to sendDocument when Telegram rejects a local sendPhoto payload as invalid', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+    };
+    const tempDir = await mkdtemp(join(tmpdir(), 'omx-dispatcher-photo-document-retry-'));
+    const photoPath = join(tempDir, 'preview.png');
+    await import('node:fs/promises').then(({ writeFile }) => writeFile(photoPath, Buffer.from('png')));
+    const requestOrder: string[] = [];
+
+    try {
+      const result = await sendTelegram(
+        config,
+        {
+          ...basePayload,
+          message: '',
+          richContent: {
+            visibleText: '',
+            parts: [
+              { kind: 'photo', source: { type: 'local_path', path: photoPath, trust: 'turn-artifact' } },
+            ],
+          },
+        },
+        {
+          resolveTelegramDestinationImpl: async () => ({
+            chatId: '777',
+            sourceChatKey: 'telegram:123456:777',
+            messageThreadId: '9001',
+          }),
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendChatAction`]: () => {
+              requestOrder.push('sendChatAction');
+              return { statusCode: 200, body: { ok: true, result: true } };
+            },
+            [`POST /bot${config.botToken}/sendPhoto`]: () => {
+              requestOrder.push('sendPhoto');
+              return {
+                statusCode: 400,
+                body: {
+                  ok: false,
+                  error_code: 400,
+                  description: 'Bad Request: PHOTO_INVALID_DIMENSIONS',
+                },
+              };
+            },
+            [`POST /bot${config.botToken}/sendDocument`]: (body) => {
+              requestOrder.push('sendDocument');
+              assert.match(body, /name="document"; filename="preview\.png"/);
+              assert.ok(body.includes('name="message_thread_id"\r\n\r\n9001'));
+              return {
+                statusCode: 200,
+                body: { ok: true, result: { message_id: 1003, message_thread_id: 9001 } },
+              };
+            },
+          }),
+        },
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.messageId, '1003');
+      assert.deepEqual(requestOrder, ['sendChatAction', 'sendPhoto', 'sendDocument']);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not upload rich media when Telegram rich replies are disabled in the effective config', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      richReplies: { enabled: false },
+    };
+    const tempDir = await mkdtemp(join(tmpdir(), 'omx-dispatcher-rich-disabled-'));
+    const photoPath = join(tempDir, 'preview.png');
+    await import('node:fs/promises').then(({ writeFile }) => writeFile(photoPath, Buffer.from('png')));
+    const requestOrder: string[] = [];
+
+    try {
+      const result = await sendTelegram(
+        config,
+        {
+          ...basePayload,
+          message: 'Text fallback only',
+          richContent: {
+            visibleText: 'Text fallback only',
+            parts: [
+              { kind: 'text', text: 'Text fallback only', format: 'plain' },
+              { kind: 'photo', source: { type: 'local_path', path: photoPath, trust: 'turn-artifact' } },
+            ],
+          },
+        },
+        {
+          resolveTelegramDestinationImpl: async () => ({
+            chatId: '777',
+            sourceChatKey: 'telegram:123456:777',
+          }),
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+              requestOrder.push('sendMessage');
+              const parsed = JSON.parse(body) as { text?: string };
+              assert.equal(parsed.text, 'Text fallback only');
+              return {
+                statusCode: 200,
+                body: { ok: true, result: { message_id: 1004 } },
+              };
+            },
+            [`POST /bot${config.botToken}/sendPhoto`]: () => {
+              requestOrder.push('sendPhoto');
+              return { statusCode: 500, body: { ok: false, description: 'should not upload' } };
+            },
+          }),
+        },
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.messageId, '1004');
+      assert.deepEqual(requestOrder, ['sendMessage']);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('sends rich document fallback payloads with sendDocument', async () => {
     const config: TelegramNotificationConfig = {
       enabled: true,
@@ -3160,6 +3284,47 @@ describe('getEffectivePlatformConfig', () => {
       fallbackToGeneral: false,
       naming: 'projectNameWithHash',
       createFailureCooldownMs: 60_000,
+    });
+  });
+
+  it('deep-merges nested event-level Telegram richReplies overrides', () => {
+    const merged = getEffectivePlatformConfig<TelegramNotificationConfig>(
+      'telegram',
+      {
+        enabled: true,
+        telegram: {
+          enabled: true,
+          botToken: 'top-token',
+          chatId: 'top-chat',
+          richReplies: {
+            enabled: false,
+            maxPhotoBytes: 1024,
+            maxUploadBytes: 2048,
+          },
+        },
+        events: {
+          'result-ready': {
+            enabled: true,
+            telegram: {
+              enabled: true,
+              botToken: 'event-token',
+              chatId: 'event-chat',
+              richReplies: {
+                enabled: true,
+                maxPhotoBytes: 4096,
+              },
+            },
+          },
+        },
+      },
+      'result-ready',
+    );
+
+    assert.ok(merged);
+    assert.deepEqual(merged?.richReplies, {
+      enabled: true,
+      maxPhotoBytes: 4096,
+      maxUploadBytes: 2048,
     });
   });
 });

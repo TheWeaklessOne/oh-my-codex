@@ -38,6 +38,11 @@ interface NormalizedLocalFile {
   extension: string;
 }
 
+interface TrustedArtifactRoot {
+  path: string;
+  boundaryPath?: string;
+}
+
 interface ManifestExtractionResult {
   visibleText: string;
   rawManifests: string[];
@@ -141,44 +146,79 @@ function codexHomeRoots(env: NodeJS.ProcessEnv = process.env): string[] {
   ]);
 }
 
-function generatedImageRoots(input: BuildCompletedTurnDeliveryEnvelopeInput): string[] {
+function generatedImageRoots(input: BuildCompletedTurnDeliveryEnvelopeInput): TrustedArtifactRoot[] {
   const ids = unique([
     safeString(input.threadId),
     safeString(input.sessionId),
   ]);
   const codexRoots = codexHomeRoots(input.env).flatMap((root) =>
-    ids.map((id) => join(root, "generated_images", id))
+    ids.map((id) => ({
+      path: join(root, "generated_images", id),
+      boundaryPath: root,
+    }))
   );
   const projectArtifactRoots = input.projectPath
-    ? ids.map((id) => join(input.projectPath!, ".omx", "artifacts", id))
+    ? ids.map((id) => ({
+      path: join(input.projectPath!, ".omx", "artifacts", id),
+      boundaryPath: input.projectPath!,
+    }))
     : [];
-  return unique([...codexRoots, ...projectArtifactRoots]);
+  return dedupeTrustedRoots([...codexRoots, ...projectArtifactRoots]);
 }
 
-function explicitArtifactRoots(input: BuildCompletedTurnDeliveryEnvelopeInput): string[] {
+function explicitArtifactRoots(input: BuildCompletedTurnDeliveryEnvelopeInput): TrustedArtifactRoot[] {
   const configured = input.telegramRichRepliesConfig?.allowedArtifactRoots ?? [];
   const configuredRoots = configured.map((entry) =>
     isAbsolute(entry)
-      ? entry
+      ? { path: entry }
       : input.projectPath
-        ? join(input.projectPath, entry)
-        : ""
+        ? { path: join(input.projectPath, entry), boundaryPath: input.projectPath }
+        : { path: "" }
   );
-  return unique([
+  return dedupeTrustedRoots([
     ...generatedImageRoots(input),
-    ...(input.projectPath ? [join(input.projectPath, ".omx", "artifacts")] : []),
+    ...(input.projectPath
+      ? [{ path: join(input.projectPath, ".omx", "artifacts"), boundaryPath: input.projectPath }]
+      : []),
     ...configuredRoots,
   ]);
 }
 
-async function isPathInsideRoot(path: string, root: string): Promise<boolean> {
-  if (!path || !root || !existsSync(root)) return false;
+function dedupeTrustedRoots(roots: readonly TrustedArtifactRoot[]): TrustedArtifactRoot[] {
+  const seen = new Set<string>();
+  const result: TrustedArtifactRoot[] = [];
+  for (const root of roots) {
+    const normalizedPath = safeString(root.path);
+    if (!normalizedPath) continue;
+    const key = `${resolve(normalizedPath)}\0${root.boundaryPath ? resolve(root.boundaryPath) : ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({
+      path: normalizedPath,
+      ...(root.boundaryPath ? { boundaryPath: root.boundaryPath } : {}),
+    });
+  }
+  return result;
+}
+
+function pathInsideRealRoot(realPath: string, realRoot: string): boolean {
+  return realPath === realRoot || realPath.startsWith(`${realRoot}${sep}`);
+}
+
+async function isPathInsideRoot(path: string, root: TrustedArtifactRoot): Promise<boolean> {
+  if (!path || !root.path || !existsSync(root.path)) return false;
   try {
     const [realFile, realRoot] = await Promise.all([
       realpath(path),
-      realpath(root),
+      realpath(root.path),
     ]);
-    return realFile === realRoot || realFile.startsWith(`${realRoot}${sep}`);
+    if (root.boundaryPath) {
+      const realBoundary = await realpath(root.boundaryPath);
+      if (!pathInsideRealRoot(realRoot, realBoundary)) {
+        return false;
+      }
+    }
+    return pathInsideRealRoot(realFile, realRoot);
   } catch {
     return false;
   }
@@ -186,7 +226,7 @@ async function isPathInsideRoot(path: string, root: string): Promise<boolean> {
 
 async function normalizeTrustedLocalFile(
   path: string,
-  roots: readonly string[],
+  roots: readonly TrustedArtifactRoot[],
   warnings: string[],
 ): Promise<NormalizedLocalFile | null> {
   const normalizedPath = resolve(path);
@@ -374,10 +414,10 @@ async function parseExplicitManifestParts(
   return parts;
 }
 
-function generatedImagePathFromCallId(callId: string, roots: readonly string[]): string[] {
+function generatedImagePathFromCallId(callId: string, roots: readonly TrustedArtifactRoot[]): string[] {
   if (!callId) return [];
   return roots
-    .map((root) => join(root, `${callId}.png`))
+    .map((root) => join(root.path, `${callId}.png`))
     .filter((path) => existsSync(path));
 }
 
@@ -399,7 +439,7 @@ function transcriptPayload(record: unknown): {
 
 async function generatedImageCandidatesFromCurrentTurnTranscript(
   input: BuildCompletedTurnDeliveryEnvelopeInput,
-  roots: readonly string[],
+  roots: readonly TrustedArtifactRoot[],
   warnings: string[],
 ): Promise<string[]> {
   const transcriptPath = safeString(input.transcriptPath);

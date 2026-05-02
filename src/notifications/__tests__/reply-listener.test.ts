@@ -727,6 +727,11 @@ describe('startReplyListener', () => {
     const originalEntryPath = process.env[OMX_ENTRY_PATH_ENV];
     const originalStartupCwd = process.env[OMX_STARTUP_CWD_ENV];
     const originalSttEnv = Object.fromEntries(TELEGRAM_VOICE_TRANSCRIPTION_ENV_KEYS.map((key) => [key, process.env[key]]));
+    const originalTmuxCleanupEnv = {
+      OMX_TMUX_SESSION_IDLE_CLEANUP: process.env.OMX_TMUX_SESSION_IDLE_CLEANUP,
+      OMX_TMUX_SESSION_IDLE_TTL_MS: process.env.OMX_TMUX_SESSION_IDLE_TTL_MS,
+      OMX_TMUX_SESSION_IDLE_INCLUDE_ATTACHED: process.env.OMX_TMUX_SESSION_IDLE_INCLUDE_ATTACHED,
+    };
     let spawnedEnv: NodeJS.ProcessEnv | undefined;
 
     try {
@@ -745,6 +750,9 @@ describe('startReplyListener', () => {
       process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_INJECT_MODE = 'transcript-only';
       process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_FFMPEG_BINARY = '/bin/ffmpeg';
       process.env.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_COMMAND = 'unsafe command string';
+      process.env.OMX_TMUX_SESSION_IDLE_CLEANUP = '0';
+      process.env.OMX_TMUX_SESSION_IDLE_TTL_MS = '4321';
+      process.env.OMX_TMUX_SESSION_IDLE_INCLUDE_ATTACHED = '1';
 
       const response = startReplyListener(createBaseConfig(), {
         ensureStateDirImpl: () => {},
@@ -779,6 +787,9 @@ describe('startReplyListener', () => {
       assert.equal(spawnedEnv?.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_INJECT_MODE, 'transcript-only');
       assert.equal(spawnedEnv?.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_FFMPEG_BINARY, '/bin/ffmpeg');
       assert.equal(spawnedEnv?.OMX_REPLY_TELEGRAM_VOICE_TRANSCRIPTION_COMMAND, undefined);
+      assert.equal(spawnedEnv?.OMX_TMUX_SESSION_IDLE_CLEANUP, '0');
+      assert.equal(spawnedEnv?.OMX_TMUX_SESSION_IDLE_TTL_MS, '4321');
+      assert.equal(spawnedEnv?.OMX_TMUX_SESSION_IDLE_INCLUDE_ATTACHED, '1');
     } finally {
       if (typeof originalNotifyProfile === 'string') process.env.OMX_NOTIFY_PROFILE = originalNotifyProfile;
       else delete process.env.OMX_NOTIFY_PROFILE;
@@ -790,6 +801,10 @@ describe('startReplyListener', () => {
       else delete process.env[OMX_STARTUP_CWD_ENV];
       for (const key of TELEGRAM_VOICE_TRANSCRIPTION_ENV_KEYS) {
         const original = originalSttEnv[key];
+        if (typeof original === 'string') process.env[key] = original;
+        else delete process.env[key];
+      }
+      for (const [key, original] of Object.entries(originalTmuxCleanupEnv)) {
         if (typeof original === 'string') process.env[key] = original;
         else delete process.env[key];
       }

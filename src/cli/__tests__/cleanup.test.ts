@@ -429,6 +429,7 @@ describe('cleanupCommand', () => {
 
   it('runs tmp and tmux cleanup after orphaned MCP cleanup', async () => {
     const calls: string[] = [];
+    const forwardedArgs: string[][] = [];
 
     await cleanupCommand(['--dry-run'], {
       cleanupProcesses: async () => {
@@ -441,16 +442,22 @@ describe('cleanupCommand', () => {
           failedPids: [],
         };
       },
-      cleanupTmpDirectories: async () => {
+      cleanupTmpDirectories: async (args) => {
         calls.push('tmp');
+        forwardedArgs.push(['tmp', ...args]);
         return 0;
       },
-      cleanupTmuxSessions: async () => {
+      cleanupTmuxSessions: async (args) => {
         calls.push('tmux');
+        forwardedArgs.push(['tmux', ...args]);
       },
     });
 
     assert.deepEqual(calls, ['processes', 'tmp', 'tmux']);
+    assert.deepEqual(forwardedArgs, [
+      ['tmp', '--dry-run'],
+      ['tmux', '--dry-run'],
+    ]);
   });
 
   it('skips tmp and tmux cleanup when showing help', async () => {

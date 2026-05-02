@@ -141,6 +141,54 @@ describe('tmux stale OMX session cleanup', () => {
     assert.match(lines.join('\n'), /would kill 1 OMX-owned tmux session/);
   });
 
+  it('resolves the current tmux session from the active pane before killing stale candidates', async () => {
+    const calls: string[][] = [];
+
+    const result = await cleanupStaleOmxTmuxSessions([], {
+      now: () => nowMs,
+      env: {
+        TMUX: '/tmp/tmux-501/default,123,0',
+        TMUX_PANE: '%7',
+      } as NodeJS.ProcessEnv,
+      writeLine: () => {},
+      runTmux: (args) => {
+        calls.push(args);
+        if (args[0] === 'list-sessions') {
+          return [
+            [
+              'omx-current-session',
+              '0',
+              String(staleActivityEpoch),
+              '1',
+              'omx-current-id',
+              '/repo/current',
+              'session',
+            ].join('\t'),
+            [
+              'omx-stale-session',
+              '0',
+              String(staleActivityEpoch),
+              '1',
+              'omx-stale-id',
+              '/repo/stale',
+              'session',
+            ].join('\t'),
+          ].join('\n');
+        }
+        if (args[0] === 'display-message') {
+          assert.deepEqual(args, ['display-message', '-p', '-t', '%7', '#S']);
+          return 'omx-current-session\n';
+        }
+        assert.deepEqual(args, ['kill-session', '-t', 'omx-stale-session']);
+        return '';
+      },
+    });
+
+    assert.deepEqual(result.killed, ['omx-stale-session']);
+    assert.deepEqual(result.candidates.map((candidate) => candidate.name), ['omx-stale-session']);
+    assert.deepEqual(calls.map((args) => args[0]), ['list-sessions', 'display-message', 'kill-session']);
+  });
+
   it('kills stale sessions by exact tmux session target', async () => {
     const calls: string[][] = [];
 

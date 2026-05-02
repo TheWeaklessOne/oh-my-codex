@@ -63,15 +63,22 @@ import {
 import {
   classifyCompletedTurn,
 } from '../runtime/turn-semantics.js';
+import { getEnabledPlatforms } from '../notifications/config.js';
 import {
   buildCompletedTurnHookFingerprint,
   planCompletedTurnNotification,
 } from '../notifications/completed-turn.js';
+import { getEffectivePlatformConfig } from '../notifications/dispatcher.js';
 import {
   buildCompletedTurnDeliveryEnvelope,
   hasDeliverableContent,
   hasRichMediaContent,
 } from '../notifications/rich-content.js';
+import type {
+  FullNotificationConfig,
+  TelegramNotificationConfig,
+  TelegramRichRepliesConfig,
+} from '../notifications/types.js';
 import { resolveTurnOriginForNotification } from '../runtime/codex-session-origin.js';
 import { markOwnerCompleted } from '../runtime/session-actors.js';
 import { reconcileRalphTerminalStateScope } from '../runtime/ralph-state-scope.js';
@@ -123,6 +130,7 @@ function isTurnCompletePayload(payload: Record<string, unknown>): boolean {
 type ProjectTurnDelivery = 'allow' | 'suppress';
 type ProjectTurnSourceKind = 'native' | 'fallback';
 type ProjectTurnDeliveryStatus = 'pending' | 'dispatching' | 'sent' | 'committed' | 'delivery_unknown';
+type CompletedTurnRichEvent = 'result-ready' | 'ask-user-question';
 
 interface ProjectTurnClaim {
   timestamp: number;
@@ -174,6 +182,24 @@ interface PendingProjectFallbackOwnerUpgrade {
   eventType: string;
   sessionId: string;
   source: string;
+}
+
+function resolveCompletedTurnTelegramRichRepliesConfig(
+  notificationConfig: FullNotificationConfig | null,
+  event: CompletedTurnRichEvent,
+): TelegramRichRepliesConfig | null {
+  if (!notificationConfig || !getEnabledPlatforms(notificationConfig, event).includes('telegram')) {
+    return { enabled: false };
+  }
+  const telegramConfig = getEffectivePlatformConfig<TelegramNotificationConfig>(
+    'telegram',
+    notificationConfig,
+    event,
+  );
+  if (!telegramConfig?.enabled) {
+    return { enabled: false };
+  }
+  return telegramConfig.richReplies ?? null;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -3115,7 +3141,10 @@ async function main() {
           || '',
         ),
         env: process.env,
-        telegramRichRepliesConfig: notificationConfig?.telegram?.richReplies ?? null,
+        telegramRichRepliesConfig: resolveCompletedTurnTelegramRichRepliesConfig(
+          notificationConfig,
+          'result-ready',
+        ),
       });
       const visibleAssistantText = deliveryEnvelope.visibleText;
       const completedTurnHasDeliverableContent = hasDeliverableContent(deliveryEnvelope);

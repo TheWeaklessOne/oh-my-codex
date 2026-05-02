@@ -301,6 +301,7 @@ export async function markPendingRoutesWaitingForOwner(
     let count = 0;
     state.routes = state.routes.map((route) => {
       if (route.ownerActorId !== ownerActorId && route.ownerActorId !== placeholderOwnerActorId) return route;
+      if (route.status === "dispatching") return route;
       count++;
       return {
         ...route,

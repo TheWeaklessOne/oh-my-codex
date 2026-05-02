@@ -177,6 +177,48 @@ describe('pending-routes', () => {
     assert.equal(second, null);
   });
 
+  it('does not reopen an already-dispatching route when a child completion is suppressed', async () => {
+    const sessionId = 'sess-pending-route-dispatching-not-reopened';
+    const owner = await registerExternalOwnerActor({
+      cwd: projectRoot,
+      sessionId,
+      nativeSessionId: 'leader-pending-route-dispatching-not-reopened',
+      source: 'test-owner',
+    });
+    await recordPendingRoute(projectRoot, sessionId, {
+      platform: 'telegram',
+      injectedInput: 'already in flight',
+      createdAt: '2026-04-30T00:00:00.000Z',
+    });
+
+    const claimed = await claimPendingRouteForOwnerCompletion(projectRoot, sessionId, {
+      ownerActorId: owner.actor.actorId,
+      latestInput: 'already in flight',
+      claimedAt: '2026-04-30T00:00:01.000Z',
+    });
+    assert.ok(claimed?.routeId);
+
+    const markedWaiting = await markPendingRoutesWaitingForOwner(projectRoot, sessionId, {
+      ownerActorId: owner.actor.actorId,
+      reason: 'non_owner_actor',
+      observedAt: '2026-04-30T00:00:02.000Z',
+    });
+    assert.equal(markedWaiting, 0);
+
+    const state = JSON.parse(await readFile(pendingRoutesStatePath(projectRoot, sessionId), 'utf-8')) as {
+      routes?: Array<{ status?: string; routeId?: string }>;
+    };
+    assert.equal(state.routes?.[0]?.routeId, claimed.routeId);
+    assert.equal(state.routes?.[0]?.status, 'dispatching');
+
+    const secondClaim = await claimPendingRouteForOwnerCompletion(projectRoot, sessionId, {
+      ownerActorId: owner.actor.actorId,
+      latestInput: 'already in flight',
+      claimedAt: '2026-04-30T00:00:03.000Z',
+    });
+    assert.equal(secondClaim, null);
+  });
+
   it('leader completion consumes exactly one matching route and records a completed terminal outcome', async () => {
     const sessionId = 'sess-pending-route-cleanup';
     const owner = await registerExternalOwnerActor({

@@ -46,7 +46,10 @@ import { updateTelegramTopicRegistryRecord } from "./telegram-topic-registry.js"
 import { deleteTelegramAcceptedAckBestEffort } from "./telegram-inbound/ack.js";
 import { hasRichMediaContent } from "./rich-content.js";
 import { performTelegramBotApiMultipartRequest } from "./telegram-outbound/files.js";
-import { buildTelegramMediaRequest } from "./telegram-outbound/render.js";
+import {
+  buildTelegramMediaRequest,
+  buildTelegramPhotoDocumentFallbackRequest,
+} from "./telegram-outbound/render.js";
 import type { TelegramMediaRequest } from "./telegram-outbound/types.js";
 import { shouldBlockLiveNotificationNetworkInTests } from "../utils/test-env.js";
 
@@ -186,6 +189,16 @@ function mergeTelegramPlatformOverrides(
     merged.projectTopics = {
       ...topLevelPlatform.projectTopics,
       ...eventPlatform.projectTopics,
+    };
+  }
+
+  if (
+    isPlainRecord(topLevelPlatform.richReplies)
+    && isPlainRecord(eventPlatform.richReplies)
+  ) {
+    merged.richReplies = {
+      ...topLevelPlatform.richReplies,
+      ...eventPlatform.richReplies,
     };
   }
 
@@ -563,13 +576,17 @@ async function sendTelegramMessageToDestination(
   destination: TelegramResolvedDestination,
   deps: TelegramTopicResolutionDeps,
 ): Promise<TelegramDestinationSendResult> {
-  if (hasRichMediaContent(payload.richContent)) {
+  if (hasRichMediaContent(payload.richContent) && config.richReplies?.enabled !== false) {
     return await sendTelegramRichContentToDestination(
       config,
       payload,
       destination,
       deps,
     );
+  }
+
+  if (hasRichMediaContent(payload.richContent) && !payload.message.trim()) {
+    throw new Error("Telegram rich media delivery is disabled and no text fallback is available");
   }
 
   const preparedMessage = prepareTelegramMessage(config, payload);
@@ -784,13 +801,36 @@ async function sendTelegramMedia(
   deps: TelegramTopicResolutionDeps,
 ): Promise<TelegramSendMessageResult> {
   if (request.localFile) {
-    return (await performTelegramBotApiMultipartRequest<TelegramSendMessageResult>(
-      config.botToken,
-      request.methodName,
-      request.body,
-      request.localFile,
-      telegramBotApiRequestDeps(deps),
-    )) ?? {};
+    try {
+      return (await performTelegramBotApiMultipartRequest<TelegramSendMessageResult>(
+        config.botToken,
+        request.methodName,
+        request.body,
+        request.localFile,
+        telegramBotApiRequestDeps(deps),
+      )) ?? {};
+    } catch (error) {
+      const fallbackRequest = buildTelegramPhotoDocumentFallbackRequest(request);
+      const classification = classifyTelegramBotApiError(error);
+      const canFallback =
+        fallbackRequest
+        && classification.methodName === "sendPhoto"
+        && !classification.retryable
+        && !classification.permanent;
+      if (!canFallback) {
+        throw error;
+      }
+      if (!fallbackRequest.localFile) {
+        throw error;
+      }
+      return (await performTelegramBotApiMultipartRequest<TelegramSendMessageResult>(
+        config.botToken,
+        fallbackRequest.methodName,
+        fallbackRequest.body,
+        fallbackRequest.localFile,
+        telegramBotApiRequestDeps(deps),
+      )) ?? {};
+    }
   }
 
   return (await performTelegramBotApiRequest<TelegramSendMessageResult>(

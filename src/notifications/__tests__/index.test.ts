@@ -1012,4 +1012,79 @@ describe('notifyCompletedTurn transport override filtering', () => {
       messageThreadId: '9001',
     });
   });
+
+  it('registers every Telegram message id from multipart rich completed-turn deliveries for replies', async () => {
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = mkdtempSync(join(tmpdir(), 'omx-notify-index-message-ids-home-'));
+    const projectPath = mkdtempSync(join(tmpdir(), 'omx-notify-index-message-ids-project-'));
+
+    try {
+      process.env.HOME = tempHome;
+      process.env.USERPROFILE = tempHome;
+      const { notifyCompletedTurn, planCompletedTurnNotification } = await import(`../index.js?completed-turn-message-ids=${Date.now()}`);
+      const decision = planCompletedTurnNotification({
+        semanticOutcome: {
+          kind: 'result-ready',
+          summary: 'Done.',
+          notificationEvent: 'result-ready',
+        },
+        assistantText: 'Done.',
+        turnId: 'turn-telegram-message-ids',
+      });
+      assert.ok(decision);
+
+      const config: FullNotificationConfig = {
+        enabled: true,
+        telegram: {
+          enabled: true,
+          botToken: '123456:abc',
+          chatId: '777',
+        },
+      };
+
+      const result = await notifyCompletedTurn(
+        decision,
+        {
+          sessionId: 'sess-telegram-message-ids',
+          assistantText: 'Done.',
+          projectPath,
+          tmuxPaneId: '%42',
+          tmuxSession: 'omx-test',
+        },
+        undefined,
+        {
+          getNotificationConfigImpl: () => config,
+          isEventEnabledImpl: () => true,
+          ensureReplyListenerForConfigImpl: () => {},
+          dispatchNotificationsImpl: async (_config: FullNotificationConfig, event: string) => ({
+            event: event as never,
+            anySuccess: true,
+            results: [{
+              platform: 'telegram',
+              success: true,
+              messageId: '501',
+              messageIds: ['501', '502'],
+              messageThreadId: '9001',
+            }],
+          }),
+        },
+      );
+
+      assert.ok(result);
+      const { loadAllMappings } = await import('../session-registry.js');
+      const mappings = loadAllMappings()
+        .filter((mapping) => mapping.sessionId === 'sess-telegram-message-ids')
+        .filter((mapping) => mapping.messageId === '501' || mapping.messageId === '502');
+      assert.deepEqual(mappings.map((mapping) => mapping.messageId).sort(), ['501', '502']);
+      assert.deepEqual(new Set(mappings.map((mapping) => mapping.tmuxPaneId)), new Set(['%42']));
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+      rmSync(projectPath, { recursive: true, force: true });
+      rmSync(tempHome, { recursive: true, force: true });
+    }
+  });
 });
