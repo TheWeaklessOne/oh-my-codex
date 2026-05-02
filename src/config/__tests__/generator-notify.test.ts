@@ -260,7 +260,7 @@ describe('config generator', () => {
 
       // OMX feature flags added
       assert.match(toml, /^multi_agent = true$/m);
-      assert.match(toml, /^goal = true$/m);
+      assert.match(toml, /^goals = true$/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -360,7 +360,8 @@ describe('config generator', () => {
         '[features]',
         'custom_user_flag = false',
         'child_agents_md = false',
-        'goal = false',
+        'goal = true',
+        'goals = false',
         '',
         '[user.settings]',
         'name = "kept"',
@@ -375,7 +376,8 @@ describe('config generator', () => {
       assert.match(merged, /^custom_user_flag = false$/m);
       assert.match(merged, /^multi_agent = true$/m);
       assert.match(merged, /^child_agents_md = true$/m);
-      assert.match(merged, /^goal = true$/m);
+      assert.match(merged, /^goals = true$/m);
+      assert.doesNotMatch(merged, /^goal\s*=/m);
       assert.match(merged, /^\[user.settings\]$/m);
       assert.match(merged, /^name = "kept"$/m);
     } finally {

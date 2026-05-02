@@ -50,7 +50,7 @@ function buildOmxConfig(): string {
     'multi_agent = true',
     'child_agents_md = true',
     'codex_hooks = true',
-    'goal = true',
+    'goals = true',
     '',
     '# ============================================================',
     '# oh-my-codex (OMX) Configuration',
@@ -124,7 +124,7 @@ function buildConfigWithSeededModelContext(): string {
     'multi_agent = true',
     'child_agents_md = true',
     'codex_hooks = true',
-    'goal = true',
+    'goals = true',
     '',
     '# ============================================================',
     '# oh-my-codex (OMX) Configuration',
@@ -158,7 +158,7 @@ function buildConfigWithEditedSeededModelContext(): string {
     'multi_agent = true',
     'child_agents_md = true',
     'codex_hooks = true',
-    'goal = true',
+    'goals = true',
     '',
     '# ============================================================',
     '# oh-my-codex (OMX) Configuration',
@@ -190,7 +190,7 @@ function buildMixedConfig(): string {
     'multi_agent = true',
     'child_agents_md = true',
     'codex_hooks = true',
-    'goal = true',
+    'goals = true',
     'web_search = true',
     '',
     '[mcp_servers.user_custom]',
@@ -793,6 +793,7 @@ describe('stripOmxFeatureFlags', () => {
       '[features]',
       'multi_agent = true',
       'child_agents_md = true',
+      'goals = true',
       'goal = true',
       'web_search = true',
       '',
@@ -801,6 +802,7 @@ describe('stripOmxFeatureFlags', () => {
     const result = stripOmxFeatureFlags(config);
     assert.doesNotMatch(result, /multi_agent/);
     assert.doesNotMatch(result, /child_agents_md/);
+    assert.doesNotMatch(result, /^goals\s*=/m);
     assert.doesNotMatch(result, /^goal\s*=/m);
     assert.match(result, /web_search = true/);
     assert.match(result, /\[features\]/);
@@ -813,14 +815,14 @@ describe('stripOmxFeatureFlags', () => {
       '[features]',
       'multi_agent = true',
       'child_agents_md = true',
-      'goal = true',
+      'goals = true',
       '',
     ].join('\n');
 
     const result = stripOmxFeatureFlags(config);
     assert.doesNotMatch(result, /\[features\]/);
     assert.doesNotMatch(result, /multi_agent/);
-    assert.doesNotMatch(result, /^goal\s*=/m);
+    assert.doesNotMatch(result, /^goals\s*=/m);
   });
 
   it('handles config without [features] section', async () => {

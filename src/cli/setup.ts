@@ -1779,7 +1779,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 				? await readFile(scopeDirs.codexConfigFile, "utf-8")
 				: "";
 			console.log(
-				`  Native Codex hooks and runtime feature flags refresh complete (${scopeDirs.codexHooksFile}; codex_hooks, goal).\n`,
+				`  Native Codex hooks and runtime feature flags refresh complete (${scopeDirs.codexHooksFile}; codex_hooks, goals).\n`,
 			);
 
 		if (usePluginDeveloperInstructionsDefault) {

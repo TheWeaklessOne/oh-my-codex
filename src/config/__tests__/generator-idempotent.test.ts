@@ -175,7 +175,7 @@ describe("config generator idempotency (#384)", () => {
       assert.match(toml, /^multi_agent = true$/m);
       assert.match(toml, /^child_agents_md = true$/m);
       assert.match(toml, /^codex_hooks = true$/m);
-      assert.match(toml, /^goal = true$/m);
+      assert.match(toml, /^goals = true$/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -232,7 +232,7 @@ describe("config generator idempotency (#384)", () => {
         "",
         "[features]",
         "multi_agent = true",
-        "goal = false",
+        "goals = false",
         "",
         "[mcp_servers.omx_state]",
         'command = "node"',
@@ -349,7 +349,7 @@ describe("config generator idempotency (#384)", () => {
       const orphanedAgents = [
         "[features]",
         "multi_agent = true",
-        "goal = false",
+        "goals = false",
         "",
         "# OMX Native Agent Roles (Codex multi-agent)",
         "",

@@ -434,7 +434,7 @@ function upsertFeatureFlags(config: string): string {
       "multi_agent = true",
       "child_agents_md = true",
       "codex_hooks = true",
-      "goal = true",
+      "goals = true",
       "",
     ].join("\n");
     if (base.length === 0) {
@@ -451,9 +451,10 @@ function upsertFeatureFlags(config: string): string {
     }
   }
 
-  // Remove deprecated 'collab' key (superseded by multi_agent)
+  // Remove deprecated 'collab' key (superseded by multi_agent) and
+  // the misspelled singular 'goal' flag written by unreleased PR builds.
   for (let i = sectionEnd - 1; i > featuresStart; i--) {
-    if (/^\s*collab\s*=/.test(lines[i])) {
+    if (/^\s*(?:collab|goal)\s*=/.test(lines[i])) {
       lines.splice(i, 1);
       sectionEnd -= 1;
     }
@@ -462,7 +463,7 @@ function upsertFeatureFlags(config: string): string {
   let multiAgentIdx = -1;
   let childAgentsIdx = -1;
   let codexHooksIdx = -1;
-  let goalIdx = -1;
+  let goalsIdx = -1;
   for (let i = featuresStart + 1; i < sectionEnd; i++) {
     if (/^\s*multi_agent\s*=/.test(lines[i])) {
       multiAgentIdx = i;
@@ -470,8 +471,8 @@ function upsertFeatureFlags(config: string): string {
       childAgentsIdx = i;
     } else if (/^\s*codex_hooks\s*=/.test(lines[i])) {
       codexHooksIdx = i;
-    } else if (/^\s*goal\s*=/.test(lines[i])) {
-      goalIdx = i;
+    } else if (/^\s*goals\s*=/.test(lines[i])) {
+      goalsIdx = i;
     }
   }
 
@@ -496,10 +497,10 @@ function upsertFeatureFlags(config: string): string {
     sectionEnd += 1;
   }
 
-  if (goalIdx >= 0) {
-    lines[goalIdx] = "goal = true";
+  if (goalsIdx >= 0) {
+    lines[goalsIdx] = "goals = true";
   } else {
-    lines.splice(sectionEnd, 0, "goal = true");
+    lines.splice(sectionEnd, 0, "goals = true");
   }
 
   return lines.join("\n");
@@ -516,7 +517,7 @@ export function upsertPluginModeRuntimeFeatureFlags(config: string): string {
     const featureBlock = [
       "[features]",
       "codex_hooks = true",
-      "goal = true",
+      "goals = true",
       "",
     ].join("\n");
     if (base.length === 0) {
@@ -533,13 +534,22 @@ export function upsertPluginModeRuntimeFeatureFlags(config: string): string {
     }
   }
 
+  // Remove the misspelled singular flag from unreleased PR builds before
+  // upserting the supported plural Codex feature flag.
+  for (let i = sectionEnd - 1; i > featuresStart; i--) {
+    if (/^\s*goal\s*=/.test(lines[i])) {
+      lines.splice(i, 1);
+      sectionEnd -= 1;
+    }
+  }
+
   let codexHooksIdx = -1;
-  let goalIdx = -1;
+  let goalsIdx = -1;
   for (let i = featuresStart + 1; i < sectionEnd; i++) {
     if (/^\s*codex_hooks\s*=/.test(lines[i])) {
       codexHooksIdx = i;
-    } else if (/^\s*goal\s*=/.test(lines[i])) {
-      goalIdx = i;
+    } else if (/^\s*goals\s*=/.test(lines[i])) {
+      goalsIdx = i;
     }
   }
 
@@ -550,10 +560,10 @@ export function upsertPluginModeRuntimeFeatureFlags(config: string): string {
     sectionEnd++;
   }
 
-  if (goalIdx >= 0) {
-    lines[goalIdx] = "goal = true";
+  if (goalsIdx >= 0) {
+    lines[goalsIdx] = "goals = true";
   } else {
-    lines.splice(sectionEnd, 0, "goal = true");
+    lines.splice(sectionEnd, 0, "goals = true");
   }
 
   return lines.join("\n");
@@ -809,6 +819,7 @@ export function stripOmxFeatureFlags(config: string): string {
     "multi_agent",
     "child_agents_md",
     "codex_hooks",
+    "goals",
     "goal",
     "collab",
   ];
@@ -1429,7 +1440,7 @@ function getOmxTablesBlock(
  *
  * Layout:
  *   1. OMX top-level keys (notify, model_reasoning_effort, developer_instructions)
- *   2. [features] with multi_agent + child_agents_md + codex_hooks + goal
+ *   2. [features] with multi_agent + child_agents_md + codex_hooks + goals
  *   3. [shell_environment_policy.set] with defaulted explore-routing opt-in
  *   4. … user sections …
  *   5. OMX [table] sections (mcp_servers, tui)
