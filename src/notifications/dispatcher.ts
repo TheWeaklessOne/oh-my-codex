@@ -33,6 +33,7 @@ import {
   performTelegramBotApiRequest,
   resolveTelegramDestination,
   type TelegramResolvedDestination,
+  type TelegramBotApiRequestDeps,
   type TelegramTopicResolutionDeps,
 } from "./telegram-topics.js";
 import {
@@ -43,6 +44,10 @@ import {
 } from "./telegram-errors.js";
 import { updateTelegramTopicRegistryRecord } from "./telegram-topic-registry.js";
 import { deleteTelegramAcceptedAckBestEffort } from "./telegram-inbound/ack.js";
+import { hasRichMediaContent } from "./rich-content.js";
+import { performTelegramBotApiMultipartRequest } from "./telegram-outbound/files.js";
+import { buildTelegramMediaRequest } from "./telegram-outbound/render.js";
+import type { TelegramMediaRequest } from "./telegram-outbound/types.js";
 import { shouldBlockLiveNotificationNetworkInTests } from "../utils/test-env.js";
 
 const SEND_TIMEOUT_MS = 10_000;
@@ -70,6 +75,19 @@ interface TelegramPreparedMessage {
   chunks: TelegramPreparedMessageChunk[];
   rawFallbackChunks: TelegramPreparedMessageChunk[];
   parseMode?: "Markdown" | "HTML";
+}
+
+interface TelegramChunkSendDeps extends TelegramTopicResolutionDeps {
+  replyToMessageIdOverride?: string | number;
+}
+
+function telegramBotApiRequestDeps(
+  deps: TelegramTopicResolutionDeps,
+): TelegramBotApiRequestDeps {
+  return {
+    ...(deps.httpsRequestImpl ? { httpsRequestImpl: deps.httpsRequestImpl } : {}),
+    timeoutMs: deps.timeoutMs ?? SEND_TIMEOUT_MS,
+  };
 }
 
 function composeDiscordContent(
@@ -545,10 +563,34 @@ async function sendTelegramMessageToDestination(
   destination: TelegramResolvedDestination,
   deps: TelegramTopicResolutionDeps,
 ): Promise<TelegramDestinationSendResult> {
+  if (hasRichMediaContent(payload.richContent)) {
+    return await sendTelegramRichContentToDestination(
+      config,
+      payload,
+      destination,
+      deps,
+    );
+  }
+
   const preparedMessage = prepareTelegramMessage(config, payload);
+  return await sendPreparedTelegramChunksWithRawFallback(
+    config,
+    payload,
+    preparedMessage,
+    destination,
+    deps,
+  );
+}
+
+async function sendPreparedTelegramChunksWithRawFallback(
+  config: TelegramNotificationConfig,
+  payload: FullNotificationPayload,
+  preparedMessage: TelegramPreparedMessage,
+  destination: TelegramResolvedDestination,
+  deps: TelegramChunkSendDeps,
+): Promise<TelegramDestinationSendResult> {
   const sendsRichPayload = Boolean(preparedMessage.parseMode)
     || preparedMessage.chunks.some((chunk) => chunk.entities?.length);
-
   try {
     return await sendPreparedTelegramChunks(
       config,
@@ -575,16 +617,119 @@ async function sendTelegramMessageToDestination(
   }
 }
 
+async function sendTelegramRichContentToDestination(
+  config: TelegramNotificationConfig,
+  payload: FullNotificationPayload,
+  destination: TelegramResolvedDestination,
+  deps: TelegramTopicResolutionDeps,
+): Promise<TelegramDestinationSendResult> {
+  const parts = payload.richContent?.parts ?? [];
+  const chunkResults: TelegramSendMessageResult[] = [];
+  const replyToMessageId = resolveTelegramReplyToMessageId(payload, destination);
+  let firstItem = true;
+
+  try {
+    for (const part of parts) {
+      if (part.kind === "text") {
+        if (!part.text.trim()) continue;
+        const textPayload = richTextPartPayload(payload, part.text, firstItem);
+        const preparedMessage = prepareTelegramMessage(config, textPayload);
+        const result = await sendPreparedTelegramChunksWithRawFallback(
+          config,
+          textPayload,
+          preparedMessage,
+          destination,
+          {
+            ...deps,
+            ...(firstItem && replyToMessageId !== undefined
+              ? { replyToMessageIdOverride: replyToMessageId }
+              : {}),
+          },
+        );
+        chunkResults.push(...result.chunkResults);
+        firstItem = false;
+        continue;
+      }
+
+      const request = buildTelegramMediaRequest(
+        part,
+        destination,
+        firstItem ? replyToMessageId : undefined,
+      );
+      await sendTelegramChatActionBestEffort(config, request, destination, deps);
+      const result = await sendTelegramMedia(config, request, deps);
+      chunkResults.push(result);
+      firstItem = false;
+    }
+  } catch (error) {
+    const sentMessageIds = chunkResults
+      .map((result) => result.message_id)
+      .filter((messageId): messageId is number | string => messageId !== undefined);
+    if (sentMessageIds.length > 0) {
+      const cleanupSucceeded = await deleteTelegramMessagesBestEffort(
+        config,
+        destination,
+        sentMessageIds,
+        deps,
+      );
+      if (!cleanupSucceeded) {
+        throw new Error(
+          `Telegram partial chunk delivery cleanup failed for message_ids=${sentMessageIds.join(",")}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+    throw error;
+  }
+
+  const firstResult = chunkResults[0] ?? {};
+  return {
+    ...firstResult,
+    message_ids: chunkResults
+      .map((result) => result.message_id)
+      .filter((messageId): messageId is number | string => messageId !== undefined),
+    chunkResults,
+  };
+}
+
+function richTextPartPayload(
+  payload: FullNotificationPayload,
+  text: string,
+  firstItem: boolean,
+): FullNotificationPayload {
+  const transportOverrides = payload.transportOverrides
+    ? { ...payload.transportOverrides }
+    : undefined;
+  const telegramOverride = transportOverrides?.telegram;
+  if (telegramOverride) {
+    const {
+      message: _message,
+      entities: _entities,
+      ...remainingTelegramOverride
+    } = telegramOverride;
+    transportOverrides.telegram = remainingTelegramOverride;
+  }
+
+  return {
+    ...payload,
+    message: text,
+    ...(transportOverrides ? { transportOverrides } : {}),
+    ...(firstItem ? {} : { telegramReplyTo: undefined }),
+  };
+}
+
 async function sendPreparedTelegramChunks(
   config: TelegramNotificationConfig,
   payload: FullNotificationPayload,
   preparedMessage: Pick<TelegramPreparedMessage, "parseMode">,
   chunks: readonly TelegramPreparedMessageChunk[],
   destination: TelegramResolvedDestination,
-  deps: TelegramTopicResolutionDeps,
+  deps: TelegramChunkSendDeps,
 ): Promise<TelegramDestinationSendResult> {
   const chunkResults: TelegramSendMessageResult[] = [];
-  const replyToMessageId = resolveTelegramReplyToMessageId(payload, destination);
+  const replyToMessageId = deps.replyToMessageIdOverride
+    ?? resolveTelegramReplyToMessageId(payload, destination);
 
   for (const [index, chunk] of chunks.entries()) {
     const body = buildTelegramSendMessageBody(
@@ -631,6 +776,54 @@ async function sendPreparedTelegramChunks(
       .filter((messageId): messageId is number | string => messageId !== undefined),
     chunkResults,
   };
+}
+
+async function sendTelegramMedia(
+  config: TelegramNotificationConfig,
+  request: TelegramMediaRequest,
+  deps: TelegramTopicResolutionDeps,
+): Promise<TelegramSendMessageResult> {
+  if (request.localFile) {
+    return (await performTelegramBotApiMultipartRequest<TelegramSendMessageResult>(
+      config.botToken,
+      request.methodName,
+      request.body,
+      request.localFile,
+      telegramBotApiRequestDeps(deps),
+    )) ?? {};
+  }
+
+  return (await performTelegramBotApiRequest<TelegramSendMessageResult>(
+    config.botToken,
+    request.methodName,
+    request.body,
+    telegramBotApiRequestDeps(deps),
+  )) ?? {};
+}
+
+async function sendTelegramChatActionBestEffort(
+  config: TelegramNotificationConfig,
+  request: TelegramMediaRequest,
+  destination: TelegramResolvedDestination,
+  deps: TelegramTopicResolutionDeps,
+): Promise<void> {
+  if (!request.localFile || !request.chatAction) return;
+  try {
+    await performTelegramBotApiRequest<true>(
+      config.botToken,
+      "sendChatAction",
+      {
+        chat_id: destination.chatId,
+        action: request.chatAction,
+        ...(destination.messageThreadId
+          ? { message_thread_id: coerceTelegramMessageThreadId(destination.messageThreadId) }
+          : {}),
+      },
+      telegramBotApiRequestDeps(deps),
+    );
+  } catch {
+    // Chat actions are a UX hint only; media delivery remains authoritative.
+  }
 }
 
 function prepareTelegramMessage(
@@ -712,10 +905,7 @@ async function sendTelegramMessageChunk(
     config.botToken,
     "sendMessage",
     body,
-    {
-      ...(deps.httpsRequestImpl ? { httpsRequestImpl: deps.httpsRequestImpl } : {}),
-      timeoutMs: deps.timeoutMs ?? SEND_TIMEOUT_MS,
-    },
+    telegramBotApiRequestDeps(deps),
   )) ?? {};
 }
 
@@ -754,10 +944,7 @@ async function deleteTelegramMessageBestEffort(
         chat_id: destination.chatId,
         message_id: messageId,
       },
-      {
-        ...(deps.httpsRequestImpl ? { httpsRequestImpl: deps.httpsRequestImpl } : {}),
-        timeoutMs: deps.timeoutMs ?? SEND_TIMEOUT_MS,
-      },
+      telegramBotApiRequestDeps(deps),
     );
     return true;
   } catch {

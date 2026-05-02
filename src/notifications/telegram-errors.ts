@@ -160,12 +160,10 @@ export function isTelegramRichPayloadError(error: unknown): boolean {
 
 export function isTelegramStaleTopicError(error: unknown): boolean {
   const classification = classifyTelegramBotApiError(error);
-  return classification.methodName === "sendMessage"
-    && classification.category === "stale-topic";
+  return classification.category === "stale-topic";
 }
 
 export function isTelegramDeliveryTopicMismatchError(error: unknown): boolean {
   const classification = classifyTelegramBotApiError(error);
-  return classification.methodName === "sendMessage"
-    && classification.category === "delivery-topic-mismatch";
+  return classification.category === "delivery-topic-mismatch";
 }

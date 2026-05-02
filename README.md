@@ -260,7 +260,12 @@ If you want Telegram to receive leader final answers and real input requests whi
     "telegram": {
       "enabled": true,
       "botToken": "env-or-config-token",
-      "chatId": "env-or-config-chat"
+      "chatId": "env-or-config-chat",
+      "richReplies": {
+        "enabled": true,
+        "autoDetectGeneratedImages": true,
+        "maxUploadBytes": 52428800
+      }
     },
     "events": {
       "session-start": { "enabled": false },
@@ -296,6 +301,14 @@ Completed-turn presentation is now configurable separately from lifecycle delive
 
 - Completed-turn notifications are leader-only: native Codex subagent and OMX team worker final reports stay internal and should be summarized by the leader.
 - Every non-empty leader final turn is eligible for `result-ready` delivery as raw assistant text; the semantic classifier only upgrades explicit input requests to `ask-user-question`.
+- Telegram completed-turn delivery also accepts rich content. Trusted generated images under `$CODEX_HOME/generated_images/<thread-id>/...` are delivered even when the assistant text is empty when the current turn transcript references them; OMX sends them with `sendPhoto` when they satisfy the photo policy and falls back to `sendDocument` when they are too large or unsuitable.
+- Explicit rich delivery intent can be declared with a fenced `omx-delivery` JSON block using ordered parts such as `photo` and `document`. OMX strips that manifest from the human-visible message, validates local paths against trusted artifact roots such as `.omx/artifacts`, and owns the Telegram Bot API calls. Example:
+  ````markdown
+  ```omx-delivery
+  {"parts":[{"kind":"text","text":"Here is the preview."},{"kind":"photo","path":".omx/artifacts/preview.png","caption":"Preview"},{"kind":"document","path":".omx/artifacts/report.pdf","filename":"report.pdf"}]}
+  ```
+  ````
+- Telegram reply placeholders are deleted only after the final Telegram delivery succeeds. Failed media uploads leave explicit `pending_route_failed` / `completed_turn_delivery_failed` evidence instead of silently consuming the route.
 - `result-ready` defaults to `raw-assistant-text`, so the visible notification body is the full assistant answer.
 - `ask-user-question` also defaults to `raw-assistant-text`.
 - Telegram completed-turn raw text defaults to `telegramFormat: "entities"`: Codex/LLM Markdown is parsed with a Markdown AST/GFM parser and sent to Telegram as plain `text` plus Bot API `entities`, never as MarkdownV2.

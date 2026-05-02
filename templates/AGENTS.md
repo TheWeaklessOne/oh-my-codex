@@ -287,6 +287,11 @@ Command routing:
 - When `USE_OMX_EXPLORE_CMD` enables advisory routing, strongly prefer `omx explore` as the default surface for simple read-only repository lookup tasks (files, symbols, patterns, relationships).
 - For simple file/symbol lookups, use `omx explore` FIRST before attempting full code analysis.
 
+Rich notification delivery:
+- When an OMX Telegram reply context asks for generated media, generate the artifact normally and let OMX deliver trusted artifacts from `$CODEX_HOME/generated_images/<thread-id>/...`; do not expose local generated-image paths as the user-facing answer just to make notification delivery happen.
+- For ambiguous rich output, declare intent with a fenced `omx-delivery` JSON manifest using ordered `parts` (for example `{"parts":[{"kind":"photo","path":".omx/artifacts/preview.png"}]}`); keep Telegram Bot API method details, tokens, and direct HTTP calls inside OMX runtime.
+- Use `photo` for visual preview, `document` for exact file preservation or oversized/unsupported images, `voice` only for compatible spoken audio, and `sticker` only when explicitly requested and validated.
+
 Use `omx explore --prompt ...` for simple read-only lookups through the shell-only, allowlisted, read-only path. Use `omx sparkshell` for noisy read-only shell commands, bounded verification, repo-wide listing/search, or explicit `omx sparkshell --tmux-pane` summaries. Treat sparkshell as explicit opt-in. When to use what: keep ambiguous, implementation-heavy, edit-heavy, diagnostics, tests, MCP/web, and complex shell work on the normal path; if `omx explore` or `omx sparkshell` is incomplete, retry narrower or gracefully fall back to the normal path.
 
 Leader vs worker:

@@ -38,14 +38,47 @@ Current code recognizes these top-level `.omx-config.json` keys:
 `notifications` supports the following current shapes:
 
 - Global fields: `enabled`, `verbosity` (`verbose`, `agent`, `session`, or `minimal`), `defaultProfile`, `profiles`, `events`, `hookTemplates`, `reply`, `dispatchCooldownSeconds`, and `idleCooldownSeconds`.
-- Platform fields: `discord`, `discord-bot`, `telegram`, `slack`, `webhook`.
+- Platform fields: `discord`, `discord-bot`, `telegram`, `slack`, `webhook`. `notifications.telegram.richReplies` supports `enabled`, `autoDetectGeneratedImages`, `maxUploadBytes`, `maxPhotoBytes`, and `allowedArtifactRoots`.
 - OpenClaw/custom transport fields: `openclaw`, `custom_webhook_command`, and `custom_cli_command`.
-- Event keys under `events`: `session-start`, `session-stop`, `session-end`, `session-idle`, and `ask-user-question`. Each event can set `enabled`, `messageTemplate`, and platform overrides.
+- Event keys under `events`: `session-start`, `session-stop`, `session-end`, `session-idle`, `result-ready`, and `ask-user-question`. Each event can set `enabled`, `messageTemplate`, and platform overrides.
 - `hookTemplates` supports `version`, `enabled`, `events`, and `defaultTemplate`; per-event template config supports `enabled`, `template`, and platform template overrides.
 - `reply` supports `enabled`, `authorizedDiscordUserIds`, `authorizedTelegramUserIds`, `pollIntervalMs`, `rateLimitPerMinute`, `maxMessageLength`, `includePrefix`, Telegram polling/ack fields, and `telegramVoiceTranscription`.
 - `notifications.openclaw` supports `enabled`, `gateways`, and `hooks`. Gateway entries are HTTP (`type`, `url`, `headers`, `method`, `timeout`) or command (`type`, `command`, `timeout`). Hook entries use `gateway`, `instruction`, and `enabled`.
 
 Use [`docs/openclaw-integration.md`](../openclaw-integration.md) for full notification/OpenClaw examples. Keep credentials in environment variables where possible.
+
+#### `notifications.telegram.richReplies`
+
+`richReplies` controls Telegram completed-turn media delivery. When enabled (the default), OMX can send trusted generated artifacts and explicit delivery-manifest parts instead of requiring every completed turn to have text.
+
+```json
+{
+  "notifications": {
+    "telegram": {
+      "enabled": true,
+      "botToken": "env-or-config-token",
+      "chatId": "env-or-config-chat",
+      "richReplies": {
+        "enabled": true,
+        "autoDetectGeneratedImages": true,
+        "maxUploadBytes": 52428800,
+        "maxPhotoBytes": 10485760,
+        "allowedArtifactRoots": [".omx/artifacts"]
+      }
+    }
+  }
+}
+```
+
+Automatic detection is intentionally narrow: generated image artifacts must live under the current turn/thread's `$CODEX_HOME/generated_images/<thread-id>/...` root (or another trusted root) and be referenced by the current turn transcript. Oversized/unsupported generated images fall back from `sendPhoto` to `sendDocument`. Arbitrary local files require an explicit `omx-delivery` manifest and still must pass trusted-root validation.
+
+Explicit manifests use ordered `parts`; local `path` values may be absolute or relative to the project root, but must resolve inside a trusted artifact root:
+
+````markdown
+```omx-delivery
+{"parts":[{"kind":"text","text":"Here is the preview."},{"kind":"photo","path":".omx/artifacts/preview.png","caption":"Preview"},{"kind":"document","path":".omx/artifacts/report.pdf","filename":"report.pdf","mimeType":"application/pdf"}]}
+```
+````
 
 #### `notifications.reply.telegramVoiceTranscription`
 

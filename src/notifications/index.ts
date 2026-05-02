@@ -23,8 +23,13 @@ export type {
   DiscordNotificationConfig,
   DiscordBotNotificationConfig,
   TelegramNotificationConfig,
+  TelegramRichRepliesConfig,
   TelegramProjectTopicsConfig,
   TelegramProjectTopicNaming,
+  RichContentFileSource,
+  RichContentKind,
+  RichContentPart,
+  RichNotificationContent,
   SlackNotificationConfig,
   WebhookNotificationConfig,
   EventNotificationConfig,
@@ -36,6 +41,13 @@ export type {
   NotificationsBlock,
   VerbosityLevel,
 } from "./types.js";
+export {
+  buildCompletedTurnDeliveryEnvelope,
+  hasDeliverableContent,
+  hasRichMediaContent,
+  mimeTypeForPath,
+} from "./rich-content.js";
+export type { CompletedTurnDeliveryEnvelope } from "./rich-content.js";
 export {
   buildCompletedTurnHookFingerprint,
   buildCompletedTurnTransportOverrides,
@@ -175,6 +187,7 @@ import type {
   FullNotificationPayload,
   DispatchResult,
   NonStandardNotificationResult,
+  RichNotificationContent,
 } from "./types.js";
 import {
   getNotificationConfig,
@@ -659,6 +672,7 @@ export async function notifyCompletedTurn(
   data: Partial<FullNotificationPayload> & {
     sessionId: string;
     assistantText: string;
+    richContent?: RichNotificationContent;
   },
   profileName?: string,
   deps: NotifyCompletedTurnDeps = {},
@@ -708,6 +722,7 @@ export async function notifyCompletedTurn(
       ...(decision.replyOrigin?.platform === "telegram" && decision.replyOrigin.telegramReplyTo
         ? { telegramReplyTo: decision.replyOrigin.telegramReplyTo }
         : {}),
+      ...(data.richContent ? { richContent: data.richContent } : {}),
     };
 
     const verbosity = getVerbosity(config);

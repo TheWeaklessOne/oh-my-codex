@@ -715,6 +715,349 @@ describe('sendTelegram', () => {
     assert.deepEqual(requestOrder, ['sendMessage']);
   });
 
+
+  it('sends rich local photo payloads with topic and reply metadata before deleting the accepted ack', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+    };
+    const tempDir = await mkdtemp(join(tmpdir(), 'omx-dispatcher-rich-photo-'));
+    const photoPath = join(tempDir, 'preview.png');
+    await import('node:fs/promises').then(({ writeFile }) => writeFile(photoPath, Buffer.from('png')));
+    const requestOrder: string[] = [];
+
+    try {
+      const result = await sendTelegram(
+        config,
+        {
+          ...basePayload,
+          message: '',
+          richContent: {
+            visibleText: '',
+            parts: [
+              { kind: 'photo', source: { type: 'local_path', path: photoPath, trust: 'turn-artifact' } },
+            ],
+          },
+          telegramReplyTo: { chatId: '777', messageId: '42', messageThreadId: '9001' },
+          telegramAcceptedAck: { chatId: '777', messageId: '43', messageThreadId: '9001' },
+        },
+        {
+          resolveTelegramDestinationImpl: async () => ({
+            chatId: '777',
+            sourceChatKey: 'telegram:123456:777',
+            messageThreadId: '9001',
+          }),
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendChatAction`]: (body) => {
+              requestOrder.push('sendChatAction');
+              const parsed = JSON.parse(body) as { action?: string; message_thread_id?: number };
+              assert.equal(parsed.action, 'upload_photo');
+              assert.equal(parsed.message_thread_id, 9001);
+              return { statusCode: 200, body: { ok: true, result: true } };
+            },
+            [`POST /bot${config.botToken}/sendPhoto`]: (body, options) => {
+              requestOrder.push('sendPhoto');
+              assert.match(String((options.headers as Record<string, unknown>)['Content-Type']), /multipart\/form-data/);
+              assert.ok(body.includes('name="chat_id"\r\n\r\n777'));
+              assert.ok(body.includes('name="message_thread_id"\r\n\r\n9001'));
+              assert.ok(body.includes('name="reply_to_message_id"\r\n\r\n42'));
+              assert.match(body, /name="photo"; filename="preview\.png"/);
+              return {
+                statusCode: 200,
+                body: { ok: true, result: { message_id: 1001, message_thread_id: 9001, is_topic_message: true } },
+              };
+            },
+            [`POST /bot${config.botToken}/deleteMessage`]: (body) => {
+              requestOrder.push('deleteMessage');
+              const parsed = JSON.parse(body) as { message_id?: number };
+              assert.equal(String(parsed.message_id), '43');
+              return { statusCode: 200, body: { ok: true, result: true } };
+            },
+          }),
+        },
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.messageId, '1001');
+      assert.deepEqual(requestOrder, ['sendChatAction', 'sendPhoto', 'deleteMessage']);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('sends rich document fallback payloads with sendDocument', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+    };
+    const tempDir = await mkdtemp(join(tmpdir(), 'omx-dispatcher-rich-document-'));
+    const documentPath = join(tempDir, 'large.png');
+    await import('node:fs/promises').then(({ writeFile }) => writeFile(documentPath, Buffer.from('large')));
+    const requestOrder: string[] = [];
+
+    try {
+      const result = await sendTelegram(
+        config,
+        {
+          ...basePayload,
+          message: '',
+          richContent: {
+            visibleText: '',
+            parts: [
+              {
+                kind: 'document',
+                source: { type: 'local_path', path: documentPath, trust: 'turn-artifact' },
+                filename: 'large.png"\r\nX-Injected: 1',
+                mimeType: 'image/png\r\nX-Injected: 1',
+              },
+            ],
+          },
+        },
+        {
+          resolveTelegramDestinationImpl: async () => ({
+            chatId: '777',
+            sourceChatKey: 'telegram:123456:777',
+          }),
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendChatAction`]: () => {
+              requestOrder.push('sendChatAction');
+              return { statusCode: 200, body: { ok: true, result: true } };
+            },
+            [`POST /bot${config.botToken}/sendDocument`]: (body) => {
+              requestOrder.push('sendDocument');
+              assert.doesNotMatch(body, /\r\nX-Injected/);
+              assert.match(body, /name="document"; filename="large\.png___X-Injected: 1"/);
+              assert.match(body, /Content-Type: application\/octet-stream/);
+              return {
+                statusCode: 200,
+                body: { ok: true, result: { message_id: 1002 } },
+              };
+            },
+          }),
+        },
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.messageId, '1002');
+      assert.deepEqual(requestOrder, ['sendChatAction', 'sendDocument']);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('retries mixed rich text parts as raw text before sending media', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      parseMode: 'Markdown',
+    };
+    const tempDir = await mkdtemp(join(tmpdir(), 'omx-dispatcher-rich-text-fallback-'));
+    const photoPath = join(tempDir, 'preview.png');
+    await import('node:fs/promises').then(({ writeFile }) => writeFile(photoPath, Buffer.from('png')));
+    const requestOrder: string[] = [];
+    const requestBodies: Array<{ text: string; parse_mode?: string; entities?: unknown[] }> = [];
+
+    try {
+      const result = await sendTelegram(
+        config,
+        {
+          ...basePayload,
+          message: '',
+          richContent: {
+            visibleText: '*unterminated',
+            parts: [
+              { kind: 'text', text: '*unterminated', format: 'markdown' },
+              { kind: 'photo', source: { type: 'local_path', path: photoPath, trust: 'turn-artifact' } },
+            ],
+          },
+        },
+        {
+          resolveTelegramDestinationImpl: async () => ({
+            chatId: '777',
+            sourceChatKey: 'telegram:123456:777',
+          }),
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+              requestOrder.push('sendMessage');
+              requestBodies.push(JSON.parse(body));
+              if (requestBodies.length === 1) {
+                return {
+                  statusCode: 400,
+                  body: {
+                    ok: false,
+                    error_code: 400,
+                    description: "Bad Request: can't parse entities: can't find end of the entity",
+                  },
+                };
+              }
+              return {
+                statusCode: 200,
+                body: { ok: true, result: { message_id: 501 } },
+              };
+            },
+            [`POST /bot${config.botToken}/sendChatAction`]: () => {
+              requestOrder.push('sendChatAction');
+              return { statusCode: 200, body: { ok: true, result: true } };
+            },
+            [`POST /bot${config.botToken}/sendPhoto`]: (body) => {
+              requestOrder.push('sendPhoto');
+              assert.match(body, /name="photo"; filename="preview\.png"/);
+              return {
+                statusCode: 200,
+                body: { ok: true, result: { message_id: 502 } },
+              };
+            },
+          }),
+        },
+      );
+
+      assert.equal(result.success, true);
+      assert.deepEqual(requestOrder, ['sendMessage', 'sendMessage', 'sendChatAction', 'sendPhoto']);
+      assert.equal(requestBodies[0].parse_mode, 'Markdown');
+      assert.equal('parse_mode' in requestBodies[1], false);
+      assert.equal('entities' in requestBodies[1], false);
+      assert.equal(requestBodies[1].text, '*unterminated');
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('uses rich text part content instead of the completed-turn telegram message override', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+    };
+    let requestBody: { text?: string; entities?: unknown[] } | null = null;
+    const tempDir = await mkdtemp(join(tmpdir(), 'omx-dispatcher-rich-text-override-'));
+    const photoPath = join(tempDir, 'preview.png');
+    await import('node:fs/promises').then(({ writeFile }) => writeFile(photoPath, Buffer.from('png')));
+
+    try {
+      const result = await sendTelegram(
+        config,
+        {
+          ...basePayload,
+          message: 'overall assistant text',
+          transportOverrides: {
+            telegram: {
+              message: 'overall transport override',
+              parseMode: null,
+              entities: [{ type: 'bold', offset: 0, length: 7 }],
+            },
+          },
+          richContent: {
+            visibleText: 'overall assistant text',
+            parts: [
+              { kind: 'text', text: 'ordered rich text part', format: 'plain' },
+              { kind: 'photo', source: { type: 'local_path', path: photoPath, trust: 'turn-artifact' } },
+            ],
+          },
+        },
+        {
+          resolveTelegramDestinationImpl: async () => ({
+            chatId: '777',
+            sourceChatKey: 'telegram:123456:777',
+          }),
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+              requestBody = JSON.parse(body) as { text?: string; entities?: unknown[] };
+              return {
+                statusCode: 200,
+                body: { ok: true, result: { message_id: 503 } },
+              };
+            },
+            [`POST /bot${config.botToken}/sendChatAction`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: true },
+            }),
+            [`POST /bot${config.botToken}/sendPhoto`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: { message_id: 504 } },
+            }),
+          }),
+        },
+      );
+
+      assert.equal(result.success, true);
+      const capturedBody = requestBody as { text?: string; entities?: unknown[] } | null;
+      assert.equal(capturedBody?.text, 'ordered rich text part');
+      assert.equal('entities' in (capturedBody ?? {}), false);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports sent rich message ids when partial rich delivery cleanup fails', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+    };
+    const tempDir = await mkdtemp(join(tmpdir(), 'omx-dispatcher-rich-cleanup-failure-'));
+    const firstPath = join(tempDir, 'first.png');
+    const secondPath = join(tempDir, 'second.png');
+    await import('node:fs/promises').then(({ writeFile }) => Promise.all([
+      writeFile(firstPath, Buffer.from('first')),
+      writeFile(secondPath, Buffer.from('second')),
+    ]));
+    let photoCalls = 0;
+
+    try {
+      const result = await sendTelegram(
+        config,
+        {
+          ...basePayload,
+          message: '',
+          richContent: {
+            visibleText: '',
+            parts: [
+              { kind: 'photo', source: { type: 'local_path', path: firstPath, trust: 'turn-artifact' } },
+              { kind: 'photo', source: { type: 'local_path', path: secondPath, trust: 'turn-artifact' } },
+            ],
+          },
+        },
+        {
+          resolveTelegramDestinationImpl: async () => ({
+            chatId: '777',
+            sourceChatKey: 'telegram:123456:777',
+          }),
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendChatAction`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: true },
+            }),
+            [`POST /bot${config.botToken}/sendPhoto`]: () => {
+              photoCalls += 1;
+              if (photoCalls === 1) {
+                return {
+                  statusCode: 200,
+                  body: { ok: true, result: { message_id: 7771 } },
+                };
+              }
+              return {
+                statusCode: 500,
+                body: { ok: false, description: 'second upload failed' },
+              };
+            },
+            [`POST /bot${config.botToken}/deleteMessage`]: () => ({
+              statusCode: 500,
+              body: { ok: false, description: 'delete failed' },
+            }),
+          }),
+        },
+      );
+
+      assert.equal(result.success, false);
+      assert.match(result.error ?? '', /message_ids=7771/);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('omits parse_mode when the payload explicitly disables telegram parsing', async () => {
     const config: TelegramNotificationConfig = {
       enabled: true,
@@ -1659,6 +2002,107 @@ describe('sendTelegram', () => {
           [{ type: 'code', offset: 'Topic '.length, length: 'code'.length }],
         ],
       );
+
+      const record = await getTelegramTopicRegistryRecord(
+        'telegram:123456:777',
+        identity.projectKey,
+      );
+      assert.equal(record?.messageThreadId, '9002');
+      assert.equal(record?.lastCreateFailureCode, undefined);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
+  it('refreshes a stale cached topic and retries rich photo sends', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      projectTopics: { enabled: true },
+    };
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-dispatcher-telegram-rich-stale-'));
+    const photoPath = join(tempHome, 'preview.png');
+    await import('node:fs/promises').then(({ writeFile }) => writeFile(photoPath, Buffer.from('png')));
+    const identity = normalizeTelegramProjectIdentity(basePayload);
+    assert.ok(identity);
+    let resolveCalls = 0;
+    const photoThreadIds: number[] = [];
+
+    process.env.HOME = tempHome;
+    process.env.USERPROFILE = tempHome;
+
+    try {
+      const result = await sendTelegram(
+        config,
+        {
+          ...basePayload,
+          message: '',
+          richContent: {
+            visibleText: '',
+            parts: [
+              { kind: 'photo', source: { type: 'local_path', path: photoPath, trust: 'turn-artifact' } },
+            ],
+          },
+        },
+        {
+          resolveTelegramDestinationImpl: async () => {
+            resolveCalls += 1;
+            return {
+              chatId: '777',
+              sourceChatKey: 'telegram:123456:777',
+              messageThreadId: resolveCalls === 1 ? '9001' : '9002',
+              projectKey: identity.projectKey,
+              canonicalProjectPath: identity.canonicalProjectPath,
+              topicName: 'project',
+            };
+          },
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendChatAction`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: true },
+            }),
+            [`POST /bot${config.botToken}/sendPhoto`]: (body) => {
+              const match = body.match(/name="message_thread_id"\r\n\r\n(\d+)/);
+              if (match?.[1]) photoThreadIds.push(Number(match[1]));
+              if (photoThreadIds.length === 1) {
+                return {
+                  statusCode: 400,
+                  body: {
+                    ok: false,
+                    error_code: 400,
+                    description: 'Bad Request: message thread not found',
+                  },
+                };
+              }
+
+              return {
+                statusCode: 200,
+                body: {
+                  ok: true,
+                  result: {
+                    message_id: 733,
+                    message_thread_id: 9002,
+                    is_topic_message: true,
+                  },
+                },
+              };
+            },
+          }),
+        },
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.messageId, '733');
+      assert.equal(result.messageThreadId, '9002');
+      assert.equal(resolveCalls, 2);
+      assert.deepEqual(photoThreadIds, [9001, 9002]);
 
       const record = await getTelegramTopicRegistryRecord(
         'telegram:123456:777',

@@ -67,10 +67,18 @@ import {
   buildCompletedTurnHookFingerprint,
   planCompletedTurnNotification,
 } from '../notifications/completed-turn.js';
+import {
+  buildCompletedTurnDeliveryEnvelope,
+  hasDeliverableContent,
+  hasRichMediaContent,
+} from '../notifications/rich-content.js';
 import { resolveTurnOriginForNotification } from '../runtime/codex-session-origin.js';
 import { markOwnerCompleted } from '../runtime/session-actors.js';
 import { reconcileRalphTerminalStateScope } from '../runtime/ralph-state-scope.js';
-import { consumePendingReplyOrigin } from '../notifications/reply-origin-state.js';
+import {
+  claimPendingReplyOrigin,
+  markPendingReplyOriginSent,
+} from '../notifications/reply-origin-state.js';
 import {
   expirePendingRoutes,
   markPendingRouteTerminalFailure,
@@ -484,6 +492,26 @@ function collectDispatchResultsForLog(result: unknown): unknown[] {
     ...(Array.isArray(raw.results) ? raw.results : []),
     ...(Array.isArray(raw.nonStandardResults) ? raw.nonStandardResults : []),
   ];
+}
+
+function hasSuccessfulOriginDelivery(result: unknown, replyOrigin: { platform?: string } | null | undefined): boolean {
+  const raw = asRecord(result);
+  if (!raw) return false;
+  if (!replyOrigin?.platform) {
+    return raw.anySuccess === true || raw.nonStandardAnySuccess === true;
+  }
+
+  const results = collectDispatchResultsForLog(result).map(asRecord).filter((entry): entry is Record<string, unknown> => entry !== null);
+  if (replyOrigin.platform === 'telegram') {
+    return results.some((entry) => safeString(entry.platform) === 'telegram' && entry.success === true);
+  }
+  if (replyOrigin.platform === 'discord') {
+    return results.some((entry) => {
+      const platform = safeString(entry.platform || entry.transport);
+      return entry.success === true && (platform === 'discord-bot' || platform === 'discord');
+    });
+  }
+  return raw.anySuccess === true || raw.nonStandardAnySuccess === true;
 }
 
 async function readCompletedTurnLogEvidence(
@@ -3069,9 +3097,23 @@ async function main() {
         recordSessionIdleHookEventSent,
       } = await import('../notifications/idle-cooldown.js');
       const notifySessionId = getEffectiveSessionId();
+      const notificationConfig = getNotificationConfig();
       const lastAssistantMessage = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '');
-      const hasAssistantText = lastAssistantMessage.trim().length > 0;
-      if (suppressCompletedTurnDelivery && hasAssistantText) {
+      const threadIdForDelivery = safeString(payload['thread-id'] || payload.thread_id || '');
+      const turnIdForDelivery = safeString(payload['turn-id'] || payload.turn_id || '');
+      const deliveryEnvelope = await buildCompletedTurnDeliveryEnvelope({
+        assistantText: lastAssistantMessage,
+        projectPath: cwd,
+        threadId: threadIdForDelivery,
+        turnId: turnIdForDelivery,
+        sessionId: notifySessionId || payloadSessionId || turnOrigin.nativeSessionId || '',
+        transcriptPath: safeString(payload.transcript_path || payload.transcriptPath || payload['transcript-path'] || ''),
+        env: process.env,
+        telegramRichRepliesConfig: notificationConfig?.telegram?.richReplies ?? null,
+      });
+      const visibleAssistantText = deliveryEnvelope.visibleText;
+      const completedTurnHasDeliverableContent = hasDeliverableContent(deliveryEnvelope);
+      if (suppressCompletedTurnDelivery && completedTurnHasDeliverableContent) {
         if (suppressExternalCompletedTurn && notifySessionId) {
           const waitingRoutes = await markPendingRoutesWaitingForOwner(cwd, notifySessionId, {
             ownerActorId: originResolution.ownerActorId,
@@ -3128,10 +3170,10 @@ async function main() {
           type: 'completed_turn_delivery_suppressed',
         });
       }
-      const semanticOutcome = classifyCompletedTurn(lastAssistantMessage);
+      const semanticOutcome = classifyCompletedTurn(visibleAssistantText);
       let canNotifyExternalCompletedTurn = Boolean(
         notifySessionId
-        && hasAssistantText
+        && completedTurnHasDeliverableContent
         && !suppressCompletedTurnDelivery,
       );
       if (
@@ -3193,22 +3235,24 @@ async function main() {
           agent_role: turnOrigin.agentRole || null,
           origin_evidence: originResolution.evidence,
           evidence_sources: originResolution.evidence.map((entry) => entry.source),
+          content_part_count: deliveryEnvelope.parts.length,
+          rich_media_part_count: deliveryEnvelope.parts.filter((part) => part.kind !== 'text').length,
+          ...(deliveryEnvelope.warnings.length ? { delivery_warnings: deliveryEnvelope.warnings } : {}),
         });
       }
       const replyOrigin = canNotifyExternalCompletedTurn && notifySessionId
-        ? await consumePendingReplyOrigin(cwd, notifySessionId, latestUserInput, originResolution.ownerActorId)
+        ? await claimPendingReplyOrigin(cwd, notifySessionId, latestUserInput, originResolution.ownerActorId)
         : null;
       if (replyOrigin?.routeId && notifySessionId) {
         await logNotifyHookEvent(logsDir, {
           timestamp: new Date().toISOString(),
-          type: 'pending_route_completed',
+          type: 'pending_route_dispatching',
           omx_session_id: notifySessionId,
           route_id: replyOrigin.routeId,
           owner_actor_id: originResolution.ownerActorId || null,
           platform: replyOrigin.platform,
         });
       }
-      const notificationConfig = getNotificationConfig();
       if (notifySessionId) {
         const expiredRoutes = await expirePendingRoutes(cwd, notifySessionId).catch(() => []);
         for (const route of expiredRoutes) {
@@ -3241,7 +3285,8 @@ async function main() {
         semanticOutcome,
         replyOrigin,
         turnId: safeString(payload['turn-id'] || payload.turn_id || ''),
-        assistantText: lastAssistantMessage,
+        assistantText: visibleAssistantText,
+        hasDeliverableContent: completedTurnHasDeliverableContent,
         notificationConfig,
       });
       const notificationEventEnabled = Boolean(
@@ -3282,7 +3327,8 @@ async function main() {
               semanticOutcome.kind === 'input-needed'
                 ? (semanticOutcome.question || semanticOutcome.summary || 'Input is needed to continue.')
                 : undefined,
-            assistantText: lastAssistantMessage,
+            assistantText: visibleAssistantText,
+            ...(hasRichMediaContent(deliveryEnvelope) ? { richContent: deliveryEnvelope } : {}),
           }, undefined, {
             getNotificationConfigImpl: () => notificationConfig,
           })
@@ -3296,7 +3342,7 @@ async function main() {
               }
               if (decision?.replyOrigin?.routeId) {
                 await markPendingRouteTerminalFailure(cwd, notifySessionId, decision.replyOrigin.routeId, {
-                  status: 'failed',
+                  status: deliveryFailureKind === 'ambiguous_timeout' ? 'delivery_unknown' : 'failed',
                   reason: error instanceof Error ? error.message : String(error),
                 }).catch(() => false);
               }
@@ -3328,7 +3374,8 @@ async function main() {
           const notificationResults = summarizeNotificationResultsForLog(
             collectDispatchResultsForLog(completedTurnResult),
           );
-          if (completedTurnResult && (completedTurnResult.anySuccess || nonStandardAnySuccess)) {
+          const originDeliverySucceeded = hasSuccessfulOriginDelivery(completedTurnResult, decision?.replyOrigin);
+          if (completedTurnResult && originDeliverySucceeded) {
             recordCompletedTurnNotificationSent(
               stateDir,
               notifySessionId,
@@ -3342,6 +3389,20 @@ async function main() {
               source: 'notify-hook-delivered',
             }).catch(() => null);
             completedTurnDeliveryStatus = 'sent';
+            if (decision?.replyOrigin?.routeId) {
+              const routeSent = await markPendingReplyOriginSent(cwd, notifySessionId, decision.replyOrigin.routeId)
+                .catch(() => false);
+              if (!routeSent) {
+                await logNotifyHookEvent(logsDir, {
+                  timestamp: new Date().toISOString(),
+                  level: 'warn',
+                  type: 'pending_route_sent_mark_failed',
+                  omx_session_id: notifySessionId,
+                  route_id: decision.replyOrigin.routeId,
+                  platform: decision.replyOrigin.platform,
+                });
+              }
+            }
             await logNotifyHookEvent(logsDir, {
               timestamp: new Date().toISOString(),
               type: 'completed_turn_delivery_sent',
@@ -3373,7 +3434,7 @@ async function main() {
             }
             if (decision?.replyOrigin?.routeId) {
               await markPendingRouteTerminalFailure(cwd, notifySessionId, decision.replyOrigin.routeId, {
-                status: 'failed',
+                status: deliveryFailureKind === 'ambiguous_timeout' ? 'delivery_unknown' : 'failed',
                 reason: summarizeNotificationFailureReason(notificationResults),
               }).catch(() => false);
             }
@@ -3441,6 +3502,39 @@ async function main() {
             // Non-fatal
           }
         }
+      }
+      if (
+        replyOrigin?.routeId
+        && !completedTurnDeliveryStatus
+        && !completedTurnNotificationFailed
+        && (
+          !decision
+          || !notificationEventEnabled
+          || !shouldNotifyCompletedTurn
+        )
+      ) {
+        completedTurnNotificationFailed = true;
+        await markPendingRouteTerminalFailure(cwd, notifySessionId, replyOrigin.routeId, {
+          status: 'failed',
+          reason: !decision
+            ? 'completed turn produced no notification decision'
+            : !notificationEventEnabled
+              ? 'completed turn notification event disabled'
+              : 'completed turn notification suppressed by cooldown',
+        }).catch(() => false);
+        await logNotifyHookEvent(logsDir, {
+          timestamp: new Date().toISOString(),
+          level: 'warn',
+          type: 'pending_route_delivery_not_dispatched',
+          omx_session_id: notifySessionId,
+          route_id: replyOrigin.routeId,
+          platform: replyOrigin.platform,
+          reason: !decision
+            ? 'no_decision'
+            : !notificationEventEnabled
+              ? 'event_disabled'
+              : 'cooldown_suppressed',
+        });
       }
       if (
         !completedTurnDeliveryStatus

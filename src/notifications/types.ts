@@ -105,6 +105,21 @@ export interface TelegramNotificationConfig {
   parseMode?: "Markdown" | "HTML";
   /** Optional per-project Telegram topic routing policy */
   projectTopics?: TelegramProjectTopicsConfig;
+  /** Rich reply delivery policy for generated artifacts and explicit manifests. */
+  richReplies?: TelegramRichRepliesConfig;
+}
+
+export interface TelegramRichRepliesConfig {
+  /** Enable structured rich replies for Telegram completed turns (default: true). */
+  enabled?: boolean;
+  /** Auto-detect trusted generated image artifacts for empty-text turns (default: true). */
+  autoDetectGeneratedImages?: boolean;
+  /** Maximum local upload size in bytes for any Telegram rich part. */
+  maxUploadBytes?: number;
+  /** Maximum generated image size that should use sendPhoto before falling back to sendDocument. */
+  maxPhotoBytes?: number;
+  /** Additional trusted artifact roots. Relative entries are resolved from the project path. */
+  allowedArtifactRoots?: string[];
 }
 
 export interface TelegramMessageReferenceTarget {
@@ -279,6 +294,40 @@ export type NotificationTransportOverrides = Partial<
   Record<NotificationPlatform, NotificationTransportOverride>
 >;
 
+export type RichContentKind =
+  | "text"
+  | "photo"
+  | "document"
+  | "audio"
+  | "voice"
+  | "sticker"
+  | "video"
+  | "animation"
+  | "video_note";
+
+export type RichContentFileSource =
+  | { type: "local_path"; path: string; trust: "turn-artifact" | "manifest" }
+  | { type: "telegram_file_id"; fileId: string }
+  | { type: "https_url"; url: string; trust: "explicit" };
+
+export type RichContentPart =
+  | { kind: "text"; text: string; format?: "plain" | "markdown" }
+  | { kind: "photo"; source: RichContentFileSource; caption?: string; alt?: string }
+  | { kind: "document"; source: RichContentFileSource; caption?: string; filename?: string; mimeType?: string }
+  | { kind: "audio"; source: RichContentFileSource; caption?: string; title?: string; performer?: string }
+  | { kind: "voice"; source: RichContentFileSource; caption?: string; durationSeconds?: number }
+  | { kind: "sticker"; source: RichContentFileSource; emoji?: string }
+  | { kind: "video" | "animation" | "video_note"; source: RichContentFileSource; caption?: string };
+
+export interface RichNotificationContent {
+  /** Ordered content parts to deliver on rich-capable transports. */
+  parts: RichContentPart[];
+  /** Human-visible assistant text after stripping machine-readable delivery manifests. */
+  visibleText?: string;
+  /** Diagnostic policy/extraction warnings safe for structured logs. */
+  warnings?: string[];
+}
+
 /** Payload sent with each notification */
 export interface FullNotificationPayload {
   /** The event that triggered this notification */
@@ -325,6 +374,8 @@ export interface FullNotificationPayload {
   tmuxTailLive?: boolean;
   /** Generic per-platform rendering overrides */
   transportOverrides?: NotificationTransportOverrides;
+  /** Structured rich content for transports that can send media/files. */
+  richContent?: RichNotificationContent;
   /** Accepted Telegram reply placeholder to delete after a successful fresh final sendMessage. */
   telegramAcceptedAck?: TelegramAcceptedAckCleanupTarget;
   /** Telegram message that the final answer should reply to. */

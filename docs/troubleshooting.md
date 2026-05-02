@@ -118,3 +118,16 @@ Adjust the terminal pattern if your client advertises a different terminfo name.
 - **Model fallback inside the explore harness**: the harness tries the configured spark model first and then the configured fallback/standard model only if spark fails. This changes the cost/behavior boundary, so stderr emits structured attempt metadata such as `fallback-attempt=model from=... to=... reason=spark_attempt_failed exit=...`. The stdout notice `## OMX Explore fallback` is emitted only after successful fallback output.
 
 A harness limitation is different from fallback. If the harness cannot answer safely (unsupported platform, missing native binary for a packaged install, missing Rust toolchain in a checkout, or a non-shell-only task), it should report the limitation and stop or ask the caller to use the richer normal path; it should not silently broaden tools or model behavior.
+
+## Telegram image-only replies never replace the “Got it…” placeholder
+
+If a Telegram-origin prompt asks Codex to generate an image, built-in image generation may finish with an empty assistant text body while saving a PNG under `$CODEX_HOME/generated_images/<thread-id>/...`. Current OMX treats that generated artifact as deliverable rich content: the final hook should call Telegram `sendPhoto` in the same topic/reply chain, or `sendDocument` if the image is too large or unsuitable for photo delivery.
+
+Checks:
+
+1. Ensure Telegram completed-turn events are enabled (`notifications.events["result-ready"].enabled`).
+2. Ensure `notifications.telegram.richReplies.enabled` and `autoDetectGeneratedImages` are not set to `false`.
+3. Inspect `.omx/logs/notify-hook-YYYY-MM-DD.jsonl` for `completed_turn_delivery_allowed` with `rich_media_part_count`, followed by `completed_turn_delivery_sent` or `completed_turn_delivery_failed`.
+4. Inspect `.omx/state/sessions/<session-id>/pending-routes.json`: successful final media delivery should move the route to terminal `completed`; delivery failures should be terminal `failed` or `delivery_unknown`, not silently completed.
+
+Do not work around this by pasting local generated-image paths into Telegram. Keep artifacts under trusted roots (`$CODEX_HOME/generated_images/<thread-id>/...` or `.omx/artifacts`) and let OMX own Telegram delivery.

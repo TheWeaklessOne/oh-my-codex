@@ -1,6 +1,8 @@
 import type { CompletedTurnReplyOrigin } from "./completed-turn.js";
 import {
+  claimPendingRouteForOwnerCompletion,
   consumePendingRouteForOwnerCompletion,
+  markPendingRouteSent,
   recordPendingRoute,
 } from "./pending-routes.js";
 import { readSessionActors } from "../runtime/session-actors.js";
@@ -27,4 +29,26 @@ export async function consumePendingReplyOrigin(
     ownerActorId: ownerActorId || registry.ownerActorId,
     latestInput,
   });
+}
+
+export async function claimPendingReplyOrigin(
+  projectPath: string | undefined,
+  sessionId: string | undefined,
+  latestInput: string,
+  ownerActorId?: string,
+): Promise<CompletedTurnReplyOrigin | null> {
+  if (!projectPath || !sessionId) return null;
+  const registry = await readSessionActors(projectPath, sessionId);
+  return await claimPendingRouteForOwnerCompletion(projectPath, sessionId, {
+    ownerActorId: ownerActorId || registry.ownerActorId,
+    latestInput,
+  });
+}
+
+export async function markPendingReplyOriginSent(
+  projectPath: string | undefined,
+  sessionId: string | undefined,
+  routeId: string | undefined,
+): Promise<boolean> {
+  return await markPendingRouteSent(projectPath, sessionId, routeId);
 }

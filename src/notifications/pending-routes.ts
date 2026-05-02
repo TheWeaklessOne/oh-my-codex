@@ -7,8 +7,8 @@ import { updateLockedJsonState } from "../runtime/locked-json-state.js";
 import { readSessionActors } from "../runtime/session-actors.js";
 import { omxLogsDir, omxStateDir } from "../utils/paths.js";
 
-export type PendingRouteStatus = "pending" | "waiting-for-owner";
-export type PendingRouteTerminalStatus = "completed" | "failed" | "expired";
+export type PendingRouteStatus = "pending" | "waiting-for-owner" | "dispatching";
+export type PendingRouteTerminalStatus = "completed" | "failed" | "expired" | "delivery_unknown";
 
 export interface PendingRoute {
   routeId: string;
@@ -114,7 +114,11 @@ function normalizeRoute(value: unknown, fallbackSessionId: string): PendingRoute
   const routeId = safeString(raw.routeId);
   if (!platform || !injectedInput || !ownerActorId || !sessionId || !routeId) return null;
   const inputHash = safeString(raw.inputHash) || hashRouteInput(injectedInput);
-  const status = raw.status === "waiting-for-owner" ? "waiting-for-owner" : "pending";
+  const status = raw.status === "waiting-for-owner"
+    ? "waiting-for-owner"
+    : raw.status === "dispatching"
+      ? "dispatching"
+      : "pending";
   const createdAt = safeString(raw.createdAt) || new Date(0).toISOString();
   const updatedAt = safeString(raw.updatedAt) || createdAt;
   const lastNonTerminalStatus = raw.lastNonTerminalStatus === "suppressed-non-terminal"
@@ -146,7 +150,11 @@ function normalizeTerminalRoute(value: unknown, fallbackSessionId: string): Pend
   }, fallbackSessionId);
   const raw = asRecord(value);
   if (!route || !raw) return null;
-  const status = raw.status === "failed" || raw.status === "expired" ? raw.status : "completed";
+  const status = raw.status === "failed"
+    || raw.status === "expired"
+    || raw.status === "delivery_unknown"
+    ? raw.status
+    : "completed";
   const terminalAt = safeString(raw.terminalAt) || route.updatedAt;
   return {
     ...route,
@@ -387,6 +395,7 @@ export async function consumePendingRouteForOwnerCompletion(
     const routeIndex = state.routes.findIndex((route) =>
       (route.ownerActorId === ownerActorId || route.ownerActorId === placeholderOwnerActorId)
       && route.inputHash === inputHash
+      && route.status !== "dispatching"
     );
     if (routeIndex === -1) {
       return {
@@ -433,12 +442,117 @@ export async function consumePendingRouteForOwnerCompletion(
   return mutation.replyOrigin;
 }
 
+export async function claimPendingRouteForOwnerCompletion(
+  projectPath: string | undefined,
+  sessionId: string | undefined,
+  input: {
+    ownerActorId: string | undefined;
+    latestInput: string;
+    claimedAt?: string;
+  },
+): Promise<CompletedTurnReplyOrigin | null> {
+  if (!projectPath || !isSafeSessionId(sessionId)) return null;
+  const ownerActorId = safeString(input.ownerActorId);
+  if (!ownerActorId) return null;
+  const inputHash = hashRouteInput(input.latestInput);
+  const placeholderOwnerActorId = `owner:${sessionId}`;
+  const claimedAt = input.claimedAt || new Date().toISOString();
+  const now = new Date(claimedAt);
+  type ClaimMutationResult = {
+    replyOrigin: CompletedTurnReplyOrigin | null;
+    claimedRoute: PendingRoute | null;
+    expired: PendingRouteTerminalRecord[];
+  };
+  const mutation = await updatePendingRoutes<ClaimMutationResult>(projectPath, sessionId, async (state) => {
+    const expired = Number.isFinite(now.getTime()) ? expireRoutesInState(state, now) : [];
+    const routeIndex = state.routes.findIndex((route) =>
+      (route.ownerActorId === ownerActorId || route.ownerActorId === placeholderOwnerActorId)
+      && route.inputHash === inputHash
+      && route.status !== "dispatching"
+    );
+    if (routeIndex === -1) {
+      return {
+        result: { replyOrigin: null, claimedRoute: null, expired },
+        write: expired.length > 0,
+      };
+    }
+    const route = state.routes[routeIndex];
+    if (!route) {
+      return {
+        result: { replyOrigin: null, claimedRoute: null, expired },
+        write: expired.length > 0,
+      };
+    }
+    const claimedRoute = {
+      ...route,
+      ownerActorId: route.ownerActorId === placeholderOwnerActorId ? ownerActorId : route.ownerActorId,
+      status: "dispatching" as const,
+      updatedAt: claimedAt,
+    };
+    state.routes[routeIndex] = claimedRoute;
+    return {
+      result: {
+        replyOrigin: routeToReplyOrigin(claimedRoute),
+        claimedRoute,
+        expired,
+      },
+      write: true,
+    };
+  });
+  if (mutation.expired.length > 0) {
+    await logExpiredRoutes(projectPath, sessionId, mutation.expired);
+  }
+  if (!mutation.replyOrigin || !mutation.claimedRoute) return null;
+  await appendPendingRouteLog(projectPath, {
+    event: "pending_route_dispatching",
+    session_id: sessionId,
+    route_id: mutation.claimedRoute.routeId,
+    owner_actor_id: mutation.claimedRoute.ownerActorId,
+    platform: mutation.claimedRoute.platform,
+  });
+  return mutation.replyOrigin;
+}
+
+export async function markPendingRouteSent(
+  projectPath: string | undefined,
+  sessionId: string | undefined,
+  routeId: string | undefined,
+  input: {
+    terminalAt?: string;
+  } = {},
+): Promise<boolean> {
+  if (!projectPath || !isSafeSessionId(sessionId) || !safeString(routeId)) return false;
+  const terminalAt = input.terminalAt || new Date().toISOString();
+  const marked = await updatePendingRoutes(projectPath, sessionId, async (state) => {
+    const existingTerminal = state.terminal.find((route) => route.routeId === routeId);
+    if (existingTerminal?.status === "completed") return { result: true, write: false };
+    const pendingIndex = state.routes.findIndex((route) => route.routeId === routeId);
+    if (pendingIndex === -1) return { result: false, write: false };
+    const [route] = state.routes.splice(pendingIndex, 1);
+    if (!route) return { result: false, write: false };
+    state.terminal.push({
+      ...route,
+      status: "completed",
+      terminalAt,
+      updatedAt: terminalAt,
+    });
+    return { result: true, write: true };
+  });
+  if (!marked) return false;
+  await appendPendingRouteLog(projectPath, {
+    event: "pending_route_sent",
+    session_id: sessionId,
+    route_id: routeId,
+  });
+  return true;
+}
+
 export async function markPendingRouteTerminalFailure(
   projectPath: string | undefined,
   sessionId: string | undefined,
   routeId: string | undefined,
   input: {
-    status: "failed" | "expired";
+    status: "failed" | "expired" | "delivery_unknown";
     reason: string;
     terminalAt?: string;
   },
@@ -449,6 +563,7 @@ export async function markPendingRouteTerminalFailure(
     const existingTerminalIndex = state.terminal.findIndex((route) => route.routeId === routeId);
     if (existingTerminalIndex !== -1) {
       const existing = state.terminal[existingTerminalIndex]!;
+      if (existing.status === "completed") return { result: false, write: false };
       state.terminal[existingTerminalIndex] = {
         ...existing,
         status: input.status,

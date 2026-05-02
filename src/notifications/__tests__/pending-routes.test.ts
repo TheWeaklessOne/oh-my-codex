@@ -5,8 +5,10 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import {
+  claimPendingRouteForOwnerCompletion,
   consumePendingRouteForOwnerCompletion,
   expirePendingRoutes,
+  markPendingRouteSent,
   markPendingRouteTerminalFailure,
   markPendingRoutesWaitingForOwner,
   pendingRoutesStatePath,
@@ -99,6 +101,82 @@ describe('pending-routes', () => {
     assert.equal(consumed?.injectedInput, 'child must not consume this');
   });
 
+
+  it('claims a matching route as dispatching and marks it completed only after delivery succeeds', async () => {
+    const sessionId = 'sess-pending-route-claim-sent';
+    const owner = await registerExternalOwnerActor({
+      cwd: projectRoot,
+      sessionId,
+      nativeSessionId: 'leader-pending-route-claim-sent',
+      source: 'test-owner',
+    });
+    await recordPendingRoute(projectRoot, sessionId, {
+      platform: 'telegram',
+      injectedInput: 'deliver after claim',
+      createdAt: '2026-04-30T00:00:00.000Z',
+      telegramAck: { chatId: '777', messageId: '10', messageThreadId: '99' },
+    });
+
+    const claimed = await claimPendingRouteForOwnerCompletion(projectRoot, sessionId, {
+      ownerActorId: owner.actor.actorId,
+      latestInput: 'deliver after claim',
+      claimedAt: '2026-04-30T00:00:01.000Z',
+    });
+    assert.ok(claimed?.routeId);
+
+    const dispatchingState = JSON.parse(await readFile(pendingRoutesStatePath(projectRoot, sessionId), 'utf-8')) as {
+      routes?: Array<{ routeId?: string; status?: string }>;
+      terminal?: Array<unknown>;
+    };
+    assert.equal(dispatchingState.routes?.length, 1);
+    assert.equal(dispatchingState.routes?.[0]?.routeId, claimed.routeId);
+    assert.equal(dispatchingState.routes?.[0]?.status, 'dispatching');
+    assert.equal(dispatchingState.terminal?.length, 0);
+
+    const marked = await markPendingRouteSent(projectRoot, sessionId, claimed.routeId, {
+      terminalAt: '2026-04-30T00:00:02.000Z',
+    });
+    assert.equal(marked, true);
+
+    const sentState = JSON.parse(await readFile(pendingRoutesStatePath(projectRoot, sessionId), 'utf-8')) as {
+      routes?: Array<unknown>;
+      terminal?: Array<{ routeId?: string; status?: string }>;
+    };
+    assert.deepEqual(sentState.routes, []);
+    assert.equal(sentState.terminal?.length, 1);
+    assert.equal(sentState.terminal?.[0]?.routeId, claimed.routeId);
+    assert.equal(sentState.terminal?.[0]?.status, 'completed');
+  });
+
+  it('does not claim an already-dispatching route a second time', async () => {
+    const sessionId = 'sess-pending-route-double-claim';
+    const owner = await registerExternalOwnerActor({
+      cwd: projectRoot,
+      sessionId,
+      nativeSessionId: 'leader-pending-route-double-claim',
+      source: 'test-owner',
+    });
+    await recordPendingRoute(projectRoot, sessionId, {
+      platform: 'telegram',
+      injectedInput: 'claim only once',
+      createdAt: '2026-04-30T00:00:00.000Z',
+    });
+
+    const first = await claimPendingRouteForOwnerCompletion(projectRoot, sessionId, {
+      ownerActorId: owner.actor.actorId,
+      latestInput: 'claim only once',
+      claimedAt: '2026-04-30T00:00:01.000Z',
+    });
+    const second = await claimPendingRouteForOwnerCompletion(projectRoot, sessionId, {
+      ownerActorId: owner.actor.actorId,
+      latestInput: 'claim only once',
+      claimedAt: '2026-04-30T00:00:02.000Z',
+    });
+
+    assert.ok(first?.routeId);
+    assert.equal(second, null);
+  });
+
   it('leader completion consumes exactly one matching route and records a completed terminal outcome', async () => {
     const sessionId = 'sess-pending-route-cleanup';
     const owner = await registerExternalOwnerActor({
@@ -171,7 +249,7 @@ describe('pending-routes', () => {
     assert.equal(state.terminal?.[0]?.injectedInput, 'stale input');
   });
 
-  it('can reclassify a consumed route as failed after delivery failure', async () => {
+  it('can mark a dispatching route as failed after delivery failure', async () => {
     const sessionId = 'sess-pending-route-failed-after-complete';
     const owner = await registerExternalOwnerActor({
       cwd: projectRoot,
@@ -185,14 +263,14 @@ describe('pending-routes', () => {
       createdAt: '2026-04-30T00:00:00.000Z',
     });
 
-    const consumed = await consumePendingRouteForOwnerCompletion(projectRoot, sessionId, {
+    const claimed = await claimPendingRouteForOwnerCompletion(projectRoot, sessionId, {
       ownerActorId: owner.actor.actorId,
       latestInput: 'delivery will fail',
-      completedAt: '2026-04-30T00:00:01.000Z',
+      claimedAt: '2026-04-30T00:00:01.000Z',
     });
-    assert.ok(consumed?.routeId);
+    assert.ok(claimed?.routeId);
 
-    const marked = await markPendingRouteTerminalFailure(projectRoot, sessionId, consumed.routeId, {
+    const marked = await markPendingRouteTerminalFailure(projectRoot, sessionId, claimed.routeId, {
       status: 'failed',
       reason: 'telegram delivery failed',
       terminalAt: '2026-04-30T00:00:02.000Z',
@@ -203,9 +281,46 @@ describe('pending-routes', () => {
       terminal?: Array<{ routeId?: string; status?: string; terminalReason?: string }>;
     };
     assert.equal(state.terminal?.length, 1);
-    assert.equal(state.terminal?.[0]?.routeId, consumed.routeId);
+    assert.equal(state.terminal?.[0]?.routeId, claimed.routeId);
     assert.equal(state.terminal?.[0]?.status, 'failed');
     assert.equal(state.terminal?.[0]?.terminalReason, 'telegram delivery failed');
+  });
+
+  it('does not overwrite a completed terminal route with a later failure', async () => {
+    const sessionId = 'sess-pending-route-completed-wins';
+    const owner = await registerExternalOwnerActor({
+      cwd: projectRoot,
+      sessionId,
+      nativeSessionId: 'leader-pending-route-completed-wins',
+      source: 'test-owner',
+    });
+    await recordPendingRoute(projectRoot, sessionId, {
+      platform: 'telegram',
+      injectedInput: 'already delivered',
+      createdAt: '2026-04-30T00:00:00.000Z',
+    });
+    const claimed = await claimPendingRouteForOwnerCompletion(projectRoot, sessionId, {
+      ownerActorId: owner.actor.actorId,
+      latestInput: 'already delivered',
+      claimedAt: '2026-04-30T00:00:01.000Z',
+    });
+    assert.ok(claimed?.routeId);
+    assert.equal(await markPendingRouteSent(projectRoot, sessionId, claimed.routeId), true);
+
+    const failed = await markPendingRouteTerminalFailure(projectRoot, sessionId, claimed.routeId, {
+      status: 'failed',
+      reason: 'late failure from duplicate sender',
+      terminalAt: '2026-04-30T00:00:02.000Z',
+    });
+    assert.equal(failed, false);
+
+    const state = JSON.parse(await readFile(pendingRoutesStatePath(projectRoot, sessionId), 'utf-8')) as {
+      terminal?: Array<{ routeId?: string; status?: string; terminalReason?: string }>;
+    };
+    assert.equal(state.terminal?.length, 1);
+    assert.equal(state.terminal?.[0]?.routeId, claimed.routeId);
+    assert.equal(state.terminal?.[0]?.status, 'completed');
+    assert.equal(state.terminal?.[0]?.terminalReason, undefined);
   });
 
   it('expires pending routes explicitly without consuming them', async () => {

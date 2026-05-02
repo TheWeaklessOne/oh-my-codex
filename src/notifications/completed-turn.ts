@@ -290,6 +290,7 @@ export function planCompletedTurnNotification(input: {
   replyOrigin?: CompletedTurnReplyOrigin | null;
   turnId?: string;
   assistantText?: string;
+  hasDeliverableContent?: boolean;
   notificationConfig?: Pick<FullNotificationConfig, "completedTurn"> | null;
 }): CompletedTurnNotificationDecision | null {
   const { semanticOutcome } = input;
@@ -297,6 +298,7 @@ export function planCompletedTurnNotification(input: {
   const hasAssistantText =
     typeof input.assistantText === "string"
     && input.assistantText.trim().length > 0;
+  const hasAnyDeliverableContent = input.hasDeliverableContent ?? hasAssistantText;
   const semanticEvent = semanticOutcome.notificationEvent === "result-ready"
     || semanticOutcome.notificationEvent === "ask-user-question"
     ? semanticOutcome.notificationEvent
@@ -309,7 +311,7 @@ export function planCompletedTurnNotification(input: {
   const effectiveEvent: CompletedTurnEffectiveEvent | undefined =
     explicitInputNeeded
       ? "ask-user-question"
-      : hasAssistantText
+      : hasAnyDeliverableContent
         ? "result-ready"
         : semanticEvent
           ?? (canPromoteReplyOriginTurn ? "result-ready" : undefined);

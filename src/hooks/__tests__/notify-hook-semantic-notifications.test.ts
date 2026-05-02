@@ -230,6 +230,67 @@ syncBuiltinESMExports();
   return preloadPath;
 }
 
+
+async function writeTelegramFailingSendPhotoPreload(dir: string): Promise<string> {
+  const preloadPath = join(dir, 'mock-telegram-send-photo-failure.mjs');
+  await writeFile(preloadPath, `
+import { appendFileSync } from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
+import { PassThrough } from 'node:stream';
+
+const capturePath = process.env.OMX_TELEGRAM_CAPTURE_PATH;
+globalThis.__OMX_TEST_MOCK_TELEGRAM_TRANSPORT__ = 'https-request-capture';
+const require = createRequire(import.meta.url);
+const https = require('node:https');
+
+https.request = (options, callback) => {
+  const listeners = new Map();
+  let requestBody = '';
+  const emit = (event, value) => {
+    for (const handler of listeners.get(event) ?? []) handler(value);
+  };
+  const request = {
+    on(event, handler) {
+      listeners.set(event, [...(listeners.get(event) ?? []), handler]);
+      return request;
+    },
+    write(chunk) {
+      requestBody += Buffer.isBuffer(chunk) ? chunk.toString('utf-8') : chunk;
+      return true;
+    },
+    end() {
+      queueMicrotask(() => {
+        const path = String(options?.path ?? '');
+        if (capturePath) appendFileSync(capturePath, JSON.stringify({ url: path, body: requestBody }) + '\\n');
+        const response = new PassThrough();
+        if (path.includes('/sendPhoto')) {
+          response.statusCode = 500;
+          callback?.(response);
+          response.end(JSON.stringify({ ok: false, description: 'media upload failed' }));
+          return;
+        }
+        response.statusCode = 200;
+        callback?.(response);
+        response.end(JSON.stringify({
+          ok: true,
+          result: { message_id: 321, message_thread_id: 9001, is_topic_message: true },
+        }));
+      });
+      return request;
+    },
+    destroy(error) {
+      if (error) emit('error', error);
+      return request;
+    },
+  };
+  return request;
+};
+
+syncBuiltinESMExports();
+`, 'utf-8');
+  return preloadPath;
+}
+
 async function readCapturedRequests(path: string): Promise<Array<{ url: string; body: string }>> {
   try {
     const raw = await readFile(path, 'utf-8');
@@ -272,6 +333,18 @@ async function writeTelegramTopicRegistryRecord(
       },
     ],
   }, null, 2));
+}
+
+async function writeImageGenerationTranscript(
+  path: string,
+  turnId: string,
+  imagePath: string,
+): Promise<void> {
+  await writeFile(path, [
+    JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } }),
+    JSON.stringify({ type: 'event_msg', payload: { type: 'image_generation_end', saved_path: imagePath } }),
+    JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId, last_agent_message: null } }),
+  ].join('\n') + '\n');
 }
 
 async function writeSessionIdleHookPlugin(workdir: string, capturePath: string): Promise<void> {
@@ -2850,6 +2923,337 @@ describe('notify-hook semantic notifications', () => {
       assert.equal(body.text, rawMessage);
       assert.equal(body.message_thread_id, 9001);
       assert.equal('parse_mode' in body, false);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+
+  it('sends a generated image-only Telegram follow-up as sendPhoto and completes the pending route after delivery', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-telegram-image-only-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'telegram-captures.ndjson');
+    const preloadPath = await writeTelegramCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const sessionId = 'sess-telegram-image-only';
+    const threadId = 'thread-telegram-image-only';
+    const turnId = 'turn-telegram-image-only';
+
+    try {
+      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
+      await writeNotificationConfig(codexHome, {
+        webhook: { enabled: false },
+        telegram: {
+          enabled: true,
+          botToken: '123456:telegram-token',
+          chatId: '777',
+          projectTopics: { enabled: true },
+        },
+      });
+      await writeTelegramTopicRegistryRecord(tempRoot, workdir, {
+        botId: '123456',
+        chatId: '777',
+        topicName: 'repo-topic',
+        messageThreadId: '9001',
+      });
+      await writeOwnerSessionState(workdir, sessionId, threadId);
+      const generatedDir = join(codexHome, 'generated_images', threadId);
+      await mkdir(generatedDir, { recursive: true });
+      await writeFile(join(generatedDir, 'stale.png'), Buffer.from('stale-png'));
+      const imagePath = join(generatedDir, 'result.png');
+      await writeFile(imagePath, Buffer.from('png'));
+      const transcriptPath = join(tempRoot, 'rollout-image-only.jsonl');
+      await writeImageGenerationTranscript(transcriptPath, turnId, imagePath);
+
+      const latestInput = buildExpectedReplyInput('Generate an image of a blue robot', 'telegram');
+      await recordPendingReplyOrigin(workdir, sessionId, {
+        platform: 'telegram',
+        injectedInput: latestInput,
+        createdAt: new Date().toISOString(),
+        telegramAck: { chatId: '777', messageId: '3760', messageThreadId: '9001' },
+        telegramReplyTo: { chatId: '777', messageId: '3759', messageThreadId: '9001' },
+      });
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: turnId,
+        transcript_path: transcriptPath,
+        input_messages: [latestInput],
+        last_assistant_message: null,
+      }, {
+        CODEX_HOME: codexHome,
+        HOME: tempRoot,
+        USERPROFILE: tempRoot,
+        OMX_TELEGRAM_CAPTURE_PATH: capturePath,
+        OMX_TEST_MOCK_TELEGRAM_TRANSPORT: '1',
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const requests = await readCapturedRequests(capturePath);
+      assert.equal(requests.filter((request) => /sendMessage/.test(request.url)).length, 0);
+      const sendPhotoRequests = requests.filter((request) => /sendPhoto/.test(request.url));
+      assert.equal(sendPhotoRequests.length, 1);
+      assert.match(sendPhotoRequests[0].body, /name="photo"; filename="result\.png"/);
+      assert.ok(sendPhotoRequests[0].body.includes('name="message_thread_id"\r\n\r\n9001'));
+      assert.ok(sendPhotoRequests[0].body.includes('name="reply_to_message_id"\r\n\r\n3759'));
+      assert.equal(requests.filter((request) => /deleteMessage/.test(request.url)).length, 1);
+
+      const routes = JSON.parse(await readFile(pendingRoutesStatePath(workdir, sessionId), 'utf-8')) as {
+        routes?: unknown[];
+        terminal?: Array<{ status?: string }>;
+      };
+      assert.deepEqual(routes.routes, []);
+      assert.equal(routes.terminal?.[0]?.status, 'completed');
+
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      assert.ok(entries.some((entry) => entry.type === 'completed_turn_delivery_allowed' && entry.rich_media_part_count === 1));
+      assert.ok(entries.some((entry) => entry.type === 'completed_turn_delivery_sent'));
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('sends an image-only Telegram follow-up as sendDocument when photo policy rejects it', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-telegram-image-document-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'telegram-captures.ndjson');
+    const preloadPath = await writeTelegramCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const sessionId = 'sess-telegram-image-document';
+    const threadId = 'thread-telegram-image-document';
+    const turnId = 'turn-telegram-image-document';
+
+    try {
+      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
+      await writeNotificationConfig(codexHome, {
+        webhook: { enabled: false },
+        telegram: {
+          enabled: true,
+          botToken: '123456:telegram-token',
+          chatId: '777',
+          projectTopics: { enabled: true },
+          richReplies: { maxPhotoBytes: 1 },
+        },
+      });
+      await writeTelegramTopicRegistryRecord(tempRoot, workdir, {
+        botId: '123456',
+        chatId: '777',
+        topicName: 'repo-topic',
+        messageThreadId: '9001',
+      });
+      await writeOwnerSessionState(workdir, sessionId, threadId);
+      const generatedDir = join(codexHome, 'generated_images', threadId);
+      await mkdir(generatedDir, { recursive: true });
+      const imagePath = join(generatedDir, 'result.png');
+      await writeFile(imagePath, Buffer.from('png'));
+      const transcriptPath = join(tempRoot, 'rollout-image-document.jsonl');
+      await writeImageGenerationTranscript(transcriptPath, turnId, imagePath);
+
+      const latestInput = buildExpectedReplyInput('Generate a large image of a blue robot', 'telegram');
+      await recordPendingReplyOrigin(workdir, sessionId, {
+        platform: 'telegram',
+        injectedInput: latestInput,
+        createdAt: new Date().toISOString(),
+        telegramAck: { chatId: '777', messageId: '3760', messageThreadId: '9001' },
+        telegramReplyTo: { chatId: '777', messageId: '3759', messageThreadId: '9001' },
+      });
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: turnId,
+        transcript_path: transcriptPath,
+        input_messages: [latestInput],
+        last_assistant_message: '',
+      }, {
+        CODEX_HOME: codexHome,
+        HOME: tempRoot,
+        USERPROFILE: tempRoot,
+        OMX_TELEGRAM_CAPTURE_PATH: capturePath,
+        OMX_TEST_MOCK_TELEGRAM_TRANSPORT: '1',
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const requests = await readCapturedRequests(capturePath);
+      assert.equal(requests.filter((request) => /sendPhoto/.test(request.url)).length, 0);
+      const sendDocumentRequests = requests.filter((request) => /sendDocument/.test(request.url));
+      assert.equal(sendDocumentRequests.length, 1);
+      assert.match(sendDocumentRequests[0].body, /name="document"; filename="result\.png"/);
+      assert.ok(sendDocumentRequests[0].body.includes('name="message_thread_id"\r\n\r\n9001'));
+      assert.ok(sendDocumentRequests[0].body.includes('name="reply_to_message_id"\r\n\r\n3759'));
+      assert.equal(requests.filter((request) => /deleteMessage/.test(request.url)).length, 1);
+
+      const routes = JSON.parse(await readFile(pendingRoutesStatePath(workdir, sessionId), 'utf-8')) as {
+        routes?: unknown[];
+        terminal?: Array<{ status?: string }>;
+      };
+      assert.deepEqual(routes.routes, []);
+      assert.equal(routes.terminal?.[0]?.status, 'completed');
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+
+  it('marks a generated image-only Telegram follow-up route failed when sendPhoto fails', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-telegram-image-failure-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'telegram-captures.ndjson');
+    const preloadPath = await writeTelegramFailingSendPhotoPreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const sessionId = 'sess-telegram-image-failure';
+    const threadId = 'thread-telegram-image-failure';
+    const turnId = 'turn-telegram-image-failure';
+
+    try {
+      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
+      await writeNotificationConfig(codexHome, {
+        webhook: { enabled: false },
+        telegram: {
+          enabled: true,
+          botToken: '123456:telegram-token',
+          chatId: '777',
+          projectTopics: { enabled: true },
+        },
+      });
+      await writeTelegramTopicRegistryRecord(tempRoot, workdir, {
+        botId: '123456',
+        chatId: '777',
+        topicName: 'repo-topic',
+        messageThreadId: '9001',
+      });
+      await writeOwnerSessionState(workdir, sessionId, threadId);
+      const generatedDir = join(codexHome, 'generated_images', threadId);
+      await mkdir(generatedDir, { recursive: true });
+      await writeFile(join(generatedDir, 'stale.png'), Buffer.from('stale-png'));
+      const imagePath = join(generatedDir, 'result.png');
+      await writeFile(imagePath, Buffer.from('png'));
+      const transcriptPath = join(tempRoot, 'rollout-image-failure.jsonl');
+      await writeImageGenerationTranscript(transcriptPath, turnId, imagePath);
+
+      const latestInput = buildExpectedReplyInput('Generate an image of a red robot', 'telegram');
+      await recordPendingReplyOrigin(workdir, sessionId, {
+        platform: 'telegram',
+        injectedInput: latestInput,
+        createdAt: new Date().toISOString(),
+        telegramAck: { chatId: '777', messageId: '3760', messageThreadId: '9001' },
+        telegramReplyTo: { chatId: '777', messageId: '3759', messageThreadId: '9001' },
+      });
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: turnId,
+        transcript_path: transcriptPath,
+        input_messages: [latestInput],
+        last_assistant_message: '',
+      }, {
+        CODEX_HOME: codexHome,
+        HOME: tempRoot,
+        USERPROFILE: tempRoot,
+        OMX_TELEGRAM_CAPTURE_PATH: capturePath,
+        OMX_TEST_MOCK_TELEGRAM_TRANSPORT: '1',
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const requests = await readCapturedRequests(capturePath);
+      assert.equal(requests.filter((request) => /sendPhoto/.test(request.url)).length, 1);
+      assert.equal(requests.filter((request) => /deleteMessage/.test(request.url)).length, 0);
+
+      const routes = JSON.parse(await readFile(pendingRoutesStatePath(workdir, sessionId), 'utf-8')) as {
+        routes?: unknown[];
+        terminal?: Array<{ status?: string; terminalReason?: string }>;
+      };
+      assert.deepEqual(routes.routes, []);
+      assert.equal(routes.terminal?.[0]?.status, 'failed');
+      assert.match(routes.terminal?.[0]?.terminalReason ?? '', /media upload failed|HTTP 500/);
+
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      assert.ok(entries.some((entry) => entry.type === 'completed_turn_delivery_failed'));
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('marks a claimed Telegram route failed when result-ready delivery is disabled before dispatch', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-telegram-route-not-dispatched-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'telegram-captures.ndjson');
+    const preloadPath = await writeTelegramCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const sessionId = 'sess-telegram-route-not-dispatched';
+    const threadId = 'thread-telegram-route-not-dispatched';
+    const turnId = 'turn-telegram-route-not-dispatched';
+
+    try {
+      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
+      await writeNotificationConfig(codexHome, {
+        webhook: { enabled: false },
+        telegram: {
+          enabled: true,
+          botToken: '123456:telegram-token',
+          chatId: '777',
+        },
+        events: {
+          'result-ready': { enabled: false },
+        },
+      });
+      await writeOwnerSessionState(workdir, sessionId, threadId);
+
+      const latestInput = buildExpectedReplyInput('Do the work', 'telegram');
+      await recordPendingReplyOrigin(workdir, sessionId, {
+        platform: 'telegram',
+        injectedInput: latestInput,
+        createdAt: new Date().toISOString(),
+        telegramAck: { chatId: '777', messageId: '3760' },
+        telegramReplyTo: { chatId: '777', messageId: '3759' },
+      });
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: turnId,
+        input_messages: [latestInput],
+        last_assistant_message: 'Done.',
+      }, {
+        CODEX_HOME: codexHome,
+        HOME: tempRoot,
+        USERPROFILE: tempRoot,
+        OMX_TELEGRAM_CAPTURE_PATH: capturePath,
+        OMX_TEST_MOCK_TELEGRAM_TRANSPORT: '1',
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.deepEqual(await readCapturedRequests(capturePath), []);
+
+      const routes = JSON.parse(await readFile(pendingRoutesStatePath(workdir, sessionId), 'utf-8')) as {
+        routes?: unknown[];
+        terminal?: Array<{ status?: string; terminalReason?: string }>;
+      };
+      assert.deepEqual(routes.routes, []);
+      assert.equal(routes.terminal?.[0]?.status, 'failed');
+      assert.equal(routes.terminal?.[0]?.terminalReason, 'completed turn notification event disabled');
+
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      assert.ok(entries.some((entry) =>
+        entry.type === 'pending_route_delivery_not_dispatched'
+        && entry.reason === 'event_disabled'
+      ));
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }
