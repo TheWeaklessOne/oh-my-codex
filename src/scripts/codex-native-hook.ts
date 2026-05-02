@@ -259,6 +259,26 @@ async function nativeSubagentSessionStartBelongsToCanonicalSession(
   return summary.allThreadIds.includes(parentThreadId);
 }
 
+async function isNativeSubagentPromptSubmit(
+  cwd: string,
+  canonicalSessionId: string,
+  nativeSessionId: string,
+  threadId: string,
+): Promise<boolean> {
+  const sessionId = canonicalSessionId.trim();
+  if (!sessionId) return false;
+
+  const summary = await readSubagentSessionSummary(cwd, sessionId).catch(() => null);
+  if (!summary) return false;
+
+  const candidateIds = [nativeSessionId, threadId]
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (candidateIds.length === 0) return false;
+
+  return candidateIds.some((id) => summary.allSubagentThreadIds.includes(id));
+}
+
 async function recordIgnoredNativeSubagentSessionStart(
   cwd: string,
   canonicalSessionId: string,
@@ -2266,10 +2286,13 @@ export async function dispatchCodexNativeHook(
   const eventSessionId = canonicalSessionId || nativeSessionId || undefined;
   const sessionIdForState = canonicalSessionId || nativeSessionId;
   let outputJson: Record<string, unknown> | null = null;
+  const isSubagentPromptSubmit = hookEventName === "UserPromptSubmit"
+    ? await isNativeSubagentPromptSubmit(cwd, canonicalSessionId, nativeSessionId, threadId)
+    : false;
 
   if (hookEventName === "UserPromptSubmit") {
     const prompt = readPromptText(payload);
-    if (prompt) {
+    if (prompt && !isSubagentPromptSubmit) {
       skillState = buildNativeOutsideTmuxTeamPromptBlockState(
         prompt,
         cwd,
@@ -2286,7 +2309,7 @@ export async function dispatchCodexNativeHook(
       });
     }
     // --- Triage classifier (advisory-only, non-keyword prompts) ---
-    if (prompt && skillState === null) {
+    if (prompt && skillState === null && !isSubagentPromptSubmit) {
       try {
         if (readTriageConfig().enabled) {
           const normalized = prompt.trim().toLowerCase();
@@ -2389,7 +2412,9 @@ export async function dispatchCodexNativeHook(
         canonicalSessionId,
         nativeSessionId: resolvedNativeSessionId || nativeSessionId,
       })
-      : (buildAdditionalContextMessage(readPromptText(payload), skillState, cwd, payload) ?? triageAdditionalContext);
+      : isSubagentPromptSubmit
+        ? null
+        : (buildAdditionalContextMessage(readPromptText(payload), skillState, cwd, payload) ?? triageAdditionalContext);
     if (additionalContext) {
       outputJson = {
         hookSpecificOutput: {
