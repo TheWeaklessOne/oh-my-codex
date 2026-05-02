@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'child_process';
-import { mkdtemp, rm, writeFile, readFile, mkdir, chmod } from 'fs/promises';
+import { mkdtemp, rm, writeFile, readFile, mkdir, chmod, readdir } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
@@ -45,6 +45,7 @@ import {
 import { resolveAgentReasoningEffort, resolveTeamLowComplexityDefaultModel } from '../model-contract.js';
 import { readTeamEvents } from '../state/events.js';
 import { sanitizeTeamName } from '../tmux-session.js';
+import { buildInternalTeamName, resolveTeamIdentityScope } from '../team-identity.js';
 
 async function initRepo(): Promise<string> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-worktree-repo-'));
@@ -163,7 +164,7 @@ async function markPendingInboxDispatchesDelivered(
     afterDeliver?: () => Promise<void>;
   } = {},
 ): Promise<void> {
-  const requests = await listDispatchRequests(teamName, cwd, { kind: 'inbox' }).catch(() => []);
+  const requests = await listDispatchRequests(await resolveRuntimeTeamName(cwd, teamName), cwd, { kind: 'inbox' }).catch(() => []);
   for (const request of requests) {
     if (request.status !== 'pending') continue;
     if (opts.toWorker && request.to_worker !== opts.toWorker) continue;
@@ -197,7 +198,7 @@ async function markPendingInboxDispatchesNotified(
     lastReason?: string;
   } = {},
 ): Promise<void> {
-  const requests = await listDispatchRequests(teamName, cwd, { kind: 'inbox' }).catch(() => []);
+  const requests = await listDispatchRequests(await resolveRuntimeTeamName(cwd, teamName), cwd, { kind: 'inbox' }).catch(() => []);
   for (const request of requests) {
     if (request.status !== 'pending') continue;
     if (opts.toWorker && request.to_worker !== opts.toWorker) continue;
@@ -292,6 +293,17 @@ async function waitForFileText(
   throw new Error(`timed out waiting for ${filePath}`);
 }
 
+async function resolveRuntimeTeamName(cwd: string, requestedName: string): Promise<string> {
+  const teamsRoot = join(cwd, '.omx', 'state', 'team');
+  const entries = await readdir(teamsRoot, { withFileTypes: true }).catch(() => []);
+  const prefix = requestedName.slice(0, 18);
+  const names = entries
+    .filter((entry) => entry.isDirectory() && (entry.name === requestedName || entry.name.startsWith(`${requestedName}-`) || entry.name.startsWith(prefix)))
+    .map((entry) => entry.name)
+    .sort((a, b) => a.length - b.length || a.localeCompare(b));
+  return names[0] ?? requestedName;
+}
+
 async function writeFakePromptWorkerBinary(
   binaryPath: string,
   scriptBody: string,
@@ -303,7 +315,7 @@ async function writeFakePromptWorkerBinary(
 const fs = require('fs');
 const path = require('path');
 const stateRoot = process.env.OMX_TEAM_STATE_ROOT;
-const worker = String(process.env.OMX_TEAM_WORKER || '');
+const worker = String(process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER || '');
 const [teamName, workerName] = worker.split('/');
 if (stateRoot && teamName && workerName) {
   const workerDir = path.join(stateRoot, 'team', teamName, 'workers', workerName);
@@ -949,9 +961,10 @@ esac
           delete process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS;
           process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = '1';
           process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS = '50';
+          const expectedTeamName = buildInternalTeamName('team-startup-window', resolveTeamIdentityScope(process.env));
 
           receiptNotifier = setInterval(() => {
-            void markPendingInboxDispatchesNotified('team-startup-window', cwd, {
+            void markPendingInboxDispatchesNotified(expectedTeamName, cwd, {
               toWorker: 'worker-1',
               lastReason: 'test_notified_receipt',
             }).catch(() => {});
@@ -959,7 +972,7 @@ esac
 
           progressWriter = setTimeout(() => {
             void writeWorkerStatus(
-              'team-startup-window',
+              expectedTeamName,
               'worker-1',
               {
                 state: 'working',
@@ -980,8 +993,8 @@ esac
               cwd,
             ));
 
-          assert.equal(runtime.teamName, 'team-startup-window');
-          assert.ok(await readTeamConfig('team-startup-window', cwd));
+          assert.equal(runtime.teamName, expectedTeamName);
+          assert.ok(await readTeamConfig(runtime.teamName, cwd));
         },
       );
     } finally {
@@ -1109,18 +1122,19 @@ esac
           process.env.OMX_TEAM_STARTUP_EVIDENCE_TIMEOUT_MS = '500';
           process.env.OMX_TEAM_STARTUP_DISPATCH_RETRIES = '1';
           process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS = '50';
+          const expectedTeamName = buildInternalTeamName('team-startup-no-evidence', resolveTeamIdentityScope(process.env));
 
           receiptFailer = setInterval(() => {
             void (async () => {
               const requests = await listDispatchRequests(
-                'team-startup-no-evidence',
+                expectedTeamName,
                 cwd,
                 { kind: 'inbox' },
               ).catch(() => []);
               for (const request of requests) {
                 if (request.status !== 'pending') continue;
                 await transitionDispatchRequest(
-                  'team-startup-no-evidence',
+                  expectedTeamName,
                   request.request_id,
                   'pending',
                   'failed',
@@ -1146,7 +1160,7 @@ esac
             receiptFailer = null;
           }
 
-          assert.ok(await readTeamConfig('team-startup-no-evidence', cwd));
+          assert.ok(await readTeamConfig(runtime.teamName, cwd));
           const workerStatus = await readWorkerStatus(runtime.teamName, 'worker-1', cwd);
           assert.ok(['unknown', 'idle'].includes(workerStatus.state));
 
@@ -1264,7 +1278,8 @@ sleep 5
         [{ subject: 's', description: 'd', owner: 'worker-1' }],
         cwd,
       );
-      assert.equal(runtime.teamName, 'nested-allowed');
+      assert.match(runtime.teamName, /^nested-allowed-[a-f0-9]{8}$/);
+      assert.equal(runtime.config.display_name, 'nested-allowed');
       await shutdownTeam(runtime.teamName, cwd, { force: true });
       runtime = null;
     } finally {
@@ -1576,8 +1591,9 @@ case "\${1:-}" in
   split-window)
     case "$*" in
       *" -h "*)
-        mkdir -p "${cwd}/.omx/state/team/team-interactive-cleanup/workers/worker-1"
-        cat > "${cwd}/.omx/state/team/team-interactive-cleanup/workers/worker-1/status.json" <<'EOF'
+        team_dir=$(find "${cwd}/.omx/state/team" -maxdepth 1 -type d -name 'team-interactive*' | head -n 1)
+        mkdir -p "$team_dir/workers/worker-1"
+        cat > "$team_dir/workers/worker-1/status.json" <<'EOF'
 {
   "state": "working",
   "current_task_id": "1",
@@ -1707,8 +1723,9 @@ case "\${1:-}" in
   split-window)
     case "$*" in
       *" -h "*)
-        mkdir -p "${cwd}/.omx/state/team/team-pane-pid/workers/worker-1"
-        cat > "${cwd}/.omx/state/team/team-pane-pid/workers/worker-1/status.json" <<'EOF'
+        team_dir=$(find "${cwd}/.omx/state/team" -maxdepth 1 -type d -name 'team-pane-pid*' | head -n 1)
+        mkdir -p "$team_dir/workers/worker-1"
+        cat > "$team_dir/workers/worker-1/status.json" <<'EOF'
 {
   "state": "working",
   "current_task_id": "1",
@@ -2297,7 +2314,7 @@ process.on('SIGTERM', () => process.exit(0));
 
           receiptFailer = setInterval(() => {
             void (async () => {
-              const requests = await listDispatchRequests(teamName, cwd, { kind: 'inbox' }).catch(() => []);
+              const requests = await listDispatchRequests(await resolveRuntimeTeamName(cwd, teamName), cwd, { kind: 'inbox' }).catch(() => []);
               for (const request of requests) {
                 if (request.status !== 'pending') continue;
                 await transitionDispatchRequest(
@@ -2325,15 +2342,16 @@ process.on('SIGTERM', () => process.exit(0));
               cwd,
             ));
 
-          const worker1Status = await readWorkerStatus(teamName, 'worker-1', cwd);
-          const worker2Status = await readWorkerStatus(teamName, 'worker-2', cwd);
+          const runtimeTeamName = runtime.teamName;
+          const worker1Status = await readWorkerStatus(runtimeTeamName, 'worker-1', cwd);
+          const worker2Status = await readWorkerStatus(runtimeTeamName, 'worker-2', cwd);
           assert.equal(worker1Status.state, 'unknown');
           assert.equal(worker2Status.state, 'unknown');
           assert.match(worker1Status.reason ?? '', /startup_no_evidence|fallback_attempted_but_unconfirmed/);
           assert.match(worker2Status.reason ?? '', /startup_no_evidence|fallback_attempted_but_unconfirmed/);
 
-          const task1 = await readTask(teamName, '1', cwd);
-          const task2 = await readTask(teamName, '2', cwd);
+          const task1 = await readTask(runtimeTeamName, '1', cwd);
+          const task2 = await readTask(runtimeTeamName, '2', cwd);
           assert.equal(task1?.status, 'pending');
           assert.equal(task2?.status, 'pending');
         },
@@ -2764,7 +2782,7 @@ process.on('SIGTERM', () => process.exit(0));
           ],
         },
         async () => {
-          const sanitizedTeamName = sanitizeTeamName('team-materialize-before-evidence');
+          let runtimeTeamName = sanitizeTeamName('team-materialize-before-evidence');
           delete process.env.TMUX;
           process.env.TMUX_PANE = '%1';
           process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'interactive';
@@ -2776,11 +2794,13 @@ process.on('SIGTERM', () => process.exit(0));
 
           receiptFailer = setInterval(() => {
             void (async () => {
-              const requests = await listDispatchRequests('team-materialize-before-evidence', cwd, { kind: 'inbox' }).catch(() => []);
+              const activeTeamName = await resolveRuntimeTeamName(cwd, 'team-materialize-before-evidence');
+              runtimeTeamName = activeTeamName;
+              const requests = await listDispatchRequests(activeTeamName, cwd, { kind: 'inbox' }).catch(() => []);
               for (const request of requests) {
                 if (request.status !== 'pending') continue;
                 await transitionDispatchRequest(
-                  'team-materialize-before-evidence',
+                  activeTeamName,
                   request.request_id,
                   'pending',
                   'failed',
@@ -2808,12 +2828,12 @@ process.on('SIGTERM', () => process.exit(0));
             (error: unknown) => ({ ok: false as const, error }),
           );
 
-          const workerOneIdentity = join(cwd, '.omx', 'state', 'team', sanitizedTeamName, 'workers', 'worker-1', 'identity.json');
-          const workerTwoIdentity = join(cwd, '.omx', 'state', 'team', sanitizedTeamName, 'workers', 'worker-2', 'identity.json');
-          const workerTwoInbox = join(cwd, '.omx', 'state', 'team', sanitizedTeamName, 'workers', 'worker-2', 'inbox.md');
-
           let materializedAllWorkers = false;
           for (let attempt = 0; attempt < 200; attempt += 1) {
+            runtimeTeamName = await resolveRuntimeTeamName(cwd, 'team-materialize-before-evidence');
+            const workerOneIdentity = join(cwd, '.omx', 'state', 'team', runtimeTeamName, 'workers', 'worker-1', 'identity.json');
+            const workerTwoIdentity = join(cwd, '.omx', 'state', 'team', runtimeTeamName, 'workers', 'worker-2', 'identity.json');
+            const workerTwoInbox = join(cwd, '.omx', 'state', 'team', runtimeTeamName, 'workers', 'worker-2', 'inbox.md');
             if (
               existsSync(workerOneIdentity)
               && existsSync(workerTwoIdentity)
@@ -2836,7 +2856,7 @@ process.on('SIGTERM', () => process.exit(0));
           assert.match(String((outcome as { ok: false; error: Error }).error), /worker_notify_failed:worker-1/);
 
           assert.equal(
-            existsSync(join(cwd, '.omx', 'state', 'team', sanitizedTeamName)),
+            existsSync(join(cwd, '.omx', 'state', 'team', runtimeTeamName)),
             false,
           );
         },
@@ -3028,7 +3048,7 @@ sleep 5
 
       const expectedArgv = [
         '-i',
-        'Read .omx/state/team/team-gemini-prompt/workers/worker-1/inbox.md, start work now, report concrete progress, then continue assigned work or next feasible task.',
+        `Read .omx/state/team/${runtime.teamName}/workers/worker-1/inbox.md, start work now, report concrete progress, then continue assigned work or next feasible task.`,
       ];
       let argv: string[] | null = null;
       for (let attempt = 0; attempt < 50; attempt += 1) {
@@ -3597,7 +3617,7 @@ process.on('SIGTERM', () => process.exit(0));
       assert.notEqual(workerPath, repo);
       const workerAgents = await readFile(join(workerPath as string, 'AGENTS.md'), 'utf-8');
       assert.match(workerAgents, /Team Worker Runtime Instructions/);
-      assert.match(workerAgents, /team-detached-worktree-paths/);
+      assert.match(workerAgents, new RegExp(runtime.teamName));
 
       const startupLog = await waitForFileText(
         stdinLogPath,
@@ -3605,11 +3625,11 @@ process.on('SIGTERM', () => process.exit(0));
       );
       assert.match(
         startupLog,
-        /\$OMX_TEAM_STATE_ROOT\/team\/team-detached-worktree-paths\/workers\/worker-1\/inbox\.md/,
+        new RegExp(`\\$OMX_TEAM_STATE_ROOT/team/${runtime.teamName}/workers/worker-1/inbox\\.md`),
       );
       assert.doesNotMatch(
         startupLog,
-        /Read \.omx\/state\/team\/team-detached-worktree-paths\/workers\/worker-1\/inbox\.md/,
+        new RegExp(`Read \\.omx/state/team/${runtime.teamName}/workers/worker-1/inbox\\.md`),
       );
 
       const envLog = JSON.parse(await waitForFileText(envLogPath, (content) => content.includes('teamStateRoot'))) as {
@@ -3622,7 +3642,7 @@ process.on('SIGTERM', () => process.exit(0));
       assert.equal(envLog.worker, 'team-detached-worktree-paths/worker-1');
       const rootAgents = await readFile(join(workerPath, 'AGENTS.md'), 'utf-8');
       assert.match(rootAgents, /Team Worker Runtime Instructions/);
-      assert.match(rootAgents, /Inbox path: .*team-detached-worktree-paths\/workers\/worker-1\/inbox\.md/);
+      assert.match(rootAgents, new RegExp(`Inbox path: .*${runtime.teamName}/workers/worker-1/inbox\\.md`));
 
       await sendWorkerMessage(runtime.teamName, 'leader-fixed', 'worker-1', 'follow-up', repo);
       const mailboxLog = await waitForFileText(
@@ -3631,7 +3651,7 @@ process.on('SIGTERM', () => process.exit(0));
       );
       assert.match(
         mailboxLog,
-        /\$OMX_TEAM_STATE_ROOT\/team\/team-detached-worktree-paths\/mailbox\/worker-1\.json/,
+        new RegExp(`\\$OMX_TEAM_STATE_ROOT/team/${runtime.teamName}/mailbox/worker-1\\.json`),
       );
 
       await shutdownTeam(runtime.teamName, repo, { force: true });
@@ -6067,7 +6087,7 @@ esac
         ),
       );
 
-      const task = await readTask('team-delegation-persist', '1', cwd);
+      const task = await readTask(runtime.teamName, '1', cwd);
       assert.equal(task?.delegation?.mode, 'auto');
       assert.equal(task?.delegation?.child_model, 'gpt-5.4-mini');
       assert.equal(task?.delegation?.required_parallel_probe, true);
@@ -6144,15 +6164,15 @@ esac
         ),
       );
 
-      const first = await readTask('team-dag-remap', '1', cwd);
-      const second = await readTask('team-dag-remap', '2', cwd);
+      const first = await readTask(runtime.teamName, '1', cwd);
+      const second = await readTask(runtime.teamName, '2', cwd);
       assert.deepEqual(first?.depends_on, []);
       assert.deepEqual(first?.blocked_by, undefined);
       assert.deepEqual(second?.depends_on, ['1']);
       assert.deepEqual(second?.blocked_by, ['1']);
 
       const report = JSON.parse(
-        await readFile(join(cwd, '.omx', 'state', 'team', 'team-dag-remap', 'decomposition-report.json'), 'utf-8'),
+        await readFile(join(cwd, '.omx', 'state', 'team', runtime.teamName, 'decomposition-report.json'), 'utf-8'),
       ) as {
         node_id_to_task_id?: Record<string, string>;
         task_hints?: Record<string, { node_id?: string; depends_on?: string[]; symbolic_depends_on?: string[] }>;
@@ -6161,7 +6181,7 @@ esac
       assert.deepEqual(report.task_hints?.['2']?.depends_on, ['1']);
       assert.deepEqual(report.task_hints?.['2']?.symbolic_depends_on, ['impl']);
 
-      const inbox = await readFile(join(cwd, '.omx', 'state', 'team', 'team-dag-remap', 'workers', 'worker-2', 'inbox.md'), 'utf-8');
+      const inbox = await readFile(join(cwd, '.omx', 'state', 'team', runtime.teamName, 'workers', 'worker-2', 'inbox.md'), 'utf-8');
       assert.match(inbox, /Blocked by: 1/);
       assert.doesNotMatch(inbox, /Blocked by: impl/);
       assert.doesNotMatch(inbox, /Depends on: impl/);

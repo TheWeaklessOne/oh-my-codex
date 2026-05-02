@@ -1815,16 +1815,21 @@ describe("detached tmux new-session sequencing", () => {
       "--model gpt-5",
       "/tmp/codex-home",
       '{"active":true}',
+      false,
+      "omx-session-test",
     );
     assert.deepEqual(
       steps.map((step) => step.name),
-      ["new-session", "split-and-capture-hud-pane"],
+      ["new-session", "tag-session", "split-and-capture-hud-pane"],
     );
-    assert.equal(steps[1]?.args[3], String(HUD_TMUX_HEIGHT_LINES));
-    assert.equal(steps[1]?.args[6], "omx-demo");
-    assert.equal(steps[1]?.args.includes("-P"), true);
-    assert.equal(steps[1]?.args.includes("#{pane_id}"), true);
+    const splitStep = steps.find((step) => step.name === "split-and-capture-hud-pane");
+    assert.ok(splitStep);
+    assert.equal(splitStep.args[3], String(HUD_TMUX_HEIGHT_LINES));
+    assert.equal(splitStep.args[6], "omx-demo");
+    assert.equal(splitStep.args.includes("-P"), true);
+    assert.equal(splitStep.args.includes("#{pane_id}"), true);
     assert.equal(steps[0]?.args.includes("-e"), true);
+    assert.equal(steps[0]?.args.includes("OMX_SESSION_ID=omx-session-test"), true);
     assert.equal(
       steps[0]?.args.includes('OMX_NOTIFY_TEMP_CONTRACT={\"active\":true}'),
       true,

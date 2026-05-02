@@ -2059,12 +2059,14 @@ process.on('SIGTERM', () => process.exit(0));
 
       await withMockPromptModeCodexAllowed(() =>
         withoutTeamTestWorkerEnv(() => teamCommand(['1:executor', teamTask])));
+      const startedState = await readModeState('team', wd);
+      const runtimeTeamName = String(startedState?.team_name ?? teamName);
 
       let statusOutput = '';
       for (let attempt = 0; attempt < 50; attempt += 1) {
         logs.length = 0;
         stderr.length = 0;
-        await withoutTeamTestWorkerEnv(() => teamCommand(['status', teamName]));
+        await withoutTeamTestWorkerEnv(() => teamCommand(['status', runtimeTeamName]));
         statusOutput = logs.join('\n');
         if (/phase=failed/.test(statusOutput)) break;
         await new Promise((resolve) => setTimeout(resolve, 20));
@@ -2073,13 +2075,13 @@ process.on('SIGTERM', () => process.exit(0));
       assert.doesNotMatch(stderr.join('\n'), /ESRCH/);
 
       logs.length = 0;
-      await withoutTeamTestWorkerEnv(() => teamCommand(['await', teamName, '--json', '--timeout-ms', '250']));
+      await withoutTeamTestWorkerEnv(() => teamCommand(['await', runtimeTeamName, '--json', '--timeout-ms', '250']));
       const payload = JSON.parse(logs.at(-1) ?? '{}') as {
         team_name?: string;
         status?: string;
         event?: { type?: string; worker?: string; reason?: string | null } | null;
       };
-      assert.equal(payload.team_name, teamName);
+      assert.equal(payload.team_name, runtimeTeamName);
       assert.equal(payload.status, 'event');
       assert.equal(payload.event?.type, 'worker_stopped');
       assert.equal(payload.event?.worker, 'worker-1');
@@ -2133,18 +2135,20 @@ process.on('SIGTERM', () => process.exit(0));
         withoutTeamTestWorkerEnv(() => teamCommand(['1:executor', teamTask])));
 
       const startedState = await readModeState('team', wd);
+      const runtimeTeamName = String(startedState?.team_name ?? teamName);
       assert.equal(startedState?.active, true);
-      assert.equal(startedState?.team_name, teamName);
+      assert.equal(startedState?.team_name, runtimeTeamName);
+      assert.equal(startedState?.display_name, teamName);
       assert.equal(startedState?.current_phase, 'team-exec');
 
       await rm(join(wd, '.omx', 'state', 'team-state.json'), { force: true });
       assert.equal(await readModeState('team', wd), null);
 
-      await withoutTeamTestWorkerEnv(() => teamCommand(['resume', teamName]));
+      await withoutTeamTestWorkerEnv(() => teamCommand(['resume', runtimeTeamName]));
 
       const resumedState = await readModeState('team', wd);
       assert.equal(resumedState?.active, true);
-      assert.equal(resumedState?.team_name, teamName);
+      assert.equal(resumedState?.team_name, runtimeTeamName);
       assert.equal(resumedState?.current_phase, 'team-exec');
     } finally {
       process.chdir(previousCwd);
@@ -2192,8 +2196,10 @@ process.on('SIGTERM', () => process.exit(0));
 
       await withMockPromptModeCodexAllowed(() =>
         withoutTeamTestWorkerEnv(() => teamCommand(['1:executor', teamTask])));
+      const startedState = await readModeState('team', wd);
+      const runtimeTeamName = String(startedState?.team_name ?? teamName);
       await writeFile(
-        join(wd, '.omx', 'state', 'team', teamName, 'phase.json'),
+        join(wd, '.omx', 'state', 'team', runtimeTeamName, 'phase.json'),
         JSON.stringify({
           current_phase: 'complete',
           max_fix_attempts: 3,
@@ -2204,11 +2210,11 @@ process.on('SIGTERM', () => process.exit(0));
       );
       await rm(join(wd, '.omx', 'state', 'team-state.json'), { force: true });
 
-      await withoutTeamTestWorkerEnv(() => teamCommand(['resume', teamName]));
+      await withoutTeamTestWorkerEnv(() => teamCommand(['resume', runtimeTeamName]));
 
       const resumedState = await readModeState('team', wd);
       assert.equal(resumedState?.active, false);
-      assert.equal(resumedState?.team_name, teamName);
+      assert.equal(resumedState?.team_name, runtimeTeamName);
       assert.equal(resumedState?.current_phase, 'complete');
     } finally {
       process.chdir(previousCwd);

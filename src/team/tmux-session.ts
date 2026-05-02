@@ -949,8 +949,16 @@ export function buildWorkerProcessLaunchSpec(
         modelProviderOverride,
       )
     : {};
+  const internalWorkerIdentity = `${teamName}/worker-${workerIndex}`;
+  const displayTeamName = typeof extraEnv.OMX_TEAM_DISPLAY_NAME === 'string'
+    ? extraEnv.OMX_TEAM_DISPLAY_NAME.trim()
+    : '';
+  const publicWorkerIdentity = displayTeamName
+    ? `${displayTeamName}/worker-${workerIndex}`
+    : internalWorkerIdentity;
   const workerEnv: Record<string, string> = {
-    OMX_TEAM_WORKER: `${teamName}/worker-${workerIndex}`,
+    OMX_TEAM_WORKER: publicWorkerIdentity,
+    OMX_TEAM_INTERNAL_WORKER: internalWorkerIdentity,
     [OMX_LEADER_NODE_PATH_ENV]: resolveLeaderNodePath(),
     [OMX_LEADER_CLI_PATH_ENV]: resolvedLauncherPath,
     ...(workerCli === 'codex' && workerCodexHomeOverride

@@ -124,6 +124,7 @@ import {
   type TeamReasoningEffort,
 } from './model-contract.js';
 import { resolveCanonicalTeamStateRoot } from './state-root.js';
+import { buildInternalTeamName, resolveTeamIdentityScope, resolveTeamNameForCurrentContext } from './team-identity.js';
 import { inferPhaseTargetFromTaskCounts, reconcilePhaseStateForMonitor } from './phase-controller.js';
 import { getTeamTmuxSessions } from '../notifications/tmux.js';
 import { hasStructuredVerificationEvidence } from '../verification/verifier.js';
@@ -1519,7 +1520,7 @@ function resolveGovernancePolicy(
 }
 
 async function assertNestedTeamAllowed(cwd: string): Promise<void> {
-  const workerContext = parseTeamWorkerContext(process.env.OMX_TEAM_WORKER);
+  const workerContext = parseTeamWorkerContext(process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER);
   if (!workerContext) return;
 
   for (const candidateCwd of resolveManifestLookupCwds(cwd)) {
@@ -2179,10 +2180,15 @@ export async function startTeam(
   const leaderCwd = resolve(cwd);
   await assertNestedTeamAllowed(leaderCwd);
   const effectiveWorktreeMode = resolveEffectiveTeamWorktreeMode(leaderCwd, options.worktreeMode);
-  const sanitized = sanitizeTeamName(teamName);
-  const leaderSessionId = await resolveLeaderSessionId(leaderCwd);
+  const displayName = sanitizeTeamName(teamName);
+  const identityScope = resolveTeamIdentityScope(process.env);
+  const sanitized = buildInternalTeamName(displayName, identityScope);
+  const leaderSessionId = identityScope.sessionId || identityScope.paneId || identityScope.tmuxTarget || identityScope.runId || await resolveLeaderSessionId(leaderCwd);
 
   await assertTeamStartupIsNonDestructive(sanitized, leaderCwd, leaderSessionId);
+  if (displayName !== sanitized) {
+    await assertTeamStartupIsNonDestructive(displayName, leaderCwd, leaderSessionId);
+  }
 
   const workerLaunchMode = resolveTeamWorkerLaunchMode(process.env);
   const displayMode = workerLaunchMode === 'interactive' ? 'split_pane' : 'auto';
@@ -2276,11 +2282,19 @@ export async function startTeam(
       workerCount,
       leaderCwd,
       DEFAULT_MAX_WORKERS,
-      { ...process.env, OMX_TEAM_DISPLAY_MODE: displayMode, OMX_TEAM_WORKER_LAUNCH_MODE: workerLaunchMode },
+      {
+        ...process.env,
+        OMX_SESSION_ID: leaderSessionId,
+        OMX_TEAM_DISPLAY_MODE: displayMode,
+        OMX_TEAM_WORKER_LAUNCH_MODE: workerLaunchMode,
+      },
       {
         leader_cwd: leaderCwd,
         team_state_root: teamStateRoot,
         workspace_mode: workspaceMode,
+        display_name: displayName,
+        requested_name: displayName,
+        identity_source: identityScope.source,
         worktree_mode: effectiveWorktreeMode,
       },
       'default',
@@ -2291,6 +2305,9 @@ export async function startTeam(
     config.leader_cwd = leaderCwd;
     config.team_state_root = teamStateRoot;
     config.workspace_mode = workspaceMode;
+    config.display_name = displayName;
+    config.requested_name = displayName;
+    config.identity_source = identityScope.source;
     config.worktree_mode = effectiveWorktreeMode;
 
     // 4. Create tasks. Repo-aware DAG dependencies are symbolic until the
@@ -2448,6 +2465,7 @@ export async function startTeam(
         [TEAM_STATE_ROOT_ENV]: teamStateRoot,
         [TEAM_LEADER_CWD_ENV]: leaderCwd,
         [MODEL_INSTRUCTIONS_FILE_ENV]: plan.instructionsFilePath,
+        OMX_TEAM_DISPLAY_NAME: displayName,
       };
       if (plan.workerWorkspace.worktreePath) {
         env.OMX_TEAM_WORKTREE_PATH = plan.workerWorkspace.worktreePath;
@@ -2894,7 +2912,7 @@ export async function startTeam(
  */
 export async function monitorTeam(teamName: string, cwd: string): Promise<TeamSnapshot | null> {
   const monitorStartMs = performance.now();
-  const sanitized = sanitizeTeamName(teamName);
+  const sanitized = resolveTeamNameForCurrentContext(teamName, cwd);
   const config = await readTeamConfig(sanitized, cwd);
   if (!config) return null;
   const manifest = await readTeamManifestV2(sanitized, cwd);
@@ -3266,6 +3284,22 @@ export async function reassignTask(
   await assignTask(teamName, toWorker, taskId, cwd);
 }
 
+function resolveCommitHygieneArtifactTeamNames(config: TeamConfig, internalTeamName: string): string[] {
+  const names: string[] = [];
+  for (const value of [config.requested_name, config.display_name, internalTeamName]) {
+    if (typeof value !== 'string' || value.trim() === '') continue;
+    try {
+      const sanitized = sanitizeTeamName(value);
+      if (!names.includes(sanitized)) names.push(sanitized);
+    } catch {
+      // Persisted display/request names are best-effort aliases. If an older
+      // state file contains an invalid value, fall back to the internal name.
+    }
+  }
+  if (!names.includes(internalTeamName)) names.push(internalTeamName);
+  return names;
+}
+
 /**
  * Graceful shutdown: send shutdown inbox to all workers, wait, force kill, cleanup.
  */
@@ -3273,7 +3307,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   const force = options.force === true;
   const confirmIssues = options.confirmIssues === true;
   let skipWorkerAcks = false;
-  const sanitized = sanitizeTeamName(teamName);
+  const sanitized = resolveTeamNameForCurrentContext(teamName, cwd);
   const config = await readTeamConfig(sanitized, cwd);
   if (!config) {
     // No config -- just try to kill tmux session and clean up
@@ -3559,14 +3593,22 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   }
 
   const artifactCwd = resolveTeamCommitHygieneArtifactCwd(config, cwd);
-  const ledger = await appendTeamCommitHygieneEntries(sanitized, commitHygieneEntries, artifactCwd)
   const taskView = await listTasks(sanitized, cwd).catch(() => [])
-  const commitHygieneContext = buildTeamCommitHygieneContext({
-    teamName: sanitized,
-    tasks: taskView,
-    ledger,
-  })
-  const commitHygieneArtifacts = await writeTeamCommitHygieneContext(sanitized, commitHygieneContext, artifactCwd)
+  const internalLedger = await appendTeamCommitHygieneEntries(sanitized, commitHygieneEntries, artifactCwd)
+  const commitHygieneArtifactTeamNames = resolveCommitHygieneArtifactTeamNames(config, sanitized);
+  let commitHygieneArtifacts: TeamCommitHygieneArtifactPaths | null = null;
+  for (const artifactTeamName of commitHygieneArtifactTeamNames) {
+    const ledger = artifactTeamName === sanitized
+      ? internalLedger
+      : await appendTeamCommitHygieneEntries(artifactTeamName, internalLedger.entries, artifactCwd)
+    const commitHygieneContext = buildTeamCommitHygieneContext({
+      teamName: artifactTeamName,
+      tasks: taskView,
+      ledger,
+    })
+    const writtenArtifacts = await writeTeamCommitHygieneContext(artifactTeamName, commitHygieneContext, artifactCwd)
+    commitHygieneArtifacts ??= writtenArtifacts
+  }
 
   // 5. Remove worker worktree-root instructions and team-scoped fallback instructions.
   for (const worker of config.workers) {
@@ -3624,7 +3666,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
  * Resume monitoring an existing team.
  */
 export async function resumeTeam(teamName: string, cwd: string): Promise<TeamRuntime | null> {
-  const sanitized = sanitizeTeamName(teamName);
+  const sanitized = resolveTeamNameForCurrentContext(teamName, cwd);
   const config = await readTeamConfig(sanitized, cwd);
   if (!config) return null;
   config.lifecycle_profile = 'default';
