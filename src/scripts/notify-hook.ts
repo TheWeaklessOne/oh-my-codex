@@ -3107,7 +3107,13 @@ async function main() {
         threadId: threadIdForDelivery,
         turnId: turnIdForDelivery,
         sessionId: notifySessionId || payloadSessionId || turnOrigin.nativeSessionId || '',
-        transcriptPath: safeString(payload.transcript_path || payload.transcriptPath || payload['transcript-path'] || ''),
+        transcriptPath: safeString(
+          payload.transcript_path
+          || payload.transcriptPath
+          || payload['transcript-path']
+          || originResolution.transcriptPath
+          || '',
+        ),
         env: process.env,
         telegramRichRepliesConfig: notificationConfig?.telegram?.richReplies ?? null,
       });

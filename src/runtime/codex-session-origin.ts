@@ -38,6 +38,7 @@ export interface NotificationOriginResolution {
   reason: string;
   evidence: OriginEvidence[];
   sessionMeta?: Record<string, unknown>;
+  transcriptPath?: string;
   actorId?: string;
   ownerActorId?: string;
   actorLifecycleStatus?: string;
@@ -271,6 +272,7 @@ async function readRolloutSessionMetaFromPath(
   sessionMeta: Record<string, unknown>;
   origin: TurnOrigin;
   evidence: OriginEvidence[];
+  transcriptPath: string;
 } | null> {
   const content = await readFile(path, "utf-8").catch(() => "");
   if (!content) return null;
@@ -288,6 +290,7 @@ async function readRolloutSessionMetaFromPath(
     return {
       sessionMeta: parsed.sessionMeta,
       origin: parsed.origin,
+      transcriptPath: path,
       evidence: [
         ...parsed.evidence,
         { source: "rollout-path", detail: sanitizeEvidenceDetail("rollout-path", path) },
@@ -308,6 +311,7 @@ async function resolveOriginFromRollouts(input: {
 }): Promise<{
   origin: TurnOrigin;
   sessionMeta: Record<string, unknown>;
+  transcriptPath: string;
 } | null> {
   const exactPath = safeString(input.transcriptPath);
   if (exactPath) {
@@ -318,7 +322,7 @@ async function resolveOriginFromRollouts(input: {
     });
     if (exact) {
       for (const entry of exact.evidence) appendEvidence(input.evidence, input.seenEvidence, entry.source, entry.detail);
-      return { origin: exact.origin, sessionMeta: exact.sessionMeta };
+      return { origin: exact.origin, sessionMeta: exact.sessionMeta, transcriptPath: exact.transcriptPath };
     }
     appendEvidence(input.evidence, input.seenEvidence, "transcript-path", "no_matching_session_meta");
   }
@@ -333,7 +337,7 @@ async function resolveOriginFromRollouts(input: {
     });
     if (!found) continue;
     for (const entry of found.evidence) appendEvidence(input.evidence, input.seenEvidence, entry.source, entry.detail);
-    return { origin: found.origin, sessionMeta: found.sessionMeta };
+    return { origin: found.origin, sessionMeta: found.sessionMeta, transcriptPath: found.transcriptPath };
   }
   return null;
 }
@@ -363,6 +367,7 @@ export async function resolveTurnOriginForNotification(
   const transcriptPath = payloadTranscriptPath(input.payload);
   let origin = resolveTurnOrigin(input.payload, env);
   let sessionMeta: Record<string, unknown> | undefined;
+  let resolvedTranscriptPath = transcriptPath;
 
   appendEvidence(evidence, seenEvidence, "payload", `origin_kind=${origin.kind}`);
   if (payloadThread) appendEvidence(evidence, seenEvidence, "payload", `thread_id=${payloadThread}`);
@@ -379,9 +384,12 @@ export async function resolveTurnOriginForNotification(
       evidence,
       seenEvidence,
     }).catch(() => null);
-    if (rollout && rollout.origin.kind !== "unknown") {
-      origin = { ...origin, ...rollout.origin };
-      sessionMeta = rollout.sessionMeta;
+    if (rollout) {
+      resolvedTranscriptPath = firstString(resolvedTranscriptPath, rollout.transcriptPath);
+      if (rollout.origin.kind !== "unknown") {
+        origin = { ...origin, ...rollout.origin };
+        sessionMeta = rollout.sessionMeta;
+      }
     }
   }
 
@@ -425,6 +433,8 @@ export async function resolveTurnOriginForNotification(
         ? sessionActor
         : null
     );
+  const resolutionTranscriptPath = (actor?: { transcriptPath?: string }): string =>
+    firstString(resolvedTranscriptPath, actor?.transcriptPath, ownerActor?.transcriptPath);
   if (actor) {
     appendEvidence(evidence, seenEvidence, "actor-registry", `actor_id=${actor.actorId}`);
     const resolvedOrigin: TurnOrigin = {
@@ -449,6 +459,7 @@ export async function resolveTurnOriginForNotification(
         delivery: "suppress",
         reason: "superseded_owner_actor",
         evidence,
+        ...(resolutionTranscriptPath(actor) ? { transcriptPath: resolutionTranscriptPath(actor) } : {}),
         actorId: actor.actorId,
         ...(ownerActorId ? { ownerActorId } : {}),
         ...(sessionMeta ? { sessionMeta } : {}),
@@ -469,6 +480,7 @@ export async function resolveTurnOriginForNotification(
         delivery: "suppress",
         reason: "non_owner_actor",
         evidence,
+        ...(resolutionTranscriptPath(actor) ? { transcriptPath: resolutionTranscriptPath(actor) } : {}),
         actorId: actor.actorId,
         ...(ownerActorId ? { ownerActorId } : {}),
         ...(sessionMeta ? { sessionMeta } : {}),
@@ -487,6 +499,7 @@ export async function resolveTurnOriginForNotification(
         delivery: "allow",
         reason: "owner_actor_completed",
         evidence,
+        ...(resolutionTranscriptPath(actor) ? { transcriptPath: resolutionTranscriptPath(actor) } : {}),
         actorId: actor.actorId,
         ownerActorId,
         ...(sessionMeta ? { sessionMeta } : {}),
@@ -500,6 +513,7 @@ export async function resolveTurnOriginForNotification(
         delivery: "suppress",
         reason: "owner_actor_lifecycle_not_deliverable",
         evidence,
+        ...(resolutionTranscriptPath(actor) ? { transcriptPath: resolutionTranscriptPath(actor) } : {}),
         actorId: actor.actorId,
         ownerActorId,
         ...(sessionMeta ? { sessionMeta } : {}),
@@ -512,6 +526,7 @@ export async function resolveTurnOriginForNotification(
       delivery: "suppress",
       reason: actor.quarantined ? actor.quarantineReason || "actor_quarantined" : "non_owner_actor",
       evidence,
+      ...(resolutionTranscriptPath(actor) ? { transcriptPath: resolutionTranscriptPath(actor) } : {}),
       actorId: actor.actorId,
       ...(ownerActorId ? { ownerActorId } : {}),
       ...(sessionMeta ? { sessionMeta } : {}),
@@ -525,6 +540,7 @@ export async function resolveTurnOriginForNotification(
       audience: originAudience,
       ...deliveryForAudience(originAudience, "non_owner_actor"),
       evidence,
+      ...(resolutionTranscriptPath() ? { transcriptPath: resolutionTranscriptPath() } : {}),
       ...(ownerActorId ? { ownerActorId } : {}),
       ...(sessionMeta ? { sessionMeta } : {}),
       ...ownerLifecycleFields,
@@ -551,6 +567,7 @@ export async function resolveTurnOriginForNotification(
       delivery: "suppress",
       reason: "unknown_actor_with_owner",
       evidence,
+      ...(resolutionTranscriptPath() ? { transcriptPath: resolutionTranscriptPath() } : {}),
       ownerActorId: registry.ownerActorId,
       ...(sessionMeta ? { sessionMeta } : {}),
       ...ownerLifecycleFields,
@@ -565,6 +582,7 @@ export async function resolveTurnOriginForNotification(
       delivery: "suppress",
       reason: "unknown_without_current_owner_fail_closed",
       evidence,
+      ...(resolutionTranscriptPath() ? { transcriptPath: resolutionTranscriptPath() } : {}),
       ...(sessionMeta ? { sessionMeta } : {}),
       ...ownerLifecycleFields,
     };
@@ -577,6 +595,7 @@ export async function resolveTurnOriginForNotification(
     delivery: "suppress",
     reason: "missing_actor_registry_owner",
     evidence,
+    ...(resolutionTranscriptPath() ? { transcriptPath: resolutionTranscriptPath() } : {}),
     ...(sessionMeta ? { sessionMeta } : {}),
     ...ownerLifecycleFields,
   };

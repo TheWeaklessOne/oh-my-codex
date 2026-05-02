@@ -3018,6 +3018,102 @@ describe('notify-hook semantic notifications', () => {
     }
   });
 
+  it('discovers the rollout transcript for image-only Telegram follow-ups when the hook payload omits transcript_path', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-telegram-image-rollout-discovery-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'telegram-captures.ndjson');
+    const preloadPath = await writeTelegramCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const sessionId = 'sess-telegram-image-rollout-discovery';
+    const threadId = 'thread-telegram-image-rollout-discovery';
+    const turnId = 'turn-telegram-image-rollout-discovery';
+
+    try {
+      await mkdir(join(workdir, '.omx', 'state'), { recursive: true });
+      await writeNotificationConfig(codexHome, {
+        webhook: { enabled: false },
+        telegram: {
+          enabled: true,
+          botToken: '123456:telegram-token',
+          chatId: '777',
+          projectTopics: { enabled: true },
+        },
+      });
+      await writeTelegramTopicRegistryRecord(tempRoot, workdir, {
+        botId: '123456',
+        chatId: '777',
+        topicName: 'repo-topic',
+        messageThreadId: '9001',
+      });
+      await writeOwnerSessionState(workdir, sessionId, threadId);
+      const generatedDir = join(codexHome, 'generated_images', threadId);
+      await mkdir(generatedDir, { recursive: true });
+      const imagePath = join(generatedDir, 'result.png');
+      await writeFile(imagePath, Buffer.from('png'));
+
+      const now = new Date();
+      const transcriptDir = join(
+        codexHome,
+        'sessions',
+        String(now.getFullYear()),
+        String(now.getMonth() + 1).padStart(2, '0'),
+        String(now.getDate()).padStart(2, '0'),
+      );
+      await mkdir(transcriptDir, { recursive: true });
+      const transcriptPath = join(transcriptDir, `rollout-test-${threadId}.jsonl`);
+      await writeFile(transcriptPath, [
+        JSON.stringify({ type: 'session_meta', payload: { id: threadId, cwd: workdir } }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: turnId } }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'image_generation_end', saved_path: imagePath } }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: turnId, last_agent_message: null } }),
+      ].join('\n') + '\n');
+
+      const latestInput = buildExpectedReplyInput('Generate an image of a green robot', 'telegram');
+      await recordPendingReplyOrigin(workdir, sessionId, {
+        platform: 'telegram',
+        injectedInput: latestInput,
+        createdAt: new Date().toISOString(),
+        telegramAck: { chatId: '777', messageId: '3760', messageThreadId: '9001' },
+        telegramReplyTo: { chatId: '777', messageId: '3759', messageThreadId: '9001' },
+      });
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: turnId,
+        input_messages: [latestInput],
+        last_assistant_message: null,
+      }, {
+        CODEX_HOME: codexHome,
+        HOME: tempRoot,
+        USERPROFILE: tempRoot,
+        OMX_TELEGRAM_CAPTURE_PATH: capturePath,
+        OMX_TEST_MOCK_TELEGRAM_TRANSPORT: '1',
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const requests = await readCapturedRequests(capturePath);
+      const sendPhotoRequests = requests.filter((request) => /sendPhoto/.test(request.url));
+      assert.equal(sendPhotoRequests.length, 1);
+      assert.match(sendPhotoRequests[0].body, /name="photo"; filename="result\.png"/);
+
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      assert.ok(entries.some((entry) =>
+        entry.type === 'completed_turn_delivery_allowed'
+        && entry.rich_media_part_count === 1
+        && Array.isArray(entry.evidence_sources)
+        && entry.evidence_sources.includes('rollout-path')
+      ));
+      assert.ok(entries.some((entry) => entry.type === 'completed_turn_delivery_sent'));
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it('sends an image-only Telegram follow-up as sendDocument when photo policy rejects it', async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-telegram-image-document-'));
     const codexHome = join(tempRoot, 'codex-home');
