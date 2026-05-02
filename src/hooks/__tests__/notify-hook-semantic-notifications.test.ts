@@ -896,6 +896,66 @@ describe('notify-hook semantic notifications', () => {
     }
   });
 
+  it('closes completed-turn delivery claims when notification preparation throws after dispatch claim', async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-result-ready-prep-exception-'));
+    const codexHome = join(tempRoot, 'codex-home');
+    const capturePath = join(tempRoot, 'captures.ndjson');
+    const preloadPath = await writeFetchCapturePreload(tempRoot);
+    const workdir = join(tempRoot, 'repo');
+    const stateDir = join(workdir, '.omx', 'state');
+    const sessionId = 'sess-result-ready-prep-exception';
+    const threadId = 'thread-result-ready-prep-exception';
+    const turnId = 'turn-result-ready-prep-exception';
+    const key = `${threadId}|${turnId}|agent-turn-complete`;
+
+    try {
+      await mkdir(stateDir, { recursive: true });
+      await writeNotificationConfig(codexHome);
+      await writeOwnerSessionState(workdir, sessionId, threadId);
+      const pendingRoutesPath = pendingRoutesStatePath(workdir, sessionId);
+      await mkdir(dirname(pendingRoutesPath), { recursive: true });
+      await writeFile(pendingRoutesPath, '{ this is not valid JSON', 'utf-8');
+
+      const result = runNotifyHook({
+        cwd: workdir,
+        type: 'agent-turn-complete',
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: turnId,
+        input_messages: ['please sync releases'],
+        last_assistant_message: 'The release sync completed successfully.',
+      }, {
+        CODEX_HOME: codexHome,
+        OMX_FETCH_CAPTURE_PATH: capturePath,
+        NODE_OPTIONS: `--import=${preloadPath}`,
+      });
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const notifyLog = join(workdir, '.omx', 'logs', `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const entries = await readJsonLines(notifyLog);
+      assert.ok(entries.some((entry) =>
+        entry.type === 'completed_turn_delivery_allowed'
+        && entry.turn_id === turnId
+      ));
+      const exception = entries.find((entry) =>
+        entry.type === 'completed_turn_notification_exception'
+        && entry.turn_id === turnId
+      );
+      assert.equal(exception?.delivery_status, 'committed');
+      assert.match(String(exception?.error ?? ''), /JSON|valid/i);
+
+      const projectState = JSON.parse(
+        await readFile(join(stateDir, 'notify-hook-turn-dedupe.json'), 'utf-8'),
+      ) as {
+        turn_claims?: Record<string, { delivery_status?: string }>;
+      };
+      assert.equal(projectState.turn_claims?.[key]?.delivery_status, 'committed');
+      assert.equal((await readCapturedRequests(capturePath)).length, 0);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   it('does not immediately retry completed-turn delivery after ambiguous dispatch timeout evidence', async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), 'omx-notify-hook-result-ready-timeout-fail-closed-'));
     const codexHome = join(tempRoot, 'codex-home');

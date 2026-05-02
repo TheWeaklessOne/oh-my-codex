@@ -3464,8 +3464,25 @@ async function main() {
           completedTurnDeliveryStatus,
         );
       }
-    } catch {
-      // Non-fatal: notification module may not be built or config may not exist
+    } catch (error) {
+      await logNotifyHookEvent(logsDir, {
+        timestamp: new Date().toISOString(),
+        level: 'warn',
+        type: 'completed_turn_notification_exception',
+        thread_id: safeString(payload['thread-id'] || payload.thread_id || '') || null,
+        turn_id: safeString(payload['turn-id'] || payload.turn_id || '') || null,
+        omx_session_id: getEffectiveSessionId() || null,
+        delivery_status: 'committed',
+        error: error instanceof Error ? error.message : String(error),
+      }).catch(() => {});
+      if (completedTurnDedupeForDeliveryStatus) {
+        await markProjectTurnDeliveryStatus(
+          stateDir,
+          logsDir,
+          completedTurnDedupeForDeliveryStatus,
+          'committed',
+        ).catch(() => {});
+      }
     }
   }
 
