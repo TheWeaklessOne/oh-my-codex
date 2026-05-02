@@ -10,7 +10,11 @@ import { readTeamEvents, waitForTeamEvent } from '../team/state/events.js';
 import type { TeamEvent } from '../team/state.js';
 import { parseWorktreeMode, type WorktreeMode } from '../team/worktree.js';
 import { classifyTaskSize } from '../hooks/task-size-detector.js';
-import { readApprovedExecutionLaunchHint, type ApprovedRepositoryContextSummary } from '../planning/artifacts.js';
+import {
+  readApprovedExecutionLaunchHint,
+  readApprovedExecutionLaunchHintOutcome,
+  type ApprovedRepositoryContextSummary,
+} from '../planning/artifacts.js';
 import { routeTaskToRole } from '../team/role-router.js';
 import { allocateTasksToWorkers } from '../team/allocation-policy.js';
 import {
@@ -104,8 +108,12 @@ function resolveApprovedTeamFollowupContext(cwd: string, task: string): TeamFoll
   const shortFollowup = ['team', 'team으로 해줘', 'team으로 해주세요'].includes(normalizedTask);
   if (!shortFollowup) return null;
 
-  const approvedHint = readApprovedExecutionLaunchHint(cwd, 'team');
-  if (!approvedHint) return null;
+  const approvedHintOutcome = readApprovedExecutionLaunchHintOutcome(cwd, 'team');
+  if (approvedHintOutcome.status === 'ambiguous') {
+    throw new Error('approved_execution_hint_ambiguous:team');
+  }
+  if (approvedHintOutcome.status !== 'resolved') return null;
+  const approvedHint = approvedHintOutcome.hint;
 
   const persistedTask = typeof existingTeamState?.task_description === 'string'
     ? existingTeamState.task_description
@@ -752,7 +760,7 @@ function parseTeamArgs(args: string[], cwd: string = process.cwd()): ParsedTeamA
     }
   }
 
-  const approvedHint = readApprovedExecutionLaunchHint(cwd, 'team');
+  const approvedHint = readApprovedExecutionLaunchHint(cwd, 'team', { task: effectiveTask });
   const matchesApprovedLaunchHint = approvedHint?.task.trim() === effectiveTask.trim()
     && (approvedHint.workerCount == null || approvedHint.workerCount === workerCount)
     && (approvedHint.agentType == null || approvedHint.agentType === agentType);
