@@ -57,6 +57,14 @@ async function writeJson(path: string, value: unknown): Promise<void> {
   await writeFile(path, JSON.stringify(value, null, 2));
 }
 
+async function initTempGitRepo(prefix: string): Promise<string> {
+  const cwd = await mkdtemp(join(tmpdir(), prefix));
+  execFileSync("git", ["init"], { cwd, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd, stdio: "ignore" });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd, stdio: "ignore" });
+  return cwd;
+}
+
 async function writeActiveAutopilotSession(cwd: string, sessionId: string): Promise<void> {
   await writeJson(join(cwd, ".omx", "state", "session.json"), {
     session_id: sessionId,
@@ -2597,6 +2605,263 @@ esac
       );
 
       assert.equal(result.omxEventName, "pre-tool-use");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+
+  it("blocks Stop for untracked non-Bash-style sloppy fallback source edits", async () => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-untracked-");
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await writeFile(
+        join(cwd, "src", "runtime.ts"),
+        [
+          "export function loadRuntime() {",
+          "  // implement a quick hack fallback if it fails",
+          "  return process.env.RUNTIME || 'local';",
+          "}",
+        ].join("\n"),
+      );
+
+      const result = await dispatchCodexNativeHook(
+        { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-untracked" },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.equal((result.outputJson as { stopReason?: string } | null)?.stopReason, "sloppy_fallback_diff_audit");
+      assert.match(JSON.stringify(result.outputJson), /src\/runtime\.ts/);
+      assert.match(JSON.stringify(result.outputJson), /grounded design/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+
+  it("keeps blocking repeated Stop while sloppy fallback diff remains", async () => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-repeat-");
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await writeFile(
+        join(cwd, "src", "runtime.ts"),
+        [
+          "export function loadRuntime() {",
+          "  // implement a quick hack fallback if it fails",
+          "  return process.env.RUNTIME || 'local';",
+          "}",
+        ].join("\n"),
+      );
+      const payload = { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-repeat", turn_id: "turn-repeat" };
+
+      const first = await dispatchCodexNativeHook(payload, { cwd });
+      const repeated = await dispatchCodexNativeHook({ ...payload, stop_hook_active: true }, { cwd });
+
+      assert.equal((first.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.equal((repeated.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.equal((repeated.outputJson as { stopReason?: string } | null)?.stopReason, "sloppy_fallback_diff_audit");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+
+  it("blocks Stop for unstaged tracked sloppy fallback source edits", async () => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-unstaged-");
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await writeFile(join(cwd, "src", "runtime.ts"), "export const runtime = 'base';\n");
+      execFileSync("git", ["add", "src/runtime.ts"], { cwd, stdio: "ignore" });
+      execFileSync("git", ["commit", "-m", "initial"], { cwd, stdio: "ignore" });
+      await writeFile(
+        join(cwd, "src", "runtime.ts"),
+        [
+          "export function loadRuntime() {",
+          "  // just bypass fallback if it fails",
+          "  return process.env.RUNTIME || 'local';",
+          "}",
+        ].join("\n"),
+      );
+
+      const result = await dispatchCodexNativeHook(
+        { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-unstaged" },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.match(JSON.stringify(result.outputJson), /unstaged/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks Stop from a subdirectory cwd for untracked sloppy source elsewhere", async () => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-subdir-");
+    try {
+      await mkdir(join(cwd, "src", "nested"), { recursive: true });
+      await writeFile(join(cwd, "src", "nested", "anchor.ts"), "export const anchor = true;\n");
+      await writeFile(
+        join(cwd, "src", "runtime.ts"),
+        [
+          "export function loadRuntime() {",
+          "  // implement a quick hack fallback if it fails",
+          "  return process.env.RUNTIME || 'local';",
+          "}",
+        ].join("\n"),
+      );
+
+      const subdir = join(cwd, "src", "nested");
+      const result = await dispatchCodexNativeHook(
+        { hook_event_name: "Stop", cwd: subdir, session_id: "sess-stop-slop-subdir" },
+        { cwd: subdir },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.match(JSON.stringify(result.outputJson), /src\/runtime\.ts/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks Stop for staged sloppy fallback source edits", async () => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-staged-");
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await writeFile(join(cwd, "src", "runtime.ts"), "export const runtime = 'base';\n");
+      execFileSync("git", ["add", "src/runtime.ts"], { cwd, stdio: "ignore" });
+      execFileSync("git", ["commit", "-m", "initial"], { cwd, stdio: "ignore" });
+      await writeFile(
+        join(cwd, "src", "runtime.ts"),
+        [
+          "export function loadRuntime() {",
+          "  // temporary workaround fallback if it fails",
+          "  return process.env.RUNTIME || 'local';",
+          "}",
+        ].join("\n"),
+      );
+      execFileSync("git", ["add", "src/runtime.ts"], { cwd, stdio: "ignore" });
+
+      const result = await dispatchCodexNativeHook(
+        { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-staged" },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.match(JSON.stringify(result.outputJson), /staged/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not block Stop for grounded compatibility fallback source edits", async () => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-grounded-");
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await writeFile(
+        join(cwd, "src", "compat.ts"),
+        [
+          "export function resolveCompatMode() {",
+          "  // temporary fallback for legacy startup",
+          "  // compatibility fail-safe tested by regression coverage",
+          "  return 'legacy';",
+          "}",
+        ].join("\n"),
+      );
+
+      const result = await dispatchCodexNativeHook(
+        { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-grounded" },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+
+  it("does not block Stop when existing nearby source context grounds a new fallback line", async () => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-existing-ground-");
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await writeFile(
+        join(cwd, "src", "compat.ts"),
+        [
+          "export function resolveCompatMode() {",
+          "  // compatibility fail-safe tested by regression coverage",
+          "  return 'legacy';",
+          "}",
+        ].join("\n"),
+      );
+      execFileSync("git", ["add", "src/compat.ts"], { cwd, stdio: "ignore" });
+      execFileSync("git", ["commit", "-m", "initial"], { cwd, stdio: "ignore" });
+      await writeFile(
+        join(cwd, "src", "compat.ts"),
+        [
+          "export function resolveCompatMode() {",
+          "  // compatibility fail-safe tested by regression coverage",
+          "  // temporary fallback if it fails",
+          "  return 'legacy';",
+          "}",
+        ].join("\n"),
+      );
+
+      const result = await dispatchCodexNativeHook(
+        { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-existing-ground" },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+
+  it("does not block Stop for source-adjacent test file fallback wording", async () => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-test-file-");
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await writeFile(
+        join(cwd, "src", "runtime.test.ts"),
+        "it('documents no quick hack fallback if it fails', () => {});\n",
+      );
+
+      const result = await dispatchCodexNativeHook(
+        { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-test-file" },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not block Stop for docs-only fallback wording", async () => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-docs-");
+    try {
+      await mkdir(join(cwd, "docs"), { recursive: true });
+      await writeFile(
+        join(cwd, "docs", "notes.md"),
+        "Do not implement a quick hack fallback if it fails.\n",
+      );
+
+      const result = await dispatchCodexNativeHook(
+        { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-docs" },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "stop");
       assert.equal(result.outputJson, null);
     } finally {
       await rm(cwd, { recursive: true, force: true });
