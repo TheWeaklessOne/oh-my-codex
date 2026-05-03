@@ -56,7 +56,7 @@ describe('package bin contract', () => {
     assert.equal(pkg.scripts?.['test:ci:compiled'], 'npm run verify:native-agents && npm run verify:plugin-bundle && npm run test:node && node dist/scripts/generate-catalog-docs.js --check');
     assert.equal(
       pkg.scripts?.['coverage:team-critical'],
-      "npm run build && c8 --all --src dist/team --src dist/state --include 'dist/team/**/*.js' --include 'dist/state/**/*.js' --exclude '**/__tests__/**' --reporter=text-summary --reporter=lcov --reporter=json-summary --report-dir coverage/team --check-coverage --lines=78 --functions=90 --branches=70 --statements=78 node dist/scripts/run-test-files.js dist/team/__tests__ dist/state/__tests__",
+      'npm run build && npm run coverage:team-critical:compiled',
     );
     assert.equal(
       pkg.scripts?.['coverage:team-critical:compiled'],
@@ -64,7 +64,7 @@ describe('package bin contract', () => {
     );
     assert.equal(
       pkg.scripts?.['coverage:ts:full'],
-      "npm run build && c8 --all --src dist --exclude '**/__tests__/**' --exclude 'dist/bin/**' --exclude 'dist/**/*.d.ts' --reporter=text-summary --reporter=lcov --reporter=json-summary --report-dir coverage/ts-full node dist/scripts/run-test-files.js dist",
+      'npm run build && npm run coverage:ts:full:compiled',
     );
     assert.equal(
       pkg.scripts?.['coverage:ts:full:compiled'],
