@@ -4710,12 +4710,15 @@ exit 0
       process.env.OMX_TEAM_STATE_ROOT = stateDir;
       process.env.OMX_TEAM_LEADER_CWD = cwd;
 
-      const result = await dispatchCodexNativeHook(
-        {
-          hook_event_name: "Stop",
-          cwd: workerCwd,
-          session_id: "sess-stop-team-worker-stale",
-        },
+      const payload = {
+        hook_event_name: "Stop",
+        cwd: workerCwd,
+        session_id: "sess-stop-team-worker-stale",
+        thread_id: "thread-stop-team-worker-stale",
+      };
+      const result = await dispatchCodexNativeHook(payload, { cwd: workerCwd });
+      const replay = await dispatchCodexNativeHook(
+        { ...payload, stop_hook_active: true },
         { cwd: workerCwd },
       );
 
@@ -4723,6 +4726,7 @@ exit 0
         (result.outputJson as { stopReason?: string } | null)?.stopReason,
         "team_worker_worker-1_1_in_progress",
       );
+      assert.equal(replay.outputJson, null);
     } finally {
       if (typeof prevTeamWorker === "string") process.env.OMX_TEAM_WORKER = prevTeamWorker;
       else delete process.env.OMX_TEAM_WORKER;
@@ -4734,7 +4738,7 @@ exit 0
     }
   });
 
-  it("suppresses identical team worker Stop replays but re-blocks fresh turns and task state changes", async () => {
+  it("re-blocks live team worker Stop replays but suppresses stale terminal worker repeats", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-team-worker-repeat-"));
     try {
       await initTeamState(
@@ -4812,12 +4816,12 @@ exit 0
         created_at: new Date().toISOString(),
       });
       const stateChanged = await dispatchCodexNativeHook(
-        { ...basePayload, turn_id: "turn-stop-team-worker-repeat-2", stop_hook_active: true },
+        { ...basePayload, turn_id: "turn-stop-team-worker-repeat-3", stop_hook_active: true },
         { cwd: workerCwd },
       );
 
       assert.deepEqual(first.outputJson, expectedInProgress);
-      assert.deepEqual(replay.outputJson, null);
+      assert.deepEqual(replay.outputJson, expectedInProgress);
       assert.deepEqual(freshTurn.outputJson, expectedInProgress);
       assert.deepEqual(stateChanged.outputJson, {
         decision: "block",

@@ -115,6 +115,7 @@ export interface NativeHookDispatchResult {
 const TERMINAL_MODE_PHASES = new Set(["complete", "completed", "failed", "cancelled"]);
 const SKILL_STOP_BLOCKERS = new Set(["ralplan"]);
 const TEAM_STOP_BLOCKING_TASK_STATUSES = new Set(["pending", "in_progress", "blocked"]);
+const TEAM_WORKER_TERMINAL_RUN_STATES = new Set(["done", "complete", "completed", "failed", "stopped", "cancelled"]);
 const NATIVE_STOP_STATE_FILE = "native-stop-state.json";
 const STABLE_FINAL_RECOMMENDATION_PATTERNS = [
   /^\s*(?:launch|release|ship)-?ready\s*:\s*(?:yes|no)\b[^\n\r]*/im,
@@ -1419,6 +1420,7 @@ type TeamWorkerStopDecision =
       stateDir: string;
       workerContext: { teamName: string; workerName: string };
       output: Record<string, unknown>;
+      allowRepeatDuringStopHook: boolean;
     }
   | {
       kind: "allowed";
@@ -1446,6 +1448,7 @@ async function resolveTeamWorkerStopDecision(
     kind: "blocked",
     stateDir: stateDirForDecision,
     workerContext,
+    allowRepeatDuringStopHook: false,
     output: {
       decision: "block",
       reason:
@@ -1466,6 +1469,8 @@ async function resolveTeamWorkerStopDecision(
     readJsonIfExists(join(workerRoot, "identity.json")),
     readJsonIfExists(join(workerRoot, "status.json")),
   ]);
+  const workerRunState = safeString(status?.state).trim().toLowerCase();
+  const workerRunStateIsTerminal = TEAM_WORKER_TERMINAL_RUN_STATES.has(workerRunState);
   if (!identity && !status && !existsSync(workerRoot)) {
     return blockWorkerStop("missing_worker_state", "worker identity/status state is missing", stateDir);
   }
@@ -1522,6 +1527,7 @@ async function resolveTeamWorkerStopDecision(
       kind: "blocked",
       stateDir,
       workerContext,
+      allowRepeatDuringStopHook: !workerRunStateIsTerminal,
       output: {
         decision: "block",
         reason:
@@ -1969,6 +1975,10 @@ function resolveRepeatableStopSessionId(
   return canonicalSessionId?.trim() || readPayloadSessionId(payload) || "";
 }
 
+function isStateLevelStopSignatureKind(kind: string): boolean {
+  return kind === "team-worker-stop" || kind === "team-stop";
+}
+
 function buildRepeatableStopSignature(
   payload: CodexHookPayload,
   kind: string,
@@ -1977,8 +1987,11 @@ function buildRepeatableStopSignature(
 ): string {
   const sessionId = resolveRepeatableStopSessionId(payload, canonicalSessionId) || "no-session";
   const threadId = readPayloadThreadId(payload) || "no-thread";
-  const turnId = readPayloadTurnId(payload);
   const normalizedDetail = normalizeAutoNudgeSignatureText(detail) || safeString(detail).trim().toLowerCase();
+  if (isStateLevelStopSignatureKind(kind)) {
+    return [kind, sessionId, threadId, normalizedDetail || "no-detail"].join("|");
+  }
+  const turnId = readPayloadTurnId(payload);
   const transcriptPath = safeString(payload.transcript_path ?? payload.transcriptPath).trim() || "no-transcript";
   const lastAssistantMessage = normalizeAutoNudgeSignatureText(
     payload.last_assistant_message ?? payload.lastAssistantMessage,
@@ -2374,7 +2387,7 @@ async function buildStopHookOutput(
         safeString(teamWorkerDecision.output.stopReason),
         teamWorkerDecision.output,
         canonicalSessionId,
-        { allowRepeatDuringStopHook: false },
+        { allowRepeatDuringStopHook: teamWorkerDecision.allowRepeatDuringStopHook },
       );
     }
     if (teamWorkerDecision.kind === "allowed") {
