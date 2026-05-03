@@ -39,6 +39,43 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  rust-tests:
+    name: Rust Tests + Coverage Signal
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Run Rust tests with coverage summaries
+        shell: bash
+        run: |
+          mkdir -p coverage/rust
+
+          cargo llvm-cov --workspace --summary-only | tee coverage/rust/workspace-summary.txt
+          cargo llvm-cov --manifest-path crates/omx-sparkshell/Cargo.toml --summary-only | tee coverage/rust/omx-sparkshell-summary.txt
+      - name: Add Rust coverage summary to job summary
+        shell: bash
+        run: |
+          {
+            echo '## Rust Test Coverage Summary'
+            echo ''
+            echo '### Workspace'
+            echo '```text'
+            cat coverage/rust/workspace-summary.txt
+            echo '```'
+            echo ''
+            echo '### omx-sparkshell manifest'
+            echo '```text'
+            cat coverage/rust/omx-sparkshell-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -264,12 +301,13 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [rustfmt, clippy, lint, typecheck, test, coverage-team-critical, ralph-persistence-gate, build]
+    needs: [rustfmt, clippy, rust-tests, lint, typecheck, test, coverage-team-critical, ralph-persistence-gate, build]
     steps:
       - name: Check required job results
         run: |
           if [[ "${{ needs.rustfmt.result }}" != "success" ]] ||
              [[ "${{ needs.clippy.result }}" != "success" ]] ||
+             [[ "${{ needs.rust-tests.result }}" != "success" ]] ||
              [[ "${{ needs.lint.result }}" != "success" ]] ||
              [[ "${{ needs.typecheck.result }}" != "success" ]] ||
              [[ "${{ needs.test.result }}" != "success" ]] ||
@@ -279,6 +317,7 @@ jobs:
             echo "::error::One or more required CI jobs failed"
             echo "  rustfmt: ${{ needs.rustfmt.result }}"
             echo "  clippy: ${{ needs.clippy.result }}"
+            echo "  rust-tests: ${{ needs.rust-tests.result }}"
             echo "  lint: ${{ needs.lint.result }}"
             echo "  typecheck: ${{ needs.typecheck.result }}"
             echo "  test: ${{ needs.test.result }}"

@@ -16,8 +16,9 @@ function jobBlock(workflow: string, jobName: string): string {
 }
 
 describe('CI Rust gates', () => {
-  it('requires rustfmt and clippy gates plus an explicit Rust toolchain setup for the final native build lane', () => {
+  it('requires rustfmt, clippy, and Rust test coverage gates plus an explicit Rust toolchain setup for the final native build lane', () => {
     const workflow = readCiWorkflow();
+    const rustTestsJob = jobBlock(workflow, 'rust-tests');
 
     assert.match(workflow, /rustfmt:/);
     assert.match(workflow, /components:\s*rustfmt/);
@@ -26,6 +27,15 @@ describe('CI Rust gates', () => {
     assert.match(workflow, /clippy:/);
     assert.match(workflow, /components:\s*clippy/);
     assert.match(workflow, /cargo clippy --workspace --all-targets -- -D warnings/);
+
+    assert.match(workflow, /rust-tests:/);
+    assert.match(workflow, /name:\s*Rust Tests \+ Coverage Signal/);
+    assert.match(workflow, /components:\s*llvm-tools-preview/);
+    assert.match(workflow, /taiki-e\/install-action@cargo-llvm-cov/);
+    assert.match(workflow, /cargo llvm-cov --workspace --summary-only/);
+    assert.match(workflow, /cargo llvm-cov --manifest-path crates\/omx-sparkshell\/Cargo\.toml --summary-only/);
+    assert.match(workflow, /cat coverage\/rust\/omx-sparkshell-summary\.txt/);
+    assert.doesNotMatch(rustTestsJob, /--lcov|output-path|Upload Rust coverage artifact/);
 
     assert.match(
       workflow,
@@ -69,14 +79,16 @@ describe('CI Rust gates', () => {
   });
 
 
-  it('marks rustfmt and clippy as required in the CI status gate', () => {
+  it('marks Rust formatting, Clippy, and tests as required in the CI status gate', () => {
     const workflow = readCiWorkflow();
 
-    assert.match(workflow, /needs:\s*\[rustfmt, clippy, lint, typecheck, test, coverage-team-critical, ralph-persistence-gate, build\]/);
+    assert.match(workflow, /needs:\s*\[rustfmt, clippy, rust-tests, lint, typecheck, test, coverage-team-critical, ralph-persistence-gate, build\]/);
     assert.match(workflow, /needs\.rustfmt\.result/);
     assert.match(workflow, /needs\.clippy\.result/);
+    assert.match(workflow, /needs\.rust-tests\.result/);
     assert.match(workflow, /echo "  rustfmt: \$\{\{ needs\.rustfmt\.result \}\}"/);
     assert.match(workflow, /echo "  clippy: \$\{\{ needs\.clippy\.result \}\}"/);
+    assert.match(workflow, /echo "  rust-tests: \$\{\{ needs\.rust-tests\.result \}\}"/);
   });
 
 
@@ -84,9 +96,7 @@ describe('CI Rust gates', () => {
     const workflow = readCiWorkflow();
 
     assert.doesNotMatch(workflow, /^  coverage-ts-full:/m);
-    assert.doesNotMatch(workflow, /^  coverage-rust:/m);
     assert.doesNotMatch(workflow, /needs\.coverage-ts-full\.result/);
-    assert.doesNotMatch(workflow, /needs\.coverage-rust\.result/);
   });
 
   it('runs typecheck once while retaining the Node 22 smoke lane for runtime coverage', () => {
@@ -105,6 +115,7 @@ describe('CI Rust gates', () => {
     for (const jobName of [
       'rustfmt',
       'clippy',
+      'rust-tests',
       'lint',
       'typecheck',
       'build-dist',
