@@ -325,6 +325,7 @@ If this happens, try:
 - [Agent catalog](./docs/agents.html)
 - [Skills reference](./docs/skills.html)
 - [Codex native hook mapping](./docs/codex-native-hooks.md)
+- [GitHub / PR / package identity pipeline](./docs/pipeline/github-pr-package-identity.md)
 - [Integrations](./docs/integrations.html)
 - [Troubleshooting execution readiness](./docs/troubleshooting.md)
 - [OpenClaw / notification gateway guide](./docs/openclaw-integration.md)
