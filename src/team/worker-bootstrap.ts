@@ -854,25 +854,23 @@ export function generateTaskAssignmentInbox(
     : taskOrId;
   const taskId = task.id;
   const taskDescription = task.description;
-  const workerGoalSection = renderTeamWorkerGoalInstruction(
-    typeof taskOrId === "string"
-      ? undefined
-      : {
-          teamName,
-          workerName,
-          objective: `Complete assigned OMX team task ${task.id} with verified evidence, preserving leader-owned audit.`,
-          taskIds: [task.id],
-          taskReferences: [{
-            id: task.id,
-            subject: task.subject,
-            status: task.status,
-            claimOwner: task.claim?.owner,
-            claimLeasedUntil: task.claim?.leased_until,
-          }],
-          artifactPath: `<team_state_root>/goals/team/${teamName}/workers/${workerName}.json`,
-          leaderAuditPath: `<team_state_root>/goals/team/${teamName}/leader-audit.json`,
-        },
-  );
+  const workerGoalSection = typeof taskOrId === "string"
+    ? ""
+    : renderTeamWorkerGoalInstruction({
+        teamName,
+        workerName,
+        objective: `Complete assigned OMX team task ${taskOrId.id} with verified evidence, preserving leader-owned audit.`,
+        taskIds: [taskOrId.id],
+        taskReferences: [{
+          id: taskOrId.id,
+          subject: taskOrId.subject,
+          status: taskOrId.status,
+          claimOwner: taskOrId.claim?.owner,
+          claimLeasedUntil: taskOrId.claim?.leased_until,
+        }],
+        artifactPath: `<team_state_root>/goals/team/${teamName}/workers/${workerName}.json`,
+        leaderAuditPath: `<team_state_root>/goals/team/${teamName}/leader-audit.json`,
+      });
   const delegationSection = renderDelegationContracts([task as TeamTask]);
 
   return `# New Task Assignment
