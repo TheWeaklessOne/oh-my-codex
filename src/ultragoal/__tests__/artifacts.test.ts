@@ -64,7 +64,7 @@ describe('ultragoal artifacts', () => {
       assert.match(instruction, /Complete first milestone/);
       assert.doesNotMatch(instruction, /\/goal\b/);
       assert.doesNotMatch(instruction, /\.\.\/\.\.\/codex/);
-      assert.doesNotMatch(instruction, /^\s*codex\s+goal\b/im);
+      assert.doesNotMatch(instruction, /`codex\s+goal\b/i);
     });
   });
 
