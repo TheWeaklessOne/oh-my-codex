@@ -35,6 +35,7 @@ import { agentsInitCommand } from "./agents-init.js";
 import { agentsCommand } from "./agents.js";
 import { sessionCommand } from "./session-search.js";
 import { autoresearchCommand } from "./autoresearch.js";
+import { autoresearchGoalCommand } from "./autoresearch-goal.js";
 import { mcpParityCommand } from "./mcp-parity.js";
 import { mcpServeCommand } from "./mcp-serve.js";
 import { adaptCommand } from "./adapt.js";
@@ -188,8 +189,8 @@ Usage:
   omx team      Spawn parallel worker panes in tmux and bootstrap inbox/task state
   omx ralph     Launch Codex with ralph persistence mode active
   omx ultragoal Create, resume, and checkpoint durable multi-goal plans over Codex goal mode
-  omx performance-goal
-                Create evaluator-gated performance optimization goals over Codex goal mode
+  omx autoresearch-goal
+                Create, hand off, and gate professor-critic research goals
   omx autoresearch [DEPRECATED] Use $autoresearch; direct CLI launch removed
   omx version   Show version information
   omx tmux-hook Manage tmux prompt injection workaround (init|status|validate|test)
@@ -346,6 +347,7 @@ const NESTED_HELP_COMMANDS = new Set<CliCommand>([
   "cleanup",
   "adapt",
   "autoresearch",
+  "autoresearch-goal",
   "agents",
   "agents-init",
   "deepinit",
@@ -1042,6 +1044,7 @@ export async function main(args: string[]): Promise<void> {
     "ask",
     "question",
     "autoresearch",
+  "autoresearch-goal",
     "explore",
     "sparkshell",
     "team",
@@ -1142,6 +1145,9 @@ export async function main(args: string[]): Promise<void> {
         break;
       case "autoresearch":
         await autoresearchCommand(args.slice(1));
+        break;
+      case "autoresearch-goal":
+        await autoresearchGoalCommand(args.slice(1));
         break;
       case "explore":
         await exploreCommand(args.slice(1));
