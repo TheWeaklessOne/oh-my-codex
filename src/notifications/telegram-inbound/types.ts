@@ -5,6 +5,11 @@ export type TelegramMediaKind = 'photo' | 'document' | 'audio' | 'voice';
 export interface TelegramRawUpdate {
   update_id?: number;
   message?: TelegramRawMessage;
+  callback_query?: TelegramRawCallbackQuery;
+}
+
+export interface TelegramRawUser {
+  id?: number | string;
 }
 
 export interface TelegramRawMessage {
@@ -15,9 +20,7 @@ export interface TelegramRawMessage {
     id?: number | string;
     type?: string;
   };
-  from?: {
-    id?: number | string;
-  };
+  from?: TelegramRawUser;
   text?: string;
   caption?: string;
   photo?: TelegramRawPhotoSize[];
@@ -28,6 +31,13 @@ export interface TelegramRawMessage {
     message_id?: number | string;
     message_thread_id?: number | string;
   };
+}
+
+export interface TelegramRawCallbackQuery {
+  id?: string;
+  from?: TelegramRawUser;
+  message?: TelegramRawMessage;
+  data?: string;
 }
 
 export interface TelegramRawPhotoSize {
@@ -100,6 +110,18 @@ export interface TelegramInboundMessage {
   textPart?: TelegramTextPart;
   mediaParts: TelegramMediaPart[];
   rawMessage: TelegramRawMessage;
+}
+
+export interface TelegramInboundCallbackQuery {
+  updateId?: number;
+  id: string;
+  senderId?: number | string;
+  chatId?: number | string;
+  chatType?: string;
+  messageId?: number | string;
+  messageThreadId?: number | string;
+  data?: string;
+  rawCallbackQuery: TelegramRawCallbackQuery;
 }
 
 export interface TelegramFileInfo {

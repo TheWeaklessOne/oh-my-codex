@@ -85,10 +85,12 @@ import {
   deleteTelegramAcceptedAckBestEffort,
   getTelegramInboundText,
   hasTelegramInboundContent,
+  normalizeTelegramCallbackQuery,
   normalizeTelegramUpdate,
   trySendTelegramProcessingAction,
 } from './telegram-inbound/index.js';
 import type {
+  TelegramInboundCallbackQuery,
   TelegramInboundMessage,
   TelegramRawMessage as TelegramMessage,
   TelegramRawUpdate as TelegramUpdate,
@@ -98,10 +100,21 @@ import type {
   ReplyAcknowledgementMode,
   ReplyConfig,
   TelegramAcceptedAckCleanupTarget,
+  TelegramMessageEntity,
   TelegramMessageReferenceTarget,
   TelegramReplyAcknowledgementMode,
   TelegramStartupBacklogPolicy,
 } from './types.js';
+import {
+  buildTelegramProgressToggleMarkup,
+  loadTelegramProgressFinalState,
+  loadTelegramProgressTrace,
+  parseTelegramProgressCallbackToken,
+  renderCollapsedTrace,
+  renderTraceFallbackMessage,
+  updateTelegramProgressFinalState,
+} from './telegram-progress.js';
+import { renderMarkdownToTelegramEntities } from './telegram-markdown-renderer.js';
 
 const __filename = fileURLToPath(import.meta.url);
 
@@ -802,6 +815,17 @@ function isTelegramMessageFromAuthorizedSender(
   }
 
   return msg.chat?.type === 'private';
+}
+
+function isTelegramCallbackFromAuthorizedSender(
+  config: ReplyListenerDaemonConfig,
+  callback: TelegramInboundCallbackQuery,
+): boolean {
+  if (config.authorizedTelegramUserIds.length > 0) {
+    const senderId = callback.senderId !== undefined ? String(callback.senderId) : null;
+    return !!senderId && config.authorizedTelegramUserIds.includes(senderId);
+  }
+  return callback.chatType === 'private';
 }
 
 function buildTelegramGetUpdatesPath(
@@ -1728,6 +1752,7 @@ async function sendTelegramReplyMessage(
   config: ReplyListenerDaemonConfig,
   httpsRequestImpl: typeof httpsRequest,
   body: Record<string, unknown>,
+  methodName = 'sendMessage',
 ): Promise<TelegramReplySendResult | null> {
   const replyBody = JSON.stringify(body);
 
@@ -1735,7 +1760,7 @@ async function sendTelegramReplyMessage(
     const replyReq = httpsRequestImpl(
       {
         hostname: 'api.telegram.org',
-        path: `/bot${config.telegramBotToken}/sendMessage`,
+        path: `/bot${config.telegramBotToken}/${methodName}`,
         method: 'POST',
         family: 4,
         headers: {
@@ -1818,6 +1843,250 @@ async function sendTelegramTextReply(
       ? { message_thread_id: coerceTelegramMessageThreadId(target.messageThreadId) }
       : {}),
   });
+}
+
+async function answerTelegramCallbackQuery(
+  config: ReplyListenerDaemonConfig,
+  httpsRequestImpl: typeof httpsRequest,
+  callbackQueryId: string,
+  options: { text?: string; showAlert?: boolean } = {},
+): Promise<void> {
+  await sendTelegramReplyMessage(
+    config,
+    httpsRequestImpl,
+    {
+      callback_query_id: callbackQueryId,
+      ...(options.text ? { text: options.text } : {}),
+      ...(options.showAlert !== undefined ? { show_alert: options.showAlert } : {}),
+    },
+    'answerCallbackQuery',
+  );
+}
+
+async function editTelegramMessageText(
+  config: ReplyListenerDaemonConfig,
+  httpsRequestImpl: typeof httpsRequest,
+  body: Record<string, unknown>,
+): Promise<void> {
+  await sendTelegramReplyMessage(config, httpsRequestImpl, body, 'editMessageText');
+}
+
+function renderProgressFinalForEntityEdit(finalState: {
+  finalText: string;
+  finalEntities?: TelegramMessageEntity[];
+  finalParseMode?: "Markdown" | "HTML" | null;
+}): {
+  text: string;
+  entities?: TelegramMessageEntity[];
+  canInline: boolean;
+} {
+  if (finalState.finalEntities?.length) {
+    return {
+      text: finalState.finalText,
+      entities: finalState.finalEntities,
+      canInline: true,
+    };
+  }
+  if (finalState.finalParseMode === "Markdown") {
+    const rendered = renderMarkdownToTelegramEntities(finalState.finalText);
+    return {
+      text: rendered.text,
+      entities: rendered.entities,
+      canInline: true,
+    };
+  }
+  if (finalState.finalParseMode === "HTML") {
+    return {
+      text: finalState.finalText,
+      canInline: false,
+    };
+  }
+  return {
+    text: finalState.finalText,
+    canInline: true,
+  };
+}
+
+async function handleTelegramProgressCallback(
+  config: ReplyListenerDaemonConfig,
+  callback: TelegramInboundCallbackQuery,
+  source: ReplySourceDescriptor,
+  lookupByMessageIdImpl: NonNullable<ReplyListenerPollDeps['lookupByMessageIdImpl']>,
+  httpsRequestImpl: typeof httpsRequest,
+  logImpl: typeof log,
+): Promise<boolean> {
+  const token = parseTelegramProgressCallbackToken(callback.data);
+  if (!token) return false;
+
+  if (String(callback.chatId) !== config.telegramChatId) {
+    return true;
+  }
+
+  if (!isTelegramCallbackFromAuthorizedSender(config, callback)) {
+    await answerTelegramCallbackQuery(config, httpsRequestImpl, callback.id, {
+      text: TELEGRAM_UNAUTHORIZED_REPLY_MESSAGE,
+      showAlert: true,
+    }).catch((error) => {
+      logImpl(`WARN: Failed to answer unauthorized Telegram progress callback: ${formatUnknownError(error)}`);
+    });
+    logSourceEvent(logImpl, source, 'telegram_progress_callback_unauthorized', {
+      messageId: callback.messageId,
+    });
+    return true;
+  }
+
+  if (callback.messageId === undefined || callback.messageId === null) {
+    await answerTelegramCallbackQuery(config, httpsRequestImpl, callback.id, {
+      text: 'Ход выполнения недоступен.',
+      showAlert: true,
+    }).catch(() => {});
+    return true;
+  }
+
+  const mapping = lookupByMessageIdImpl('telegram', String(callback.messageId), source.key);
+  if (!mapping?.projectPath) {
+    await answerTelegramCallbackQuery(config, httpsRequestImpl, callback.id, {
+      text: 'Ход выполнения больше недоступен.',
+      showAlert: true,
+    }).catch(() => {});
+    return true;
+  }
+
+  const finalState = await loadTelegramProgressFinalState(
+    mapping.projectPath,
+    mapping.sessionId,
+    token,
+  );
+  if (
+    !finalState
+    || finalState.chatId !== String(callback.chatId)
+    || finalState.messageId !== String(callback.messageId)
+  ) {
+    await answerTelegramCallbackQuery(config, httpsRequestImpl, callback.id, {
+      text: 'Ход выполнения больше недоступен.',
+      showAlert: true,
+    }).catch(() => {});
+    return true;
+  }
+
+  const trace = await loadTelegramProgressTrace(
+    finalState.projectPath,
+    finalState.sessionId,
+    finalState.turnId,
+  );
+  if (!trace || trace.entries.length === 0) {
+    await answerTelegramCallbackQuery(config, httpsRequestImpl, callback.id, {
+      text: 'Ход выполнения пуст.',
+      showAlert: true,
+    }).catch(() => {});
+    return true;
+  }
+
+  if (finalState.shown) {
+    await editTelegramMessageText(config, httpsRequestImpl, {
+      chat_id: finalState.chatId,
+      message_id: finalState.messageId,
+      text: finalState.finalText,
+      ...(finalState.finalEntities?.length
+        ? { entities: finalState.finalEntities }
+        : finalState.finalParseMode
+          ? { parse_mode: finalState.finalParseMode }
+          : {}),
+      reply_markup: buildTelegramProgressToggleMarkup(finalState.token, false),
+    });
+    await updateTelegramProgressFinalState({
+      ...finalState,
+      shown: false,
+    });
+    await answerTelegramCallbackQuery(config, httpsRequestImpl, callback.id, {
+      text: 'Ход скрыт.',
+    }).catch(() => {});
+    logSourceEvent(logImpl, source, 'telegram_progress_callback_hide', {
+      messageId: finalState.messageId,
+      turnId: finalState.turnId,
+    });
+    return true;
+  }
+
+  const finalRender = renderProgressFinalForEntityEdit(finalState);
+  const expanded = finalRender.canInline
+    ? renderCollapsedTrace(trace, finalRender.text, {
+        finalEntities: finalRender.entities,
+      })
+    : {
+        fits: false,
+        text: finalRender.text,
+        entities: finalRender.entities ?? [],
+        traceText: '',
+      };
+  if (expanded.fits) {
+    await editTelegramMessageText(config, httpsRequestImpl, {
+      chat_id: finalState.chatId,
+      message_id: finalState.messageId,
+      text: expanded.text,
+      entities: expanded.entities,
+      reply_markup: buildTelegramProgressToggleMarkup(finalState.token, true),
+    });
+    await updateTelegramProgressFinalState({
+      ...finalState,
+      shown: true,
+    });
+    await answerTelegramCallbackQuery(config, httpsRequestImpl, callback.id, {
+      text: 'Ход показан.',
+    }).catch(() => {});
+    logSourceEvent(logImpl, source, 'telegram_progress_callback_show', {
+      messageId: finalState.messageId,
+      turnId: finalState.turnId,
+    });
+    return true;
+  }
+
+  if (finalState.fullTraceDelivery === 'none') {
+    await answerTelegramCallbackQuery(config, httpsRequestImpl, callback.id, {
+      text: 'Ход слишком длинный для показа в Telegram.',
+      showAlert: true,
+    }).catch(() => {});
+    logSourceEvent(logImpl, source, 'telegram_progress_callback_fallback_suppressed', {
+      messageId: finalState.messageId,
+      turnId: finalState.turnId,
+      reason: 'full-trace-delivery-none',
+    });
+    return true;
+  }
+
+  if (finalState.fallbackSentAt) {
+    await answerTelegramCallbackQuery(config, httpsRequestImpl, callback.id, {
+      text: 'Ход уже отправлен отдельным сообщением.',
+    }).catch(() => {});
+    logSourceEvent(logImpl, source, 'telegram_progress_callback_fallback_deduped', {
+      messageId: finalState.messageId,
+      turnId: finalState.turnId,
+    });
+    return true;
+  }
+
+  const fallbackText = renderTraceFallbackMessage(trace);
+  await sendTelegramReplyMessage(config, httpsRequestImpl, {
+    chat_id: finalState.chatId,
+    text: fallbackText,
+    reply_to_message_id: finalState.messageId,
+    ...(finalState.messageThreadId !== undefined
+      ? { message_thread_id: coerceTelegramMessageThreadId(finalState.messageThreadId) }
+      : {}),
+  });
+  await updateTelegramProgressFinalState({
+    ...finalState,
+    fallbackSentAt: new Date().toISOString(),
+  });
+  await answerTelegramCallbackQuery(config, httpsRequestImpl, callback.id, {
+    text: 'Ход отправлен отдельным сообщением.',
+  }).catch(() => {});
+  logSourceEvent(logImpl, source, 'telegram_progress_callback_fallback', {
+    messageId: finalState.messageId,
+    turnId: finalState.turnId,
+    delivery: finalState.fullTraceDelivery ?? 'message',
+  });
+  return true;
 }
 
 async function trySendTelegramTextReply(
@@ -2329,6 +2598,22 @@ export async function pollTelegramOnce(
       const updateId = typeof update.update_id === 'number' ? update.update_id : null;
       if (updateId === null) {
         continue;
+      }
+
+      const callback = normalizeTelegramCallbackQuery(update);
+      if (callback) {
+        const handledCallback = await handleTelegramProgressCallback(
+          config,
+          callback,
+          source,
+          lookupByMessageIdImpl,
+          httpsRequestImpl,
+          logImpl,
+        );
+        if (handledCallback) {
+          commitTelegramCursor(state, config, source, updateId, writeDaemonStateImpl);
+          continue;
+        }
       }
 
       const inbound = normalizeTelegramUpdate(update);

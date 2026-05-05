@@ -1,4 +1,5 @@
 import type {
+  TelegramInboundCallbackQuery,
   TelegramInboundMessage,
   TelegramMediaPart,
   TelegramRawMessage,
@@ -164,5 +165,26 @@ export function normalizeTelegramUpdate(update: TelegramRawUpdate): TelegramInbo
     ...(textPart ? { textPart } : {}),
     mediaParts: buildMediaParts(message),
     rawMessage: message,
+  };
+}
+
+export function normalizeTelegramCallbackQuery(update: TelegramRawUpdate): TelegramInboundCallbackQuery | null {
+  const callbackQuery = update.callback_query;
+  if (!callbackQuery || typeof callbackQuery.id !== 'string' || callbackQuery.id.trim() === '') {
+    return null;
+  }
+
+  const message = callbackQuery.message;
+  const chatType = normalizeTrimmedString(message?.chat?.type);
+  return {
+    ...(typeof update.update_id === 'number' ? { updateId: update.update_id } : {}),
+    id: callbackQuery.id.trim(),
+    ...(callbackQuery.from?.id !== undefined ? { senderId: callbackQuery.from.id } : {}),
+    ...(message?.chat?.id !== undefined ? { chatId: message.chat.id } : {}),
+    ...(chatType ? { chatType } : {}),
+    ...(message?.message_id !== undefined ? { messageId: message.message_id } : {}),
+    ...(message?.message_thread_id !== undefined ? { messageThreadId: message.message_thread_id } : {}),
+    ...(typeof callbackQuery.data === 'string' ? { data: callbackQuery.data } : {}),
+    rawCallbackQuery: callbackQuery,
   };
 }

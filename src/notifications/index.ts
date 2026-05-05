@@ -64,9 +64,11 @@ export type {
 
 export {
   dispatchNotifications,
+  getEffectivePlatformConfig,
   sendDiscord,
   sendDiscordBot,
   sendTelegram,
+  sendTelegramMessageDraft,
   sendSlack,
   sendWebhook,
 } from "./dispatcher.js";
@@ -188,6 +190,8 @@ import type {
   DispatchResult,
   NonStandardNotificationResult,
   RichNotificationContent,
+  TelegramNotificationConfig,
+  TelegramMessageEntity,
 } from "./types.js";
 import {
   getNotificationConfig,
@@ -206,7 +210,10 @@ import {
   type NotifyTempContract,
 } from "./temp-contract.js";
 import { formatNotification } from "./formatter.js";
-import { dispatchNotifications } from "./dispatcher.js";
+import {
+  dispatchNotifications,
+  getEffectivePlatformConfig,
+} from "./dispatcher.js";
 import { getCurrentTmuxSession, sanitizeTmuxAlertText } from "./tmux.js";
 import { startReplyListener, stopReplyListener } from "./reply-listener.js";
 import {
@@ -229,6 +236,13 @@ import {
   shouldIncludeSessionIdleTmuxTail,
   recordSessionIdleTmuxTailSent,
 } from "./idle-cooldown.js";
+import {
+  buildTelegramProgressToggleMarkup,
+  createTelegramProgressToken,
+  isTelegramProgressButtonEnabled,
+  loadTelegramProgressTrace,
+  registerTelegramProgressFinalMessage,
+} from "./telegram-progress.js";
 
 // Suppress unused import — used by callers via re-export
 void getActiveProfileName;
@@ -303,6 +317,104 @@ interface NotifyLifecycleDeps {
 
 interface NotifyCompletedTurnDeps extends NotifyLifecycleDeps {}
 
+function resolveTelegramProgressFinalRender(
+  telegramConfig: TelegramNotificationConfig,
+  payload: FullNotificationPayload,
+): {
+  text: string;
+  entities?: TelegramMessageEntity[];
+  parseMode?: "Markdown" | "HTML" | null;
+} {
+  const override = payload.transportOverrides?.telegram;
+  const text = override?.message ?? payload.message;
+  const hasEntityOverride = Object.prototype.hasOwnProperty.call(
+    override ?? {},
+    "entities",
+  );
+  const hasParseModeOverride = Object.prototype.hasOwnProperty.call(
+    override ?? {},
+    "parseMode",
+  );
+  return {
+    text,
+    ...(hasEntityOverride && override?.entities ? { entities: override.entities } : {}),
+    ...(hasParseModeOverride
+      ? { parseMode: override?.parseMode }
+      : hasEntityOverride
+        ? { parseMode: null }
+        : { parseMode: telegramConfig.parseMode ?? "Markdown" }),
+  };
+}
+
+function hasTelegramTextAnchor(payload: FullNotificationPayload): boolean {
+  const richParts = payload.richContent?.parts ?? [];
+  if (richParts.length === 0) {
+    return payload.message.trim().length > 0;
+  }
+
+  const firstDeliverablePart = richParts.find((part) => (
+    part.kind !== "text" || part.text.trim().length > 0
+  ));
+  return firstDeliverablePart?.kind === "text";
+}
+
+async function maybeAttachTelegramProgressButton(
+  config: FullNotificationConfig,
+  decision: CompletedTurnNotificationDecision,
+  payload: FullNotificationPayload,
+): Promise<void> {
+  if (!payload.projectPath || !payload.tmuxPaneId || !decision.turnId || !hasTelegramTextAnchor(payload)) {
+    return;
+  }
+  const telegramConfig = getEffectivePlatformConfig<TelegramNotificationConfig>(
+    "telegram",
+    config,
+    decision.effectiveEvent,
+  );
+  if (!telegramConfig?.enabled || !isTelegramProgressButtonEnabled(telegramConfig.progress)) {
+    return;
+  }
+  const replyTelegramConfig = getReplyListenerPlatformConfig(config);
+  if (
+    !replyTelegramConfig.telegramEnabled
+    || replyTelegramConfig.telegramBotToken !== telegramConfig.botToken
+    || replyTelegramConfig.telegramChatId !== telegramConfig.chatId
+  ) {
+    return;
+  }
+  const trace = await loadTelegramProgressTrace(
+    payload.projectPath,
+    payload.sessionId,
+    decision.turnId,
+  );
+  if (!trace || trace.entries.length === 0) {
+    return;
+  }
+
+  const token = createTelegramProgressToken();
+  const telegramOverride = payload.transportOverrides?.telegram ?? {};
+  const finalRender = resolveTelegramProgressFinalRender(telegramConfig, payload);
+  payload.transportOverrides = {
+    ...(payload.transportOverrides ?? {}),
+    telegram: {
+      ...telegramOverride,
+      replyMarkup: buildTelegramProgressToggleMarkup(token, false),
+    },
+  };
+  payload.telegramProgressFinal = {
+    token,
+    turnId: decision.turnId,
+    finalText: finalRender.text,
+    ...(finalRender.entities?.length ? { finalEntities: finalRender.entities } : {}),
+    ...(Object.prototype.hasOwnProperty.call(finalRender, "parseMode")
+      ? { finalParseMode: finalRender.parseMode }
+      : {}),
+    ...(telegramConfig.progress?.fullTraceDelivery
+      ? { fullTraceDelivery: telegramConfig.progress.fullTraceDelivery }
+      : {}),
+  };
+}
+
 async function maybeRegisterReplyMappings(
   config: FullNotificationConfig,
   payload: FullNotificationPayload,
@@ -318,6 +430,11 @@ async function maybeRegisterReplyMappings(
       buildDiscordReplySource,
       buildTelegramReplySource,
     } = await import("./reply-source.js");
+    const telegramConfig = getEffectivePlatformConfig<TelegramNotificationConfig>(
+      "telegram",
+      config,
+      payload.event,
+    );
     for (const r of result.results) {
       if (
         r.success &&
@@ -352,6 +469,34 @@ async function maybeRegisterReplyMappings(
             topicName: r.topicName,
           });
         }
+      }
+      if (
+        r.success
+        && r.platform === "telegram"
+        && r.messageId
+        && payload.telegramProgressFinal
+        && payload.projectPath
+        && telegramConfig?.chatId
+      ) {
+        await registerTelegramProgressFinalMessage({
+          token: payload.telegramProgressFinal.token,
+          projectPath: payload.projectPath,
+          sessionId: payload.sessionId,
+          turnId: payload.telegramProgressFinal.turnId,
+          chatId: telegramConfig.chatId,
+          messageId: r.messageId,
+          ...(r.messageThreadId ? { messageThreadId: r.messageThreadId } : {}),
+          finalText: payload.telegramProgressFinal.finalText,
+          ...(payload.telegramProgressFinal.finalEntities?.length
+            ? { finalEntities: payload.telegramProgressFinal.finalEntities }
+            : {}),
+          ...(Object.prototype.hasOwnProperty.call(payload.telegramProgressFinal, "finalParseMode")
+            ? { finalParseMode: payload.telegramProgressFinal.finalParseMode }
+            : {}),
+          ...(payload.telegramProgressFinal.fullTraceDelivery
+            ? { fullTraceDelivery: payload.telegramProgressFinal.fullTraceDelivery }
+            : {}),
+        });
       }
     }
   } catch {
@@ -760,6 +905,7 @@ export async function notifyCompletedTurn(
       data.assistantText,
       getEnabledPlatforms(config, decision.effectiveEvent),
     );
+    await maybeAttachTelegramProgressButton(config, decision, payload);
 
     const openClawEvent = toOpenClawEvent(decision.effectiveEvent);
     const dispatchOpenClawLater = await buildOpenClawDispatch(

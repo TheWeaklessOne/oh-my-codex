@@ -21,6 +21,7 @@ import {
   getEffectivePlatformConfig,
   sendSlack,
   sendTelegram,
+  sendTelegramMessageDraft,
   sendWebhook,
   dispatchNotifications,
 } from '../dispatcher.js';
@@ -40,6 +41,10 @@ const basePayload: FullNotificationPayload = {
   projectPath: '/home/user/project',
   projectName: 'project',
 };
+
+afterEach(() => {
+  mock.restoreAll();
+});
 
 function joinTelegramChunkTexts(texts: readonly string[]): string {
   return texts
@@ -378,6 +383,220 @@ describe('sendTelegram', () => {
     assert.equal(parsedBody.text, basePayload.message);
     assert.equal(parsedBody.parse_mode, 'Markdown');
     assert.equal(parsedBody.message_thread_id, 9001);
+  });
+
+  it('passes Telegram inline reply markup on the first text chunk', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+    };
+    let requestBody = '';
+
+    const result = await sendTelegram(
+      config,
+      {
+        ...basePayload,
+        transportOverrides: {
+          telegram: {
+            replyMarkup: {
+              inline_keyboard: [[
+                { text: 'Показать ход', callback_data: 'omx:pg:abc123' },
+              ]],
+            },
+          },
+        },
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+            requestBody = body;
+            return {
+              statusCode: 200,
+              body: { ok: true, result: { message_id: 321 } },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.success, true);
+    const parsedBody = JSON.parse(requestBody) as Record<string, unknown>;
+    assert.deepEqual(parsedBody.reply_markup, {
+      inline_keyboard: [[
+        { text: 'Показать ход', callback_data: 'omx:pg:abc123' },
+      ]],
+    });
+  });
+
+  it('sends Telegram progress drafts with sendMessageDraft', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      progress: {
+        enabled: true,
+        mode: 'peek',
+        transport: 'draft',
+      },
+    };
+    let requestBody = '';
+
+    const result = await sendTelegramMessageDraft(
+      config,
+      basePayload,
+      {
+        draftId: 42,
+        text: 'live progress',
+        parseMode: 'HTML',
+      },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '777',
+          sourceChatKey: 'telegram:123456:777',
+          messageThreadId: '9001',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessageDraft`]: (body) => {
+            requestBody = body;
+            return {
+              statusCode: 200,
+              body: { ok: true, result: true },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.sent, true);
+    const parsedBody = JSON.parse(requestBody) as Record<string, unknown>;
+    assert.equal(parsedBody.chat_id, '777');
+    assert.equal(parsedBody.draft_id, 42);
+    assert.equal(parsedBody.text, 'live progress');
+    assert.equal(parsedBody.parse_mode, 'HTML');
+    assert.equal(parsedBody.message_thread_id, 9001);
+  });
+
+  it('treats Telegram progress draft failures as non-fatal', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:draft-failure',
+      chatId: '778',
+      progress: {
+        enabled: true,
+        mode: 'peek',
+        transport: 'draft',
+      },
+    };
+    let now = 1_700_000_000_000;
+    let attempts = 0;
+    mock.method(Date, 'now', () => now);
+
+    const result = await sendTelegramMessageDraft(
+      config,
+      basePayload,
+      { draftId: 42, text: 'live progress' },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '778',
+          sourceChatKey: 'telegram:123456:778',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessageDraft`]: () => {
+            attempts += 1;
+            return {
+              statusCode: 400,
+              body: { ok: false, description: 'draft unsupported' },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(result.sent, false);
+    assert.match(result.error ?? '', /draft unsupported/);
+
+    const cached = await sendTelegramMessageDraft(
+      config,
+      basePayload,
+      { draftId: 42, text: 'live progress' },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '778',
+          sourceChatKey: 'telegram:123456:778',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessageDraft`]: () => {
+            attempts += 1;
+            return {
+              statusCode: 200,
+              body: { ok: true, result: true },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(cached.sent, false);
+    assert.equal(cached.suppressedReason, 'draft-failure-cached');
+    assert.equal(attempts, 1);
+
+    now += 10 * 60_000 + 1;
+    const recovered = await sendTelegramMessageDraft(
+      config,
+      basePayload,
+      { draftId: 42, text: 'live progress recovered' },
+      {
+        resolveTelegramDestinationImpl: async () => ({
+          chatId: '778',
+          sourceChatKey: 'telegram:123456:778',
+        }),
+        httpsRequestImpl: createHttpsRequestMock({
+          [`POST /bot${config.botToken}/sendMessageDraft`]: () => {
+            attempts += 1;
+            return {
+              statusCode: 200,
+              body: { ok: true, result: true },
+            };
+          },
+        }),
+      },
+    );
+
+    assert.equal(recovered.sent, true);
+    assert.equal(attempts, 2);
+  });
+
+  it('skips Telegram progress drafts when progress is disabled', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+      progress: {
+        enabled: false,
+        mode: 'off',
+        transport: 'none',
+      },
+    };
+
+    const result = await sendTelegramMessageDraft(
+      config,
+      basePayload,
+      { draftId: 42, text: 'live progress' },
+      {
+        resolveTelegramDestinationImpl: async () => {
+          throw new Error('resolver should not run when drafts are disabled');
+        },
+        httpsRequestImpl: createHttpsRequestMock({}),
+      },
+    );
+
+    assert.equal(result.sent, false);
+    assert.equal(result.suppressedReason, 'progress-disabled');
   });
 
   it('sends Telegram final answers as fresh non-silent messages then deletes accepted placeholders', async () => {
@@ -1112,6 +1331,79 @@ describe('sendTelegram', () => {
       const capturedBody = requestBody as { text?: string; entities?: unknown[] } | null;
       assert.equal(capturedBody?.text, 'ordered rich text part');
       assert.equal('entities' in (capturedBody ?? {}), false);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('attaches Telegram progress reply markup only to the first rich text message anchor', async () => {
+    const config: TelegramNotificationConfig = {
+      enabled: true,
+      botToken: '123456:abc',
+      chatId: '777',
+    };
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const tempDir = await mkdtemp(join(tmpdir(), 'omx-dispatcher-rich-progress-markup-'));
+    const photoPath = join(tempDir, 'preview.png');
+    await import('node:fs/promises').then(({ writeFile }) => writeFile(photoPath, Buffer.from('png')));
+
+    try {
+      const result = await sendTelegram(
+        config,
+        {
+          ...basePayload,
+          message: 'overall assistant text',
+          transportOverrides: {
+            telegram: {
+              replyMarkup: {
+                inline_keyboard: [[
+                  { text: 'Показать ход', callback_data: 'omx:pg:abc123' },
+                ]],
+              },
+            },
+          },
+          richContent: {
+            visibleText: 'overall assistant text',
+            parts: [
+              { kind: 'text', text: 'first rich text part', format: 'plain' },
+              { kind: 'photo', source: { type: 'local_path', path: photoPath, trust: 'turn-artifact' } },
+              { kind: 'text', text: 'second rich text part', format: 'plain' },
+            ],
+          },
+        },
+        {
+          resolveTelegramDestinationImpl: async () => ({
+            chatId: '777',
+            sourceChatKey: 'telegram:123456:777',
+          }),
+          httpsRequestImpl: createHttpsRequestMock({
+            [`POST /bot${config.botToken}/sendMessage`]: (body) => {
+              requestBodies.push(JSON.parse(body) as Record<string, unknown>);
+              return {
+                statusCode: 200,
+                body: { ok: true, result: { message_id: 500 + requestBodies.length } },
+              };
+            },
+            [`POST /bot${config.botToken}/sendChatAction`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: true },
+            }),
+            [`POST /bot${config.botToken}/sendPhoto`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: { message_id: 550 } },
+            }),
+          }),
+        },
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(requestBodies.length, 2);
+      assert.deepEqual(requestBodies[0]?.reply_markup, {
+        inline_keyboard: [[
+          { text: 'Показать ход', callback_data: 'omx:pg:abc123' },
+        ]],
+      });
+      assert.equal(requestBodies[1]?.reply_markup, undefined);
     } finally {
       await rm(tempDir, { recursive: true, force: true });
     }
@@ -3325,6 +3617,51 @@ describe('getEffectivePlatformConfig', () => {
       enabled: true,
       maxPhotoBytes: 4096,
       maxUploadBytes: 2048,
+    });
+  });
+
+  it('deep-merges nested event-level Telegram progress overrides', () => {
+    const merged = getEffectivePlatformConfig<TelegramNotificationConfig>(
+      'telegram',
+      {
+        enabled: true,
+        telegram: {
+          enabled: true,
+          botToken: 'top-token',
+          chatId: 'top-chat',
+          progress: {
+            enabled: true,
+            mode: 'peek',
+            transport: 'draft',
+            showButton: true,
+            fullTraceDelivery: 'message',
+          },
+        },
+        events: {
+          'result-ready': {
+            enabled: true,
+            telegram: {
+              enabled: true,
+              botToken: 'event-token',
+              chatId: 'event-chat',
+              progress: {
+                showButton: false,
+                fullTraceDelivery: 'none',
+              },
+            },
+          },
+        },
+      },
+      'result-ready',
+    );
+
+    assert.ok(merged);
+    assert.deepEqual(merged?.progress, {
+      enabled: true,
+      mode: 'peek',
+      transport: 'draft',
+      showButton: false,
+      fullTraceDelivery: 'none',
     });
   });
 });

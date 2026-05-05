@@ -24,6 +24,10 @@ import type {
   TelegramNotificationConfig,
   VerbosityLevel,
 } from "./types.js";
+import {
+  isTelegramProgressButtonEnabled,
+  normalizeTelegramProgressConfig,
+} from "./telegram-progress.js";
 import type {
   AudioTranscriptionPreprocessMode,
   TelegramVoiceTranscriptionConfig,
@@ -195,11 +199,66 @@ export function normalizeCompletedTurnPresentationConfig(
   };
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function hasOwn(value: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
 function normalizeNotificationConfig(
   config: FullNotificationConfig,
 ): FullNotificationConfig {
+  const normalizeTelegramConfig = (
+    telegram: TelegramNotificationConfig | undefined,
+    baseTelegram?: TelegramNotificationConfig,
+    options: { includeDefaultProgress: boolean } = { includeDefaultProgress: true },
+  ): TelegramNotificationConfig | undefined => {
+    if (!telegram) return undefined;
+    const hasProgressOverride = hasOwn(telegram, "progress");
+    const rawProgress =
+      hasProgressOverride
+      && isPlainRecord(baseTelegram?.progress)
+      && isPlainRecord(telegram.progress)
+        ? { ...baseTelegram.progress, ...telegram.progress }
+        : hasProgressOverride
+          ? telegram.progress
+          : undefined;
+    const normalized: TelegramNotificationConfig = {
+      ...telegram,
+    };
+    if (options.includeDefaultProgress || hasProgressOverride) {
+      normalized.progress = normalizeTelegramProgressConfig(rawProgress);
+    }
+    return normalized;
+  };
+  const events = config.events
+    ? Object.fromEntries(
+        Object.entries(config.events).map(([eventName, eventConfig]) => {
+          const normalizedEvent = eventConfig
+            ? {
+                ...eventConfig,
+                ...(eventConfig.telegram
+                  ? {
+                      telegram: normalizeTelegramConfig(
+                        eventConfig.telegram,
+                        config.telegram,
+                        { includeDefaultProgress: false },
+                      ),
+                    }
+                  : {}),
+              }
+            : eventConfig;
+          return [eventName, normalizedEvent];
+        }),
+      ) as FullNotificationConfig["events"]
+    : undefined;
+
   return {
     ...config,
+    ...(config.telegram ? { telegram: normalizeTelegramConfig(config.telegram) } : {}),
+    ...(events ? { events } : {}),
     completedTurn: normalizeCompletedTurnPresentationConfig(config.completedTurn),
   };
 }
@@ -1313,6 +1372,17 @@ function parseTelegramReplyAckMode(
     : fallback;
 }
 
+function hasTelegramProgressCallbackUx(config: FullNotificationConfig): boolean {
+  const candidates: Array<TelegramNotificationConfig | undefined> = [
+    config.telegram,
+    ...Object.values(config.events ?? {}).map((eventConfig) => eventConfig?.telegram),
+  ];
+  return candidates.some((telegramConfig) => (
+    telegramConfig?.enabled === true
+    && isTelegramProgressButtonEnabled(telegramConfig.progress)
+  ));
+}
+
 function parseTelegramStartupBacklogPolicy(
   envValue: string | undefined,
   configValue: unknown,
@@ -1412,6 +1482,18 @@ export function getReplyConfig(
     process.env.OMX_REPLY_TELEGRAM_ALLOWED_UPDATES,
     replyRaw?.telegramAllowedUpdates,
   );
+  const defaultTelegramAllowedUpdates = hasTelegramProgressCallbackUx(notifConfig)
+    ? [...REPLY_TELEGRAM_ALLOWED_UPDATES_DEFAULT, "callback_query"]
+    : [...REPLY_TELEGRAM_ALLOWED_UPDATES_DEFAULT];
+  const effectiveTelegramAllowedUpdates = telegramAllowedUpdates.length > 0
+    ? telegramAllowedUpdates
+    : defaultTelegramAllowedUpdates;
+  if (
+    hasTelegramProgressCallbackUx(notifConfig)
+    && !effectiveTelegramAllowedUpdates.includes("callback_query")
+  ) {
+    effectiveTelegramAllowedUpdates.push("callback_query");
+  }
   const telegramVoiceTranscription = normalizeTelegramVoiceTranscriptionConfig(
     replyRaw?.telegramVoiceTranscription,
     process.env,
@@ -1439,9 +1521,7 @@ export function getReplyConfig(
     authorizedTelegramUserIds,
     telegramPollTimeoutSeconds,
     telegramAllowedUpdates:
-      telegramAllowedUpdates.length > 0
-        ? telegramAllowedUpdates
-        : [...REPLY_TELEGRAM_ALLOWED_UPDATES_DEFAULT],
+      effectiveTelegramAllowedUpdates,
     telegramStartupBacklogPolicy: parseTelegramStartupBacklogPolicy(
       process.env.OMX_REPLY_TELEGRAM_STARTUP_BACKLOG,
       replyRaw?.telegramStartupBacklogPolicy,

@@ -1231,13 +1231,19 @@ export function summarizeSessionActors(
     const lastSeen = Date.parse(actor.lastSeenAt);
     return Number.isFinite(lastSeen) && nowMs - lastSeen <= activeWindowMs;
   }).flatMap((actor) => [actor.threadId, actor.nativeSessionId])).sort();
+  const latestActorTimestamp = (candidates: readonly string[]): string | undefined => (
+    candidates
+      .filter((value) => Number.isFinite(Date.parse(value)))
+      .sort((left, right) => Date.parse(right) - Date.parse(left))[0]
+  );
+  const subagentUpdatedAt = latestActorTimestamp(subagents.map((actor) => actor.lastSeenAt));
   return {
     sessionId: registry.sessionId,
     leaderThreadId: owner?.threadId ?? owner?.nativeSessionId,
     allThreadIds,
     allSubagentThreadIds,
     activeSubagentThreadIds,
-    updatedAt: registry.updatedAt,
+    updatedAt: subagentUpdatedAt ?? owner?.lastSeenAt ?? registry.updatedAt,
   };
 }
 

@@ -9,9 +9,12 @@ import {
   parseMentionAllowedMentions,
   buildConfigFromEnv,
   getNotificationConfig,
+  getReplyConfig,
   getReplyListenerPlatformConfig,
   normalizeCompletedTurnPresentationConfig,
 } from '../config.js';
+import { getEffectivePlatformConfig } from '../dispatcher.js';
+import type { TelegramNotificationConfig } from '../types.js';
 
 const ENV_KEYS = [
   'CODEX_HOME',
@@ -30,6 +33,8 @@ const ENV_KEYS = [
   'OMX_SLACK_MENTION',
   'OMX_REPLY_ENABLED',
   'OMX_REPLY_DISCORD_USER_IDS',
+  'OMX_REPLY_TELEGRAM_USER_IDS',
+  'OMX_REPLY_TELEGRAM_ALLOWED_UPDATES',
   'OMX_REPLY_POLL_INTERVAL_MS',
   'OMX_REPLY_RATE_LIMIT',
 ];
@@ -386,6 +391,8 @@ describe('getNotificationConfig', () => {
       assert.ok(config);
       assert.equal(config.webhook?.enabled, true);
       assert.equal(config.telegram?.projectTopics?.enabled, true);
+      assert.equal(config.telegram?.progress?.enabled, false);
+      assert.equal(config.telegram?.progress?.mode, 'off');
       assert.equal(config.completedTurn?.resultReadyMode, 'raw-assistant-text');
       assert.equal(config.completedTurn?.askUserQuestionMode, 'raw-assistant-text');
     } finally {
@@ -424,6 +431,257 @@ describe('getNotificationConfig', () => {
         config.completedTurn?.platformOverrides?.telegram?.telegramFormat,
         'literal',
       );
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('normalizes Telegram progress config from .omx-config.json', async () => {
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-notification-config-'));
+    const codexHome = join(tempHome, '.codex');
+
+    try {
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: '123456:telegram-token',
+            chatId: '777',
+            progress: {
+              enabled: true,
+              mode: 'peek',
+              transport: 'draft',
+              minUpdateIntervalMs: 10,
+              maxDraftChars: 99_999,
+              maxStoredEntries: 5,
+              showButton: true,
+            },
+          },
+        },
+      }, null, 2));
+      process.env.HOME = tempHome;
+      process.env.CODEX_HOME = codexHome;
+
+      const config = getNotificationConfig();
+      assert.ok(config);
+      assert.equal(config.telegram?.progress?.enabled, true);
+      assert.equal(config.telegram?.progress?.mode, 'peek');
+      assert.equal(config.telegram?.progress?.transport, 'draft');
+      assert.equal(config.telegram?.progress?.minUpdateIntervalMs, 800);
+      assert.equal(config.telegram?.progress?.maxDraftChars, 4096);
+      assert.equal(config.telegram?.progress?.maxStoredEntries, 5);
+      assert.equal(config.telegram?.progress?.showButton, true);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps explicit Telegram progress off disabled', async () => {
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-notification-config-'));
+    const codexHome = join(tempHome, '.codex');
+
+    try {
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: '123456:telegram-token',
+            chatId: '777',
+            progress: {
+              enabled: true,
+              mode: 'off',
+              transport: 'draft',
+            },
+          },
+        },
+      }, null, 2));
+      process.env.HOME = tempHome;
+      process.env.CODEX_HOME = codexHome;
+
+      const config = getNotificationConfig();
+      assert.ok(config);
+      assert.equal(config.telegram?.progress?.enabled, false);
+      assert.equal(config.telegram?.progress?.mode, 'off');
+      assert.equal(config.telegram?.progress?.transport, 'none');
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves top-level Telegram progress when event Telegram overrides omit progress', async () => {
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-notification-config-'));
+    const codexHome = join(tempHome, '.codex');
+
+    try {
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: '123456:telegram-token',
+            chatId: '777',
+            progress: {
+              enabled: true,
+              mode: 'peek',
+              transport: 'draft',
+            },
+          },
+          events: {
+            'result-ready': {
+              enabled: true,
+              telegram: {
+                enabled: true,
+                botToken: '123456:event-token',
+                chatId: '888',
+              },
+            },
+          },
+        },
+      }, null, 2));
+      process.env.HOME = tempHome;
+      process.env.CODEX_HOME = codexHome;
+
+      const config = getNotificationConfig();
+      assert.ok(config);
+      const effective = getEffectivePlatformConfig<TelegramNotificationConfig>(
+        'telegram',
+        config,
+        'result-ready',
+      );
+      assert.equal(effective?.botToken, '123456:event-token');
+      assert.equal(effective?.chatId, '888');
+      assert.equal(effective?.progress?.enabled, true);
+      assert.equal(effective?.progress?.mode, 'peek');
+      assert.equal(effective?.progress?.transport, 'draft');
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('deep-merges partial event Telegram progress overrides with top-level progress', async () => {
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-notification-config-'));
+    const codexHome = join(tempHome, '.codex');
+
+    try {
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: '123456:telegram-token',
+            chatId: '777',
+            progress: {
+              enabled: true,
+              mode: 'peek',
+              transport: 'draft',
+              showButton: true,
+              fullTraceDelivery: 'message',
+            },
+          },
+          events: {
+            'result-ready': {
+              enabled: true,
+              telegram: {
+                enabled: true,
+                progress: {
+                  showButton: false,
+                  fullTraceDelivery: 'none',
+                },
+              },
+            },
+          },
+        },
+      }, null, 2));
+      process.env.HOME = tempHome;
+      process.env.CODEX_HOME = codexHome;
+
+      const config = getNotificationConfig();
+      assert.ok(config);
+      const effective = getEffectivePlatformConfig<TelegramNotificationConfig>(
+        'telegram',
+        config,
+        'result-ready',
+      );
+      assert.equal(effective?.progress?.enabled, true);
+      assert.equal(effective?.progress?.mode, 'peek');
+      assert.equal(effective?.progress?.transport, 'draft');
+      assert.equal(effective?.progress?.showButton, false);
+      assert.equal(effective?.progress?.fullTraceDelivery, 'none');
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('adds callback_query allowed updates when Telegram progress buttons are enabled', async () => {
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-notification-config-'));
+    const codexHome = join(tempHome, '.codex');
+
+    try {
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: '123456:telegram-token',
+            chatId: '777',
+            progress: {
+              enabled: true,
+              mode: 'peek',
+              transport: 'draft',
+              showButton: true,
+            },
+          },
+          reply: {
+            enabled: true,
+            telegramAllowedUpdates: ['message'],
+            authorizedTelegramUserIds: ['telegram-user-1'],
+          },
+        },
+      }, null, 2));
+      process.env.HOME = tempHome;
+      process.env.CODEX_HOME = codexHome;
+
+      const config = getNotificationConfig();
+      assert.ok(config);
+      assert.deepEqual(getReplyConfig(config)?.telegramAllowedUpdates, [
+        'message',
+        'callback_query',
+      ]);
+
+      await writeFile(join(codexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: '123456:telegram-token',
+            chatId: '777',
+            progress: {
+              enabled: true,
+              mode: 'peek',
+              transport: 'draft',
+              showButton: true,
+            },
+          },
+          reply: {
+            enabled: true,
+            authorizedTelegramUserIds: ['telegram-user-1'],
+          },
+        },
+      }, null, 2));
+
+      const defaultConfig = getNotificationConfig();
+      assert.ok(defaultConfig);
+      assert.deepEqual(getReplyConfig(defaultConfig)?.telegramAllowedUpdates, [
+        'message',
+        'callback_query',
+      ]);
     } finally {
       await rm(tempHome, { recursive: true, force: true });
     }

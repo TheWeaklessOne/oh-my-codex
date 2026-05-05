@@ -137,6 +137,370 @@ export async function onHookEvent(event) {
     }
   });
 
+  it('records public commentary progress and ignores final/reasoning rollout records', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'omx-hook-derived-progress-'));
+    const homeDir = join(base, 'home');
+    const codexHome = join(homeDir, '.codex');
+    const cwd = join(base, 'cwd');
+    const sessionId = 'session-progress';
+    const turnId = 'turn-progress';
+
+    try {
+      await mkdir(todaySessionDir(homeDir), { recursive: true });
+      await mkdir(join(cwd, '.omx', 'state', 'sessions', sessionId), { recursive: true });
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: '123456:telegram-token',
+            chatId: '777',
+            progress: {
+              enabled: true,
+              mode: 'peek',
+              transport: 'draft',
+            },
+          },
+          events: {
+            'result-ready': { enabled: true },
+          },
+        },
+      }, null, 2));
+      await writeFile(join(cwd, '.omx', 'state', 'sessions', sessionId, 'actors.json'), JSON.stringify({
+        schemaVersion: 1,
+        sessionId,
+        cwd,
+        ownerActorId: 'leader-1',
+        actors: {
+          'leader-1': {
+            actorId: 'leader-1',
+            kind: 'leader',
+            audience: 'external-owner',
+            threadId: 'thread-progress',
+            nativeSessionId: sessionId,
+            source: 'test',
+            firstSeenAt: new Date().toISOString(),
+            lastSeenAt: new Date().toISOString(),
+            lifecycleStatus: 'active',
+            claimStrength: 'turn-started',
+          },
+        },
+        aliases: {},
+      }, null, 2));
+
+      const rolloutPath = join(todaySessionDir(homeDir), 'rollout-hook-derived-progress.jsonl');
+      await writeFile(
+        rolloutPath,
+        [
+          JSON.stringify({
+            type: 'session_meta',
+            payload: {
+              id: 'thread-progress',
+              cwd,
+            },
+          }),
+          JSON.stringify({
+            timestamp: new Date().toISOString(),
+            type: 'event_msg',
+            payload: {
+              type: 'agent_message',
+              phase: 'commentary',
+              turn_id: turnId,
+              message: [
+                { type: 'output_text', text: 'Public commentary update' },
+                { type: 'reasoning', content: [{ text: 'nested hidden reasoning leak' }] },
+                { type: 'encrypted_content', text: 'encrypted secret leak' },
+              ],
+            },
+          }),
+          JSON.stringify({
+            timestamp: new Date().toISOString(),
+            type: 'event_msg',
+            payload: {
+              type: 'task_complete',
+              turn_id: turnId,
+              content: 'raw secret tool output token=sk-proj-should-not-leak',
+            },
+          }),
+          JSON.stringify({
+            timestamp: new Date().toISOString(),
+            type: 'event_msg',
+            payload: {
+              type: 'agent_message',
+              phase: 'final_answer',
+              turn_id: turnId,
+              message: 'Final answer must not be progress',
+            },
+          }),
+          JSON.stringify({
+            timestamp: new Date().toISOString(),
+            type: 'response_item',
+            payload: {
+              type: 'reasoning',
+              content: 'hidden reasoning must not be progress',
+            },
+          }),
+          '',
+        ].join('\n'),
+      );
+
+      const watcherScript = new URL('../hook-derived-watcher.js', import.meta.url).pathname;
+      const result = spawnSync(
+        process.execPath,
+        [watcherScript, '--once', '--cwd', cwd, '--poll-ms', '250'],
+        {
+          cwd,
+          env: {
+            ...process.env,
+            HOME: homeDir,
+            CODEX_HOME: codexHome,
+            OMX_SESSION_ID: sessionId,
+            OMX_HOOK_DERIVED_SIGNALS: '1',
+          },
+          encoding: 'utf8',
+        },
+      );
+
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      const tracePath = join(cwd, '.omx', 'state', 'sessions', sessionId, 'telegram-progress', `${turnId}.json`);
+      const trace = JSON.parse(await readFile(tracePath, 'utf-8')) as {
+        entries: Array<{ text: string }>;
+      };
+      assert.equal(trace.entries.length, 2);
+      assert.equal(trace.entries[0]?.text, 'Public commentary update');
+      assert.equal(trace.entries[1]?.text, 'Задача завершена');
+      assert.doesNotMatch(JSON.stringify(trace), /hidden reasoning|encrypted secret|sk-proj-should-not-leak/);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it('does not record Telegram progress when notifications or result-ready delivery are disabled', async () => {
+    for (const [name, notificationsEnabled, resultReadyEnabled] of [
+      ['global-disabled', false, true],
+      ['event-disabled', true, false],
+    ] as const) {
+      const base = await mkdtemp(join(tmpdir(), `omx-hook-derived-progress-${name}-`));
+      const homeDir = join(base, 'home');
+      const codexHome = join(homeDir, '.codex');
+      const cwd = join(base, 'cwd');
+      const sessionId = `session-progress-${name}`;
+      const turnId = `turn-progress-${name}`;
+
+      try {
+        await mkdir(todaySessionDir(homeDir), { recursive: true });
+        await mkdir(join(cwd, '.omx', 'state', 'sessions', sessionId), { recursive: true });
+        await mkdir(codexHome, { recursive: true });
+        await writeFile(join(codexHome, '.omx-config.json'), JSON.stringify({
+          notifications: {
+            enabled: notificationsEnabled,
+            telegram: {
+              enabled: true,
+              botToken: '123456:telegram-token',
+              chatId: '777',
+              progress: {
+                enabled: true,
+                mode: 'peek',
+                transport: 'draft',
+              },
+            },
+            events: {
+              'result-ready': { enabled: resultReadyEnabled },
+            },
+          },
+        }, null, 2));
+        await writeFile(join(cwd, '.omx', 'state', 'sessions', sessionId, 'actors.json'), JSON.stringify({
+          schemaVersion: 1,
+          sessionId,
+          cwd,
+          ownerActorId: 'leader-1',
+          actors: {
+            'leader-1': {
+              actorId: 'leader-1',
+              kind: 'leader',
+              audience: 'external-owner',
+              threadId: `thread-progress-${name}`,
+              nativeSessionId: sessionId,
+              source: 'test',
+              firstSeenAt: new Date().toISOString(),
+              lastSeenAt: new Date().toISOString(),
+              lifecycleStatus: 'active',
+              claimStrength: 'turn-started',
+            },
+          },
+          aliases: {},
+        }, null, 2));
+
+        const rolloutPath = join(todaySessionDir(homeDir), `rollout-hook-derived-progress-${name}.jsonl`);
+        await writeFile(
+          rolloutPath,
+          [
+            JSON.stringify({
+              type: 'session_meta',
+              payload: {
+                id: `thread-progress-${name}`,
+                cwd,
+              },
+            }),
+            JSON.stringify({
+              timestamp: new Date().toISOString(),
+              type: 'event_msg',
+              payload: {
+                type: 'agent_message',
+                phase: 'commentary',
+                turn_id: turnId,
+                message: [{ type: 'output_text', text: 'Should not be stored' }],
+              },
+            }),
+            '',
+          ].join('\n'),
+        );
+
+        const watcherScript = new URL('../hook-derived-watcher.js', import.meta.url).pathname;
+        const result = spawnSync(
+          process.execPath,
+          [watcherScript, '--once', '--cwd', cwd, '--poll-ms', '250'],
+          {
+            cwd,
+            env: {
+              ...process.env,
+              HOME: homeDir,
+              CODEX_HOME: codexHome,
+              OMX_SESSION_ID: sessionId,
+              OMX_HOOK_DERIVED_SIGNALS: '1',
+            },
+            encoding: 'utf8',
+          },
+        );
+
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        const tracePath = join(cwd, '.omx', 'state', 'sessions', sessionId, 'telegram-progress', `${turnId}.json`);
+        assert.equal(existsSync(tracePath), false);
+      } finally {
+        await rm(base, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('suppresses Telegram progress from non-owner rollout actors', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'omx-hook-derived-progress-non-owner-'));
+    const homeDir = join(base, 'home');
+    const codexHome = join(homeDir, '.codex');
+    const cwd = join(base, 'cwd');
+    const sessionId = 'session-progress-non-owner';
+    const turnId = 'turn-progress-non-owner';
+
+    try {
+      await mkdir(todaySessionDir(homeDir), { recursive: true });
+      await mkdir(join(cwd, '.omx', 'state', 'sessions', sessionId), { recursive: true });
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: '123456:telegram-token',
+            chatId: '777',
+            progress: {
+              enabled: true,
+              mode: 'peek',
+              transport: 'draft',
+            },
+          },
+          events: {
+            'result-ready': { enabled: true },
+          },
+        },
+      }, null, 2));
+      await writeFile(join(cwd, '.omx', 'state', 'sessions', sessionId, 'actors.json'), JSON.stringify({
+        schemaVersion: 1,
+        sessionId,
+        cwd,
+        ownerActorId: 'leader-1',
+        actors: {
+          'leader-1': {
+            actorId: 'leader-1',
+            kind: 'leader',
+            audience: 'external-owner',
+            threadId: 'thread-owner',
+            nativeSessionId: sessionId,
+            source: 'test',
+            firstSeenAt: new Date().toISOString(),
+            lastSeenAt: new Date().toISOString(),
+            lifecycleStatus: 'active',
+            claimStrength: 'turn-started',
+          },
+          'child-1': {
+            actorId: 'child-1',
+            kind: 'native-subagent',
+            audience: 'child',
+            threadId: 'thread-child',
+            nativeSessionId: 'child-session',
+            source: 'test',
+            firstSeenAt: new Date().toISOString(),
+            lastSeenAt: new Date().toISOString(),
+            lifecycleStatus: 'active',
+            claimStrength: 'turn-started',
+          },
+        },
+        aliases: {},
+      }, null, 2));
+
+      const rolloutPath = join(todaySessionDir(homeDir), 'rollout-hook-derived-progress-non-owner.jsonl');
+      await writeFile(
+        rolloutPath,
+        [
+          JSON.stringify({
+            type: 'session_meta',
+            payload: {
+              id: 'thread-child',
+              cwd,
+            },
+          }),
+          JSON.stringify({
+            timestamp: new Date().toISOString(),
+            type: 'event_msg',
+            payload: {
+              type: 'agent_message',
+              phase: 'commentary',
+              turn_id: turnId,
+              message: [{ type: 'output_text', text: 'Child progress should not be stored' }],
+            },
+          }),
+          '',
+        ].join('\n'),
+      );
+
+      const watcherScript = new URL('../hook-derived-watcher.js', import.meta.url).pathname;
+      const result = spawnSync(
+        process.execPath,
+        [watcherScript, '--once', '--cwd', cwd, '--poll-ms', '250'],
+        {
+          cwd,
+          env: {
+            ...process.env,
+            HOME: homeDir,
+            CODEX_HOME: codexHome,
+            OMX_SESSION_ID: sessionId,
+            OMX_HOOK_DERIVED_SIGNALS: '1',
+          },
+          encoding: 'utf8',
+        },
+      );
+
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      const tracePath = join(cwd, '.omx', 'state', 'sessions', sessionId, 'telegram-progress', `${turnId}.json`);
+      assert.equal(existsSync(tracePath), false);
+      const logPath = join(cwd, '.omx', 'logs', `hook-derived-watcher-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const logContent = await readFile(logPath, 'utf-8');
+      assert.match(logContent, /telegram_progress_draft_suppressed/);
+      assert.match(logContent, /non-owner/);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
   it('preserves multibyte assistant text split across polling reads', async () => {
     const base = await mkdtemp(join(tmpdir(), 'omx-hook-derived-utf8-'));
     const homeDir = join(base, 'home');

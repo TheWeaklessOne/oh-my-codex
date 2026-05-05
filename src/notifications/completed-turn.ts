@@ -53,6 +53,7 @@ export interface CompletedTurnNotificationDecision {
     "result-ready" | "ask-user-question"
   >;
   effectiveFingerprint: string;
+  turnId?: string;
   hookMetadata: CompletedTurnHookMetadata;
   semanticOutcome: CompletedTurnSemanticOutcome;
   replyOrigin: CompletedTurnReplyOrigin | null;
@@ -323,6 +324,7 @@ export function planCompletedTurnNotification(input: {
   const decision: CompletedTurnNotificationDecision = {
     effectiveEvent,
     effectiveFingerprint: "",
+    ...(input.turnId ? { turnId: input.turnId } : {}),
     hookMetadata: {
       semanticPhase: semanticOutcome.kind,
       semanticSummary: semanticOutcome.summary || null,

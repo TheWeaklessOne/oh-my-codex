@@ -37,6 +37,11 @@ import { NO_TRACKED_SESSION_MESSAGE } from '../session-status.js';
 import { buildDiscordReplySource, buildTelegramReplySource } from '../reply-source.js';
 import { consumePendingReplyOrigin } from '../reply-origin-state.js';
 import { pendingRoutesStatePath } from '../pending-routes.js';
+import {
+  appendTelegramProgressEntry,
+  buildTelegramProgressCallbackData,
+  registerTelegramProgressFinalMessage,
+} from '../telegram-progress.js';
 import { markMockTelegramTransportForTests } from '../../utils/test-env.js';
 import { OMX_ENTRY_PATH_ENV, OMX_STARTUP_CWD_ENV } from '../../utils/paths.js';
 
@@ -1766,6 +1771,599 @@ describe('pollTelegramOnce', () => {
     assert.equal(sourceState?.lastFailureCategory, null);
     assert.equal(sourceState?.lastFailureMessage, null);
     assert.equal(sourceState?.failureCounts?.['poll-error'], 1);
+  });
+
+  it('handles Telegram progress callback show in-place without injecting into Codex', async () => {
+    resetReplyListenerTransientState();
+    const project = await mkdtemp(join(tmpdir(), 'omx-progress-callback-'));
+    try {
+      const config = createBaseConfig({ telegramAllowedUpdates: ['message', 'callback_query'] });
+      const state = createBaseState();
+      const token = 'abc123';
+      await appendTelegramProgressEntry(project, 'session-1', 'turn-1', {
+        kind: 'commentary',
+        text: 'Public progress update',
+      });
+      await registerTelegramProgressFinalMessage({
+        token,
+        projectPath: project,
+        sessionId: 'session-1',
+        turnId: 'turn-1',
+        chatId: '777',
+        messageId: '222',
+        messageThreadId: '9001',
+        finalText: 'Final answer',
+        finalParseMode: null,
+      });
+      const mapping = { ...createMapping('telegram'), projectPath: project, sessionId: 'session-1', messageId: '222' };
+      const requestBodies: Record<string, unknown>[] = [];
+
+      await pollTelegramOnce(
+        config,
+        state,
+        new RateLimiter(10),
+        {
+          httpsRequestImpl: createHttpsRequestMock({
+            [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: [
+                  {
+                    update_id: 44,
+                    callback_query: {
+                      id: 'callback-1',
+                      from: { id: 'telegram-user-1' },
+                      data: buildTelegramProgressCallbackData(token),
+                      message: {
+                        message_id: 222,
+                        message_thread_id: 9001,
+                        chat: { id: 777, type: 'private' },
+                      },
+                    },
+                  },
+                ],
+              },
+            }),
+            [`POST /bot${config.telegramBotToken}/editMessageText`]: (body) => {
+              requestBodies.push(JSON.parse(body) as Record<string, unknown>);
+              return { statusCode: 200, body: { ok: true, result: { message_id: 222 } } };
+            },
+            [`POST /bot${config.telegramBotToken}/answerCallbackQuery`]: (body) => {
+              requestBodies.push(JSON.parse(body) as Record<string, unknown>);
+              return { statusCode: 200, body: { ok: true, result: true } };
+            },
+          }),
+          lookupByMessageIdImpl: () => mapping,
+          injectReplyImpl: () => {
+            throw new Error('callback must not inject into Codex');
+          },
+        },
+      );
+
+      assert.equal(state.messagesInjected, 0);
+      assert.equal(state.telegramLastUpdateId, 44);
+      const editBody = requestBodies.find((body) => body.text && body.message_id === '222');
+      assert.ok(editBody);
+      assert.match(String(editBody.text), /Ход выполнения/);
+      assert.match(String(editBody.text), /Public progress update/);
+      assert.match(String(editBody.text), /Final answer/);
+      assert.equal(Array.isArray(editBody.entities), true);
+      assert.equal((editBody.reply_markup as { inline_keyboard: Array<Array<{ text: string }>> }).inline_keyboard[0]?.[0]?.text, 'Скрыть ход');
+    } finally {
+      await rm(project, { recursive: true, force: true });
+    }
+  });
+
+  it('handles Telegram progress callback hide by restoring the clean final answer', async () => {
+    resetReplyListenerTransientState();
+    const project = await mkdtemp(join(tmpdir(), 'omx-progress-callback-'));
+    try {
+      const config = createBaseConfig({ telegramAllowedUpdates: ['message', 'callback_query'] });
+      const state = createBaseState();
+      const token = 'hide123';
+      await appendTelegramProgressEntry(project, 'session-1', 'turn-1', {
+        kind: 'commentary',
+        text: 'Public progress update',
+      });
+      await registerTelegramProgressFinalMessage({
+        token,
+        projectPath: project,
+        sessionId: 'session-1',
+        turnId: 'turn-1',
+        chatId: '777',
+        messageId: '222',
+        finalText: 'Final answer',
+        shown: true,
+      });
+      const mapping = { ...createMapping('telegram'), projectPath: project, sessionId: 'session-1', messageId: '222' };
+      let editBody: Record<string, unknown> | null = null;
+
+      await pollTelegramOnce(
+        config,
+        state,
+        new RateLimiter(10),
+        {
+          httpsRequestImpl: createHttpsRequestMock({
+            [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: [
+                  {
+                    update_id: 45,
+                    callback_query: {
+                      id: 'callback-hide',
+                      from: { id: 'telegram-user-1' },
+                      data: buildTelegramProgressCallbackData(token),
+                      message: {
+                        message_id: 222,
+                        chat: { id: 777, type: 'private' },
+                      },
+                    },
+                  },
+                ],
+              },
+            }),
+            [`POST /bot${config.telegramBotToken}/editMessageText`]: (body) => {
+              editBody = JSON.parse(body) as Record<string, unknown>;
+              return { statusCode: 200, body: { ok: true, result: { message_id: 222 } } };
+            },
+            [`POST /bot${config.telegramBotToken}/answerCallbackQuery`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: true },
+            }),
+          }),
+          lookupByMessageIdImpl: () => mapping,
+          injectReplyImpl: () => {
+            throw new Error('callback must not inject into Codex');
+          },
+        },
+      );
+
+      const restoredBody = editBody as Record<string, unknown> | null;
+      assert.ok(restoredBody);
+      assert.equal(restoredBody.text, 'Final answer');
+      assert.equal((restoredBody.reply_markup as { inline_keyboard: Array<Array<{ text: string }>> }).inline_keyboard[0]?.[0]?.text, 'Показать ход');
+      assert.equal(state.messagesInjected, 0);
+    } finally {
+      await rm(project, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects unauthorized Telegram progress callbacks without editing or injecting', async () => {
+    resetReplyListenerTransientState();
+    const config = createBaseConfig({ telegramAllowedUpdates: ['message', 'callback_query'] });
+    const state = createBaseState();
+    let answerBody: Record<string, unknown> | null = null;
+
+    await pollTelegramOnce(
+      config,
+      state,
+      new RateLimiter(10),
+      {
+        httpsRequestImpl: createHttpsRequestMock({
+          [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D`]: () => ({
+            statusCode: 200,
+            body: {
+              ok: true,
+              result: [
+                {
+                  update_id: 46,
+                  callback_query: {
+                    id: 'callback-bad',
+                    from: { id: 'intruder' },
+                    data: buildTelegramProgressCallbackData('abc123'),
+                    message: {
+                      message_id: 222,
+                      chat: { id: 777, type: 'private' },
+                    },
+                  },
+                },
+              ],
+            },
+          }),
+          [`POST /bot${config.telegramBotToken}/answerCallbackQuery`]: (body) => {
+            answerBody = JSON.parse(body) as Record<string, unknown>;
+            return { statusCode: 200, body: { ok: true, result: true } };
+          },
+        }),
+        lookupByMessageIdImpl: () => {
+          throw new Error('lookup should not run for unauthorized callbacks');
+        },
+        injectReplyImpl: () => {
+          throw new Error('callback must not inject into Codex');
+        },
+      },
+    );
+
+    assert.equal(state.messagesInjected, 0);
+    assert.equal(state.telegramLastUpdateId, 46);
+    const unauthorizedAnswer = answerBody as Record<string, unknown> | null;
+    assert.ok(unauthorizedAnswer);
+    assert.equal(unauthorizedAnswer.show_alert, true);
+    assert.match(String(unauthorizedAnswer.text), /not authorized/i);
+  });
+
+  it('rejects authorized Telegram progress callbacks with mismatched final message binding', async () => {
+    resetReplyListenerTransientState();
+    const project = await mkdtemp(join(tmpdir(), 'omx-progress-callback-'));
+    try {
+      const config = createBaseConfig({ telegramAllowedUpdates: ['message', 'callback_query'] });
+      const state = createBaseState();
+      const token = 'mismatch123';
+      await appendTelegramProgressEntry(project, 'session-1', 'turn-1', {
+        kind: 'commentary',
+        text: 'Public progress update',
+      });
+      await registerTelegramProgressFinalMessage({
+        token,
+        projectPath: project,
+        sessionId: 'session-1',
+        turnId: 'turn-1',
+        chatId: '777',
+        messageId: '999',
+        finalText: 'Final answer',
+      });
+      const mapping = { ...createMapping('telegram'), projectPath: project, sessionId: 'session-1', messageId: '222' };
+      let answerBody: Record<string, unknown> | null = null;
+
+      await pollTelegramOnce(
+        config,
+        state,
+        new RateLimiter(10),
+        {
+          httpsRequestImpl: createHttpsRequestMock({
+            [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: [
+                  {
+                    update_id: 461,
+                    callback_query: {
+                      id: 'callback-mismatch',
+                      from: { id: 'telegram-user-1' },
+                      data: buildTelegramProgressCallbackData(token),
+                      message: {
+                        message_id: 222,
+                        chat: { id: 777, type: 'private' },
+                      },
+                    },
+                  },
+                ],
+              },
+            }),
+            [`POST /bot${config.telegramBotToken}/answerCallbackQuery`]: (body) => {
+              answerBody = JSON.parse(body) as Record<string, unknown>;
+              return { statusCode: 200, body: { ok: true, result: true } };
+            },
+          }),
+          lookupByMessageIdImpl: () => mapping,
+          injectReplyImpl: () => {
+            throw new Error('callback must not inject into Codex');
+          },
+        },
+      );
+
+      const answer = answerBody as Record<string, unknown> | null;
+      assert.ok(answer);
+      assert.equal(answer.show_alert, true);
+      assert.match(String(answer.text), /недоступен/i);
+      assert.equal(state.messagesInjected, 0);
+    } finally {
+      await rm(project, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves Markdown final formatting when expanding Telegram progress inline', async () => {
+    resetReplyListenerTransientState();
+    const project = await mkdtemp(join(tmpdir(), 'omx-progress-callback-'));
+    try {
+      const config = createBaseConfig({ telegramAllowedUpdates: ['message', 'callback_query'] });
+      const state = createBaseState();
+      const token = 'markdown123';
+      await appendTelegramProgressEntry(project, 'session-1', 'turn-1', {
+        kind: 'commentary',
+        text: 'Public progress update',
+      });
+      await registerTelegramProgressFinalMessage({
+        token,
+        projectPath: project,
+        sessionId: 'session-1',
+        turnId: 'turn-1',
+        chatId: '777',
+        messageId: '222',
+        finalText: '**Bold** [docs](https://example.com/docs)',
+        finalParseMode: 'Markdown',
+      });
+      const mapping = { ...createMapping('telegram'), projectPath: project, sessionId: 'session-1', messageId: '222' };
+      let editBody: Record<string, unknown> | null = null;
+
+      await pollTelegramOnce(
+        config,
+        state,
+        new RateLimiter(10),
+        {
+          httpsRequestImpl: createHttpsRequestMock({
+            [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: [
+                  {
+                    update_id: 462,
+                    callback_query: {
+                      id: 'callback-markdown',
+                      from: { id: 'telegram-user-1' },
+                      data: buildTelegramProgressCallbackData(token),
+                      message: {
+                        message_id: 222,
+                        chat: { id: 777, type: 'private' },
+                      },
+                    },
+                  },
+                ],
+              },
+            }),
+            [`POST /bot${config.telegramBotToken}/editMessageText`]: (body) => {
+              editBody = JSON.parse(body) as Record<string, unknown>;
+              return { statusCode: 200, body: { ok: true, result: { message_id: 222 } } };
+            },
+            [`POST /bot${config.telegramBotToken}/answerCallbackQuery`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: true },
+            }),
+          }),
+          lookupByMessageIdImpl: () => mapping,
+          injectReplyImpl: () => {
+            throw new Error('callback must not inject into Codex');
+          },
+        },
+      );
+
+      const edit = editBody as Record<string, unknown> | null;
+      assert.ok(edit);
+      assert.doesNotMatch(String(edit.text), /\*\*Bold\*\*|\]\(/);
+      assert.match(String(edit.text), /Bold docs/);
+      const entityTypes = ((edit.entities ?? []) as Array<{ type: string }>).map((entity) => entity.type);
+      assert.ok(entityTypes.includes('expandable_blockquote'));
+      assert.ok(entityTypes.includes('bold'));
+      assert.ok(entityTypes.includes('text_link'));
+      assert.equal('parse_mode' in edit, false);
+      assert.equal(state.messagesInjected, 0);
+    } finally {
+      await rm(project, { recursive: true, force: true });
+    }
+  });
+
+  it('sends separate Telegram progress fallback when final plus trace cannot fit', async () => {
+    resetReplyListenerTransientState();
+    const project = await mkdtemp(join(tmpdir(), 'omx-progress-callback-'));
+    try {
+      const config = createBaseConfig({ telegramAllowedUpdates: ['message', 'callback_query'] });
+      const state = createBaseState();
+      const token = 'long123';
+      await appendTelegramProgressEntry(project, 'session-1', 'turn-1', {
+        kind: 'commentary',
+        text: 'Public progress update',
+      });
+      await registerTelegramProgressFinalMessage({
+        token,
+        projectPath: project,
+        sessionId: 'session-1',
+        turnId: 'turn-1',
+        chatId: '777',
+        messageId: '222',
+        messageThreadId: '9001',
+        finalText: 'F'.repeat(4090),
+      });
+      const mapping = { ...createMapping('telegram'), projectPath: project, sessionId: 'session-1', messageId: '222' };
+      let fallbackBody: Record<string, unknown> | null = null;
+
+      await pollTelegramOnce(
+        config,
+        state,
+        new RateLimiter(10),
+        {
+          httpsRequestImpl: createHttpsRequestMock({
+            [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: [
+                  {
+                    update_id: 47,
+                    callback_query: {
+                      id: 'callback-long',
+                      from: { id: 'telegram-user-1' },
+                      data: buildTelegramProgressCallbackData(token),
+                      message: {
+                        message_id: 222,
+                        message_thread_id: 9001,
+                        chat: { id: 777, type: 'private' },
+                      },
+                    },
+                  },
+                ],
+              },
+            }),
+            [`POST /bot${config.telegramBotToken}/sendMessage`]: (body) => {
+              fallbackBody = JSON.parse(body) as Record<string, unknown>;
+              return { statusCode: 200, body: { ok: true, result: { message_id: 333 } } };
+            },
+            [`POST /bot${config.telegramBotToken}/answerCallbackQuery`]: () => ({
+              statusCode: 200,
+              body: { ok: true, result: true },
+            }),
+          }),
+          lookupByMessageIdImpl: () => mapping,
+          injectReplyImpl: () => {
+            throw new Error('callback must not inject into Codex');
+          },
+        },
+      );
+
+      const fallback = fallbackBody as Record<string, unknown> | null;
+      assert.ok(fallback);
+      assert.match(String(fallback.text), /Ход выполнения/);
+      assert.match(String(fallback.text), /Public progress update/);
+      assert.equal(fallback.reply_to_message_id, '222');
+      assert.equal(fallback.message_thread_id, 9001);
+      assert.equal(String(fallback.text).includes('F'.repeat(100)), false);
+      assert.equal(state.messagesInjected, 0);
+    } finally {
+      await rm(project, { recursive: true, force: true });
+    }
+  });
+
+  it('dedupes repeated Telegram progress fallback callbacks', async () => {
+    resetReplyListenerTransientState();
+    const project = await mkdtemp(join(tmpdir(), 'omx-progress-callback-'));
+    try {
+      const config = createBaseConfig({ telegramAllowedUpdates: ['message', 'callback_query'] });
+      const state = createBaseState();
+      const token = 'sent123';
+      await appendTelegramProgressEntry(project, 'session-1', 'turn-1', {
+        kind: 'commentary',
+        text: 'Public progress update',
+      });
+      await registerTelegramProgressFinalMessage({
+        token,
+        projectPath: project,
+        sessionId: 'session-1',
+        turnId: 'turn-1',
+        chatId: '777',
+        messageId: '222',
+        finalText: 'F'.repeat(4090),
+        fallbackSentAt: '2026-05-05T12:00:00.000Z',
+      });
+      const mapping = { ...createMapping('telegram'), projectPath: project, sessionId: 'session-1', messageId: '222' };
+      let answerBody: Record<string, unknown> | null = null;
+
+      await pollTelegramOnce(
+        config,
+        state,
+        new RateLimiter(10),
+        {
+          httpsRequestImpl: createHttpsRequestMock({
+            [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: [
+                  {
+                    update_id: 48,
+                    callback_query: {
+                      id: 'callback-repeat',
+                      from: { id: 'telegram-user-1' },
+                      data: buildTelegramProgressCallbackData(token),
+                      message: {
+                        message_id: 222,
+                        chat: { id: 777, type: 'private' },
+                      },
+                    },
+                  },
+                ],
+              },
+            }),
+            [`POST /bot${config.telegramBotToken}/sendMessage`]: () => {
+              throw new Error('repeated fallback callback must not send another trace message');
+            },
+            [`POST /bot${config.telegramBotToken}/answerCallbackQuery`]: (body) => {
+              answerBody = JSON.parse(body) as Record<string, unknown>;
+              return { statusCode: 200, body: { ok: true, result: true } };
+            },
+          }),
+          lookupByMessageIdImpl: () => mapping,
+          injectReplyImpl: () => {
+            throw new Error('callback must not inject into Codex');
+          },
+        },
+      );
+
+      const answer = answerBody as Record<string, unknown> | null;
+      assert.ok(answer);
+      assert.match(String(answer.text), /уже отправлен/);
+      assert.equal(state.messagesInjected, 0);
+    } finally {
+      await rm(project, { recursive: true, force: true });
+    }
+  });
+
+  it('suppresses Telegram progress fallback when fullTraceDelivery is none', async () => {
+    resetReplyListenerTransientState();
+    const project = await mkdtemp(join(tmpdir(), 'omx-progress-callback-'));
+    try {
+      const config = createBaseConfig({ telegramAllowedUpdates: ['message', 'callback_query'] });
+      const state = createBaseState();
+      const token = 'none123';
+      await appendTelegramProgressEntry(project, 'session-1', 'turn-1', {
+        kind: 'commentary',
+        text: 'Public progress update',
+      });
+      await registerTelegramProgressFinalMessage({
+        token,
+        projectPath: project,
+        sessionId: 'session-1',
+        turnId: 'turn-1',
+        chatId: '777',
+        messageId: '222',
+        finalText: 'F'.repeat(4090),
+        fullTraceDelivery: 'none',
+      });
+      const mapping = { ...createMapping('telegram'), projectPath: project, sessionId: 'session-1', messageId: '222' };
+      let answerBody: Record<string, unknown> | null = null;
+
+      await pollTelegramOnce(
+        config,
+        state,
+        new RateLimiter(10),
+        {
+          httpsRequestImpl: createHttpsRequestMock({
+            [`GET /bot${config.telegramBotToken}/getUpdates?offset=0&timeout=30&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D`]: () => ({
+              statusCode: 200,
+              body: {
+                ok: true,
+                result: [
+                  {
+                    update_id: 48,
+                    callback_query: {
+                      id: 'callback-none',
+                      from: { id: 'telegram-user-1' },
+                      data: buildTelegramProgressCallbackData(token),
+                      message: {
+                        message_id: 222,
+                        chat: { id: 777, type: 'private' },
+                      },
+                    },
+                  },
+                ],
+              },
+            }),
+            [`POST /bot${config.telegramBotToken}/sendMessage`]: () => {
+              throw new Error('fullTraceDelivery=none must not send fallback trace');
+            },
+            [`POST /bot${config.telegramBotToken}/answerCallbackQuery`]: (body) => {
+              answerBody = JSON.parse(body) as Record<string, unknown>;
+              return { statusCode: 200, body: { ok: true, result: true } };
+            },
+          }),
+          lookupByMessageIdImpl: () => mapping,
+          injectReplyImpl: () => {
+            throw new Error('callback must not inject into Codex');
+          },
+        },
+      );
+
+      const answer = answerBody as Record<string, unknown> | null;
+      assert.ok(answer);
+      assert.equal(answer.show_alert, true);
+      assert.match(String(answer.text), /слишком длинный/);
+      assert.equal(state.messagesInjected, 0);
+    } finally {
+      await rm(project, { recursive: true, force: true });
+    }
   });
 
   it('injects Telegram replies and sends a removable placeholder acknowledgement', async () => {

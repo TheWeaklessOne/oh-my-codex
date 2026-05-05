@@ -95,6 +95,29 @@ export interface TelegramProjectTopicsConfig {
   createFailureCooldownMs?: number;
 }
 
+export type TelegramProgressMode = "off" | "peek" | "archive";
+export type TelegramProgressTransport = "draft" | "none";
+export type TelegramProgressFullTraceDelivery = "message" | "document" | "none";
+
+export interface TelegramProgressConfig {
+  /** Enable Telegram live progress drafts + final-message show/hide UX (default: false). */
+  enabled?: boolean;
+  /** Progress UX mode. `off` disables the feature; `peek` streams draft and shows on demand. */
+  mode?: TelegramProgressMode;
+  /** Live progress transport. `draft` uses Bot API sendMessageDraft. */
+  transport?: TelegramProgressTransport;
+  /** Minimum interval between draft updates. */
+  minUpdateIntervalMs?: number;
+  /** Hard draft viewport budget, clamped to Telegram's 4096-character limit. */
+  maxDraftChars?: number;
+  /** Maximum sanitized progress entries persisted per turn. */
+  maxStoredEntries?: number;
+  /** Attach the final-message inline button when a trace exists (default: true when enabled). */
+  showButton?: boolean;
+  /** Fallback policy when trace + final answer cannot fit in one Telegram edit. */
+  fullTraceDelivery?: TelegramProgressFullTraceDelivery;
+}
+
 export interface TelegramNotificationConfig {
   enabled: boolean;
   /** Telegram bot token */
@@ -107,6 +130,8 @@ export interface TelegramNotificationConfig {
   projectTopics?: TelegramProjectTopicsConfig;
   /** Rich reply delivery policy for generated artifacts and explicit manifests. */
   richReplies?: TelegramRichRepliesConfig;
+  /** Live progress draft/show-flow UX. Disabled by default. */
+  progress?: TelegramProgressConfig;
 }
 
 export interface TelegramRichRepliesConfig {
@@ -245,6 +270,15 @@ export interface TelegramMessageEntity {
   language?: string;
 }
 
+export interface TelegramInlineKeyboardButton {
+  text: string;
+  callback_data?: string;
+}
+
+export interface TelegramInlineKeyboardMarkup {
+  inline_keyboard: TelegramInlineKeyboardButton[][];
+}
+
 export type TelegramRenderWarningCode =
   | "unsafe-url-dropped"
   | "sensitive-url-dropped"
@@ -288,6 +322,8 @@ export interface NotificationTransportOverride {
   parseMode?: "Markdown" | "HTML" | null;
   /** Telegram Bot API message entities; when present Telegram sends omit parse_mode. */
   entities?: TelegramMessageEntity[];
+  /** Telegram Bot API reply markup, used for inline progress controls. */
+  replyMarkup?: TelegramInlineKeyboardMarkup;
 }
 
 export type NotificationTransportOverrides = Partial<
@@ -380,6 +416,15 @@ export interface FullNotificationPayload {
   telegramAcceptedAck?: TelegramAcceptedAckCleanupTarget;
   /** Telegram message that the final answer should reply to. */
   telegramReplyTo?: TelegramMessageReferenceTarget;
+  /** Telegram progress callback metadata to register after final message delivery. */
+  telegramProgressFinal?: {
+    token: string;
+    turnId: string;
+    finalText: string;
+    finalEntities?: TelegramMessageEntity[];
+    finalParseMode?: "Markdown" | "HTML" | null;
+    fullTraceDelivery?: TelegramProgressFullTraceDelivery;
+  };
   /** Agent name (populated by extensibility plugins, not set by core Codex CLI hooks) */
   agentName?: string;
   /** Agent type (populated by extensibility plugins, not set by core Codex CLI hooks) */

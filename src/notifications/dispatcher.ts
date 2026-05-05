@@ -20,6 +20,7 @@ import type {
   FullNotificationConfig,
   NotificationEvent,
   TelegramMessageEntity,
+  TelegramInlineKeyboardMarkup,
 } from "./types.js";
 
 import { parseMentionAllowedMentions } from "./config.js";
@@ -57,6 +58,8 @@ const SEND_TIMEOUT_MS = 10_000;
 const DISPATCH_TIMEOUT_MS = 15_000;
 const DISCORD_MAX_CONTENT_LENGTH = 2000;
 const TELEGRAM_RENDER_DEBUG_ENV = "OMX_TELEGRAM_RENDER_DEBUG";
+const TELEGRAM_DRAFT_FAILURE_CACHE_MS = 10 * 60_000;
+const telegramDraftFailureCache = new Map<string, number>();
 
 interface TelegramSendMessageResult {
   message_id?: number | string;
@@ -80,6 +83,19 @@ interface TelegramPreparedMessage {
   parseMode?: "Markdown" | "HTML";
 }
 
+export interface TelegramMessageDraft {
+  draftId: number;
+  text: string;
+  parseMode?: "Markdown" | "HTML" | null;
+  entities?: TelegramMessageEntity[];
+}
+
+export interface TelegramMessageDraftResult {
+  sent: boolean;
+  suppressedReason?: string;
+  error?: string;
+}
+
 interface TelegramChunkSendDeps extends TelegramTopicResolutionDeps {
   replyToMessageIdOverride?: string | number;
 }
@@ -91,6 +107,10 @@ function telegramBotApiRequestDeps(
     ...(deps.httpsRequestImpl ? { httpsRequestImpl: deps.httpsRequestImpl } : {}),
     timeoutMs: deps.timeoutMs ?? SEND_TIMEOUT_MS,
   };
+}
+
+function isLikelyTelegramPrivateChatId(chatId: string): boolean {
+  return /^[1-9]\d{0,19}$/.test(chatId.trim());
 }
 
 function composeDiscordContent(
@@ -202,7 +222,29 @@ function mergeTelegramPlatformOverrides(
     };
   }
 
+  if (
+    isPlainRecord(topLevelPlatform.progress)
+    && isPlainRecord(eventPlatform.progress)
+  ) {
+    merged.progress = {
+      ...topLevelPlatform.progress,
+      ...eventPlatform.progress,
+    };
+  }
+
   return merged;
+}
+
+function hasTelegramDraftFailureCached(cacheKey: string, now = Date.now()): boolean {
+  const blockedUntil = telegramDraftFailureCache.get(cacheKey);
+  if (blockedUntil === undefined) {
+    return false;
+  }
+  if (blockedUntil <= now) {
+    telegramDraftFailureCache.delete(cacheKey);
+    return false;
+  }
+  return true;
 }
 
 function getTransportOverride(
@@ -355,6 +397,90 @@ function telegramFailureResult(
     ...(classification.statusCode !== undefined ? { statusCode: classification.statusCode } : {}),
     ...extra,
   };
+}
+
+export async function sendTelegramMessageDraft(
+  config: TelegramNotificationConfig,
+  payload: FullNotificationPayload,
+  draft: TelegramMessageDraft,
+  deps: (TelegramTopicResolutionDeps & {
+    resolveTelegramDestinationImpl?: typeof resolveTelegramDestination;
+  }) = {},
+): Promise<TelegramMessageDraftResult> {
+  if (!config.enabled || !config.botToken || !config.chatId) {
+    return { sent: false, suppressedReason: "not-configured" };
+  }
+  if (config.progress?.enabled !== true || config.progress.mode === "off" || config.progress.transport !== "draft") {
+    return { sent: false, suppressedReason: "progress-disabled" };
+  }
+  if (!validateTelegramToken(config.botToken)) {
+    return { sent: false, suppressedReason: "invalid-token" };
+  }
+  if (!Number.isInteger(draft.draftId) || draft.draftId <= 0) {
+    return { sent: false, suppressedReason: "invalid-draft-id" };
+  }
+  const text = draft.text.trim();
+  if (!text) {
+    return { sent: false, suppressedReason: "empty-draft" };
+  }
+  if (text.length > TELEGRAM_MESSAGE_MAX_LENGTH) {
+    return { sent: false, suppressedReason: "draft-too-long" };
+  }
+  if (shouldBlockLiveNotificationNetworkInTests(process.env, deps.httpsRequestImpl)) {
+    return { sent: false, suppressedReason: "test-network-blocked" };
+  }
+
+  const failureCacheKey = `${config.botToken.slice(0, 12)}:${config.chatId}`;
+  if (hasTelegramDraftFailureCached(failureCacheKey)) {
+    return { sent: false, suppressedReason: "draft-failure-cached" };
+  }
+
+  try {
+    const resolveTelegramDestinationImpl =
+      deps.resolveTelegramDestinationImpl ?? resolveTelegramDestination;
+    const destination = await resolveTelegramDestinationImpl(config, payload, deps);
+    if (destination.skipSend) {
+      return { sent: false, suppressedReason: "destination-skipped" };
+    }
+    if (!isLikelyTelegramPrivateChatId(destination.chatId)) {
+      return { sent: false, suppressedReason: "non-private-chat" };
+    }
+
+    const body: Record<string, unknown> = {
+      chat_id: destination.chatId,
+      draft_id: draft.draftId,
+      text,
+      ...(draft.entities?.length
+        ? { entities: draft.entities }
+        : draft.parseMode
+          ? { parse_mode: draft.parseMode }
+          : {}),
+      ...(destination.messageThreadId
+        ? {
+            message_thread_id: coerceTelegramMessageThreadId(
+              destination.messageThreadId,
+            ),
+          }
+        : {}),
+    };
+
+    await performTelegramBotApiRequest<true>(
+      config.botToken,
+      "sendMessageDraft",
+      body,
+      telegramBotApiRequestDeps(deps),
+    );
+    return { sent: true };
+  } catch (error) {
+    telegramDraftFailureCache.set(
+      failureCacheKey,
+      Date.now() + TELEGRAM_DRAFT_FAILURE_CACHE_MS,
+    );
+    return {
+      sent: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 export async function sendTelegram(
@@ -720,11 +846,12 @@ function richTextPartPayload(
     : undefined;
   const telegramOverride = transportOverrides?.telegram;
   if (telegramOverride) {
-    const {
-      message: _message,
-      entities: _entities,
-      ...remainingTelegramOverride
-    } = telegramOverride;
+    const remainingTelegramOverride = { ...telegramOverride };
+    delete remainingTelegramOverride.message;
+    delete remainingTelegramOverride.entities;
+    if (!firstItem) {
+      delete remainingTelegramOverride.replyMarkup;
+    }
     transportOverrides.telegram = remainingTelegramOverride;
   }
 
@@ -747,6 +874,7 @@ async function sendPreparedTelegramChunks(
   const chunkResults: TelegramSendMessageResult[] = [];
   const replyToMessageId = deps.replyToMessageIdOverride
     ?? resolveTelegramReplyToMessageId(payload, destination);
+  const replyMarkup = getTransportOverride(payload, "telegram")?.replyMarkup;
 
   for (const [index, chunk] of chunks.entries()) {
     const body = buildTelegramSendMessageBody(
@@ -754,6 +882,7 @@ async function sendPreparedTelegramChunks(
       chunk,
       destination,
       index === 0 ? replyToMessageId : undefined,
+      index === 0 ? replyMarkup : undefined,
     );
     try {
       const result = await sendTelegramMessageChunk(
@@ -914,6 +1043,7 @@ function buildTelegramSendMessageBody(
   chunk: TelegramPreparedMessageChunk,
   destination: TelegramResolvedDestination,
   replyToMessageId?: string | number,
+  replyMarkup?: TelegramInlineKeyboardMarkup,
 ): Record<string, unknown> {
   return {
     ...(chunk.entities?.length
@@ -933,6 +1063,7 @@ function buildTelegramSendMessageBody(
             ),
           }
         : {}),
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
   };
 }
 

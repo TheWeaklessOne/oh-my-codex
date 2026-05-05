@@ -38,7 +38,7 @@ Current code recognizes these top-level `.omx-config.json` keys:
 `notifications` supports the following current shapes:
 
 - Global fields: `enabled`, `verbosity` (`verbose`, `agent`, `session`, or `minimal`), `defaultProfile`, `profiles`, `events`, `hookTemplates`, `reply`, `dispatchCooldownSeconds`, and `idleCooldownSeconds`.
-- Platform fields: `discord`, `discord-bot`, `telegram`, `slack`, `webhook`. `notifications.telegram.richReplies` supports `enabled`, `autoDetectGeneratedImages`, `maxUploadBytes`, `maxPhotoBytes`, and `allowedArtifactRoots`.
+- Platform fields: `discord`, `discord-bot`, `telegram`, `slack`, `webhook`. `notifications.telegram.richReplies` supports `enabled`, `autoDetectGeneratedImages`, `maxUploadBytes`, `maxPhotoBytes`, and `allowedArtifactRoots`. `notifications.telegram.progress` supports disabled-by-default live progress drafts and final-message show/hide controls.
 - OpenClaw/custom transport fields: `openclaw`, `custom_webhook_command`, and `custom_cli_command`.
 - Event keys under `events`: `session-start`, `session-stop`, `session-end`, `session-idle`, `result-ready`, and `ask-user-question`. Each event can set `enabled`, `messageTemplate`, and platform overrides.
 - `hookTemplates` supports `version`, `enabled`, `events`, and `defaultTemplate`; per-event template config supports `enabled`, `template`, and platform template overrides.
@@ -79,6 +79,62 @@ Explicit manifests use ordered `parts`; local `path` values may be absolute or r
 {"parts":[{"kind":"text","text":"Here is the preview."},{"kind":"photo","path":".omx/artifacts/preview.png","caption":"Preview"},{"kind":"document","path":".omx/artifacts/report.pdf","filename":"report.pdf","mimeType":"application/pdf"}]}
 ```
 ````
+
+#### `notifications.telegram.progress`
+
+`progress` controls the Telegram live progress UX. It is **disabled by default**.
+When enabled, OMX records only public progress commentary/high-level statuses,
+streams the live viewport through Telegram Bot API `sendMessageDraft`, and keeps
+the completed-turn final answer as the durable chat message. If a progress trace
+exists, the final text message gets a `Показать ход` inline button; the callback
+toggles UI only and never injects anything into Codex.
+
+```jsonc
+{
+  "notifications": {
+    "telegram": {
+      "enabled": true,
+      "botToken": "env-or-config-token",
+      "chatId": "777",
+      "progress": {
+        "enabled": true,
+        "mode": "peek",
+        "transport": "draft",
+        "minUpdateIntervalMs": 1000,
+        "maxDraftChars": 3900,
+        "maxStoredEntries": 200,
+        "showButton": true,
+        "fullTraceDelivery": "message"
+      }
+    }
+  }
+}
+```
+
+Supported values:
+
+- `enabled`: boolean, default `false`.
+- `mode`: `off`, `peek`, or `archive`; `off` disables progress even if other
+  fields are present.
+- `transport`: `draft` or `none`; draft transport uses `sendMessageDraft`.
+- `minUpdateIntervalMs`: clamped to a safe floor.
+- `maxDraftChars`: clamped to Telegram's 4096-character message limit.
+- `maxStoredEntries`: cap for sanitized per-turn trace state.
+- `showButton`: whether final messages with a trace get `Показать ход`.
+- `fullTraceDelivery`: `message`, `document`, or `none` for long-trace fallback
+  policy. Current fallback sends a bounded separate message; document mode is
+  reserved for future full-trace archival.
+
+Privacy boundary: progress rendering never includes hidden chain-of-thought,
+`response_item.reasoning`, `encrypted_content`, or raw sensitive tool output.
+Only `agent_message` with `phase: "commentary"` and high-level task/tool status
+summaries are eligible. Progress delivery uses the same owner/privacy posture as
+completed-turn delivery and fails closed for helper/subagent/internal turns.
+
+Reply listener note: when Telegram progress buttons are enabled, OMX adds
+`callback_query` to Telegram `allowed_updates` unless the configured list already
+contains it. If you override `notifications.reply.telegramAllowedUpdates`, keep
+`callback_query` included for the show/hide button to work.
 
 #### `notifications.reply.telegramVoiceTranscription`
 

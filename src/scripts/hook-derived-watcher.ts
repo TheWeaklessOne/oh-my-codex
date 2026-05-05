@@ -11,6 +11,14 @@ import {
   parseCommandResult,
   parseExecCommandArgs,
 } from './notify-hook/operational-events.js';
+import { readCurrentSessionId } from './notify-hook/state-io.js';
+import { readUsableSessionState } from '../hooks/session.js';
+import { resolveTurnOriginForNotification } from '../runtime/codex-session-origin.js';
+import { getNotificationConfig, isEventEnabled } from '../notifications/config.js';
+import { getEffectivePlatformConfig } from '../notifications/dispatcher.js';
+import type { TelegramNotificationConfig } from '../notifications/types.js';
+import { recordTelegramProgressEntryAndMaybeDraft } from '../notifications/telegram-progress-runtime.js';
+import type { ProgressTraceEntry } from '../notifications/telegram-progress.js';
 
 function argValue(name: string, fallback = ''): string {
   const idx = process.argv.indexOf(name);
@@ -57,6 +65,7 @@ interface PendingCall {
 
 const fileState = new Map<string, FileMeta>();
 const pendingCalls = new Map<string, PendingCall>();
+const progressDeliveryCache = new Map<string, { allowed: boolean; checkedAt: number; sessionId: string }>();
 let stopping = false;
 let flushedOnShutdown = false;
 
@@ -104,6 +113,46 @@ function extractMessageText(payload: Record<string, unknown>): string {
     if (text) return text;
   }
   return '';
+}
+
+function collectPublicAgentMessageText(value: unknown, fragments: string[]): void {
+  if (typeof value === 'string') {
+    if (value.trim() !== '') fragments.push(value);
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) collectPublicAgentMessageText(item, fragments);
+    return;
+  }
+
+  if (!value || typeof value !== 'object') return;
+
+  const record = value as Record<string, unknown>;
+  const itemType = safeString(record.type).toLowerCase();
+  if (
+    itemType.includes('reason')
+    || itemType.includes('encrypted')
+    || itemType.includes('cipher')
+  ) {
+    return;
+  }
+
+  if (itemType && itemType !== 'output_text' && itemType !== 'text') {
+    return;
+  }
+
+  if ('text' in record) {
+    collectPublicAgentMessageText(record.text, fragments);
+  }
+}
+
+function extractPublicAgentMessageText(payload: Record<string, unknown>): string {
+  const fragments: string[] = [];
+  for (const candidate of [payload.text, payload.message, payload.content]) {
+    collectPublicAgentMessageText(candidate, fragments);
+  }
+  return fragments.join('\n').trim();
 }
 
 function derivedLog(entry: Record<string, unknown>): Promise<void> {
@@ -310,6 +359,172 @@ function inferOperationalCall(parsed: Record<string, unknown> | null, meta: File
   return null;
 }
 
+function inferProgressEntry(parsed: Record<string, unknown> | null, meta: FileMeta): ProgressTraceEntry | null {
+  if (!parsed || parsed.type !== 'event_msg' || !parsed.payload) return null;
+  const payload = parsed.payload as Record<string, unknown>;
+  const payloadType = safeString(payload.type).toLowerCase();
+  const phase = safeString(payload.phase).toLowerCase();
+  const timestamp = safeString(parsed.timestamp) || new Date().toISOString();
+
+  if (payloadType === 'agent_message') {
+    if (phase !== 'commentary') return null;
+    if ('encrypted_content' in payload) return null;
+    const text = extractPublicAgentMessageText(payload);
+    if (!text) return null;
+    return {
+      kind: 'commentary',
+      text,
+      timestamp,
+    };
+  }
+
+  if (payloadType === 'task_started') {
+    return {
+      kind: 'task-start',
+      text: 'Задача началась',
+      timestamp,
+    };
+  }
+
+  if (payloadType === 'task_complete') {
+    return {
+      kind: 'task-complete',
+      text: 'Задача завершена',
+      timestamp,
+    };
+  }
+
+  return null;
+}
+
+function progressEntryFromOperationalCall(operational: OperationalCall): ProgressTraceEntry | null {
+  if (operational.kind === 'test') {
+    return {
+      kind: operational.phase === 'start' ? 'tool-start' : 'tool-finish',
+      toolName: operational.toolName || 'exec_command',
+      text: operational.phase === 'start'
+        ? `Запускаю проверку: ${operational.command}`
+        : operational.result?.success === false
+          ? 'Проверка завершилась с ошибкой'
+          : 'Проверка завершилась успешно',
+      timestamp: operational.timestamp,
+      ...(operational.phase === 'finish'
+        ? { status: operational.result?.success === false ? 'failed' : 'finished' }
+        : { status: 'started' }),
+    };
+  }
+
+  if (operational.kind === 'pr-create') {
+    return {
+      kind: operational.phase === 'start' ? 'tool-start' : 'tool-finish',
+      toolName: operational.toolName || 'exec_command',
+      text: operational.phase === 'start'
+        ? 'Готовлю публикацию изменений'
+        : 'Публикация изменений завершена',
+      timestamp: operational.timestamp,
+      ...(operational.phase === 'finish'
+        ? { status: operational.result?.success === false ? 'failed' : 'finished' }
+        : { status: 'started' }),
+    };
+  }
+
+  return null;
+}
+
+function progressTurnId(parsed: Record<string, unknown> | null, meta: FileMeta): string {
+  const payload = parsed?.payload && typeof parsed.payload === 'object'
+    ? parsed.payload as Record<string, unknown>
+    : {};
+  return safeString(payload.turn_id || parsed?.turn_id || parsed?.id || meta.currentTurnId || meta.threadId);
+}
+
+async function resolveProgressSessionId(meta: FileMeta): Promise<string> {
+  const current = await readCurrentSessionId(stateDir).catch(() => undefined);
+  return safeString(current) || meta.sessionId;
+}
+
+async function isProgressDeliveryAllowed(meta: FileMeta, turnId: string): Promise<{ allowed: boolean; sessionId: string }> {
+  const sessionId = await resolveProgressSessionId(meta);
+  const cacheKey = `${sessionId}:${meta.threadId}`;
+  const cached = progressDeliveryCache.get(cacheKey);
+  if (cached && Date.now() - cached.checkedAt < 5_000) {
+    return { allowed: cached.allowed, sessionId: cached.sessionId };
+  }
+
+  const currentSessionState = await readUsableSessionState(cwd).catch(() => null);
+  const resolution = await resolveTurnOriginForNotification({
+    cwd,
+    stateDir,
+    payload: {
+      type: 'agent-turn-progress',
+      session_id: sessionId,
+      thread_id: meta.threadId,
+      turn_id: turnId,
+    },
+    env: process.env,
+    currentSessionState,
+    currentOmxSessionId: sessionId,
+  }).catch(() => null);
+  const allowed = resolution?.delivery === 'allow';
+  progressDeliveryCache.set(cacheKey, {
+    allowed,
+    checkedAt: Date.now(),
+    sessionId,
+  });
+  return { allowed, sessionId };
+}
+
+async function recordProgressEntry(
+  meta: FileMeta,
+  parsed: Record<string, unknown> | null,
+  entry: ProgressTraceEntry | null,
+): Promise<void> {
+  if (!entry) return;
+  const config = getNotificationConfig();
+  if (!config || !isEventEnabled(config, 'result-ready')) {
+    return;
+  }
+  const telegramConfig = config
+    ? getEffectivePlatformConfig<TelegramNotificationConfig>('telegram', config, 'result-ready')
+    : undefined;
+  if (!telegramConfig?.enabled || telegramConfig.progress?.enabled !== true || telegramConfig.progress.mode === 'off') {
+    return;
+  }
+
+  const turnId = progressTurnId(parsed, meta);
+  const delivery = await isProgressDeliveryAllowed(meta, turnId);
+  if (!delivery.allowed) {
+    await derivedLog({
+      type: 'telegram_progress_draft_suppressed',
+      reason: 'non-owner',
+      thread_id: meta.threadId,
+      turn_id: turnId,
+    });
+    return;
+  }
+
+  await recordTelegramProgressEntryAndMaybeDraft({
+    projectPath: cwd,
+    sessionId: delivery.sessionId,
+    turnId,
+    telegramConfig,
+    entry,
+    payload: {
+      projectPath: cwd,
+      tmuxSession: process.env.TMUX ? process.env.TMUX.split(',')[0] : undefined,
+    },
+    log: derivedLog,
+  }).catch(async (error) => {
+    await derivedLog({
+      type: 'telegram_progress_draft_suppressed',
+      reason: 'error',
+      thread_id: meta.threadId,
+      turn_id: turnId,
+      error: error instanceof Error ? error.message : 'progress_failed',
+    });
+  });
+}
+
 async function dispatchDerivedEvent(event: Record<string, unknown>): Promise<void> {
   try {
     const { dispatchHookEvent } = await import('../hooks/extensibility/dispatcher.js');
@@ -464,6 +679,7 @@ async function processLine(meta: FileMeta, line: string): Promise<void> {
         confidence: 0.92,
       });
     }
+    await recordProgressEntry(meta, parsed, progressEntryFromOperationalCall(operational));
   } else if (operational?.phase === 'finish') {
     if (operational.callId) pendingCalls.delete(operational.callId);
     if (operational.kind === 'test') {
@@ -501,7 +717,10 @@ async function processLine(meta: FileMeta, line: string): Promise<void> {
         confidence: 0.97,
       });
     }
+    await recordProgressEntry(meta, parsed, progressEntryFromOperationalCall(operational));
   }
+
+  await recordProgressEntry(meta, parsed, inferProgressEntry(parsed, meta));
 
   const derived = inferDerivedEvent(parsed, meta);
   if (!derived) return;

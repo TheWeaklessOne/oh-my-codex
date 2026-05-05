@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   getTelegramInboundText,
   hasTelegramInboundContent,
+  normalizeTelegramCallbackQuery,
   normalizeTelegramUpdate,
   selectBestTelegramPhotoVariant,
 } from '../telegram-inbound/parse.js';
@@ -117,5 +118,32 @@ describe('telegram inbound parser', () => {
   it('ignores updates without a message', () => {
     assert.equal(normalizeTelegramUpdate({ update_id: 1 }), null);
     assert.equal(hasTelegramInboundContent(null), false);
+  });
+
+  it('normalizes callback queries separately from message replies', () => {
+    const callback = normalizeTelegramCallbackQuery({
+      update_id: 45,
+      callback_query: {
+        id: 'callback-1',
+        from: { id: 'telegram-user-1' },
+        data: 'omx:pg:abc123',
+        message: {
+          message_id: 222,
+          message_thread_id: 9001,
+          chat: { id: 777, type: 'private' },
+        },
+      },
+    });
+
+    assert.ok(callback);
+    assert.equal(callback.updateId, 45);
+    assert.equal(callback.id, 'callback-1');
+    assert.equal(callback.senderId, 'telegram-user-1');
+    assert.equal(callback.chatId, 777);
+    assert.equal(callback.chatType, 'private');
+    assert.equal(callback.messageId, 222);
+    assert.equal(callback.messageThreadId, 9001);
+    assert.equal(callback.data, 'omx:pg:abc123');
+    assert.equal(normalizeTelegramUpdate({ update_id: 45, callback_query: callback.rawCallbackQuery }), null);
   });
 });
