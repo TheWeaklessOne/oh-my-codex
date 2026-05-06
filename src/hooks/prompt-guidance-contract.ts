@@ -162,7 +162,6 @@ export const WAVE_TWO_CONTRACTS: GuidanceSurfaceContract[] = [
   'test-engineer',
   'code-reviewer',
   'quality-reviewer',
-  'security-reviewer',
   'researcher',
   'explore',
 ].map((name) => ({
@@ -174,7 +173,6 @@ export const WAVE_TWO_CONTRACTS: GuidanceSurfaceContract[] = [
 export const CATALOG_CONTRACTS: GuidanceSurfaceContract[] = [
   'analyst',
   'api-reviewer',
-  'build-fixer',
   'dependency-expert',
   'designer',
   'git-master',
@@ -224,12 +222,10 @@ export const SKILL_CONTRACTS: GuidanceSurfaceContract[] = [
   ...[
     'analyze',
     'autopilot',
-    'build-fix',
     'code-review',
     'plan',
     'ralph',
     'ralplan',
-    'security-review',
     'team',
     'ultraqa',
   ].map((name) => ({

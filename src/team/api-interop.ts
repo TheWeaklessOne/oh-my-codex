@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve as resolvePath } from 'node:path';
+import { omxStateDir } from '../utils/paths.js';
 import { sendWorkerMessage, shutdownTeam } from './runtime.js';
 import {
   TEAM_NAME_SAFE_PATTERN,
@@ -300,7 +301,7 @@ function buildIdleState(
 }
 
 function readLatestLeaderRuntimeActivityMs(cwd: string): number {
-  const path = join(cwd, '.omx', 'state', 'leader-runtime-activity.json');
+  const path = join(omxStateDir(cwd), 'leader-runtime-activity.json');
   if (!existsSync(path)) return Number.NaN;
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as { last_activity_at?: string };
@@ -446,7 +447,7 @@ function parseValidatedTaskIdArray(value: unknown, fieldName: string): string[] 
 
 function teamStateExists(teamName: string, candidateCwd: string): boolean {
   if (!TEAM_NAME_SAFE_PATTERN.test(teamName)) return false;
-  const teamRoot = join(candidateCwd, '.omx', 'state', 'team', teamName);
+  const teamRoot = join(resolveCanonicalTeamStateRoot(candidateCwd), 'team', teamName);
   return existsSync(join(teamRoot, 'config.json')) || existsSync(join(teamRoot, 'tasks')) || existsSync(teamRoot);
 }
 
@@ -468,7 +469,7 @@ function stateRootToWorkingDirectory(stateRoot: string): string {
 }
 
 function resolveTeamWorkingDirectoryFromMetadata(teamName: string, candidateCwd: string): string | null {
-  const teamRoot = join(candidateCwd, '.omx', 'state', 'team', teamName);
+  const teamRoot = join(resolveCanonicalTeamStateRoot(candidateCwd), 'team', teamName);
   if (!existsSync(teamRoot)) return null;
 
   const fromManifest = readTeamStateRootFromManifest(join(teamRoot, 'manifest.v2.json'));

@@ -9,7 +9,9 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { buildLeaderMonitoringHints, parseTeamStartArgs, teamCommand } from '../team.js';
 import { readModeState } from '../../modes/base.js';
+import { readApprovedExecutionLaunchHint } from '../../planning/artifacts.js';
 import { DEFAULT_MAX_WORKERS } from '../../team/state.js';
+import { sameFilePath } from '../../utils/paths.js';
 import {
   appendTeamEvent,
   createTask,
@@ -21,11 +23,21 @@ import {
   writeTaskApproval,
   writeWorkerStatus,
 } from '../../team/state.js';
+import {
+  buildApprovedTeamExecutionBinding,
+  writePersistedApprovedTeamExecutionBinding,
+} from '../../team/approved-execution.js';
 import { isRealTmuxAvailable, withTempTmuxSession, type TempTmuxSessionFixture } from '../../team/__tests__/tmux-test-fixture.js';
 
 const OMX_CLI_PATH = fileURLToPath(new URL('../omx.js', import.meta.url));
 const ORIGINAL_OMX_TEAM_WORKER = process.env.OMX_TEAM_WORKER;
 const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
+
+function encodeApprovedExecutionTask(task: string, quote: 'single' | 'double'): string {
+  return quote === 'single'
+    ? `'${task.replace(/'/g, "\\'")}'`
+    : `"${task.replace(/"/g, '\\"')}"`;
+}
 
 beforeEach(() => {
   delete process.env.OMX_TEAM_WORKER;
@@ -239,6 +251,266 @@ describe('parseTeamStartArgs', () => {
       const result = parseTeamStartArgs(['team으로', '해줘']);
       assert.equal(result.parsed.task, 'Execute approved issue 831 plan');
       assert.equal(result.parsed.workerCount, 3);
+    } finally {
+      process.chdir(previousCwd);
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('prefers the persisted approved binding over a newer latest approved hint for a short follow-up', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-team-followup-bound-'));
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(wd);
+      const plansDir = join(wd, '.omx', 'plans');
+      await mkdir(plansDir, { recursive: true });
+      const boundPrdPath = join(plansDir, 'prd-20260501T010203Z-issue-831.md');
+      await writeFile(
+        boundPrdPath,
+        '# Approved plan\n\nLaunch via omx team 2:executor "Execute approved issue 831 plan"\n',
+      );
+      await writeFile(
+        join(plansDir, 'test-spec-20260501T010203Z-issue-831.md'),
+        '# Test spec\n',
+      );
+      await writeFile(
+        join(plansDir, 'prd-20260502T010203Z-issue-999.md'),
+        '# Approved plan\n\nLaunch via omx team 5:debugger "Execute newer approved issue 999 plan"\n',
+      );
+      await writeFile(
+        join(plansDir, 'test-spec-20260502T010203Z-issue-999.md'),
+        '# Test spec\n',
+      );
+      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await writeFile(
+        join(wd, '.omx', 'state', 'team-state.json'),
+        JSON.stringify({ active: true, team_name: 'bound-team' }, null, 2),
+      );
+      await writePersistedApprovedTeamExecutionBinding('bound-team', wd, {
+        prd_path: boundPrdPath,
+        task: 'Execute approved issue 831 plan',
+        command: 'omx team 2:executor "Execute approved issue 831 plan"',
+      });
+
+      const result = parseTeamStartArgs(['team']);
+      assert.equal(result.parsed.task, 'Execute approved issue 831 plan');
+      assert.equal(result.parsed.workerCount, 2);
+      assert.equal(result.parsed.agentType, 'executor');
+      assert.equal(result.parsed.approvedExecution?.task, 'Execute approved issue 831 plan');
+      assert.equal(
+        result.parsed.approvedExecution?.command,
+        'omx team 2:executor "Execute approved issue 831 plan"',
+      );
+      assert.equal(
+        sameFilePath(result.parsed.approvedExecution?.prd_path ?? '', boundPrdPath),
+        true,
+      );
+    } finally {
+      process.chdir(previousCwd);
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('round-trips single-quoted approved follow-ups from launch hint encoding through persisted binding', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-team-followup-bound-quoted-'));
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(wd);
+      const plansDir = join(wd, '.omx', 'plans');
+      await mkdir(plansDir, { recursive: true });
+      const boundTask = "Fix Bob's regression in C:\\\\tmp";
+      const boundCommand = `omx team 2:executor ${encodeApprovedExecutionTask(boundTask, 'single')}`;
+      const boundPrdPath = join(plansDir, 'prd-issue-831-quoted.md');
+      await writeFile(
+        boundPrdPath,
+        `# Approved plan\n\nLaunch via ${boundCommand}\n`,
+      );
+      await writeFile(join(plansDir, 'test-spec-issue-831-quoted.md'), '# Test spec\n');
+      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await writeFile(
+        join(wd, '.omx', 'state', 'team-state.json'),
+        JSON.stringify({ active: true, team_name: 'bound-team-quoted' }, null, 2),
+      );
+      const approvedHint = readApprovedExecutionLaunchHint(wd, 'team');
+      assert.ok(approvedHint);
+      assert.equal(approvedHint?.task, boundTask);
+      assert.equal(approvedHint?.command, boundCommand);
+      await writePersistedApprovedTeamExecutionBinding(
+        'bound-team-quoted',
+        wd,
+        buildApprovedTeamExecutionBinding(approvedHint),
+      );
+
+      const result = parseTeamStartArgs(['team']);
+      assert.equal(result.parsed.task, boundTask);
+      assert.equal(result.parsed.workerCount, 2);
+      assert.equal(result.parsed.agentType, 'executor');
+      assert.equal(result.parsed.approvedExecution?.task, boundTask);
+      assert.equal(result.parsed.approvedExecution?.command, boundCommand);
+    } finally {
+      process.chdir(previousCwd);
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('round-trips double-quoted approved follow-ups from launch hint encoding through persisted binding', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-team-followup-bound-double-quoted-'));
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(wd);
+      const plansDir = join(wd, '.omx', 'plans');
+      await mkdir(plansDir, { recursive: true });
+      const boundTask = String.raw`Use C:\tmp and keep \n literal plus "quotes"`;
+      const boundCommand = `omx team 2:executor ${encodeApprovedExecutionTask(boundTask, 'double')}`;
+      const boundPrdPath = join(plansDir, 'prd-issue-831-double-quoted.md');
+      await writeFile(
+        boundPrdPath,
+        `# Approved plan\n\nLaunch via ${boundCommand}\n`,
+      );
+      await writeFile(join(plansDir, 'test-spec-issue-831-double-quoted.md'), '# Test spec\n');
+      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await writeFile(
+        join(wd, '.omx', 'state', 'team-state.json'),
+        JSON.stringify({ active: true, team_name: 'bound-team-double-quoted' }, null, 2),
+      );
+      const approvedHint = readApprovedExecutionLaunchHint(wd, 'team');
+      assert.ok(approvedHint);
+      assert.equal(approvedHint?.task, boundTask);
+      assert.equal(approvedHint?.command, boundCommand);
+      await writePersistedApprovedTeamExecutionBinding(
+        'bound-team-double-quoted',
+        wd,
+        buildApprovedTeamExecutionBinding(approvedHint),
+      );
+
+      const result = parseTeamStartArgs(['team']);
+      assert.equal(result.parsed.task, boundTask);
+      assert.equal(result.parsed.workerCount, 2);
+      assert.equal(result.parsed.agentType, 'executor');
+      assert.equal(result.parsed.approvedExecution?.task, boundTask);
+      assert.equal(result.parsed.approvedExecution?.command, boundCommand);
+    } finally {
+      process.chdir(previousCwd);
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('reuses the persisted approved binding from session-scoped team state for a short follow-up', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-team-followup-bound-session-'));
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(wd);
+      const sessionId = 'sess-team-followup-bound';
+      const plansDir = join(wd, '.omx', 'plans');
+      await mkdir(plansDir, { recursive: true });
+      const prdPath = join(plansDir, 'prd-issue-954.md');
+      await writeFile(
+        prdPath,
+        '# Approved plan\n\nLaunch via omx team 5:executor "Execute approved session-scoped plan"\n',
+      );
+      await writeFile(join(plansDir, 'test-spec-issue-954.md'), '# Test spec\n');
+      await mkdir(join(wd, '.omx', 'state', 'sessions', sessionId), { recursive: true });
+      await writeFile(
+        join(wd, '.omx', 'state', 'session.json'),
+        JSON.stringify({ session_id: sessionId }, null, 2),
+      );
+      await writeFile(
+        join(wd, '.omx', 'state', 'sessions', sessionId, 'team-state.json'),
+        JSON.stringify({
+          active: true,
+          team_name: 'bound-team-session',
+          task_description: 'Execute approved session-scoped plan',
+          agent_count: 5,
+        }, null, 2),
+      );
+      await writePersistedApprovedTeamExecutionBinding('bound-team-session', wd, {
+        prd_path: prdPath,
+        task: 'Execute approved session-scoped plan',
+        command: 'omx team 5:executor "Execute approved session-scoped plan"',
+      });
+
+      const result = parseTeamStartArgs(['team']);
+      assert.equal(result.parsed.task, 'Execute approved session-scoped plan');
+      assert.equal(result.parsed.workerCount, 5);
+      assert.equal(result.parsed.agentType, 'executor');
+    } finally {
+      process.chdir(previousCwd);
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed for a short follow-up when the persisted approved binding is malformed', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-team-followup-malformed-binding-'));
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(wd);
+      const plansDir = join(wd, '.omx', 'plans');
+      const stateDir = join(wd, '.omx', 'state');
+      await mkdir(plansDir, { recursive: true });
+      await mkdir(join(stateDir, 'team', 'broken-team'), { recursive: true });
+      await writeFile(
+        join(plansDir, 'prd-issue-831.md'),
+        '# Approved plan\n\nLaunch via omx team 3:executor "Execute approved issue 831 plan"\n',
+      );
+      await writeFile(join(plansDir, 'test-spec-issue-831.md'), '# Test spec\n');
+      await writeFile(
+        join(stateDir, 'team-state.json'),
+        JSON.stringify({ active: true, team_name: 'broken-team' }, null, 2),
+      );
+      await writeFile(
+        join(stateDir, 'team', 'broken-team', 'approved-execution.json'),
+        '{"prd_path":42}',
+        'utf-8',
+      );
+
+      assert.throws(
+        () => parseTeamStartArgs(['team']),
+        /approved_execution_binding_malformed:broken-team/,
+      );
+    } finally {
+      process.chdir(previousCwd);
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed for a short follow-up when the persisted approved binding is stale even if a newer PRD is ready', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-team-followup-bound-stale-'));
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(wd);
+      const plansDir = join(wd, '.omx', 'plans');
+      await mkdir(plansDir, { recursive: true });
+      const stalePrdPath = join(plansDir, 'prd-issue-955-alpha.md');
+      await writeFile(
+        stalePrdPath,
+        '# Approved plan\n\nLaunch via omx team 4:executor "Execute approved alpha plan"\n',
+      );
+      await writeFile(join(plansDir, 'test-spec-issue-955-alpha.md'), '# Test spec\n');
+      await writeFile(
+        join(plansDir, 'prd-issue-955-zeta.md'),
+        '# Approved plan\n\nLaunch via omx team 6:debugger "Execute approved zeta plan"\n',
+      );
+      await writeFile(join(plansDir, 'test-spec-issue-955-zeta.md'), '# Test spec\n');
+      await rm(stalePrdPath, { force: true });
+      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await writeFile(
+        join(wd, '.omx', 'state', 'team-state.json'),
+        JSON.stringify({
+          active: true,
+          team_name: 'bound-team-stale',
+          task_description: 'Execute approved alpha plan',
+          agent_count: 4,
+        }, null, 2),
+      );
+      await writePersistedApprovedTeamExecutionBinding('bound-team-stale', wd, {
+        prd_path: stalePrdPath,
+        task: 'Execute approved alpha plan',
+      });
+
+      assert.throws(
+        () => parseTeamStartArgs(['team']),
+        /approved_execution_binding_stale:.*Execute approved alpha plan/,
+      );
     } finally {
       process.chdir(previousCwd);
       await rm(wd, { recursive: true, force: true });

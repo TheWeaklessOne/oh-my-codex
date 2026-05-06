@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { updateModeState, startMode, readModeState } from '../modes/base.js';
-import { getStatePath, validateSessionId } from '../mcp/state-paths.js';
+import { getStateFilePath, getStatePath, validateSessionId } from '../mcp/state-paths.js';
 import { monitorTeam, resumeTeam, shutdownTeam, startTeam, type TeamRuntime, type TeamSnapshot } from '../team/runtime.js';
 import { buildRepoAwareTeamExecutionPlan } from '../team/repo-aware-decomposition.js';
 import { DEFAULT_MAX_WORKERS } from '../team/state.js';
@@ -13,6 +13,7 @@ import { classifyTaskSize } from '../hooks/task-size-detector.js';
 import {
   readApprovedExecutionLaunchHint,
   readApprovedExecutionLaunchHintOutcome,
+  type ApprovedExecutionLaunchHint,
   type ApprovedRepositoryContextSummary,
 } from '../planning/artifacts.js';
 import { routeTaskToRole } from '../team/role-router.js';
@@ -32,6 +33,11 @@ import { teamReadConfig as readTeamConfig, teamReadPhase as readTeamPhase } from
 import { resolveTeamNameForCurrentContext } from '../team/team-identity.js';
 import { recordLeaderRuntimeActivity } from '../team/leader-activity.js';
 import { readTeamPaneStatus } from '../team/pane-status.js';
+import {
+  buildApprovedTeamExecutionBinding,
+  resolvePersistedApprovedTeamExecutionContinuityStateSync,
+  type ApprovedTeamExecutionBinding,
+} from '../team/approved-execution.js';
 
 interface TeamCliOptions {
   verbose?: boolean;
@@ -47,6 +53,7 @@ interface ParsedTeamArgs {
   displayName?: string;
   allowRepoAwareDagHandoff: boolean;
   approvedRepositoryContextSummary?: ApprovedRepositoryContextSummary;
+  approvedExecution?: ApprovedTeamExecutionBinding;
 }
 
 interface TeamFollowupContext {
@@ -55,6 +62,7 @@ interface TeamFollowupContext {
   explicitWorkerCount: boolean;
   agentType?: string;
   explicitAgentType?: boolean;
+  approvedHint?: ApprovedExecutionLaunchHint;
 }
 
 function persistExactTeamModeState(
@@ -75,6 +83,9 @@ function persistExactTeamModeState(
 }
 
 function readPersistedTeamFollowupState(cwd: string): {
+  active?: boolean;
+  team_name?: string;
+  team_state_root?: string;
   task?: string;
   task_description?: string;
   workerCount?: number;
@@ -83,37 +94,108 @@ function readPersistedTeamFollowupState(cwd: string): {
   agent_types?: string;
   linkedRalph?: boolean;
 } | null {
-  const path = join(cwd, '.omx', 'state', 'team-state.json');
-  if (!existsSync(path)) return null;
-  try {
-    return JSON.parse(readFileSync(path, 'utf-8')) as {
-      task?: string;
-      workerCount?: number;
-      agentType?: string;
-      linkedRalph?: boolean;
-      task_description?: string;
-      agent_count?: number;
-      agent_types?: string;
-    };
-  } catch {
-    return null;
+  const readState = (path: string) => {
+    if (!existsSync(path)) return null;
+    try {
+      return JSON.parse(readFileSync(path, 'utf-8')) as {
+        active?: boolean;
+        team_name?: string;
+        team_state_root?: string;
+        task?: string;
+        workerCount?: number;
+        agentType?: string;
+        linkedRalph?: boolean;
+        task_description?: string;
+        agent_count?: number;
+        agent_types?: string;
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  const isActiveTeamState = (state: {
+    active?: boolean;
+    team_name?: string;
+  } | null): state is {
+    active: true;
+    team_name: string;
+    team_state_root?: string;
+    task?: string;
+    task_description?: string;
+    workerCount?: number;
+    agent_count?: number;
+    agentType?: string;
+    agent_types?: string;
+    linkedRalph?: boolean;
+  } => state?.active === true && typeof state.team_name === 'string' && state.team_name.trim() !== '';
+
+  const sessionStatePath = getStateFilePath('session.json', cwd);
+  let scopedSessionId: string | undefined;
+  if (existsSync(sessionStatePath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(sessionStatePath, 'utf-8')) as { session_id?: unknown };
+      scopedSessionId = validateSessionId(parsed.session_id);
+    } catch {
+      // Best-effort state lookup only.
+    }
   }
+
+  if (scopedSessionId) {
+    const scopedState = readState(getStatePath('team', cwd, scopedSessionId));
+    if (isActiveTeamState(scopedState)) {
+      return scopedState;
+    }
+  }
+
+  const path = getStatePath('team', cwd);
+  if (!existsSync(path)) return null;
+  const state = readState(path);
+  return isActiveTeamState(state) ? state : null;
 }
 
 function resolveApprovedTeamFollowupContext(cwd: string, task: string): TeamFollowupContext | null {
   const normalizedTask = task.trim();
   if (!normalizedTask) return null;
 
-  const existingTeamState = readPersistedTeamFollowupState(cwd);
   const shortFollowup = ['team', 'team으로 해줘', 'team으로 해주세요'].includes(normalizedTask);
   if (!shortFollowup) return null;
 
-  const approvedHintOutcome = readApprovedExecutionLaunchHintOutcome(cwd, 'team');
-  if (approvedHintOutcome.status === 'ambiguous') {
-    throw new Error('approved_execution_hint_ambiguous:team');
+  const existingTeamState = readPersistedTeamFollowupState(cwd);
+  const persistedTeamName = typeof existingTeamState?.team_name === 'string'
+    ? existingTeamState.team_name.trim()
+    : '';
+  const persistedTeamStateRoot = typeof existingTeamState?.team_state_root === 'string'
+    && existingTeamState.team_state_root.trim() !== ''
+    ? existingTeamState.team_state_root.trim()
+    : undefined;
+  let approvedHint: ApprovedExecutionLaunchHint | null = null;
+
+  if (persistedTeamName !== '') {
+    const continuity = resolvePersistedApprovedTeamExecutionContinuityStateSync(
+      persistedTeamName,
+      cwd,
+      persistedTeamStateRoot,
+    );
+    if (continuity.status === 'malformed') {
+      throw new Error(`approved_execution_binding_malformed:${persistedTeamName}`);
+    }
+    if (continuity.status === 'stale') {
+      throw new Error(`approved_execution_binding_stale:${continuity.binding.prd_path}:${continuity.binding.task}`);
+    }
+    if (continuity.status === 'valid') {
+      approvedHint = continuity.approvedHint;
+    }
   }
-  if (approvedHintOutcome.status !== 'resolved') return null;
-  const approvedHint = approvedHintOutcome.hint;
+
+  if (!approvedHint) {
+    const approvedHintOutcome = readApprovedExecutionLaunchHintOutcome(cwd, 'team');
+    if (approvedHintOutcome.status === 'ambiguous') {
+      throw new Error('approved_execution_hint_ambiguous:team');
+    }
+    if (approvedHintOutcome.status !== 'resolved') return null;
+    approvedHint = approvedHintOutcome.hint;
+  }
 
   const persistedTask = typeof existingTeamState?.task_description === 'string'
     ? existingTeamState.task_description
@@ -132,6 +214,7 @@ function resolveApprovedTeamFollowupContext(cwd: string, task: string): TeamFoll
       explicitWorkerCount: true,
       agentType: approvedHint.agentType,
       explicitAgentType: approvedHint.agentType != null,
+      approvedHint,
     };
   }
 
@@ -141,6 +224,7 @@ function resolveApprovedTeamFollowupContext(cwd: string, task: string): TeamFoll
     explicitWorkerCount: approvedHint.workerCount != null,
     agentType: approvedHint.agentType,
     explicitAgentType: approvedHint.agentType != null,
+    approvedHint,
   };
 }
 
@@ -760,7 +844,8 @@ export function parseTeamArgs(args: string[], cwd: string = process.cwd()): Pars
     }
   }
 
-  const approvedHint = readApprovedExecutionLaunchHint(cwd, 'team', { task: effectiveTask });
+  const approvedHint = followupContext?.approvedHint
+    ?? readApprovedExecutionLaunchHint(cwd, 'team', { task: effectiveTask });
   const matchesApprovedLaunchHint = approvedHint?.task.trim() === effectiveTask.trim()
     && (approvedHint.workerCount == null || approvedHint.workerCount === workerCount)
     && (approvedHint.agentType == null || approvedHint.agentType === agentType);
@@ -780,6 +865,7 @@ export function parseTeamArgs(args: string[], cwd: string = process.cwd()): Pars
     displayName: teamName,
     allowRepoAwareDagHandoff,
     ...(approvedRepositoryContextSummary ? { approvedRepositoryContextSummary } : {}),
+    ...(allowRepoAwareDagHandoff && approvedHint ? { approvedExecution: buildApprovedTeamExecutionBinding(approvedHint) } : {}),
   };
 }
 
@@ -1538,7 +1624,11 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
     executionPlan.workerCount,
     tasks,
     cwd,
-    { worktreeMode, decompositionMetadata: executionPlan.metadata },
+    {
+      worktreeMode,
+      decompositionMetadata: executionPlan.metadata,
+      approvedExecution: parsed.approvedExecution ?? null,
+    },
   );
 
   await ensureTeamModeState({ ...effectiveParsed, teamName: runtime.teamName, displayName: runtime.config.display_name ?? effectiveParsed.displayName }, tasks);

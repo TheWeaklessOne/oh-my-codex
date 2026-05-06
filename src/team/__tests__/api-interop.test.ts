@@ -1838,6 +1838,61 @@ describe('executeTeamApiOperation: read-stall-state', () => {
     }
   });
 
+  it('reads leader runtime activity from boxed OMX_ROOT state consistently with writer path', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-interop-boxed-cwd-'));
+    const box = await mkdtemp(join(tmpdir(), 'omx-interop-boxed-root-'));
+    const previousRoot = process.env.OMX_ROOT;
+    const previousStateRoot = process.env.OMX_STATE_ROOT;
+    const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
+    try {
+      process.env.OMX_ROOT = box;
+      delete process.env.OMX_STATE_ROOT;
+      delete process.env.OMX_TEAM_STATE_ROOT;
+      await initTeamState('stall-state-boxed-activity', 'boxed activity test', 'executor', 1, cwd);
+      await writeTeamLeaderAttention('stall-state-boxed-activity', {
+        team_name: 'stall-state-boxed-activity',
+        updated_at: '2026-03-10T10:05:00.000Z',
+        source: 'native_stop',
+        leader_decision_state: 'still_actionable',
+        leader_attention_pending: true,
+        leader_attention_reason: 'leader_session_stopped',
+        attention_reasons: ['leader_session_stopped'],
+        leader_stale: false,
+        leader_session_active: false,
+        leader_session_id: 'leader-session-1',
+        leader_session_stopped_at: '2026-03-10T10:05:00.000Z',
+        unread_leader_message_count: 0,
+        work_remaining: false,
+        stalled_for_ms: null,
+      }, cwd);
+      await mkdir(join(box, '.omx', 'state'), { recursive: true });
+      await writeFile(join(box, '.omx', 'state', 'leader-runtime-activity.json'), JSON.stringify({
+        last_activity_at: '2026-03-10T10:06:00.000Z',
+        last_source: 'team_status',
+        last_team_name: 'stall-state-boxed-activity',
+      }, null, 2));
+
+      const result = await executeTeamApiOperation('read-stall-state', {
+        team_name: 'stall-state-boxed-activity',
+      }, cwd);
+
+      assert.equal(result.ok, true);
+      if (result.ok) {
+        assert.equal(result.data.leader_attention_pending, false);
+        assert.equal(result.data.leader_stale, false);
+      }
+    } finally {
+      if (typeof previousRoot === 'string') process.env.OMX_ROOT = previousRoot;
+      else delete process.env.OMX_ROOT;
+      if (typeof previousStateRoot === 'string') process.env.OMX_STATE_ROOT = previousStateRoot;
+      else delete process.env.OMX_STATE_ROOT;
+      if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
+      else delete process.env.OMX_TEAM_STATE_ROOT;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(box, { recursive: true, force: true });
+    }
+  });
+
   it('suppresses stale native-stop attention after newer leader activity', async () => {
     const { cwd, cleanup } = await setupTeam('stall-state-resume');
     try {

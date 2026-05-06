@@ -59,13 +59,17 @@ describe('catalog schema', () => {
     assert.ok(counts.activeAgentCount > 0);
   });
 
-  it('includes ask-claude and ask-gemini as active built-in skills', () => {
+  it('includes ask as active and legacy ask provider skills as hard-deprecated entries', () => {
     const parsed = validateCatalogManifest(readSourceManifest());
+    const ask = parsed.skills.find((skill) => skill.name === 'ask');
     const askClaude = parsed.skills.find((skill) => skill.name === 'ask-claude');
     const askGemini = parsed.skills.find((skill) => skill.name === 'ask-gemini');
 
-    assert.equal(askClaude?.status, 'active');
-    assert.equal(askGemini?.status, 'active');
+    assert.equal(ask?.status, 'active');
+    assert.equal(askClaude?.status, 'deprecated');
+    assert.equal(askClaude?.canonical, undefined);
+    assert.equal(askGemini?.status, 'deprecated');
+    assert.equal(askGemini?.canonical, undefined);
   });
 
   it('includes ai-slop-cleaner as an active built-in skill', () => {
@@ -82,5 +86,14 @@ describe('catalog schema', () => {
 
     assert.equal(autoresearch?.category, 'execution');
     assert.equal(autoresearch?.status, 'active');
+  });
+
+  it('includes ultragoal as a core execution skill', () => {
+    const parsed = validateCatalogManifest(readSourceManifest());
+    const ultragoal = parsed.skills.find((skill) => skill.name === 'ultragoal');
+
+    assert.equal(ultragoal?.category, 'execution');
+    assert.equal(ultragoal?.status, 'active');
+    assert.equal(ultragoal?.core, true);
   });
 });

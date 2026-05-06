@@ -105,20 +105,16 @@ export function isPlanningComplete(artifacts: PlanningArtifacts): boolean {
   return Boolean(selection.prdPath) && selection.testSpecPaths.length > 0;
 }
 
-function decodeQuotedValue(raw: string): string | null {
+export function decodeApprovedExecutionQuotedValue(raw: string): string | null {
   const normalized = raw.trim();
   if (!normalized) return null;
-  try {
-    return JSON.parse(normalized) as string;
-  } catch {
-    if (
-      (normalized.startsWith('"') && normalized.endsWith('"'))
-      || (normalized.startsWith("'") && normalized.endsWith("'"))
-    ) {
-      return normalized.slice(1, -1);
-    }
-    return null;
+  if (normalized.startsWith('"') && normalized.endsWith('"')) {
+    return normalized.slice(1, -1).replace(/\\"/g, '"');
   }
+  if (normalized.startsWith("'") && normalized.endsWith("'")) {
+    return normalized.slice(1, -1).replace(/\\'/g, "'");
+  }
+  return null;
 }
 
 function artifactPathSuffix(path: string, prefixPattern: RegExp): string | null {
@@ -337,7 +333,7 @@ function selectLaunchHintMatch(
       if (!command || command !== normalizedCommand) {
         return [];
       }
-      const task = match.groups?.task ? decodeQuotedValue(match.groups.task) : null;
+      const task = match.groups?.task ? decodeApprovedExecutionQuotedValue(match.groups.task) : null;
       return task ? [{ match, task }] : [];
     });
     if (exactMatches.length === 0) return { status: 'no-match' };
@@ -347,7 +343,7 @@ function selectLaunchHintMatch(
 
   if (!normalizedTask) {
     const decodedMatches = matches.flatMap((match) => {
-      const task = match.groups?.task ? decodeQuotedValue(match.groups.task) : null;
+      const task = match.groups?.task ? decodeApprovedExecutionQuotedValue(match.groups.task) : null;
       return task ? [{ match, task }] : [];
     });
     if (decodedMatches.length === 0) return { status: 'no-match' };
@@ -356,7 +352,7 @@ function selectLaunchHintMatch(
   }
 
   const exactMatches = matches.flatMap((match) => {
-    const task = match.groups?.task ? decodeQuotedValue(match.groups.task) : null;
+    const task = match.groups?.task ? decodeApprovedExecutionQuotedValue(match.groups.task) : null;
     return task && task.trim() === normalizedTask ? [{ match, task }] : [];
   });
   if (exactMatches.length === 0) return { status: 'no-match' };

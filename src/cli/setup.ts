@@ -39,8 +39,8 @@ import {
 	stripOmxEnvSettings,
 	stripOmxFeatureFlags,
 	stripOmxSeededBehavioralDefaults,
-	upsertCodexHooksFeatureFlag,
-	OMX_DEVELOPER_INSTRUCTIONS,
+	upsertPluginModeRuntimeFeatureFlags,
+	OMX_PLUGIN_DEVELOPER_INSTRUCTIONS,
 } from "../config/generator.js";
 import { mergeManagedCodexHooksConfig } from "../config/codex-hooks.js";
 import {
@@ -229,6 +229,21 @@ function applyScopePathRewritesToAgentsTemplate(
 ): string {
 	if (scope !== "project") return content;
 	return content.replaceAll("~/.codex", "./.codex");
+}
+
+function applyPluginModeWordingToAgentsTemplate(
+	content: string,
+	scope: SetupScope,
+): string {
+	const scopedContent = applyScopePathRewritesToAgentsTemplate(content, scope);
+	const userSkillPath =
+		scope === "project"
+			? "`./.codex/skills` for project scope, or `~/.codex/skills` for user-installed skills"
+			: "`~/.codex/skills`";
+	return scopedContent.replace(
+		/Role prompts under `prompts\/\*\.md` are narrower execution surfaces\. They must follow this file, not override it\.\nWhen OMX is installed, load the installed prompt\/skill\/agent surfaces from [^\n]+active\)\./,
+		`Registered Codex plugin marketplace surfaces supply OMX workflows, prompts, and native-agent roles when the plugin is installed. They must follow this file, not override it.\nUser-installed skills may still live under ${userSkillPath}. Setup-owned prompt files and native-agent TOML defaults are intentionally omitted in plugin mode unless explicitly installed.`,
+	);
 }
 
 interface ResolvedSetupScope {
@@ -1280,7 +1295,7 @@ async function applyPluginModeHooksConfig(
 		? await readFile(configPath, "utf-8")
 		: "";
 	const nextConfig =
-		upsertCodexHooksFeatureFlag(existingConfig).trimEnd() + "\n";
+		upsertPluginModeRuntimeFeatureFlags(existingConfig).trimEnd() + "\n";
 	if (nextConfig !== existingConfig) {
 		if (
 			await ensureBackup(
@@ -1317,11 +1332,11 @@ async function applyPluginModeHooksConfig(
 		`native hooks ${hooksPath}`,
 	);
 
-	if (options.verbose) {
-		console.log(
-			`  ${options.dryRun ? "would configure" : "configured"} plugin-mode native hooks at ${hooksPath}`,
-		);
-	}
+		if (options.verbose) {
+			console.log(
+				`  ${options.dryRun ? "would configure" : "configured"} plugin-mode native hooks and runtime feature flags at ${hooksPath}`,
+			);
+		}
 }
 
 async function applyPluginDeveloperInstructionsDefault(
@@ -1336,7 +1351,7 @@ async function applyPluginDeveloperInstructionsDefault(
 	const existing = existsSync(configPath)
 		? await readFile(configPath, "utf-8")
 		: "";
-	const line = `developer_instructions = ${JSON.stringify(OMX_DEVELOPER_INSTRUCTIONS)}`;
+	const line = `developer_instructions = ${JSON.stringify(OMX_PLUGIN_DEVELOPER_INSTRUCTIONS)}`;
 	const hasExistingDeveloperInstructions = rootHasTomlKey(
 		existing,
 		"developer_instructions",
@@ -1775,12 +1790,12 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 				`  Local Codex plugin marketplace ${OMX_LOCAL_MARKETPLACE_NAME} already registered (${pkgRoot}).`,
 			);
 		}
-		resolvedConfig = existsSync(scopeDirs.codexConfigFile)
-			? await readFile(scopeDirs.codexConfigFile, "utf-8")
-			: "";
-		console.log(
-			`  Native Codex hooks refresh complete (${scopeDirs.codexHooksFile}).\n`,
-		);
+			resolvedConfig = existsSync(scopeDirs.codexConfigFile)
+				? await readFile(scopeDirs.codexConfigFile, "utf-8")
+				: "";
+			console.log(
+				`  Native Codex hooks and runtime feature flags refresh complete (${scopeDirs.codexHooksFile}; codex_hooks, goals).\n`,
+			);
 
 		if (usePluginDeveloperInstructionsDefault) {
 			const developerInstructionsResult =
@@ -1929,7 +1944,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 				);
 				const rewritten = upsertAgentsModelTable(
 					addGeneratedAgentsMarker(
-						applyScopePathRewritesToAgentsTemplate(
+						applyPluginModeWordingToAgentsTemplate(
 							content,
 							resolvedScope.scope,
 						),

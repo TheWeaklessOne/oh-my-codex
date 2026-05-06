@@ -107,6 +107,43 @@ describe('state-server directory initialization', () => {
     }
   });
 
+  it('creates boxed runtime state under OMX_ROOT for mutating tools', async () => {
+    process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
+    const previousOmxRoot = process.env.OMX_ROOT;
+    const { handleStateToolCall } = await import('../state-server.js');
+
+    const root = await mkdtemp(join(tmpdir(), 'omx-state-server-boxed-'));
+    const box = join(root, 'box');
+    const wd = join(root, 'source');
+    try {
+      await mkdir(wd, { recursive: true });
+      process.env.OMX_ROOT = box;
+
+      const response = await handleStateToolCall({
+        params: {
+          name: 'state_write',
+          arguments: {
+            workingDirectory: wd,
+            mode: 'ralph',
+            active: true,
+            iteration: 1,
+            current_phase: 'executing',
+          },
+        },
+      });
+
+      assert.equal(response.isError, undefined);
+      assert.equal(existsSync(join(box, '.omx', 'state', 'ralph-state.json')), true);
+      assert.equal(existsSync(join(box, '.omx', 'tmux-hook.json')), true);
+      assert.equal(existsSync(join(wd, '.omx', 'state')), false);
+      assert.equal(existsSync(join(wd, '.omx', 'tmux-hook.json')), false);
+    } finally {
+      if (typeof previousOmxRoot === 'string') process.env.OMX_ROOT = previousOmxRoot;
+      else delete process.env.OMX_ROOT;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('keeps missing state_read side-effect-free without setup', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
     const { handleStateToolCall } = await import('../state-server.js');

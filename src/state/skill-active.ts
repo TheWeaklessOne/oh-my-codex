@@ -113,6 +113,56 @@ function normalizeSkillActiveEntry(raw: unknown): SkillActiveEntry | null {
   };
 }
 
+export function extractSessionIdFromInitializedStatePath(pathValue: unknown): string | undefined {
+  const pathText = safeString(pathValue).trim();
+  if (!pathText) return undefined;
+  const normalized = pathText.replace(/\\/g, '/');
+  const match = /(?:^|\/)sessions\/([^/]+)\/[^/]+-state\.json$/.exec(normalized);
+  return match?.[1];
+}
+
+function baseInitializationMatchesTargetSession(
+  base: SkillActiveStateLike | null,
+  targetSessionId?: string,
+): boolean {
+  const normalizedTargetSessionId = safeString(targetSessionId).trim();
+  if (!normalizedTargetSessionId) return true;
+
+  const initializedPathSessionId = extractSessionIdFromInitializedStatePath(base?.initialized_state_path);
+  if (initializedPathSessionId && initializedPathSessionId !== normalizedTargetSessionId) {
+    return false;
+  }
+
+  const baseSessionId = safeString(base?.session_id).trim();
+  if (baseSessionId && baseSessionId !== normalizedTargetSessionId) {
+    return false;
+  }
+
+  return true;
+}
+
+function sanitizeInheritedSkillActiveBase(
+  base: SkillActiveStateLike | null,
+  targetSessionId?: string,
+): SkillActiveStateLike {
+  const inherited = { ...(base ?? {}) };
+  if (!baseInitializationMatchesTargetSession(base, targetSessionId)) {
+    delete inherited.initialized_mode;
+    delete inherited.initialized_state_path;
+    delete inherited.input_lock;
+    delete inherited.context_snapshot_path;
+    delete inherited.prd_path;
+    delete inherited.test_spec_path;
+    delete inherited.task_slug;
+    delete inherited.task_description;
+    delete inherited.owner_omx_session_id;
+    delete inherited.owner_codex_session_id;
+    delete inherited.owner_codex_thread_id;
+    delete inherited.tmux_pane_id;
+  }
+  return inherited;
+}
+
 export function listActiveSkills(raw: unknown): SkillActiveEntry[] {
   if (!raw || typeof raw !== 'object') return [];
   const state = raw as SkillActiveStateLike;
@@ -278,23 +328,25 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
     base: SkillActiveStateLike | null,
     entries: SkillActiveEntry[],
     fallbackMode: string,
+    targetSessionId?: string,
   ): SkillActiveStateLike => {
-    const currentPrimary = safeString(base?.skill).trim();
+    const inheritedBase = sanitizeInheritedSkillActiveBase(base, targetSessionId);
+    const currentPrimary = safeString(inheritedBase.skill).trim();
     const primarySkill = pickPrimaryWorkflowMode(currentPrimary, entries.map((entry) => entry.skill), fallbackMode);
     const primaryEntry = entries.find((entry) => entry.skill === primarySkill) ?? entries[0];
     return {
-      ...(base ?? {}),
+      ...inheritedBase,
       version: 1,
       active: entries.length > 0,
       skill: primaryEntry?.skill || primarySkill || fallbackMode,
-      keyword: safeString(base?.keyword).trim(),
-      phase: primaryEntry?.phase || safeString(base?.phase).trim(),
-      activated_at: primaryEntry?.activated_at || safeString(base?.activated_at).trim() || nowIso,
+      keyword: safeString(inheritedBase.keyword).trim(),
+      phase: primaryEntry?.phase || safeString(inheritedBase.phase).trim(),
+      activated_at: primaryEntry?.activated_at || safeString(inheritedBase.activated_at).trim() || nowIso,
       updated_at: nowIso,
-      source: safeString(base?.source).trim() || source,
-      session_id: primaryEntry?.session_id || safeString(base?.session_id).trim() || undefined,
-      thread_id: primaryEntry?.thread_id || safeString(base?.thread_id).trim() || undefined,
-      turn_id: primaryEntry?.turn_id || safeString(base?.turn_id).trim() || undefined,
+      source: safeString(inheritedBase.source).trim() || source,
+      session_id: primaryEntry?.session_id || safeString(inheritedBase.session_id).trim() || undefined,
+      thread_id: primaryEntry?.thread_id || safeString(inheritedBase.thread_id).trim() || undefined,
+      turn_id: primaryEntry?.turn_id || safeString(inheritedBase.turn_id).trim() || undefined,
       active_skills: entries,
     };
   };
@@ -323,6 +375,7 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
       existingSession ?? existingRoot,
       [...nextRootEntries, ...nextSessionEntries],
       mode,
+      normalizedSessionId,
     );
     const nextRootState = nextRootEntries.length > 0
       ? applyEntriesToState(existingRoot, nextRootEntries, mode)
@@ -330,6 +383,7 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
         existingSession ?? existingRoot,
         active ? nextSessionEntries : [],
         mode,
+        normalizedSessionId,
       );
     await writeSkillActiveStateCopies(cwd, nextSessionState, sessionId, nextRootState);
     return;
@@ -377,6 +431,7 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
       existingSessionState ?? existingRoot,
       nextSessionEntries,
       nextSessionEntries[0]?.skill || mode,
+      sessionId,
     );
     await writeSkillActiveStateCopies(cwd, nextSessionState, sessionId, nextRootState);
   }

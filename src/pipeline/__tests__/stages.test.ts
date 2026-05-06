@@ -18,6 +18,12 @@ import { packageRoot } from '../../utils/paths.js';
 
 let tempDir: string;
 
+function encodeApprovedExecutionTask(task: string, quote: 'single' | 'double'): string {
+  return quote === 'single'
+    ? `'${task.replace(/'/g, "\\'")}'`
+    : `"${task.replace(/"/g, '\\"')}"`;
+}
+
 function makeCtx(overrides: Partial<StageContext> = {}): StageContext {
   return {
     task: 'test task',
@@ -363,12 +369,10 @@ describe('Team Exec Stage', () => {
   it('preserves literal backslashes in single-quoted approved handoff text', async () => {
     const plansDir = join(tempDir, '.omx', 'plans');
     await mkdir(plansDir, { recursive: true });
+    const expectedTask = String.raw`Fix C:\\tmp and keep \n literal`;
     await writeFile(
       join(plansDir, 'prd-zeta.md'),
-      String.raw`# Zeta plan
-
-Launch via $team 2:executor 'Fix C:\\tmp and keep \n literal'
-`,
+      `# Zeta plan\n\nLaunch via $team 2:executor ${encodeApprovedExecutionTask(expectedTask, 'single')}\n`,
     );
     await writeFile(join(plansDir, 'test-spec-zeta.md'), '# Zeta test spec\n');
 
@@ -387,7 +391,35 @@ Launch via $team 2:executor 'Fix C:\\tmp and keep \n literal'
     assert.equal(result.status, 'completed');
     const descriptor = (result.artifacts as Record<string, unknown>).teamDescriptor as Record<string, unknown>;
     const instruction = (result.artifacts as Record<string, unknown>).instruction as string;
-    const expectedTask = String.raw`Fix C:\\tmp and keep \n literal`;
+    assert.equal(descriptor.task, expectedTask);
+    assert.ok(instruction.includes(JSON.stringify(expectedTask)));
+  });
+
+  it('preserves literal backslashes in double-quoted approved handoff text', async () => {
+    const plansDir = join(tempDir, '.omx', 'plans');
+    await mkdir(plansDir, { recursive: true });
+    const expectedTask = String.raw`Use C:\tmp and keep \n literal plus "quotes"`;
+    await writeFile(
+      join(plansDir, 'prd-zeta.md'),
+      `# Zeta plan\n\nLaunch via omx team 2:executor ${encodeApprovedExecutionTask(expectedTask, 'double')}\n`,
+    );
+    await writeFile(join(plansDir, 'test-spec-zeta.md'), '# Zeta test spec\n');
+
+    const stage = createTeamExecStage();
+    const result = await stage.run(makeCtx({
+      task: 'original request task',
+      artifacts: {
+        ralplan: {
+          task: 'original request task',
+          stage: 'ralplan',
+          latestPlanPath: join('.omx', 'plans', 'prd-zeta.md'),
+        },
+      },
+    }));
+
+    assert.equal(result.status, 'completed');
+    const descriptor = (result.artifacts as Record<string, unknown>).teamDescriptor as Record<string, unknown>;
+    const instruction = (result.artifacts as Record<string, unknown>).instruction as string;
     assert.equal(descriptor.task, expectedTask);
     assert.ok(instruction.includes(JSON.stringify(expectedTask)));
   });

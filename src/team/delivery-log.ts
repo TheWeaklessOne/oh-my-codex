@@ -1,5 +1,6 @@
 import { appendFile, mkdir } from 'fs/promises';
 import { join } from 'path';
+import { omxLogsDir } from '../utils/paths.js';
 
 export type TeamDeliveryEventName =
   | 'mailbox_created'
@@ -69,5 +70,5 @@ export async function appendTeamDeliveryLog(logsDir: string, event: TeamDelivery
 }
 
 export async function appendTeamDeliveryLogForCwd(cwd: string, event: TeamDeliveryLogEvent): Promise<void> {
-  await appendTeamDeliveryLog(join(cwd, '.omx', 'logs'), event);
+  await appendTeamDeliveryLog(omxLogsDir(cwd), event);
 }

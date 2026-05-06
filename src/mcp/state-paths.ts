@@ -8,6 +8,8 @@ export const STATE_MODE_SEGMENT_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const STATE_FILE_SUFFIX = '-state.json';
 const STATE_FILE_NAME_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
 const WORKDIR_ALLOWLIST_ENV = 'OMX_MCP_WORKDIR_ROOTS';
+const OMX_ROOT_ENV = 'OMX_ROOT';
+const OMX_STATE_ROOT_ENV = 'OMX_STATE_ROOT';
 
 export type StateFileScope = 'root' | 'session';
 
@@ -160,11 +162,20 @@ function enforceWorkingDirectoryPolicy(resolvedWorkingDirectory: string): void {
 }
 
 export function getBaseStateDir(workingDirectory?: string): string {
-  if ((workingDirectory == null || workingDirectory === '') && typeof process.env.OMX_TEAM_STATE_ROOT === 'string' && process.env.OMX_TEAM_STATE_ROOT.trim() !== '') {
+  const teamStateRootOverride = process.env.OMX_TEAM_STATE_ROOT?.trim();
+  if (typeof teamStateRootOverride === 'string' && teamStateRootOverride !== '') {
     try {
-      return resolveWorkingDirectoryForState(process.env.OMX_TEAM_STATE_ROOT.trim());
+      return resolveWorkingDirectoryForState(teamStateRootOverride);
     } catch {}
   }
+
+  const omxRootOverride = process.env[OMX_ROOT_ENV]?.trim() || process.env[OMX_STATE_ROOT_ENV]?.trim();
+  if (typeof omxRootOverride === 'string' && omxRootOverride !== '') {
+    try {
+      return join(resolveWorkingDirectoryForState(omxRootOverride), '.omx', 'state');
+    } catch {}
+  }
+
   return join(resolveWorkingDirectoryForState(workingDirectory), '.omx', 'state');
 }
 
@@ -244,6 +255,11 @@ export async function resolveStateScope(
  * - explicit session_id => session path only
  * - implicit current session => session path first, root as compatibility fallback
  * - no session => root path only
+ *
+ * This is a compatibility read surface. Do not use it for active-mode
+ * decisions that drive Stop hooks or runtime continuation; use
+ * getAuthoritativeActiveStateDirs instead so stale root state cannot
+ * reactivate an explicitly session-scoped turn.
  */
 export async function getReadScopedStateDirs(
   workingDirectory?: string,
@@ -256,6 +272,34 @@ export async function getReadScopedStateDirs(
     return [scope.stateDir, getBaseStateDir(workingDirectory)];
   }
   return [scope.stateDir, getBaseStateDir(workingDirectory)];
+}
+
+/**
+ * Active-decision scope precedence:
+ * - explicit/current session => that session path only, even if it is missing
+ * - no session => root path only
+ *
+ * Stop hooks, list-active, and other continuation gates should use this path
+ * instead of compatibility reads. A missing session directory means no active
+ * state for that session; root fallback remains available only to explicit
+ * read/status compatibility surfaces.
+ */
+export async function getAuthoritativeActiveStateDirs(
+  workingDirectory?: string,
+  explicitSessionId?: string,
+): Promise<string[]> {
+  const scope = await resolveStateScope(workingDirectory, explicitSessionId);
+  return [scope.stateDir];
+}
+
+export async function getAuthoritativeActiveStatePaths(
+  mode: string,
+  workingDirectory?: string,
+  explicitSessionId?: string,
+): Promise<string[]> {
+  const dirs = await getAuthoritativeActiveStateDirs(workingDirectory, explicitSessionId);
+  const fileName = getStateFilename(mode);
+  return dirs.map((dir) => join(dir, fileName));
 }
 
 export async function getReadScopedStatePaths(

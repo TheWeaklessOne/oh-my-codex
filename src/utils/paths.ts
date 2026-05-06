@@ -18,6 +18,23 @@ export function codexHome(): string {
 export const OMX_ENTRY_PATH_ENV = "OMX_ENTRY_PATH";
 export const OMX_STARTUP_CWD_ENV = "OMX_STARTUP_CWD";
 
+function resolveOmxRootCandidate(raw?: string): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  return isAbsolute(trimmed) ? trimmed : resolve(trimmed);
+}
+
+/** Optional override root for OMX runtime files. */
+export function omxRoot(projectRoot?: string): string {
+  const override =
+    resolveOmxRootCandidate(process.env.OMX_ROOT)
+    ?? resolveOmxRootCandidate(process.env.OMX_STATE_ROOT);
+  if (override) return join(override, ".omx");
+  return join(projectRoot || process.cwd(), ".omx");
+}
+
+
 function resolveLauncherPath(rawPath: string, baseCwd: string): string {
   const absolutePath = isAbsolute(rawPath) ? rawPath : resolve(baseCwd, rawPath);
   if (!existsSync(absolutePath)) return absolutePath;
@@ -285,37 +302,37 @@ async function hashSkillDirectory(
 
 /** oh-my-codex state directory (.omx/state/) */
 export function omxStateDir(projectRoot?: string): string {
-  return join(projectRoot || process.cwd(), ".omx", "state");
+  return join(omxRoot(projectRoot), "state");
 }
 
 /** oh-my-codex project memory file (.omx/project-memory.json) */
 export function omxProjectMemoryPath(projectRoot?: string): string {
-  return join(projectRoot || process.cwd(), ".omx", "project-memory.json");
+  return join(omxRoot(projectRoot), "project-memory.json");
 }
 
 /** oh-my-codex notepad file (.omx/notepad.md) */
 export function omxNotepadPath(projectRoot?: string): string {
-  return join(projectRoot || process.cwd(), ".omx", "notepad.md");
+  return join(omxRoot(projectRoot), "notepad.md");
 }
 
 /** oh-my-codex wiki directory (.omx/wiki/) */
 export function omxWikiDir(projectRoot?: string): string {
-  return join(projectRoot || process.cwd(), ".omx", "wiki");
+  return join(omxRoot(projectRoot), "wiki");
 }
 
 /** oh-my-codex plans directory (.omx/plans/) */
 export function omxPlansDir(projectRoot?: string): string {
-  return join(projectRoot || process.cwd(), ".omx", "plans");
+  return join(omxRoot(projectRoot), "plans");
 }
 
 /** oh-my-codex adapters directory (.omx/adapters/) */
 export function omxAdaptersDir(projectRoot?: string): string {
-  return join(projectRoot || process.cwd(), ".omx", "adapters");
+  return join(omxRoot(projectRoot), "adapters");
 }
 
 /** oh-my-codex logs directory (.omx/logs/) */
 export function omxLogsDir(projectRoot?: string): string {
-  return join(projectRoot || process.cwd(), ".omx", "logs");
+  return join(omxRoot(projectRoot), "logs");
 }
 
 /** User-scope install/update stamp path ($CODEX_HOME/.omx/install-state.json) */

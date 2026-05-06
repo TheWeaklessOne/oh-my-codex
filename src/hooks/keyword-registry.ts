@@ -18,6 +18,8 @@ export const KEYWORD_TRIGGER_DEFINITIONS: readonly KeywordTriggerDefinition[] = 
   { keyword: '$ultrawork', skill: 'ultrawork', priority: 10, guidance: 'Activate ultrawork parallel execution mode' },
   { keyword: 'ulw', skill: 'ultrawork', priority: 10, guidance: 'Activate ultrawork parallel execution mode' },
   { keyword: 'parallel', skill: 'ultrawork', priority: 10, guidance: 'Activate ultrawork parallel execution mode' },
+  { keyword: '$ultragoal', skill: 'ultragoal', priority: 10, guidance: 'Activate durable ultragoal planning/execution over Codex goal mode artifacts' },
+  { keyword: 'ultragoal', skill: 'ultragoal', priority: 10, guidance: 'Activate durable ultragoal planning/execution over Codex goal mode artifacts' },
   { keyword: '$ultraqa', skill: 'ultraqa', priority: 8, guidance: 'Activate UltraQA cycling workflow' },
   { keyword: '$analyze', skill: 'analyze', priority: 7, guidance: 'Activate deep analysis workflow' },
   { keyword: 'investigate', skill: 'analyze', priority: 7, guidance: 'Activate deep analysis workflow' },
@@ -41,21 +43,11 @@ export const KEYWORD_TRIGGER_DEFINITIONS: readonly KeywordTriggerDefinition[] = 
   { keyword: '$autoresearch', skill: 'autoresearch', priority: 10, guidance: 'Activate autoresearch validator-gated research loop' },
 
   { keyword: '$team', skill: 'team', priority: 8, guidance: 'Activate coordinated team mode' },
-  { keyword: 'swarm', skill: 'team', priority: 8, guidance: 'Activate coordinated team mode (swarm is a compatibility alias for team)' },
   { keyword: 'coordinated team', skill: 'team', priority: 8, guidance: 'Activate coordinated team mode' },
-  { keyword: 'coordinated swarm', skill: 'team', priority: 8, guidance: 'Activate coordinated team mode (swarm is a compatibility alias for team)' },
 
   { keyword: '$cancel', skill: 'cancel', priority: 5, guidance: 'Cancel active execution modes' },
   { keyword: 'stop', skill: 'cancel', priority: 5, guidance: 'Cancel active execution modes' },
   { keyword: 'abort', skill: 'cancel', priority: 5, guidance: 'Cancel active execution modes' },
-
-  { keyword: '$tdd', skill: 'tdd', priority: 6, guidance: 'Activate test-driven workflow' },
-  { keyword: 'tdd', skill: 'tdd', priority: 6, guidance: 'Activate test-driven workflow' },
-  { keyword: 'test first', skill: 'tdd', priority: 6, guidance: 'Activate test-driven workflow' },
-
-  { keyword: '$build-fix', skill: 'build-fix', priority: 6, guidance: 'Activate build-fix workflow' },
-  { keyword: 'fix build', skill: 'build-fix', priority: 6, guidance: 'Activate build-fix workflow' },
-  { keyword: 'type errors', skill: 'build-fix', priority: 6, guidance: 'Activate build-fix workflow' },
 
   { keyword: '$wiki', skill: 'wiki', priority: 5, guidance: 'Activate the project wiki skill' },
   { keyword: 'wiki query', skill: 'wiki', priority: 5, guidance: 'Activate the project wiki skill for search' },
@@ -65,8 +57,6 @@ export const KEYWORD_TRIGGER_DEFINITIONS: readonly KeywordTriggerDefinition[] = 
   { keyword: 'code review', skill: 'code-review', priority: 6, guidance: 'Activate code-review workflow' },
   { keyword: '$code-review', skill: 'code-review', priority: 6, guidance: 'Activate code-review workflow' },
   { keyword: 'review code', skill: 'code-review', priority: 6, guidance: 'Activate code-review workflow' },
-  { keyword: '$security-review', skill: 'security-review', priority: 6, guidance: 'Activate security-review workflow' },
-  { keyword: 'security review', skill: 'security-review', priority: 6, guidance: 'Activate security-review workflow' },
 ] as const;
 
 export function compareKeywordMatches(a: { priority: number; keyword: string }, b: { priority: number; keyword: string }): number {
