@@ -13,6 +13,7 @@ import {
   withTelegramTopicProjectLock,
   type TelegramTopicRegistryRecord,
 } from './telegram-topic-registry.js';
+import { requestJson } from './http-client.js';
 import type {
   FullNotificationPayload,
   TelegramNotificationConfig,
@@ -202,6 +203,53 @@ export async function performTelegramBotApiRequest<T>(
   const httpsRequestImpl = deps.httpsRequestImpl ?? httpsRequest;
   const timeoutMs = deps.timeoutMs ?? TELEGRAM_REQUEST_TIMEOUT_MS;
   const requestBody = JSON.stringify(body);
+
+  if (!deps.httpsRequestImpl) {
+    const response = await requestJson(
+      `https://${TELEGRAM_API_HOST}/bot${botToken}/${methodName}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': String(Buffer.byteLength(requestBody)),
+        },
+        body: requestBody,
+        timeoutMs,
+      },
+    );
+    const responseBody = await response.text();
+    const envelope = extractEnvelope<T>(responseBody);
+    const statusCode = response.status;
+
+    if (response.ok) {
+      if (envelope?.ok === false) {
+        throw toTelegramApiError(
+          methodName,
+          envelope.description || `Telegram Bot API ${methodName} failed`,
+          {
+            statusCode,
+            errorCode: envelope.error_code,
+            description: envelope.description,
+            responseBody,
+          },
+        );
+      }
+
+      return envelope?.result;
+    }
+
+    const description = envelope?.description || responseBody.trim() || `HTTP ${statusCode || 'unknown'}`;
+    throw toTelegramApiError(
+      methodName,
+      description,
+      {
+        statusCode,
+        errorCode: envelope?.error_code,
+        description: envelope?.description,
+        responseBody,
+      },
+    );
+  }
 
   return await new Promise<T | undefined>((resolve, reject) => {
     const req = httpsRequestImpl(

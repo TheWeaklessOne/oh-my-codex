@@ -1,15 +1,19 @@
 import { execFileSync } from "child_process";
 import { closeSync, existsSync, openSync, readFileSync, readSync } from "fs";
 import { mkdir, readFile, readdir, writeFile } from "fs/promises";
-import { join, relative, resolve } from "path";
+import { extname, join, relative, resolve } from "path";
 import { pathToFileURL } from "url";
-import { readModeState, readModeStateForSession, updateModeState } from "../modes/base.js";
+import { readModeState, readModeStateForActiveDecision, readModeStateForSession, updateModeState } from "../modes/base.js";
 import {
+  extractSessionIdFromInitializedStatePath,
   listActiveSkills,
   readVisibleSkillActiveState,
 } from "../state/skill-active.js";
 import {
+  readSubagentTrackingState,
   readSubagentSessionSummary,
+  summarizeSubagentSession,
+  type SubagentSessionSummary,
 } from "../subagents/tracker.js";
 import { resolveCanonicalTeamStateRoot, resolveWorkerNotifyTeamStateRootPath } from "../team/state-root.js";
 import {
@@ -18,6 +22,7 @@ import {
   readSessionState,
   readUsableSessionState,
   reconcileNativeSessionStart,
+  type SessionState,
 } from "../hooks/session.js";
 import {
   appendTeamEvent,
@@ -43,11 +48,16 @@ import {
   resolveEffectiveAutoNudgeResponse,
 } from "./notify-hook/auto-nudge.js";
 import {
+  SLOPPY_FALLBACK_GROUNDING_PATTERNS,
+  SLOPPY_FALLBACK_IMPLEMENTATION_CONTEXT_PATTERNS,
+  SLOPPY_FALLBACK_PHRASE_PATTERNS,
   buildNativePostToolUseOutput,
   buildNativePreToolUseOutput,
   detectMcpTransportFailure,
+  hasAnyPattern,
 } from "./codex-native-pre-post.js";
 import { handleTeamWorkerPostToolUseSuccess } from "./notify-hook/team-worker-posttooluse.js";
+import { maybeNudgeLeaderForAllowedWorkerStop } from "./notify-hook/team-worker-stop.js";
 import {
   resolveCodexExecutionSurface,
   type CodexLauncherKind,
@@ -57,10 +67,10 @@ import {
   buildNativeHookEvent,
 } from "../hooks/extensibility/events.js";
 import type { HookEventEnvelope } from "../hooks/extensibility/types.js";
-import { dispatchHookEvent } from "../hooks/extensibility/dispatcher.js";
+import { dispatchHookEventRuntime } from "../hooks/extensibility/runtime.js";
 import { reconcileHudForPromptSubmit } from "../hud/reconcile.js";
 import { onSessionStart as buildWikiSessionStartContext } from "../wiki/lifecycle.js";
-import { readAutoresearchCompletionStatus, readAutoresearchModeState } from "../autoresearch/skill-validation.js";
+import { readAutoresearchCompletionStatus, readAutoresearchModeStateForActiveDecision } from "../autoresearch/skill-validation.js";
 import { readRunState } from "../runtime/run-state.js";
 import { getRunContinuationSnapshot, shouldContinueRun } from "../runtime/run-loop.js";
 import {
@@ -113,8 +123,8 @@ export interface NativeHookDispatchResult {
 
 const TERMINAL_MODE_PHASES = new Set(["complete", "completed", "failed", "cancelled"]);
 const SKILL_STOP_BLOCKERS = new Set(["ralplan"]);
-const TEAM_TERMINAL_TASK_STATUSES = new Set(["completed", "failed"]);
-const TEAM_WORKER_STOP_ACTIVE_STATES = new Set(["working", "blocked"]);
+const TEAM_STOP_BLOCKING_TASK_STATUSES = new Set(["pending", "in_progress", "blocked"]);
+const TEAM_WORKER_TERMINAL_RUN_STATES = new Set(["done", "complete", "completed", "failed", "stopped", "cancelled"]);
 const NATIVE_STOP_STATE_FILE = "native-stop-state.json";
 const STABLE_FINAL_RECOMMENDATION_PATTERNS = [
   /^\s*(?:launch|release|ship)-?ready\s*:\s*(?:yes|no)\b[^\n\r]*/im,
@@ -242,6 +252,65 @@ async function recordNativeSubagentSessionStart(
     ...(transcriptPath ? { transcript_path: transcriptPath } : {}),
     timestamp: new Date().toISOString(),
   }).catch(() => {});
+}
+
+async function nativeSubagentSessionStartBelongsToCanonicalSession(
+  cwd: string,
+  canonicalSessionId: string,
+  currentSessionState: SessionState | null,
+  metadata: NativeSubagentSessionStartMetadata,
+): Promise<boolean> {
+  const parentThreadId = metadata.parentThreadId.trim();
+  if (!parentThreadId) return false;
+
+  const currentNativeSessionId = safeString(currentSessionState?.native_session_id).trim();
+  if (currentNativeSessionId && currentNativeSessionId === parentThreadId) {
+    return true;
+  }
+
+  const summary = await readSubagentSessionSummaryCompat(cwd, canonicalSessionId).catch(() => null);
+  if (!summary) return false;
+  if (summary.leaderThreadId === parentThreadId) return true;
+  return summary.allThreadIds.includes(parentThreadId);
+}
+
+async function readSubagentSessionSummaryCompat(
+  cwd: string,
+  canonicalSessionId: string,
+): Promise<SubagentSessionSummary | null> {
+  const summary = await readSubagentSessionSummary(cwd, canonicalSessionId).catch(() => null);
+  if (summary && summary.allThreadIds.length > 0) return summary;
+
+  try {
+    const legacyState = JSON.parse(readFileSync(join(cwd, ".omx", "state", "subagent-tracking.json"), "utf-8"));
+    const legacySummary = summarizeSubagentSession(legacyState, canonicalSessionId);
+    if (legacySummary) return legacySummary;
+  } catch {
+    // Legacy projection may not exist; fall through to the registry projection.
+  }
+
+  const legacyState = await readSubagentTrackingState(cwd).catch(() => null);
+  return legacyState ? summarizeSubagentSession(legacyState, canonicalSessionId) : summary;
+}
+
+async function isNativeSubagentHook(
+  cwd: string,
+  canonicalSessionId: string,
+  nativeSessionId: string,
+  threadId: string,
+): Promise<boolean> {
+  const sessionId = canonicalSessionId.trim();
+  if (!sessionId) return false;
+
+  const summary = await readSubagentSessionSummaryCompat(cwd, sessionId).catch(() => null);
+  if (!summary) return false;
+
+  const candidateIds = [nativeSessionId, threadId]
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (candidateIds.length === 0) return false;
+
+  return candidateIds.some((id) => summary.allSubagentThreadIds.includes(id));
 }
 
 async function recordIgnoredNativeSubagentSessionStart(
@@ -418,7 +487,7 @@ async function readActiveAutoresearchState(
 ): Promise<Record<string, unknown> | null> {
   const normalizedSessionId = sessionId?.trim() || undefined;
   if (!normalizedSessionId) return null;
-  const state = await readAutoresearchModeState(cwd, normalizedSessionId);
+  const state = await readAutoresearchModeStateForActiveDecision(cwd, normalizedSessionId);
   if (state?.active !== true) return null;
   if (!isNonTerminalPhase(state.current_phase ?? state.currentPhase ?? 'executing')) return null;
   return state;
@@ -512,6 +581,19 @@ async function isVisibleRalphActiveForSession(cwd: string, sessionId: string): P
   ));
 }
 
+async function hasConsistentRalphSkillActivation(cwd: string, sessionId: string): Promise<boolean> {
+  const canonicalState = await readVisibleSkillActiveState(cwd, sessionId);
+  if (!canonicalState) return true;
+
+  const initializedMode = safeString(canonicalState.initialized_mode).trim();
+  if (initializedMode && initializedMode !== "ralph") return true;
+
+  const initializedPathSessionId = extractSessionIdFromInitializedStatePath(canonicalState.initialized_state_path);
+  if (initializedPathSessionId && initializedPathSessionId !== sessionId) return false;
+
+  return true;
+}
+
 async function readActiveRalphState(
   stateDir: string,
   preferredSessionId?: string,
@@ -565,6 +647,7 @@ async function readActiveRalphState(
         currentNativeSessionId,
         tmuxPaneId: safeString(ownerContext?.tmuxPaneId).trim(),
       })
+      && await hasConsistentRalphSkillActivation(cwd, sessionId)
     ) {
       return { state: sessionScoped, path: sessionScopedPath };
     }
@@ -693,6 +776,192 @@ function tryReadGitValue(cwd: string, args: string[]): string | null {
   }
 }
 
+interface SloppyFallbackDiffFinding {
+  path: string;
+  line: string;
+  source: "staged" | "unstaged" | "untracked";
+}
+
+const SOURCE_DIFF_EXTENSIONS = new Set([
+  ".c",
+  ".cc",
+  ".cjs",
+  ".cpp",
+  ".cs",
+  ".cts",
+  ".go",
+  ".h",
+  ".hpp",
+  ".java",
+  ".js",
+  ".jsx",
+  ".kt",
+  ".mjs",
+  ".mts",
+  ".php",
+  ".py",
+  ".rb",
+  ".rs",
+  ".sh",
+  ".swift",
+  ".ts",
+  ".tsx",
+]);
+
+function gitOutput(cwd: string, args: string[]): string {
+  try {
+    return execFileSync("git", args, {
+      cwd,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+  } catch {
+    return "";
+  }
+}
+
+function normalizeGitPath(path: string): string {
+  return path.replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
+function isDiffAuditableSourcePath(path: string): boolean {
+  const normalized = normalizeGitPath(path).toLowerCase();
+  if (!normalized || normalized.startsWith(".git/") || normalized.startsWith(".omx/")) return false;
+  if (/(^|\/)(?:docs?|documentation|changelog|changeset|\.github)(?:\/|$)/i.test(normalized)) return false;
+  if (/(^|\/)(?:__tests__|__test__|test|tests|spec|specs|fixtures?|mocks?)(?:\/|$)/i.test(normalized)) return false;
+  if (/(?:^|\/)[^\/]+\.(?:test|spec)\.[^.\/]+$/i.test(normalized)) return false;
+  if (/(?:^|\/)(?:readme|changelog|changes|license|notice)(?:\.[^\/]*)?$/i.test(normalized)) return false;
+  if (/\.(?:md|mdx|markdown|txt|rst|adoc|ya?ml|json|lock)$/i.test(normalized)) return false;
+  return SOURCE_DIFF_EXTENSIONS.has(extname(normalized));
+}
+
+function isDiffHeaderLine(line: string): boolean {
+  return line.startsWith("+++") || line.startsWith("---") || line.startsWith("@@") || line.startsWith("diff --git ");
+}
+
+function isSuspiciousSloppyFallbackAddedLine(line: string, nearbyContext: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  if (!hasAnyPattern(trimmed, SLOPPY_FALLBACK_PHRASE_PATTERNS)) return false;
+  if (!hasAnyPattern(trimmed, SLOPPY_FALLBACK_IMPLEMENTATION_CONTEXT_PATTERNS)) return false;
+  if (hasAnyPattern(nearbyContext, SLOPPY_FALLBACK_GROUNDING_PATTERNS)) return false;
+  if (/compatib(?:le|ility)|fail-?safe|tested|regression|coverage|because|issue|PR\s*#?\d|#\d/i.test(nearbyContext)) return false;
+  return true;
+}
+
+interface SloppyFallbackCandidateLine {
+  text: string;
+  added: boolean;
+}
+
+function collectFindingsFromCandidateLines(
+  path: string,
+  lines: SloppyFallbackCandidateLine[],
+  source: SloppyFallbackDiffFinding["source"],
+): SloppyFallbackDiffFinding[] {
+  if (!path || !isDiffAuditableSourcePath(path)) return [];
+  const findings: SloppyFallbackDiffFinding[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const candidate = lines[index];
+    if (!candidate?.added) continue;
+    const nearbyContext = lines
+      .slice(Math.max(0, index - 2), Math.min(lines.length, index + 3))
+      .map((line) => line.text)
+      .join("\n");
+    if (isSuspiciousSloppyFallbackAddedLine(candidate.text, nearbyContext)) {
+      findings.push({ path, line: candidate.text.trim(), source });
+    }
+  }
+  return findings;
+}
+
+function collectSloppyFallbackFindingsFromPatch(
+  patch: string,
+  source: SloppyFallbackDiffFinding["source"],
+): SloppyFallbackDiffFinding[] {
+  const findings: SloppyFallbackDiffFinding[] = [];
+  let currentPath = "";
+  let hunkLines: SloppyFallbackCandidateLine[] = [];
+
+  const flushHunk = () => {
+    findings.push(...collectFindingsFromCandidateLines(currentPath, hunkLines, source));
+    hunkLines = [];
+  };
+
+  for (const rawLine of patch.split(/\r?\n/)) {
+    const fileMatch = rawLine.match(/^diff --git a\/(.*?) b\/(.*)$/);
+    if (fileMatch) {
+      flushHunk();
+      currentPath = normalizeGitPath(fileMatch[2] || fileMatch[1] || "");
+      continue;
+    }
+    const renameMatch = rawLine.match(/^\+\+\+ b\/(.*)$/);
+    if (renameMatch) {
+      currentPath = normalizeGitPath(renameMatch[1] || currentPath);
+      continue;
+    }
+    if (rawLine.startsWith("@@")) {
+      flushHunk();
+      continue;
+    }
+    if (!currentPath || !isDiffAuditableSourcePath(currentPath) || isDiffHeaderLine(rawLine)) continue;
+    if (rawLine.startsWith("+")) {
+      hunkLines.push({ text: rawLine.slice(1), added: true });
+    } else if (rawLine.startsWith(" ")) {
+      hunkLines.push({ text: rawLine.slice(1), added: false });
+    }
+  }
+  flushHunk();
+  return findings;
+}
+
+function collectSloppyFallbackFindingsFromUntracked(cwd: string): SloppyFallbackDiffFinding[] {
+  const output = gitOutput(cwd, ["ls-files", "--others", "--exclude-standard", "-z"]);
+  if (!output) return [];
+  const findings: SloppyFallbackDiffFinding[] = [];
+  for (const rawPath of output.split("\0")) {
+    const path = normalizeGitPath(rawPath.trim());
+    if (!path || !isDiffAuditableSourcePath(path)) continue;
+    let content = "";
+    try {
+      content = readFileSync(join(cwd, path), "utf-8");
+    } catch {
+      continue;
+    }
+    findings.push(...collectFindingsFromCandidateLines(path, content.split(/\r?\n/).map((text) => ({ text, added: true })), "untracked"));
+  }
+  return findings;
+}
+
+function findSloppyFallbackDiffFindings(cwd: string): SloppyFallbackDiffFinding[] {
+  const layout = findGitLayout(cwd);
+  if (!layout) return [];
+  const auditRoot = layout.worktreeRoot;
+  return [
+    ...collectSloppyFallbackFindingsFromPatch(gitOutput(auditRoot, ["diff", "--cached", "--no-ext-diff", "--unified=3"]), "staged"),
+    ...collectSloppyFallbackFindingsFromPatch(gitOutput(auditRoot, ["diff", "--no-ext-diff", "--unified=3"]), "unstaged"),
+    ...collectSloppyFallbackFindingsFromUntracked(auditRoot),
+  ];
+}
+
+function buildSloppyFallbackDiffStopOutput(findings: SloppyFallbackDiffFinding[]): Record<string, unknown> | null {
+  if (findings.length === 0) return null;
+  const preview = findings
+    .slice(0, 3)
+    .map((finding) => `${finding.path} (${finding.source}): ${finding.line}`)
+    .join("; ");
+  const systemMessage =
+    `Sloppy fallback/workaround diff audit detected ungrounded fallback code in added source lines: ${preview}. `
+    + "Continue by replacing the bypass/workaround with a grounded design, or add explicit compatibility/fail-safe/tested/issue rationale near the code if the fallback is intentional.";
+  return {
+    decision: "block",
+    reason: systemMessage,
+    stopReason: "sloppy_fallback_diff_audit",
+    systemMessage,
+  };
+}
 
 function localExcludeAlreadyIgnoresOmx(cwd: string): boolean {
   const layout = findGitLayout(cwd);
@@ -1085,6 +1354,9 @@ function buildAdditionalContextMessage(
   const ultraworkPromptActivationNote = skillState?.initialized_mode === "ultrawork"
     ? "Ultrawork protocol: ground the task before editing, define pass/fail acceptance criteria, keep shared-file work local, and use direct-tool plus background evidence lanes only for truly independent work. Direct ultrawork provides lightweight verification only; Ralph owns persistence and the full verified-completion promise."
     : null;
+  const ultragoalPromptActivationNote = match.skill === "ultragoal"
+    ? "Ultragoal protocol: use `omx ultragoal create-goals` / `complete-goals` / `checkpoint` for `.omx/ultragoal` artifacts, then use Codex goal model tools only from the active agent handoff (`get_goal`, `create_goal`, `update_goal`) and never overwrite a different active Codex goal."
+    : null;
   const combinedTransitionMessage = (() => {
     if (!skillState?.transition_message) return null;
     if (matches.length <= 1 || activeSkills.length <= 1) return skillState.transition_message;
@@ -1111,6 +1383,7 @@ function buildAdditionalContextMessage(
         ? `planning preserved over simultaneous execution follow-up; deferred skills: ${deferredSkills.join(", ")}.`
         : null,
       promptPriorityMessage,
+      ultragoalPromptActivationNote,
       skillState.initialized_mode && skillState.initialized_state_path
         ? `skill: ${skillState.initialized_mode} activated and initial state initialized at ${skillState.initialized_state_path}; write subsequent updates via omx_state MCP.`
         : null,
@@ -1136,6 +1409,7 @@ function buildAdditionalContextMessage(
       initializedStateMessage,
       deepInterviewPromptActivationNote,
       ultraworkPromptActivationNote,
+      ultragoalPromptActivationNote,
       buildTeamRuntimeInstruction(cwd, payload),
       buildTeamHelpInstruction(cwd, payload),
       "Follow AGENTS.md routing and preserve workflow transition and planning-safety rules.",
@@ -1153,12 +1427,13 @@ function buildAdditionalContextMessage(
       `skill: ${skillState.initialized_mode} activated and initial state initialized at ${skillState.initialized_state_path}; write subsequent updates via omx_state MCP.`,
       deepInterviewPromptActivationNote,
       ultraworkPromptActivationNote,
+      ultragoalPromptActivationNote,
       ralphPromptActivationNote,
       "Follow AGENTS.md routing and preserve workflow transition and planning-safety rules.",
     ].join(" ");
   }
 
-  return [detectedKeywordMessage, promptPriorityMessage, "Follow AGENTS.md routing and preserve workflow transition and planning-safety rules."].filter(Boolean).join(" ");
+  return [detectedKeywordMessage, promptPriorityMessage, ultragoalPromptActivationNote, "Follow AGENTS.md routing and preserve workflow transition and planning-safety rules."].filter(Boolean).join(" ");
 }
 
 function parseTeamWorkerEnv(rawValue: string): { teamName: string; workerName: string } | null {
@@ -1174,26 +1449,79 @@ async function resolveTeamStateDirForWorkerContext(
   cwd: string,
   workerContext: { teamName: string; workerName: string },
 ): Promise<string | null> {
-  return resolveWorkerNotifyTeamStateRootPath(cwd, workerContext, process.env);
+  const resolved = await resolveWorkerNotifyTeamStateRootPath(cwd, workerContext, process.env).catch(() => null);
+  if (resolved) return resolved;
+  const explicit = safeString(process.env.OMX_TEAM_STATE_ROOT).trim();
+  if (explicit) {
+    const candidate = resolve(cwd, explicit);
+    const workerRoot = join(candidate, "team", workerContext.teamName, "workers", workerContext.workerName);
+    if (existsSync(workerRoot)) return candidate;
+    return candidate;
+  }
+  return null;
 }
 
 
-async function buildTeamWorkerStopOutput(
+type TeamWorkerStopDecision =
+  | {
+      kind: "blocked";
+      stateDir: string;
+      workerContext: { teamName: string; workerName: string };
+      output: Record<string, unknown>;
+      allowRepeatDuringStopHook: boolean;
+    }
+  | {
+      kind: "allowed";
+      stateDir: string;
+      workerContext: { teamName: string; workerName: string };
+    }
+  | {
+      kind: "unresolved";
+      reason: string;
+    };
+
+async function resolveTeamWorkerStopDecision(
   cwd: string,
-): Promise<Record<string, unknown> | null> {
-  const workerContext = parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER));
-  if (!workerContext) return null;
+): Promise<TeamWorkerStopDecision> {
+  const workerContext =
+    parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_INTERNAL_WORKER))
+    || parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_WORKER));
+  if (!workerContext) return { kind: "unresolved", reason: "missing_worker_context" };
+
+  const blockWorkerStop = (
+    reasonCode: string,
+    detail: string,
+    stateDirForDecision = join(cwd, ".omx", "state"),
+  ): TeamWorkerStopDecision => ({
+    kind: "blocked",
+    stateDir: stateDirForDecision,
+    workerContext,
+    allowRepeatDuringStopHook: false,
+    output: {
+      decision: "block",
+      reason:
+        `OMX team worker ${workerContext.workerName} Stop cannot be allowed for ${reasonCode}: ${detail}. ` +
+        "Continue the assigned task, repair worker state, or report a concrete blocker before stopping.",
+      stopReason: `team_worker_${workerContext.workerName}_${reasonCode}`,
+      systemMessage:
+        `OMX team worker ${workerContext.workerName} Stop lacks completed task evidence (${reasonCode}).`,
+    },
+  });
 
   const stateDir = await resolveTeamStateDirForWorkerContext(cwd, workerContext);
-  if (!stateDir) return null;
+  if (!stateDir) {
+    return blockWorkerStop("missing_state_dir", "team state root could not be resolved");
+  }
   const workerRoot = join(stateDir, "team", workerContext.teamName, "workers", workerContext.workerName);
   const [identity, status] = await Promise.all([
     readJsonIfExists(join(workerRoot, "identity.json")),
     readJsonIfExists(join(workerRoot, "status.json")),
   ]);
-
-  const workerState = safeString(status?.state).trim().toLowerCase();
-  if (!TEAM_WORKER_STOP_ACTIVE_STATES.has(workerState)) return null;
+  const workerRunState = safeString(status?.state).trim().toLowerCase();
+  const workerRunStateIsTerminal = TEAM_WORKER_TERMINAL_RUN_STATES.has(workerRunState);
+  if (!identity && !status && !existsSync(workerRoot)) {
+    return blockWorkerStop("missing_worker_state", "worker identity/status state is missing", stateDir);
+  }
 
   const candidateTaskIds = new Set<string>();
   const currentTaskId = safeString(status?.current_task_id).trim();
@@ -1204,27 +1532,66 @@ async function buildTeamWorkerStopOutput(
     if (normalized) candidateTaskIds.add(normalized);
   }
 
+  const tasksDir = join(stateDir, "team", workerContext.teamName, "tasks");
+  if (existsSync(tasksDir)) {
+    const taskFiles = await readdir(tasksDir).catch(() => []);
+    for (const entry of taskFiles) {
+      if (!/^task-\d+\.json$/.test(entry)) continue;
+      const task = await readJsonIfExists(join(tasksDir, entry));
+      const taskOwner = safeString(task?.owner).trim();
+      const taskClaimOwner = safeString(safeObject(task?.claim).owner).trim();
+      if (taskOwner !== workerContext.workerName && taskClaimOwner !== workerContext.workerName) continue;
+      const idFromFile = /^task-(\d+)\.json$/.exec(entry)?.[1] ?? "";
+      const taskId = safeString(task?.id).trim() || idFromFile;
+      if (taskId) candidateTaskIds.add(taskId);
+    }
+  }
+
+  if (candidateTaskIds.size === 0) {
+    return blockWorkerStop("missing_task_assignment", "no current_task_id or assigned_tasks are recorded", stateDir);
+  }
+
+  let completedTaskCount = 0;
   for (const taskId of candidateTaskIds) {
     const task = await readJsonIfExists(
       join(stateDir, "team", workerContext.teamName, "tasks", `task-${taskId}.json`),
     );
     const statusValue = safeString(task?.status).trim().toLowerCase();
-    if (!statusValue || TEAM_TERMINAL_TASK_STATUSES.has(statusValue)) continue;
+    if (!statusValue) {
+      return blockWorkerStop(`missing_task_state_${taskId}`, `task ${taskId} has no readable status`, stateDir);
+    }
+    if (statusValue === "completed") {
+      completedTaskCount += 1;
+      continue;
+    }
+    if (!TEAM_STOP_BLOCKING_TASK_STATUSES.has(statusValue)) {
+      return blockWorkerStop(
+        `non_completed_task_${taskId}_${statusValue}`,
+        `task ${taskId} is ${statusValue}, not completed`,
+        stateDir,
+      );
+    }
     return {
-      decision: "block",
-      reason:
-        `OMX team worker ${workerContext.workerName} is still assigned non-terminal task ${taskId} (${statusValue}); continue the current assigned task or report a concrete blocker before stopping.`,
-      stopReason: `team_worker_${workerContext.workerName}_${taskId}_${statusValue}`,
-      systemMessage:
-        `OMX team worker ${workerContext.workerName} is still assigned task ${taskId} (${statusValue}).`,
+      kind: "blocked",
+      stateDir,
+      workerContext,
+      allowRepeatDuringStopHook: !workerRunStateIsTerminal,
+      output: {
+        decision: "block",
+        reason:
+          `OMX team worker ${workerContext.workerName} is still assigned non-terminal task ${taskId} (${statusValue}); continue the current assigned task or report a concrete blocker before stopping.`,
+        stopReason: `team_worker_${workerContext.workerName}_${taskId}_${statusValue}`,
+        systemMessage:
+          `OMX team worker ${workerContext.workerName} is still assigned task ${taskId} (${statusValue}).`,
+      },
     };
   }
 
-  return null;
-}
+  if (completedTaskCount === candidateTaskIds.size) {
+    return { kind: "allowed", stateDir, workerContext };
+  }
 
-function hasTeamWorkerContext(): boolean {
-  return parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_INTERNAL_WORKER || process.env.OMX_TEAM_WORKER)) !== null;
+  return blockWorkerStop("missing_completed_task_evidence", "no referenced worker task is completed", stateDir);
 }
 
 function isStopExempt(payload: CodexHookPayload): boolean {
@@ -1251,9 +1618,7 @@ async function buildModeBasedStopOutput(
   cwd: string,
   sessionId?: string,
 ): Promise<Record<string, unknown> | null> {
-  const state = sessionId
-    ? await readModeStateForSession(mode, sessionId, cwd)
-    : await readModeState(mode, cwd);
+  const state = await readModeStateForActiveDecision(mode, sessionId?.trim() || undefined, cwd);
   if (!state || !shouldContinueRun(state)) return null;
   const phase = formatPhase(state.current_phase);
   return {
@@ -1261,6 +1626,81 @@ async function buildModeBasedStopOutput(
     reason: `OMX ${mode} is still active (phase: ${phase}); continue the task and gather fresh verification evidence before stopping.`,
     stopReason: `${mode}_${phase}`,
     systemMessage: `OMX ${mode} is still active (phase: ${phase}).`,
+  };
+}
+
+function looksLikeGoalCompletionPrompt(text: string): boolean {
+  return /\b(?:complete|checkpoint|finish|close|mark)\b.{0,80}\b(?:goal|ultragoal|performance-goal|autoresearch-goal)\b/i.test(text)
+    || /\bupdate_goal\s*\(/i.test(text)
+    || /\bomx\s+(?:ultragoal|performance-goal|autoresearch-goal)\s+(?:checkpoint|complete)\b/i.test(text);
+}
+
+async function findActiveGoalWorkflowReconciliationRequirement(cwd: string): Promise<{ workflow: string; command: string } | null> {
+  const ultragoal = await readJsonIfExists(join(cwd, ".omx", "ultragoal", "goals.json"));
+  const ultragoals = Array.isArray(ultragoal?.goals) ? ultragoal.goals.map(safeObject) : [];
+  const activeUltragoal = ultragoals.find((goal) => safeString(goal.status) === "in_progress" || safeString(goal.id) === safeString(ultragoal?.activeGoalId));
+  if (activeUltragoal) {
+    return {
+      workflow: "ultragoal",
+      command: `omx ultragoal checkpoint --goal-id ${safeString(activeUltragoal.id) || "<goal-id>"} --status complete --codex-goal-json '<get_goal JSON or path>' --evidence '<evidence>'`,
+    };
+  }
+
+  const performanceRoot = join(cwd, ".omx", "goals", "performance");
+  for (const entry of await readdir(performanceRoot, { withFileTypes: true }).catch(() => [])) {
+    if (!entry.isDirectory()) continue;
+    const state = await readJsonIfExists(join(performanceRoot, entry.name, "state.json"));
+    const status = safeString(state?.status);
+    if (state?.workflow === "performance-goal" && status && status !== "complete") {
+      return {
+        workflow: "performance-goal",
+        command: `omx performance-goal complete --slug ${safeString(state.slug) || entry.name} --codex-goal-json '<get_goal JSON or path>' --evidence '<evidence>'`,
+      };
+    }
+  }
+
+  const autoresearchRoot = join(cwd, ".omx", "goals", "autoresearch");
+  for (const entry of await readdir(autoresearchRoot, { withFileTypes: true }).catch(() => [])) {
+    if (!entry.isDirectory()) continue;
+    const mission = await readJsonIfExists(join(autoresearchRoot, entry.name, "mission.json"));
+    const status = safeString(mission?.status);
+    if (mission?.workflow === "autoresearch-goal" && status && status !== "complete") {
+      return {
+        workflow: "autoresearch-goal",
+        command: `omx autoresearch-goal complete --slug ${safeString(mission.slug) || entry.name} --codex-goal-json '<get_goal JSON or path>'`,
+      };
+    }
+  }
+
+  return null;
+}
+
+async function buildGoalWorkflowReconciliationPromptWarning(cwd: string, prompt: string): Promise<string | null> {
+  if (!looksLikeGoalCompletionPrompt(prompt)) return null;
+  const requirement = await findActiveGoalWorkflowReconciliationRequirement(cwd);
+  if (!requirement) return null;
+  return [
+    `OMX ${requirement.workflow} goal workflow requires Codex goal snapshot reconciliation before completion.`,
+    "Call get_goal, pass the resulting JSON or a path with --codex-goal-json, and do not rely on hooks or shell commands to mutate Codex-owned goal state.",
+    `Required command shape: ${requirement.command}.`,
+  ].join(" ");
+}
+
+async function buildGoalWorkflowReconciliationStopOutput(
+  payload: CodexHookPayload,
+  cwd: string,
+): Promise<Record<string, unknown> | null> {
+  const lastAssistantMessage = safeString(payload.last_assistant_message ?? payload.lastAssistantMessage);
+  if (!looksLikeGoalCompletionPrompt(lastAssistantMessage)) return null;
+  const requirement = await findActiveGoalWorkflowReconciliationRequirement(cwd);
+  if (!requirement) return null;
+  const systemMessage =
+    `OMX ${requirement.workflow} requires get_goal snapshot reconciliation before completion; call get_goal and pass --codex-goal-json to ${requirement.command}. Hooks must not mutate Codex goal state.`;
+  return {
+    decision: "block",
+    reason: systemMessage,
+    stopReason: `${requirement.workflow}_codex_goal_snapshot_required`,
+    systemMessage,
   };
 }
 
@@ -1454,7 +1894,7 @@ async function readBlockingSkillForStop(
   sessionId: string,
   threadId: string,
   requiredSkill?: string,
-): Promise<{ skill: string; phase: string } | null> {
+): Promise<{ skill: string; phase: string; latestPlanPath?: string; planningComplete?: boolean; runOutcome?: string } | null> {
   const canonicalState = await readVisibleSkillActiveState(cwd, sessionId);
   const visibleEntries = canonicalState ? listActiveSkills(canonicalState) : [];
   const candidateSkills = requiredSkill
@@ -1484,7 +1924,13 @@ async function readBlockingSkillForStop(
     }
 
     if (!canonicalState) {
-      return { skill, phase };
+      return {
+        skill,
+        phase,
+        latestPlanPath: safeString(modeState.latest_plan_path ?? modeState.latestPlanPath).trim() || undefined,
+        planningComplete: modeState.planning_complete === true || modeState.planningComplete === true,
+        runOutcome: safeString(modeState.run_outcome ?? modeState.outcome).trim() || undefined,
+      };
     }
 
     const blocker = visibleEntries.find((entry) => (
@@ -1496,10 +1942,63 @@ async function readBlockingSkillForStop(
     return {
       skill,
       phase: formatPhase(modeState.current_phase ?? blocker.phase ?? canonicalState.phase, "planning"),
+      latestPlanPath: safeString(modeState.latest_plan_path ?? modeState.latestPlanPath).trim() || undefined,
+      planningComplete: modeState.planning_complete === true || modeState.planningComplete === true,
+      runOutcome: safeString(modeState.run_outcome ?? modeState.outcome).trim() || undefined,
     };
   }
 
   return null;
+}
+
+function buildRalplanContinuationStatus(
+  blocker: { phase: string; latestPlanPath?: string; planningComplete?: boolean; runOutcome?: string },
+  activeSubagentCount: number,
+): { reason: string; systemMessage: string; stopReasonSuffix: string } {
+  const phase = blocker.phase || "planning";
+  const artifact = blocker.latestPlanPath
+    ? ` Artifact: ${blocker.latestPlanPath}.`
+    : " Artifact: use the latest `.omx/plans/` ralplan artifact if present.";
+
+  if (activeSubagentCount > 0) {
+    return {
+      reason:
+        `Status: waiting — ralplan is waiting for ${activeSubagentCount} active native subagent thread(s) to finish (phase: ${phase}). Do not stop silently; wait for the subagent result, then continue from the current ralplan artifact and proceed to the next planning/review step.${artifact}`,
+      stopReasonSuffix: "waiting_subagent",
+      systemMessage:
+        `OMX ralplan status: waiting for ${activeSubagentCount} active native subagent thread(s) at phase ${phase}; after they finish, continue from the current ralplan artifact and state the next status explicitly.`,
+    };
+  }
+
+  const normalizedPhase = phase.toLowerCase();
+  const normalizedOutcome = (blocker.runOutcome ?? "").toLowerCase();
+  const waitingForInput =
+    normalizedOutcome === "blocked_on_user"
+    || normalizedPhase.includes("blocked")
+    || normalizedPhase.includes("input")
+    || normalizedPhase.includes("question");
+
+  if (waitingForInput) {
+    return {
+      reason:
+        `Status: waiting_for_input — ralplan is paused for required user/operator input (phase: ${phase}). Ask the missing question or present the review choice explicitly before stopping.${artifact}`,
+      stopReasonSuffix: "waiting_input",
+      systemMessage:
+        `OMX ralplan status: waiting for input at phase ${phase}; ask the required question or present the explicit review choice before stopping.`,
+    };
+  }
+
+  const completeHint = blocker.planningComplete
+    ? " The planning artifacts are present; if consensus is approved, emit the final complete/approved handoff instead of stopping here."
+    : "";
+
+  return {
+    reason:
+      `Status: continue_from_artifact — ralplan is still active (phase: ${phase}) and has not emitted a terminal complete/paused/waiting status. Continue from the current ralplan artifact, resolve any review ambiguity conservatively or ask the user if needed, and proceed to the next planning/review step before stopping.${artifact}${completeHint}`,
+    stopReasonSuffix: "continue_artifact",
+    systemMessage:
+      `OMX ralplan status: continue_from_artifact at phase ${phase}; continue from the current ralplan artifact and finish by stating whether ralplan is complete, paused for review, waiting for input, or still continuing.`,
+  };
 }
 
 async function readStopAutoNudgePhase(
@@ -1596,7 +2095,12 @@ function resolveRepeatableStopSessionId(
   payload: CodexHookPayload,
   canonicalSessionId?: string,
 ): string {
-  return canonicalSessionId?.trim() || readPayloadSessionId(payload) || "";
+  const inheritedSessionId = safeString(process.env.OMX_SESSION_ID || process.env.CODEX_SESSION_ID).trim();
+  return canonicalSessionId?.trim() || readPayloadSessionId(payload) || inheritedSessionId || "";
+}
+
+function isStateLevelStopSignatureKind(kind: string): boolean {
+  return kind === "team-worker-stop" || kind === "team-stop";
 }
 
 function buildRepeatableStopSignature(
@@ -1607,8 +2111,11 @@ function buildRepeatableStopSignature(
 ): string {
   const sessionId = resolveRepeatableStopSessionId(payload, canonicalSessionId) || "no-session";
   const threadId = readPayloadThreadId(payload) || "no-thread";
-  const turnId = readPayloadTurnId(payload);
   const normalizedDetail = normalizeAutoNudgeSignatureText(detail) || safeString(detail).trim().toLowerCase();
+  if (isStateLevelStopSignatureKind(kind)) {
+    return [kind, sessionId, threadId, normalizedDetail || "no-detail"].join("|");
+  }
+  const turnId = readPayloadTurnId(payload);
   const transcriptPath = safeString(payload.transcript_path ?? payload.transcriptPath).trim() || "no-transcript";
   const lastAssistantMessage = normalizeAutoNudgeSignatureText(
     payload.last_assistant_message ?? payload.lastAssistantMessage,
@@ -1824,7 +2331,19 @@ async function buildSkillStopOutput(
   if (!blocker) return null;
 
   const subagentSummary = await readSubagentSessionSummary(cwd, sessionId).catch(() => null);
-  if (subagentSummary && subagentSummary.activeSubagentThreadIds.length > 0) {
+  const activeSubagentCount = subagentSummary?.activeSubagentThreadIds.length ?? 0;
+
+  if (blocker.skill === "ralplan") {
+    const status = buildRalplanContinuationStatus(blocker, activeSubagentCount);
+    return {
+      decision: "block",
+      reason: status.reason,
+      stopReason: `skill_${blocker.skill}_${blocker.phase}_${status.stopReasonSuffix}`,
+      systemMessage: status.systemMessage,
+    };
+  }
+
+  if (activeSubagentCount > 0) {
     return null;
   }
 
@@ -1945,6 +2464,7 @@ async function buildStopHookOutput(
   payload: CodexHookPayload,
   cwd: string,
   stateDir: string,
+  options: { skipRalphStopBlock?: boolean } = {},
 ): Promise<Record<string, unknown> | null> {
   if (isStopExempt(payload)) {
     return null;
@@ -1955,11 +2475,13 @@ async function buildStopHookOutput(
   const threadId = readPayloadThreadId(payload);
   const execFollowupOutput = await buildExecFollowupStopOutput(cwd, canonicalSessionId);
   if (execFollowupOutput) return execFollowupOutput;
-  const ralphState = await readActiveRalphState(stateDir, canonicalSessionId, {
-    payloadSessionId: sessionId,
-    threadId,
-    tmuxPaneId: safeString(process.env.TMUX_PANE).trim(),
-  });
+  const ralphState = options.skipRalphStopBlock === true
+    ? null
+    : await readActiveRalphState(stateDir, canonicalSessionId, {
+      payloadSessionId: sessionId,
+      threadId,
+      tmuxPaneId: safeString(process.env.TMUX_PANE).trim(),
+    });
   if (!ralphState) {
     const autoresearchState = await readActiveAutoresearchState(cwd, canonicalSessionId);
     if (autoresearchState) {
@@ -1983,17 +2505,29 @@ async function buildStopHookOutput(
       }
     }
 
-    const teamWorkerOutput = await buildTeamWorkerStopOutput(cwd);
-    if (hasTeamWorkerContext() && teamWorkerOutput) {
+    const teamWorkerDecision = await resolveTeamWorkerStopDecision(cwd);
+    if (teamWorkerDecision.kind === "blocked") {
       return await returnPersistentStopBlock(
         payload,
         stateDir,
         "team-worker-stop",
-        safeString(teamWorkerOutput.stopReason),
-        teamWorkerOutput,
+        safeString(teamWorkerDecision.output.stopReason),
+        teamWorkerDecision.output,
         canonicalSessionId,
-        { allowRepeatDuringStopHook: false },
+        { allowRepeatDuringStopHook: teamWorkerDecision.allowRepeatDuringStopHook },
       );
+    }
+    if (teamWorkerDecision.kind === "allowed") {
+      try {
+        await maybeNudgeLeaderForAllowedWorkerStop({
+          stateDir: teamWorkerDecision.stateDir,
+          logsDir: join(cwd, ".omx", "logs"),
+          workerContext: teamWorkerDecision.workerContext,
+        });
+      } catch (err) {
+        void err;
+      }
+      return null;
     }
 
     const autopilotOutput = await buildModeBasedStopOutput("autopilot", cwd, canonicalSessionId);
@@ -2107,6 +2641,18 @@ async function buildStopHookOutput(
     const lastAssistantMessage = safeString(
       payload.last_assistant_message ?? payload.lastAssistantMessage,
     );
+    const goalWorkflowStopOutput = await buildGoalWorkflowReconciliationStopOutput(payload, cwd);
+    if (goalWorkflowStopOutput) {
+      return await returnPersistentStopBlock(
+        payload,
+        stateDir,
+        "goal-workflow-reconciliation-stop",
+        safeString(goalWorkflowStopOutput.stopReason),
+        goalWorkflowStopOutput,
+        canonicalSessionId,
+        { allowRepeatDuringStopHook: true },
+      );
+    }
     const autoNudgeConfig = await loadAutoNudgeConfig();
     const autoNudgePhase = await readStopAutoNudgePhase(cwd, canonicalSessionId, threadId);
 
@@ -2128,6 +2674,20 @@ async function buildStopHookOutput(
             "OMX native Stop detected a stall/permission-style handoff and continued the turn automatically.",
         },
         canonicalSessionId,
+      );
+    }
+
+    const sloppyFallbackDiffFindings = findSloppyFallbackDiffFindings(cwd);
+    const sloppyFallbackDiffOutput = buildSloppyFallbackDiffStopOutput(sloppyFallbackDiffFindings);
+    if (sloppyFallbackDiffOutput) {
+      return await returnPersistentStopBlock(
+        payload,
+        stateDir,
+        "sloppy-fallback-diff-stop",
+        JSON.stringify(sloppyFallbackDiffFindings),
+        sloppyFallbackDiffOutput,
+        canonicalSessionId,
+        { allowRepeatDuringStopHook: true },
       );
     }
 
@@ -2186,6 +2746,7 @@ export async function dispatchCodexNativeHook(
   const omxEventName = mapCodexHookEventToOmxEvent(hookEventName);
   let skillState: SkillActiveState | null = null;
   let triageAdditionalContext: string | null = null;
+  let goalWorkflowAdditionalContext: string | null = null;
 
   const nativeSessionId = safeString(payload.session_id ?? payload.sessionId).trim();
   const threadId = safeString(payload.thread_id ?? payload.threadId).trim();
@@ -2277,9 +2838,10 @@ export async function dispatchCodexNativeHook(
   }
 
   if (hookEventName === "Stop") {
+    const inheritedSessionId = safeString(process.env.OMX_SESSION_ID || process.env.CODEX_SESSION_ID).trim();
     const stopCanonicalSessionId = await resolveInternalSessionIdForPayload(
       cwd,
-      readPayloadSessionId(payload),
+      readPayloadSessionId(payload) || inheritedSessionId,
     );
     if (stopCanonicalSessionId) {
       canonicalSessionId = stopCanonicalSessionId;
@@ -2310,10 +2872,23 @@ export async function dispatchCodexNativeHook(
   const eventSessionId = canonicalSessionId || nativeSessionId || undefined;
   const sessionIdForState = canonicalSessionId || nativeSessionId;
   let outputJson: Record<string, unknown> | null = null;
+  const isSubagentPromptSubmit = hookEventName === "UserPromptSubmit"
+    ? await isNativeSubagentHook(cwd, canonicalSessionId, nativeSessionId, threadId)
+    : false;
+  const isSubagentStop = hookEventName === "Stop"
+    ? (await Promise.all(
+      [...new Set([
+        canonicalSessionId,
+        safeString(currentSessionState?.session_id).trim(),
+      ].filter(Boolean))]
+        .map((candidateSessionId) => isNativeSubagentHook(cwd, candidateSessionId, nativeSessionId, threadId)),
+    )).some(Boolean)
+    : false;
 
   if (hookEventName === "UserPromptSubmit") {
     const prompt = readPromptText(payload);
-    if (prompt) {
+    goalWorkflowAdditionalContext = await buildGoalWorkflowReconciliationPromptWarning(cwd, prompt).catch(() => null);
+    if (prompt && !isSubagentPromptSubmit) {
       skillState = buildNativeOutsideTmuxTeamPromptBlockState(
         prompt,
         cwd,
@@ -2330,7 +2905,7 @@ export async function dispatchCodexNativeHook(
       });
     }
     // --- Triage classifier (advisory-only, non-keyword prompts) ---
-    if (prompt && skillState === null) {
+    if (prompt && skillState === null && !isSubagentPromptSubmit) {
       try {
         if (readTriageConfig().enabled) {
           const normalized = prompt.trim().toLowerCase();
@@ -2422,7 +2997,11 @@ export async function dispatchCodexNativeHook(
         mode: safeString(payload.mode).trim() || undefined,
       },
     );
-    await dispatchHookEvent(event, { cwd });
+    await dispatchHookEventRuntime({
+      event,
+      cwd,
+      allowTeamWorkerSideEffects: false,
+    });
   }
 
   if ((hookEventName === "SessionStart" && !skipCanonicalSessionStartContext) || hookEventName === "UserPromptSubmit") {
@@ -2433,7 +3012,9 @@ export async function dispatchCodexNativeHook(
         canonicalSessionId,
         nativeSessionId: resolvedNativeSessionId || nativeSessionId,
       })
-      : (buildAdditionalContextMessage(readPromptText(payload), skillState, cwd, payload) ?? triageAdditionalContext);
+      : isSubagentPromptSubmit
+        ? null
+        : (buildAdditionalContextMessage(readPromptText(payload), skillState, cwd, payload) ?? goalWorkflowAdditionalContext ?? triageAdditionalContext);
     if (additionalContext) {
       outputJson = {
         hookSpecificOutput: {
@@ -2451,7 +3032,9 @@ export async function dispatchCodexNativeHook(
     outputJson = buildNativePostToolUseOutput(payload);
     await handleTeamWorkerPostToolUseSuccess(payload, cwd);
   } else if (hookEventName === "Stop") {
-    outputJson = await buildStopHookOutput(payload, cwd, stateDir);
+    outputJson = await buildStopHookOutput(payload, cwd, stateDir, {
+      skipRalphStopBlock: isSubagentStop,
+    });
   }
 
   return {

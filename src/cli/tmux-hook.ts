@@ -2,6 +2,7 @@ import { existsSync } from 'fs';
 import { mkdir, readFile, writeFile } from 'fs/promises';
 import { spawnSync } from 'child_process';
 import { join } from 'path';
+import { omxRoot } from '../utils/paths.js';
 import { getPackageRoot } from '../utils/package.js';
 import { resolveCodexPane } from '../scripts/tmux-hook-engine.js';
 import { resolveTmuxBinaryForPlatform } from '../utils/platform-command.js';
@@ -90,7 +91,7 @@ export async function tmuxHookCommand(args: string[]): Promise<void> {
 }
 
 function omxDir(cwd = process.cwd()): string {
-  return join(cwd, '.omx');
+  return omxRoot(cwd);
 }
 
 function tmuxHookConfigPath(cwd = process.cwd()): string {

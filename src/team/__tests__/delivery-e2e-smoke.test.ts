@@ -561,13 +561,12 @@ describe('team message delivery end-to-end smoke tests', () => {
         const result = spawnSync(process.execPath, [watcherScript, '--once', '--cwd', cwd, '--notify-script', notifyHook], {
           encoding: 'utf-8',
           env: buildCleanNotifyEnv({
-            OMX_TEAM_WORKER_TURN_STALL_MS: '10000',
           }),
         });
         assert.equal(result.status, 0, result.stderr || result.stdout);
 
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-        assert.match(tmuxLog, /send-keys -t %95 -l Team stalled-worker-fresh-leader: worker panes stalled/);
+        assert.doesNotMatch(tmuxLog, /worker panes stalled/);
         assert.doesNotMatch(tmuxLog, /leader stale/);
       });
     } finally {

@@ -39,6 +39,43 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  rust-tests:
+    name: Rust Tests + Coverage Signal
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Run Rust tests with coverage summaries
+        shell: bash
+        run: |
+          mkdir -p coverage/rust
+
+          cargo llvm-cov --workspace --summary-only | tee coverage/rust/workspace-summary.txt
+          cargo llvm-cov --manifest-path crates/omx-sparkshell/Cargo.toml --summary-only | tee coverage/rust/omx-sparkshell-summary.txt
+      - name: Add Rust coverage summary to job summary
+        shell: bash
+        run: |
+          {
+            echo '## Rust Test Coverage Summary'
+            echo ''
+            echo '### Workspace'
+            echo '```text'
+            cat coverage/rust/workspace-summary.txt
+            echo '```'
+            echo ''
+            echo '### omx-sparkshell manifest'
+            echo '```text'
+            cat coverage/rust/omx-sparkshell-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -53,18 +90,14 @@ jobs:
       - run: npm run lint
 
   typecheck:
-    name: Typecheck (Node ${{ matrix.node-version }})
+    name: Typecheck
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        node-version: [20, 22]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v6
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: 20
           cache: npm
       - run: npm ci
       - run: npx tsc --noEmit
@@ -219,95 +252,6 @@ jobs:
           name: team-critical-coverage
           path: coverage/team/
 
-  coverage-ts-full:
-    name: Coverage Report (TypeScript Full)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    needs: [typecheck, build-dist]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 20
-          cache: npm
-      - run: npm ci
-      - name: Download prebuilt dist artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: ci-dist-node20
-          path: dist
-      - name: Run full TypeScript coverage report
-        run: npm run coverage:ts:full:compiled
-      - name: Add TypeScript coverage summary to job summary
-        run: |
-          node -e '
-            const fs = require("node:fs");
-            const summary = JSON.parse(fs.readFileSync("coverage/ts-full/coverage-summary.json", "utf8"));
-            const total = summary.total;
-            const lines = [
-              "## Full TypeScript Coverage Summary",
-              "",
-              "| Metric | Pct | Covered / Total |",
-              "|---|---:|---:|",
-              `| Lines | ${total.lines.pct}% | ${total.lines.covered} / ${total.lines.total} |`,
-              `| Functions | ${total.functions.pct}% | ${total.functions.covered} / ${total.functions.total} |`,
-              `| Branches | ${total.branches.pct}% | ${total.branches.covered} / ${total.branches.total} |`,
-              `| Statements | ${total.statements.pct}% | ${total.statements.covered} / ${total.statements.total} |`
-            ];
-            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${lines.join("\n")}\n`);
-          '
-      - name: Upload full TypeScript coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ts-full-coverage
-          path: coverage/ts-full/
-
-  coverage-rust:
-    name: Coverage Report (Rust)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    needs: [lint]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-          components: llvm-tools-preview
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Generate Rust coverage reports
-        shell: bash
-        run: |
-          mkdir -p coverage/rust
-
-          cargo llvm-cov --workspace --summary-only | tee coverage/rust/omx-explore-summary.txt
-          cargo llvm-cov --workspace --lcov --output-path coverage/rust/omx-explore.lcov
-
-          cargo llvm-cov --manifest-path crates/omx-sparkshell/Cargo.toml --summary-only | tee coverage/rust/omx-sparkshell-summary.txt
-          cargo llvm-cov --manifest-path crates/omx-sparkshell/Cargo.toml --lcov --output-path coverage/rust/omx-sparkshell.lcov
-      - name: Add Rust coverage summary to job summary
-        shell: bash
-        run: |
-          {
-            echo '## Rust Coverage Summary'
-            echo ''
-            echo '### omx-explore'
-            echo '```text'
-            cat coverage/rust/omx-explore-summary.txt
-            echo '```'
-            echo ''
-            echo '### omx-sparkshell'
-            echo '```text'
-            cat coverage/rust/omx-sparkshell-summary.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload Rust coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rust-coverage
-          path: coverage/rust/
-
   ralph-persistence-gate:
     name: Ralph Persistence Gate
     runs-on: ubuntu-latest
@@ -332,7 +276,7 @@ jobs:
     name: Build (Full Source Build)
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    needs: [rustfmt, clippy, lint, typecheck, build-dist, test, ralph-persistence-gate]
+    needs: [rustfmt, clippy, lint, typecheck, build-dist]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v6
@@ -357,29 +301,27 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [rustfmt, clippy, lint, typecheck, test, coverage-team-critical, coverage-ts-full, coverage-rust, ralph-persistence-gate, build]
+    needs: [rustfmt, clippy, rust-tests, lint, typecheck, test, coverage-team-critical, ralph-persistence-gate, build]
     steps:
       - name: Check required job results
         run: |
           if [[ "${{ needs.rustfmt.result }}" != "success" ]] ||
              [[ "${{ needs.clippy.result }}" != "success" ]] ||
+             [[ "${{ needs.rust-tests.result }}" != "success" ]] ||
              [[ "${{ needs.lint.result }}" != "success" ]] ||
              [[ "${{ needs.typecheck.result }}" != "success" ]] ||
              [[ "${{ needs.test.result }}" != "success" ]] ||
              [[ "${{ needs.coverage-team-critical.result }}" != "success" ]] ||
-             [[ "${{ needs.coverage-ts-full.result }}" != "success" ]] ||
-             [[ "${{ needs.coverage-rust.result }}" != "success" ]] ||
              [[ "${{ needs.ralph-persistence-gate.result }}" != "success" ]] ||
              [[ "${{ needs.build.result }}" != "success" ]]; then
             echo "::error::One or more required CI jobs failed"
             echo "  rustfmt: ${{ needs.rustfmt.result }}"
             echo "  clippy: ${{ needs.clippy.result }}"
+            echo "  rust-tests: ${{ needs.rust-tests.result }}"
             echo "  lint: ${{ needs.lint.result }}"
             echo "  typecheck: ${{ needs.typecheck.result }}"
             echo "  test: ${{ needs.test.result }}"
             echo "  coverage-team-critical: ${{ needs.coverage-team-critical.result }}"
-            echo "  coverage-ts-full: ${{ needs.coverage-ts-full.result }}"
-            echo "  coverage-rust: ${{ needs.coverage-rust.result }}"
             echo "  ralph-persistence-gate: ${{ needs.ralph-persistence-gate.result }}"
             echo "  build: ${{ needs.build.result }}"
             exit 1

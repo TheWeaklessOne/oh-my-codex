@@ -41,8 +41,8 @@
     {
       "name": "ecomode",
       "category": "execution",
-      "status": "merged",
-      "canonical": "ultrawork"
+      "status": "deprecated",
+      "description": "Deprecated standalone efficiency mode skill."
     },
     {
       "name": "ultraqa",
@@ -55,16 +55,34 @@
       "status": "active"
     },
     {
+      "name": "autoresearch-goal",
+      "category": "execution",
+      "status": "active",
+      "core": false
+    },
+    {
+      "name": "performance-goal",
+      "category": "execution",
+      "status": "active",
+      "core": false
+    },
+    {
       "name": "pipeline",
       "category": "execution",
       "status": "active",
       "core": false
     },
     {
+      "name": "ultragoal",
+      "category": "execution",
+      "status": "active",
+      "core": true
+    },
+    {
       "name": "swarm",
       "category": "execution",
-      "status": "alias",
-      "canonical": "team"
+      "status": "deprecated",
+      "description": "Deprecated standalone swarm skill."
     },
     {
       "name": "plan",
@@ -91,20 +109,20 @@
     {
       "name": "deepsearch",
       "category": "shortcut",
-      "status": "alias",
-      "canonical": "explore"
+      "status": "deprecated",
+      "description": "Deprecated standalone deepsearch skill."
     },
     {
       "name": "tdd",
       "category": "shortcut",
-      "status": "alias",
-      "canonical": "test-engineer"
+      "status": "deprecated",
+      "description": "Deprecated standalone TDD skill."
     },
     {
       "name": "build-fix",
       "category": "shortcut",
-      "status": "alias",
-      "canonical": "build-fixer"
+      "status": "deprecated",
+      "description": "Deprecated standalone build-fix skill."
     },
     {
       "name": "ai-slop-cleaner",
@@ -120,20 +138,20 @@
     {
       "name": "security-review",
       "category": "shortcut",
-      "status": "active",
-      "canonical": "security-reviewer"
+      "status": "deprecated",
+      "description": "Deprecated standalone security review skill."
     },
     {
       "name": "visual-verdict",
       "category": "shortcut",
-      "status": "active",
-      "canonical": "vision"
+      "status": "deprecated",
+      "description": "Deprecated standalone visual verdict skill."
     },
     {
       "name": "web-clone",
       "category": "shortcut",
-      "status": "merged",
-      "canonical": "visual-ralph"
+      "status": "deprecated",
+      "description": "Deprecated standalone web-clone skill."
     },
     {
       "name": "visual-ralph",
@@ -156,18 +174,25 @@
     {
       "name": "review",
       "category": "shortcut",
-      "status": "alias",
-      "canonical": "plan --review"
+      "status": "deprecated",
+      "description": "Deprecated standalone review skill."
+    },
+    {
+      "name": "ask",
+      "category": "shortcut",
+      "status": "active"
     },
     {
       "name": "ask-claude",
       "category": "shortcut",
-      "status": "active"
+      "status": "deprecated",
+      "description": "Deprecated provider-specific ask skill. Use the active ask skill directly for new advisor workflows."
     },
     {
       "name": "ask-gemini",
       "category": "shortcut",
-      "status": "active"
+      "status": "deprecated",
+      "description": "Deprecated provider-specific ask skill. Use the active ask skill directly for new advisor workflows."
     },
     {
       "name": "cancel",
@@ -182,17 +207,20 @@
     {
       "name": "help",
       "category": "utility",
-      "status": "active"
+      "status": "deprecated",
+      "description": "Deprecated standalone help skill."
     },
     {
       "name": "note",
       "category": "utility",
-      "status": "active"
+      "status": "deprecated",
+      "description": "Deprecated standalone note skill."
     },
     {
       "name": "trace",
       "category": "utility",
-      "status": "active"
+      "status": "deprecated",
+      "description": "Deprecated standalone trace skill."
     },
     {
       "name": "skill",
@@ -251,8 +279,8 @@
     {
       "name": "ralph-init",
       "category": "utility",
-      "status": "merged",
-      "canonical": "plan"
+      "status": "deprecated",
+      "description": "Deprecated standalone Ralph initialization skill."
     },
     {
       "name": "worker",
@@ -323,7 +351,7 @@
     {
       "name": "security-reviewer",
       "category": "review",
-      "status": "active"
+      "status": "deprecated"
     },
     {
       "name": "performance-reviewer",
@@ -355,7 +383,7 @@
     {
       "name": "build-fixer",
       "category": "domain",
-      "status": "active"
+      "status": "deprecated"
     },
     {
       "name": "designer",

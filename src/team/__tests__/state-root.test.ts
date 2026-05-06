@@ -40,6 +40,20 @@ describe('state-root', () => {
 
 
 
+  it('honors OMX_ROOT as boxed workspace root when no explicit team state root is set', () => {
+    const previousOmxRoot = process.env.OMX_ROOT;
+    try {
+      process.env.OMX_ROOT = '/tmp/omx-box';
+      assert.equal(
+        resolveCanonicalTeamStateRoot('/tmp/demo/project', {}),
+        '/tmp/omx-box/.omx/state',
+      );
+    } finally {
+      if (typeof previousOmxRoot === 'string') process.env.OMX_ROOT = previousOmxRoot;
+      else delete process.env.OMX_ROOT;
+    }
+  });
+
   async function writeTeamMetadata(
     stateRoot: string,
     teamName: string,

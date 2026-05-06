@@ -17,7 +17,7 @@ import { SKILL_ACTIVE_STATE_FILE } from '../../state/skill-active.js';
 import { isUnderspecifiedForExecution, applyRalplanGate } from '../keyword-detector.js';
 import { KEYWORD_TRIGGER_DEFINITIONS } from '../keyword-registry.js';
 
-describe('keyword detector swarm/team compatibility', () => {
+describe('keyword detector team compatibility', () => {
   it('keeps explicit $skill order in detectKeywords results (left-to-right)', () => {
     const matches = detectKeywords('$analyze $ultraqa $code-review now');
     assert.deepEqual(matches.map((m) => m.skill).slice(0, 3), ['analyze', 'ultraqa', 'code-review']);
@@ -68,12 +68,7 @@ describe('keyword detector swarm/team compatibility', () => {
     assert.deepEqual(matches.map((m) => m.skill), ['ralplan']);
   });
 
-  it('normalizes plugin-prefixed alias tokens', () => {
-    const swarm = detectPrimaryKeyword('$oh-my-codex:swarm handle this');
-    assert.ok(swarm);
-    assert.equal(swarm.skill, 'team');
-    assert.equal(swarm.keyword, '$oh-my-codex:swarm');
-
+  it('normalizes plugin-prefixed ulw shorthand token', () => {
     const ulw = detectPrimaryKeyword('$oh-my-codex:ulw continue');
     assert.ok(ulw);
     assert.equal(ulw.skill, 'ultrawork');
@@ -126,6 +121,22 @@ describe('keyword detector swarm/team compatibility', () => {
     assert.equal(match.keyword.toLowerCase(), '$analyze');
   });
 
+  it('maps explicit $ultragoal invocation to ultragoal workflow skill', () => {
+    const match = detectPrimaryKeyword('$ultragoal split this release into durable goals');
+    assert.ok(match);
+    assert.equal(match.skill, 'ultragoal');
+    assert.equal(match.keyword.toLowerCase(), '$ultragoal');
+  });
+
+  it('maps intentful ultragoal prose without triggering artifact path mentions', () => {
+    const intentful = detectPrimaryKeyword('please run ultragoal workflow for this launch');
+    assert.ok(intentful);
+    assert.equal(intentful.skill, 'ultragoal');
+
+    const pathOnly = detectPrimaryKeyword('inspect .omx/ultragoal/goals.json');
+    assert.notEqual(pathOnly?.skill, 'ultragoal');
+  });
+
   it('maps code-review keyword variants to code-review skill', () => {
     const hyphen = detectPrimaryKeyword('run $code-review before merge');
     assert.ok(hyphen);
@@ -135,6 +146,15 @@ describe('keyword detector swarm/team compatibility', () => {
     const spaced = detectPrimaryKeyword('please do a code review');
     assert.ok(spaced);
     assert.equal(spaced.skill, 'code-review');
+
+    assert.equal(
+      detectPrimaryKeyword('run $security-review before merge')?.skill,
+      undefined,
+    );
+    assert.equal(
+      detectPrimaryKeyword('please do a security review')?.skill,
+      undefined,
+    );
   });
 
   it('supports explicit multi-skill invocation by prioritizing left-most $skill', () => {
@@ -150,30 +170,6 @@ describe('keyword detector swarm/team compatibility', () => {
     assert.ok(match);
     assert.equal(match.skill, 'team');
     assert.match(match.keyword.toLowerCase(), /team/);
-  });
-
-  it('maps "swarm" to team orchestration skill', () => {
-    const match = detectPrimaryKeyword('please use swarm for this task');
-
-    assert.ok(match);
-    assert.equal(match.skill, 'team');
-  });
-
-  it('maps "coordinated swarm" phrase to team orchestration skill', () => {
-    const match = detectPrimaryKeyword('run a coordinated swarm for implementation');
-
-    assert.ok(match);
-    assert.equal(match.skill, 'team');
-    assert.match(match.keyword.toLowerCase(), /swarm/);
-  });
-
-  it('keeps swarm trigger priority aligned with explicit team invocation', () => {
-    const teamMatch = detectKeywords('use $team agents for this').find((entry) => entry.skill === 'team');
-    const swarmMatch = detectKeywords('use swarm for this').find((entry) => entry.skill === 'team');
-
-    assert.ok(teamMatch);
-    assert.ok(swarmMatch);
-    assert.equal(swarmMatch.priority, teamMatch.priority);
   });
 
   it('does not trigger team keyword from filesystem/team-state path text', () => {
@@ -222,11 +218,11 @@ describe('keyword detector swarm/team compatibility', () => {
   });
 
   it('applies longest-match tie-breaker when priorities are equal', () => {
-    const match = detectPrimaryKeyword('please run a coordinated swarm for this');
+    const match = detectPrimaryKeyword('please run a deep interview for this');
 
     assert.ok(match);
-    assert.equal(match.skill, 'team');
-    assert.equal(match.keyword.toLowerCase(), 'coordinated swarm');
+    assert.equal(match.skill, 'deep-interview');
+    assert.equal(match.keyword.toLowerCase(), 'deep interview');
   });
 
   it('maps "deep interview" phrase to deep-interview skill', () => {
@@ -376,7 +372,7 @@ describe('explicit skill-name invocation requirement', () => {
 });
 
 describe('keyword registry coverage', () => {
-  it('includes key team/swarm aliases in runtime keyword registry', () => {
+  it('includes key team aliases in runtime keyword registry', () => {
     const registryKeywords = new Set(KEYWORD_TRIGGER_DEFINITIONS.map((v) => v.keyword.toLowerCase()));
     assert.ok(registryKeywords.has('$ultraqa'));
     assert.ok(registryKeywords.has('$analyze'));
@@ -384,8 +380,6 @@ describe('keyword registry coverage', () => {
     assert.ok(registryKeywords.has('code review'));
     assert.ok(registryKeywords.has('$code-review'));
     assert.ok(registryKeywords.has('coordinated team'));
-    assert.ok(registryKeywords.has('swarm'));
-    assert.ok(registryKeywords.has('coordinated swarm'));
     assert.ok(registryKeywords.has('ouroboros'));
     assert.ok(registryKeywords.has("don't assume"));
     assert.ok(registryKeywords.has('interview me'));
@@ -393,6 +387,8 @@ describe('keyword registry coverage', () => {
     assert.ok(registryKeywords.has('wiki add'));
     assert.ok(registryKeywords.has('wiki lint'));
     assert.ok(registryKeywords.has('$autoresearch'));
+    assert.ok(registryKeywords.has('$ultragoal'));
+    assert.ok(registryKeywords.has('ultragoal'));
   });
 });
 
@@ -1350,6 +1346,27 @@ describe('keyword detector skill-active-state lifecycle', () => {
     }
   });
 
+  it('records ultragoal as a prompt skill without seeding unrelated mode state', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-state-ultragoal-'));
+    const stateDir = join(cwd, '.omx', 'state');
+    try {
+      await mkdir(stateDir, { recursive: true });
+      const result = await recordSkillActivation({
+        stateDir,
+        text: '$ultragoal split this launch into durable goals',
+      });
+
+      assert.ok(result);
+      assert.equal(result.skill, 'ultragoal');
+      assert.equal(result.keyword, '$ultragoal');
+      assert.equal(result.initialized_mode, undefined);
+      assert.equal(result.initialized_state_path, undefined);
+      assert.equal(existsSync(join(stateDir, 'ultragoal-state.json')), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('emits a warning when skill-active-state persistence fails', async () => {
     const warnings: unknown[][] = [];
     mock.method(console, 'warn', (...args: unknown[]) => {
@@ -2042,9 +2059,9 @@ describe('applyRalplanGate', () => {
   });
 
   it('preserves non-execution keywords when gating', () => {
-    const result = applyRalplanGate(['ralph', 'tdd'], 'ralph tdd fix this');
+    const result = applyRalplanGate(['ralph', 'analyze'], 'ralph analyze this');
     assert.equal(result.gateApplied, true);
-    assert.ok(result.keywords.includes('tdd'));
+    assert.ok(result.keywords.includes('analyze'));
     assert.ok(result.keywords.includes('ralplan'));
     assert.ok(!result.keywords.includes('ralph'));
   });

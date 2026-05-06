@@ -8,7 +8,7 @@
 import { readFile, writeFile, mkdir, unlink, appendFile, rm } from 'fs/promises';
 import { dirname, join } from 'path';
 import { existsSync, readFileSync } from 'fs';
-import { omxStateDir, omxLogsDir, sameFilePath } from '../utils/paths.js';
+import { omxRoot, omxStateDir, omxLogsDir, sameFilePath } from '../utils/paths.js';
 import { getStateFilePath } from '../mcp/state-paths.js';
 import {
   classifySessionStartActor,
@@ -72,7 +72,7 @@ async function removeDeadSessionHudState(
  * into a new Codex session.
  */
 export async function resetSessionMetrics(cwd: string, sessionId?: string): Promise<void> {
-  const omxDir = join(cwd, '.omx');
+  const omxDir = omxRoot(cwd);
   const stateDir = omxStateDir(cwd);
   await mkdir(omxDir, { recursive: true });
   await mkdir(stateDir, { recursive: true });

@@ -14,6 +14,7 @@ import {
   listInstalledSkillDirectories,
   detectLegacySkillRootOverlap,
   omxStateDir,
+  omxRoot,
   omxProjectMemoryPath,
   omxNotepadPath,
   omxPlansDir,
@@ -347,12 +348,43 @@ describe("listInstalledSkillDirectories", () => {
 });
 
 describe("omxStateDir", () => {
+  let originalOmxRoot: string | undefined;
+  let originalOmxStateRoot: string | undefined;
+
+  beforeEach(() => {
+    originalOmxRoot = process.env.OMX_ROOT;
+    originalOmxStateRoot = process.env.OMX_STATE_ROOT;
+  });
+
+  afterEach(() => {
+    if (typeof originalOmxRoot === "string") process.env.OMX_ROOT = originalOmxRoot;
+    else delete process.env.OMX_ROOT;
+    if (typeof originalOmxStateRoot === "string") process.env.OMX_STATE_ROOT = originalOmxStateRoot;
+    else delete process.env.OMX_STATE_ROOT;
+  });
+
   it("uses provided projectRoot", () => {
     assert.equal(omxStateDir("/my/project"), join("/my/project", ".omx", "state"));
   });
 
   it("defaults to cwd when no projectRoot given", () => {
     assert.equal(omxStateDir(), join(process.cwd(), ".omx", "state"));
+  });
+
+  it("uses OMX_ROOT override when set", () => {
+    process.env.OMX_ROOT = "/tmp/omx-root";
+    assert.equal(omxRoot("/ignored/project"), "/tmp/omx-root/.omx");
+    assert.equal(omxStateDir("/ignored/project"), "/tmp/omx-root/.omx/state");
+  });
+
+  it("uses OMX_ROOT as boxed workspace root for all runtime paths", () => {
+    process.env.OMX_ROOT = "/tmp/omx-box";
+    assert.equal(omxRoot("/ignored/project"), "/tmp/omx-box/.omx");
+    assert.equal(omxStateDir("/ignored/project"), "/tmp/omx-box/.omx/state");
+    assert.equal(omxProjectMemoryPath("/ignored/project"), "/tmp/omx-box/.omx/project-memory.json");
+    assert.equal(omxNotepadPath("/ignored/project"), "/tmp/omx-box/.omx/notepad.md");
+    assert.equal(omxPlansDir("/ignored/project"), "/tmp/omx-box/.omx/plans");
+    assert.equal(omxLogsDir("/ignored/project"), "/tmp/omx-box/.omx/logs");
   });
 });
 

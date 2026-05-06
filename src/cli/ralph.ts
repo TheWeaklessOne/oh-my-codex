@@ -295,6 +295,12 @@ export function buildRalphAppendInstructions(
           "- If the required review engine is unavailable and no explicit fallback policy exists, fail fast with a hardening error instead of silently skipping review.",
         ]
       : []),
+    'Goal mode guidance:',
+    '- If Codex goal tools are available, call `get_goal` during Ralph intake or before final verification to discover the active thread goal.',
+    '- Treat any active goal objective as the top-level completion contract for this Ralph run; Ralph mode state is not proof of goal completion by itself.',
+    '- Call `create_goal` only when the user/system explicitly requested a new goal and `get_goal` reports no active goal; otherwise do not invent a goal.',
+    '- Before completion, build a prompt-to-artifact checklist, inspect real evidence for every requirement, and continue working if any item is missing, incomplete, weakly verified, or uncovered.',
+    '- Call `update_goal({status: "complete"})` only after that audit proves the active objective is fully achieved; then report final elapsed time and token-budget usage when provided.',
     'Final deslop guidance:',
     noDeslopDisabledByHardening
       ? '- `--no-deslop` was requested, but this Mission hardening gate requires the deslop pass; ignore the opt-out and run the mandatory changed-files ai-slop-cleaner pass.'
@@ -484,6 +490,8 @@ export async function ralphCommand(
     native_subagents_enabled: true,
     native_subagent_tracking_path: '.omx/state/sessions/<sessionId>/actors.json',
     native_subagent_policy: 'Parallel Codex subagents are allowed for independent work, but phase completion must wait for active native subagent threads to finish.',
+    goal_mode_integration: 'codex-goal-tools',
+    goal_mode_policy: 'Use get_goal for active objective discovery and update_goal only after a prompt-to-artifact completion audit proves the objective is achieved.',
     deslop_enabled: !noDeslop,
     deslop_opt_out: noDeslop,
     deslop_changed_files_path: sessionFiles.changedFilesPath,

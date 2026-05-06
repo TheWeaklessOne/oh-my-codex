@@ -17,6 +17,7 @@ import { validateAndNormalizeRalphState } from '../ralph/contract.js';
 import { applyRunOutcomeContract } from '../runtime/run-outcome.js';
 import { syncRunStateFromModeState } from '../runtime/run-state.js';
 import {
+  getAuthoritativeActiveStatePaths,
   getBaseStateDir,
   getReadScopedStateDirs,
   getReadScopedStatePaths,
@@ -193,6 +194,37 @@ export async function readModeStateForSession(
   return readModeStateFromPaths(paths);
 }
 
+export async function readModeStateForActiveDecision(
+  mode: string,
+  sessionId: string | undefined,
+  projectRoot?: string,
+): Promise<ModeState | null> {
+  let paths: string[];
+  try {
+    paths = await getAuthoritativeActiveStatePaths(mode, projectRoot, sessionId);
+  } catch {
+    return null;
+  }
+  return readModeStateFromPaths(paths);
+}
+
+function assertRalphUpdateMatchesSession(state: ModeState, sessionId?: string): void {
+  const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+  if (!normalizedSessionId) return;
+
+  const ownerOmxSessionId = typeof state.owner_omx_session_id === 'string'
+    ? state.owner_omx_session_id.trim()
+    : '';
+  if (ownerOmxSessionId && ownerOmxSessionId !== normalizedSessionId) {
+    throw new Error(`Mode ralph state belongs to another session (${ownerOmxSessionId})`);
+  }
+
+  const stateSessionId = typeof state.session_id === 'string' ? state.session_id.trim() : '';
+  if (stateSessionId && stateSessionId !== normalizedSessionId) {
+    throw new Error(`Mode ralph state belongs to another session (${stateSessionId})`);
+  }
+}
+
 /**
  * Update mode state (merge fields)
  */
@@ -202,12 +234,18 @@ export async function updateModeState(
   projectRoot?: string,
   explicitSessionId?: string,
 ): Promise<ModeState> {
-  const current = explicitSessionId
-    ? await readModeStateForSession(mode, explicitSessionId, projectRoot)
-    : await readModeState(mode, projectRoot);
-  if (!current) throw new Error(`Mode ${mode} not found`);
   const scope = await resolveStateScope(projectRoot, explicitSessionId);
+  const current = mode === 'ralph' && scope.sessionId
+    ? await readModeStateForActiveDecision(mode, scope.sessionId, projectRoot)
+    : explicitSessionId
+      ? await readModeStateForSession(mode, explicitSessionId, projectRoot)
+      : await readModeState(mode, projectRoot);
+  if (!current) throw new Error(`Mode ${mode} not found`);
   await mkdir(scope.stateDir, { recursive: true });
+
+  if (mode === 'ralph') {
+    assertRalphUpdateMatchesSession(current, scope.sessionId);
+  }
 
   const updatedBase = { ...current, ...updates };
   if (!Object.prototype.hasOwnProperty.call(updates, 'run_outcome')) {

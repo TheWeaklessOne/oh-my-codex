@@ -141,6 +141,48 @@ describe('skill-active state helpers', () => {
     });
   });
 
+  it('does not carry stale Ralph initialization fields from another session into current session state', async () => {
+    await withTempRepo('omx-skill-active-stale-init-', async (cwd) => {
+      await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
+      await writeSkillActiveStateCopies(cwd, {
+        active: true,
+        skill: 'ralph',
+        phase: 'verifying',
+        session_id: 'old-session',
+        initialized_mode: 'ralph',
+        initialized_state_path: '.omx/state/sessions/old-session/ralph-state.json',
+        task_slug: 'old-ralph-task',
+        context_snapshot_path: '.omx/context/old.md',
+        active_skills: [{ skill: 'ralph', phase: 'verifying', active: true, session_id: 'old-session' }],
+      });
+
+      await syncCanonicalSkillStateForMode({
+        cwd,
+        mode: 'ralph',
+        active: true,
+        currentPhase: 'executing',
+        sessionId: 'new-session',
+        nowIso: '2026-05-03T00:00:00.000Z',
+      });
+
+      const sessionState = await readVisibleSkillActiveState(cwd, 'new-session') as Record<string, unknown> | null;
+      assert.ok(sessionState);
+      assert.equal(sessionState.initialized_mode, undefined);
+      assert.equal(sessionState.initialized_state_path, undefined);
+      assert.equal(sessionState.task_slug, undefined);
+      assert.equal(sessionState.context_snapshot_path, undefined);
+      assert.equal(sessionState.session_id, 'new-session');
+      assert.deepEqual(
+        listActiveSkills(sessionState).map(({ skill, phase, session_id }) => ({ skill, phase, session_id })),
+        [{ skill: 'ralph', phase: 'executing', session_id: 'new-session' }],
+      );
+
+      const rootState = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'skill-active-state.json'), 'utf-8')) as Record<string, unknown>;
+      assert.equal(rootState.initialized_mode, undefined);
+      assert.equal(rootState.initialized_state_path, undefined);
+    });
+  });
+
   it('clears only the matching terminal session entry and preserves unrelated active skills', async () => {
     await withTempRepo('omx-skill-active-terminal-clear-', async (cwd) => {
       await mkdir(join(cwd, '.omx', 'state'), { recursive: true });

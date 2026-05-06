@@ -480,7 +480,7 @@ exit 1
     const cwd = await mkdtemp(join(tmpdir(), 'omx-hook-team-dispatch-'));
     const previousRuntimeBridge = process.env.OMX_RUNTIME_BRIDGE;
     try {
-      process.env.OMX_RUNTIME_BRIDGE = '1';
+      process.env.OMX_RUNTIME_BRIDGE = '0';
       await initTeamState('alpha', 'task', 'executor', 1, cwd);
       const queued = await enqueueDispatchRequest('alpha', {
         kind: 'inbox',
@@ -488,6 +488,7 @@ exit 1
         worker_index: 1,
         trigger_message: 'ping',
       }, cwd);
+      process.env.OMX_RUNTIME_BRIDGE = '1';
       await writeFile(join(cwd, '.omx', 'state', 'dispatch.json'), '{ broken bridge json');
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;

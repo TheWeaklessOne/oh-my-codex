@@ -2124,7 +2124,7 @@ describe('notify-fallback watcher', () => {
     }
   });
 
-  it('runs stalled-worker leader nudges from the fallback watcher even when the leader is not stale', async () => {
+  it('does not run stalled-worker leader nudges from the fallback watcher when the leader is not stale', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-worker-stall-nudge-'));
     const fakeBinDir = join(wd, 'fake-bin');
     const tmuxLogPath = join(wd, 'tmux.log');
@@ -2284,7 +2284,6 @@ exit 0
           encoding: 'utf-8',
           env: buildCleanNotifyEnv({
             PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
-            OMX_TEAM_PROGRESS_STALL_MS: '60000',
             OMX_TEAM_LEADER_NUDGE_MS: '30000',
             OMX_TEAM_LEADER_STALE_MS: '60000',
           }),
@@ -2293,7 +2292,8 @@ exit 0
       assert.equal(result.status, 0, result.stderr || result.stdout);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
-      assert.match(tmuxLog, /send-keys -t %42 -l Team dispatch-team: worker panes stalled, no progress 3m\./);
+      assert.doesNotMatch(tmuxLog, /worker panes stalled/);
+      assert.doesNotMatch(tmuxLog, /no progress 3m/);
       assert.doesNotMatch(tmuxLog, /leader stale/);
 
       const watcherStatePath = join(wd, '.omx', 'state', 'notify-fallback-state.json');

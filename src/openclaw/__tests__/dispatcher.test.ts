@@ -2,6 +2,8 @@
  * Tests for OpenClaw gateway dispatcher.
  */
 
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -11,7 +13,73 @@ import {
   interpolateInstruction,
   isCommandGateway,
   resolveCommandTimeoutMs,
+  wakeGateway,
 } from '../dispatcher.js';
+
+
+describe('wakeGateway proxy routing', () => {
+  const ORIGINAL_ENV = {
+    HTTP_PROXY: process.env.HTTP_PROXY,
+    http_proxy: process.env.http_proxy,
+    HTTPS_PROXY: process.env.HTTPS_PROXY,
+    https_proxy: process.env.https_proxy,
+    ALL_PROXY: process.env.ALL_PROXY,
+    all_proxy: process.env.all_proxy,
+    NO_PROXY: process.env.NO_PROXY,
+    no_proxy: process.env.no_proxy,
+  };
+
+  afterEach(() => {
+    for (const key of Object.keys(ORIGINAL_ENV) as Array<keyof typeof ORIGINAL_ENV>) {
+      const value = ORIGINAL_ENV[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
+
+  async function withServer(
+    handler: (req: IncomingMessage, res: ServerResponse) => void,
+    run: (baseUrl: string) => Promise<void>,
+  ): Promise<void> {
+    const server = createServer(handler);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address() as AddressInfo;
+      await run(`http://127.0.0.1:${address.port}`);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  }
+
+  it('uses HTTP_PROXY for OpenClaw HTTP gateways', async () => {
+    const seen: string[] = [];
+    await withServer((_req, res) => {
+      res.statusCode = 500;
+      res.end('direct path should not be used');
+    }, async (targetUrl) => {
+      await withServer((req, res) => {
+        seen.push(req.url ?? '');
+        res.end('ok');
+      }, async (proxyUrl) => {
+        delete process.env.NO_PROXY;
+        delete process.env.no_proxy;
+        delete process.env.ALL_PROXY;
+        delete process.env.all_proxy;
+        process.env.HTTP_PROXY = proxyUrl;
+        delete process.env.http_proxy;
+        const result = await wakeGateway('local', { url: `${targetUrl}/wake` }, {
+          event: 'session-idle',
+          instruction: 'wake',
+          text: 'wake',
+          timestamp: '2026-05-05T00:00:00.000Z',
+          context: {},
+        });
+        assert.equal(result.success, true);
+        assert.deepEqual(seen, [`${targetUrl}/wake`]);
+      });
+    });
+  });
+});
 
 describe('validateGatewayUrl', () => {
   it('accepts https URLs', () => {

@@ -9,6 +9,7 @@ import { join } from 'path';
 import { existsSync } from 'fs';
 import { promisify } from 'util';
 import { shouldBlockLiveNotificationNetworkInTests } from '../utils/test-env.js';
+import { requestJson } from './http-client.js';
 
 const execFileAsync = promisify(execFile);
 const HTTP_REQUEST_TIMEOUT_MS = 10_000;
@@ -33,8 +34,9 @@ export interface NotificationPayload {
 }
 
 interface JsonHttpsRequestOptions {
-  hostname: string;
-  path: string;
+  url?: string;
+  hostname?: string;
+  path?: string;
   body: string;
   errorPrefix: string;
   timeoutMs?: number;
@@ -127,29 +129,24 @@ async function sendDesktopNotification(payload: NotificationPayload): Promise<vo
 }
 
 export async function _sendJsonHttpsRequest(options: JsonHttpsRequestOptions): Promise<void> {
-  const { default: https } = await import('https');
-  await new Promise<void>((resolve, reject) => {
-    const req = https.request({
-      hostname: options.hostname,
-      path: options.path,
+  const url = options.url ?? `https://${options.hostname}${options.path ?? ''}`;
+  try {
+    const response = await requestJson(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-    }, (res) => {
-      res.resume();
-      if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
-        reject(new Error(`${options.errorPrefix}_http_${res.statusCode || 'unknown'}`));
-        return;
-      }
-      resolve();
+      body: options.body,
+      timeoutMs: options.timeoutMs ?? HTTP_REQUEST_TIMEOUT_MS,
     });
 
-    req.setTimeout(options.timeoutMs ?? HTTP_REQUEST_TIMEOUT_MS, () => {
-      req.destroy(new Error(`${options.errorPrefix}_request_timeout`));
-    });
-    req.on('error', reject);
-    req.write(options.body);
-    req.end();
-  });
+    if (!response.ok) {
+      throw new Error(`${options.errorPrefix}_http_${response.status || 'unknown'}`);
+    }
+  } catch (error) {
+    if (error instanceof Error && /timeout|aborted/i.test(`${error.name} ${error.message}`)) {
+      throw new Error(`${options.errorPrefix}_request_timeout`);
+    }
+    throw error;
+  }
 }
 
 async function sendDiscordNotification(payload: NotificationPayload, webhookUrl: string): Promise<void> {
@@ -169,10 +166,8 @@ async function sendDiscordNotification(payload: NotificationPayload, webhookUrl:
   });
 
   try {
-    const url = new URL(webhookUrl);
     await _sendJsonHttpsRequest({
-      hostname: url.hostname,
-      path: url.pathname,
+      url: webhookUrl,
       body,
       errorPrefix: 'discord',
     });

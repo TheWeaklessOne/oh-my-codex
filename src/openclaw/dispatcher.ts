@@ -10,6 +10,8 @@
  * Prefers execFile for simple commands; falls back to sh -c only for shell metacharacters.
  */
 
+import { requestJson } from "../notifications/http-client.js";
+
 import type {
   OpenClawCommandGatewayConfig,
   OpenClawGatewayConfig,
@@ -155,11 +157,11 @@ export async function wakeGateway(
 
     const timeout = gatewayConfig.timeout ?? DEFAULT_HTTP_TIMEOUT_MS;
 
-    const response = await fetch(gatewayConfig.url, {
+    const response = await requestJson(gatewayConfig.url, {
       method: gatewayConfig.method || "POST",
       headers,
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(timeout),
+      timeoutMs: timeout,
     });
 
     if (!response.ok) {

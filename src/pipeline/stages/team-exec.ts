@@ -15,7 +15,12 @@ import {
   buildFollowupStaffingPlan,
   resolveAvailableAgentTypes,
 } from '../../team/followup-planner.js';
-import { readLatestPlanningArtifacts, readPlanningArtifacts, type PlanningArtifacts } from '../../planning/artifacts.js';
+import {
+  decodeApprovedExecutionQuotedValue,
+  readLatestPlanningArtifacts,
+  readPlanningArtifacts,
+  type PlanningArtifacts,
+} from '../../planning/artifacts.js';
 import { packageRoot, sameFilePath } from '../../utils/paths.js';
 
 export interface TeamExecStageOptions {
@@ -40,23 +45,6 @@ export interface TeamExecStageOptions {
 }
 
 const APPROVED_TEAM_LAUNCH_PATTERN = /(?<command>(?:omx\s+team|\$team)\s+(?<ralph>ralph\s+)?(?<count>\d+)(?::(?<role>[a-z][a-z0-9-]*))?\s+(?<task>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'))/gi;
-
-function decodeQuotedValue(raw: string): string | null {
-  const normalized = raw.trim();
-  if (!normalized) return null;
-
-  try {
-    return JSON.parse(normalized) as string;
-  } catch {
-    if (normalized.startsWith('"') && normalized.endsWith('"')) {
-      return normalized.slice(1, -1);
-    }
-    if (normalized.startsWith("'") && normalized.endsWith("'")) {
-      return normalized.slice(1, -1).replace(/\\'/g, "'");
-    }
-    return null;
-  }
-}
 
 function resolveRequestedTask(ctx: StageContext, ralplanArtifacts?: Record<string, unknown>): string {
   const ralplanTask = typeof ralplanArtifacts?.task === 'string' ? ralplanArtifacts.task.trim() : '';
@@ -178,7 +166,7 @@ function resolveApprovedTeamTaskFromPlanPath(
     throw new Error(`team_exec_approved_handoff_ambiguous:${approvedPlanPath}`);
   }
 
-  const task = matches[0]?.groups?.task ? decodeQuotedValue(matches[0].groups.task) : null;
+  const task = matches[0]?.groups?.task ? decodeApprovedExecutionQuotedValue(matches[0].groups.task) : null;
   if (!task) {
     throw new Error(`team_exec_approved_handoff_missing:${approvedPlanPath}`);
   }

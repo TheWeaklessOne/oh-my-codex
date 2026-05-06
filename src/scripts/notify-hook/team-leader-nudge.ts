@@ -75,23 +75,6 @@ export function resolveLeaderStalenessThresholdMs() {
   return 180_000;
 }
 
-export function resolveFallbackProgressStallThresholdMs() {
-  const raw = safeString(process.env.OMX_TEAM_PROGRESS_STALL_MS || '');
-  const parsed = asNumber(raw);
-  // Fallback-only threshold used when worker turn-count signals are unavailable.
-  // Default: 2 minutes. Guard against unreasonable values.
-  if (parsed !== null && parsed >= 10_000 && parsed <= 60 * 60_000) return parsed;
-  return 120_000;
-}
-
-export function resolveWorkerTurnStallThresholdMs() {
-  const raw = safeString(process.env.OMX_TEAM_WORKER_TURN_STALL_MS || '');
-  const parsed = asNumber(raw);
-  // Default: 30 seconds. Guard against unreasonable values.
-  if (parsed !== null && parsed >= 10_000 && parsed <= 10 * 60_000) return parsed;
-  return 30_000;
-}
-
 function buildStatusCheckReminder(teamName) {
   return `Next: check messages; keep orchestrating; if done, gracefully shut down: omx team shutdown ${teamName}.`;
 }
@@ -102,27 +85,6 @@ function buildMailboxCheckReminder(teamName) {
 
 function buildWorkerStartEvidenceReminder(teamName, workerName) {
   return `Next: check ${workerName} msg/output, confirm task in omx team status ${teamName}, then reassign/nudge.`;
-}
-
-function classifyLeaderActionState({
-  allWorkersIdle = false,
-  workerPanesAlive = false,
-  taskCounts = {},
-  teamProgressStalled = false,
-} = {}) {
-  const pending = Number.isFinite(taskCounts.pending) ? taskCounts.pending : 0;
-  const blocked = Number.isFinite(taskCounts.blocked) ? taskCounts.blocked : 0;
-  const inProgress = Number.isFinite(taskCounts.in_progress) ? taskCounts.in_progress : 0;
-  const tasksComplete = pending === 0 && blocked === 0 && inProgress === 0;
-  const pendingFollowUpTasks = allWorkersIdle && pending > 0 && blocked === 0 && inProgress === 0;
-  const blockedWaitingOnLeader = allWorkersIdle && blocked > 0 && pending === 0 && inProgress === 0;
-  const terminalWaitingOnLeader = allWorkersIdle && tasksComplete && workerPanesAlive;
-  const stalledWaitingOnLeader = blockedWaitingOnLeader || teamProgressStalled;
-
-  if (terminalWaitingOnLeader) return 'done_waiting_on_leader';
-  if (stalledWaitingOnLeader) return 'stuck_waiting_on_leader';
-  if (pendingFollowUpTasks) return 'still_actionable';
-  return 'still_actionable';
 }
 
 function buildLeaderActionGuidance(teamName, {
@@ -588,8 +550,6 @@ export async function maybeNudgeTeamLeader({
 }) {
   const intervalMs = resolveLeaderNudgeIntervalMs();
   const idleCooldownMs = resolveLeaderAllIdleNudgeCooldownMs();
-  const fallbackProgressStallThresholdMs = resolveFallbackProgressStallThresholdMs();
-  const workerTurnStallThresholdMs = resolveWorkerTurnStallThresholdMs();
   const nowMs = Date.now();
   const nowIso = new Date().toISOString();
   const omxDir = join(cwd, '.omx');
@@ -715,7 +675,6 @@ export async function maybeNudgeTeamLeader({
     const previousProgressAtMs = previousProgressAtIso ? Date.parse(previousProgressAtIso) : NaN;
     const previousTurnCounts = readPreviousWorkerTurnCounts(previousSignature);
     const workerTurnProgress = hasWorkerTurnProgress(progressSnapshot.workerSnapshot, previousTurnCounts);
-    const hasTrackableTurnSignals = hasTrackableActiveWorkerTurns(progressSnapshot.workerSnapshot, previousTurnCounts);
     const progressChanged = !previousSignature || previousSignature !== progressSnapshot.signature || workerTurnProgress;
     const extraProgressEvidenceMs = await readLatestTeamProgressEvidenceMs(cwd, teamName).catch(() => Number.NaN);
     const effectiveProgressAtMs = progressChanged || !Number.isFinite(previousProgressAtMs)
@@ -725,22 +684,15 @@ export async function maybeNudgeTeamLeader({
       ? Math.max(effectiveProgressAtMs, extraProgressEvidenceMs)
       : effectiveProgressAtMs;
     const effectiveProgressAtIso = new Date(latestProgressEvidenceMs).toISOString();
-    const stalledForMs = Math.max(0, nowMs - latestProgressEvidenceMs);
-    const stallThresholdMs = hasTrackableTurnSignals ? workerTurnStallThresholdMs : fallbackProgressStallThresholdMs;
-    const teamProgressStalled =
-      progressSnapshot.workRemaining
-      && paneStatus.alive
-      && !allWorkersIdle
-      && !progressChanged
-      && stalledForMs >= stallThresholdMs;
     const hasFreshProgressEvidence =
       progressSnapshot.workRemaining
-      && stalledForMs < stallThresholdMs;
+      && (progressChanged
+        || (Number.isFinite(extraProgressEvidenceMs)
+          && (nowMs - extraProgressEvidenceMs) < resolveLeaderStalenessThresholdMs()));
     const leaderActionState = classifyLeaderActionState({
       allWorkersIdle,
       workerPanesAlive: paneStatus.alive,
       taskCounts: progressSnapshot.taskCounts,
-      teamProgressStalled,
     });
     const leaderActionGuidance = buildLeaderActionGuidance(teamName, {
       allWorkersIdle,
@@ -773,8 +725,6 @@ export async function maybeNudgeTeamLeader({
     // Stale-leader follow-up is the only periodic visible nudge path.
     // This keeps the leader pane quieter when the leader is not actually stale.
     const stalePanesNudge = paneStatus.alive && leaderStale && !hasFreshProgressEvidence;
-    const previousStalledTeamNudge = prevReason === 'stuck_waiting_on_leader';
-    const stalledTeamNudge = teamProgressStalled && (dueByTime || !previousStalledTeamNudge);
     const staleFollowupDue = stalePanesNudge && dueByTime;
     const hasActionableNewMessage = hasNewMessage && (allowFreshMailboxNudges || leaderStale);
 
@@ -800,12 +750,6 @@ export async function maybeNudgeTeamLeader({
         `Team ${teamName}: ${ackWithoutStartEvidence.worker} said "${ackWithoutStartEvidence.body}" `
         + `but has no start evidence (status: ${ackWithoutStartEvidence.statusState}). `
         + buildWorkerStartEvidenceReminder(teamName, ackWithoutStartEvidence.worker);
-    } else if (stalledTeamNudge) {
-      nudgeReason = 'stuck_waiting_on_leader';
-      const stallPrefix = leaderStale ? 'leader stale, ' : 'worker panes stalled, ';
-      text =
-        `Team ${teamName}: ${stallPrefix}no progress ${formatDurationMs(stalledForMs)}. `
-        + leaderActionGuidance;
     } else if (stalePanesNudge && hasActionableNewMessage) {
       nudgeReason = 'stale_leader_with_messages';
       text =
@@ -838,7 +782,7 @@ export async function maybeNudgeTeamLeader({
         + (progressSnapshot.taskCounts.blocked || 0)
         + (progressSnapshot.taskCounts.in_progress || 0),
       unread_leader_message_count: unreadLeaderMessageCount,
-      stalled_for_ms: teamProgressStalled ? stalledForMs : null,
+      stalled_for_ms: null,
       source: source === 'notify_fallback_watcher' ? 'notify_hook' : source,
     };
     await writeTeamLeaderAttention(teamName, {
@@ -855,7 +799,7 @@ export async function maybeNudgeTeamLeader({
       leader_session_stopped_at: null,
       unread_leader_message_count: unreadLeaderMessageCount,
       work_remaining: progressSnapshot.workRemaining,
-      stalled_for_ms: teamProgressStalled ? stalledForMs : null,
+      stalled_for_ms: null,
     }, cwd).catch(() => {});
 
     if (!nudgeReason) continue;
@@ -1001,7 +945,7 @@ export async function maybeNudgeTeamLeader({
           pane_count: paneStatus.paneCount,
           leader_stale: leaderStale,
           message_count: messages.length,
-          stalled_for_ms: teamProgressStalled ? stalledForMs : undefined,
+          stalled_for_ms: undefined,
           missing_signal_workers: progressSnapshot.missingSignalWorkers,
           visible_injection_suppressed: true,
           suppression_reason: LEADER_PANE_SAME_CLASSIFIED_STATE_SUPPRESSED_REASON,
@@ -1059,7 +1003,7 @@ export async function maybeNudgeTeamLeader({
           pane_count: paneStatus.paneCount,
           leader_stale: leaderStale,
           message_count: messages.length,
-          stalled_for_ms: teamProgressStalled ? stalledForMs : undefined,
+          stalled_for_ms: undefined,
           missing_signal_workers: progressSnapshot.missingSignalWorkers,
         });
       } catch { /* ignore */ }

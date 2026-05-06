@@ -6,6 +6,7 @@
  * blocking hooks.
  */
 
+import { requestJson } from "./http-client.js";
 import type {
   DiscordNotificationConfig,
   DiscordBotNotificationConfig,
@@ -296,11 +297,11 @@ export async function sendDiscord(
       body.username = config.username;
     }
 
-    const response = await fetch(config.webhookUrl, {
+    const response = await requestJson(config.webhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+      timeoutMs: SEND_TIMEOUT_MS,
     });
 
     if (!response.ok) {
@@ -348,14 +349,14 @@ export async function sendDiscordBot(
       config.mention,
     );
     const url = `https://discord.com/api/v10/channels/${channelId}/messages`;
-    const response = await fetch(url, {
+    const response = await requestJson(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bot ${botToken}`,
       },
       body: JSON.stringify({ content, allowed_mentions }),
-      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+      timeoutMs: SEND_TIMEOUT_MS,
     });
 
     if (!response.ok) {
@@ -1279,11 +1280,11 @@ export async function sendSlack(
       body.username = config.username;
     }
 
-    const response = await fetch(config.webhookUrl, {
+    const response = await requestJson(config.webhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+      timeoutMs: SEND_TIMEOUT_MS,
     });
 
     if (!response.ok) {
@@ -1366,7 +1367,7 @@ export async function sendWebhook(
       ...config.headers,
     };
 
-    const response = await fetch(config.url, {
+    const response = await requestJson(config.url, {
       method: config.method || "POST",
       headers,
       body: JSON.stringify({
@@ -1383,7 +1384,7 @@ export async function sendWebhook(
         active_mode: payload.activeMode,
         question: payload.question,
       }),
-      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+      timeoutMs: SEND_TIMEOUT_MS,
     });
 
     if (!response.ok) {

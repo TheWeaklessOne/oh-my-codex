@@ -4,6 +4,32 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-05-06
+
+Minor release focused on skill deprecation and native Codex goal-mode integration. This release prepares durable goal workflows, Codex goal snapshot reconciliation, Team/Ralph goal handoff safety, and catalog/plugin skill delivery cleanup after `0.15.3`.
+
+### Added
+- **Native goal-mode workflows** — `ultragoal`, `performance-goal`, and `autoresearch-goal` provide durable repo artifacts, model-facing Codex goal handoffs, validation ledgers, and completion reconciliation.
+- **Goal workflow validation substrate** — shared helpers record workflow state, ledgers, validation summaries, and fresh Codex goal snapshot checks before accepting completion.
+- **Pipeline package templates and docs** — GitHub package pipeline templates, goal workflow docs, Discord integration docs, and release-readiness evidence are expanded.
+
+### Changed
+- **Ralph and Team goal handoffs are stricter** — completion paths now respect Codex goal-mode truth boundaries and approved execution context.
+- **Explore, notification, and CI paths are hardened** — explore startup bounds, notification proxy handling, question handshakes, boxed state routing, and split CI/package checks improve release reliability.
+
+### Deprecated
+- **Direct `omx autoresearch` launch remains deprecated** — use `$autoresearch` or `omx autoresearch-goal` for goal-mode-backed research workflows.
+
+### Removed
+- **Catalog-deprecated plugin skill delivery** — obsolete skills retired from installable/plugin delivery where catalog-deprecated; deprecated root wrappers may remain as compatibility stubs.
+
+### Fixed
+- **False-completion risk in goal workflows** — completion checkpoints require matching objective/status evidence from fresh Codex goal snapshots.
+- **Runtime lifecycle leaks** — stale Stop handling, MCP sibling cleanup, Ralph session rebinding, boxed state routing, and worker Stop behavior are tightened.
+
+### Verification
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.16.0.md`; publication remains blocked until local gates and GitHub CI pass.
+
 ## [0.15.1] - 2026-04-29
 
 Patch release focused on release-train hardening after `0.15.0`: direct/non-tmux leader launch controls, passive read-only state operations, concrete repo-aware Team DAG dependency remapping, setup/plugin-mode recovery, audited exec follow-ups, and runtime/hook reliability fixes.

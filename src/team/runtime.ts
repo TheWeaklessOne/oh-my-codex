@@ -109,10 +109,11 @@ import {
   buildLeaderMailboxTriggerDirective,
   writeWorkerRoleInstructionsFile,
 } from './worker-bootstrap.js';
+import { buildTeamWorkerGoalInstruction } from './goal-workflow.js';
 import { synthesizeDelegationPlan } from './delegation-policy.js';
 import { loadRolePrompt } from './role-router.js';
 import { composeRoleInstructionsForRole } from '../agents/native-config.js';
-import { codexPromptsDir } from '../utils/paths.js';
+import { codexPromptsDir, omxStateDir } from '../utils/paths.js';
 import { isTerminalPhase, type TeamPhase, type TerminalPhase } from './orchestrator.js';
 import {
   resolveTeamWorkerLaunchArgs,
@@ -131,6 +132,14 @@ import { hasStructuredVerificationEvidence } from '../verification/verifier.js';
 import { buildRebalanceDecisions } from './rebalance-policy.js';
 import { getStatePath } from '../mcp/state-paths.js';
 import { readModeState, updateModeState } from '../modes/base.js';
+import {
+  buildApprovedTeamExecutionBinding,
+  normalizeApprovedTeamExecutionBinding,
+  readApprovedTeamExecutionHintFromBinding,
+  resolvePersistedApprovedTeamExecutionContinuityState,
+  writePersistedApprovedTeamExecutionBinding,
+  type ApprovedTeamExecutionBinding,
+} from './approved-execution.js';
 import {
   appendTeamCommitHygieneEntries,
   buildTeamCommitHygieneContext,
@@ -1258,6 +1267,7 @@ export interface TeamStartOptions {
   confirmStaleCleanup?: (summary: StaleTeamSummary) => Promise<boolean>;
   cleanupLaunchOrphanedMcpProcesses?: () => Promise<CleanupResult>;
   writeCleanupWarning?: (message: string) => void;
+  approvedExecution?: ApprovedTeamExecutionBinding | null;
 }
 
 interface ShutdownGateCounts {
@@ -1389,6 +1399,22 @@ interface StartupTimingRecorder {
   flush: () => Promise<void>;
 }
 
+export function teamStartupTimingPath(teamName: string, cwd: string): string {
+  return join(resolveCanonicalTeamStateRoot(cwd), 'team', teamName, 'startup-timing.json');
+}
+
+export function teamRuntimeTeamsRoot(cwd: string): string {
+  return join(resolveCanonicalTeamStateRoot(cwd), 'team');
+}
+
+export function teamRuntimeTeamRoot(teamName: string, cwd: string): string {
+  return join(teamRuntimeTeamsRoot(cwd), teamName);
+}
+
+export function teamRuntimeSessionPath(cwd: string): string {
+  return join(omxStateDir(cwd), 'session.json');
+}
+
 function createStartupTimingRecorder(teamName: string, cwd: string): StartupTimingRecorder {
   const startedAt = performance.now();
   const events: StartupTimingEvent[] = [];
@@ -1402,7 +1428,7 @@ function createStartupTimingRecorder(teamName: string, cwd: string): StartupTimi
       });
     },
     flush: async () => {
-      const timingPath = join(cwd, '.omx', 'state', 'team', teamName, 'startup-timing.json');
+      const timingPath = teamStartupTimingPath(teamName, cwd);
       await writeAtomic(
         timingPath,
         JSON.stringify({ schema_version: STARTUP_TIMING_LOG_VERSION, team_name: teamName, events }, null, 2),
@@ -2033,13 +2059,20 @@ function spawnPromptWorker(
     initialPrompt,
     workerRole,
   );
+  const childEnv = { ...process.env, ...processSpec.env };
+  // Prompt workers are external CLI processes, not in-process runtime code.
+  // Keeping c8's NODE_V8_COVERAGE in their environment makes coverage runs
+  // track long-lived fake worker descendants and can keep node --test alive
+  // after the runtime test itself has completed.
+  delete childEnv.NODE_V8_COVERAGE;
+
   const child = spawn(
     processSpec.command,
     processSpec.args,
     {
       cwd: workerCwd,
       detached: process.platform !== 'win32',
-      env: { ...process.env, ...processSpec.env },
+      env: childEnv,
       stdio: ['pipe', 'ignore', 'ignore'],
     },
   );
@@ -2214,6 +2247,18 @@ export async function startTeam(
   }
 
   const teamStateRoot = resolveCanonicalTeamStateRoot(leaderCwd);
+  const requestedApprovedExecution = normalizeApprovedTeamExecutionBinding(options.approvedExecution);
+  const selectedApprovedExecutionHint = requestedApprovedExecution
+    ? readApprovedTeamExecutionHintFromBinding(leaderCwd, requestedApprovedExecution)
+    : null;
+  if (requestedApprovedExecution && !selectedApprovedExecutionHint) {
+    throw new Error(
+      `approved_execution_binding_stale:${requestedApprovedExecution.prd_path}:${requestedApprovedExecution.task}`,
+    );
+  }
+  const approvedExecution = selectedApprovedExecutionHint
+    ? buildApprovedTeamExecutionBinding(selectedApprovedExecutionHint)
+    : null;
   const activeWorktreeMode: 'detached' | 'named' | null =
     effectiveWorktreeMode.enabled
       ? (effectiveWorktreeMode.detached ? 'detached' : 'named')
@@ -2321,6 +2366,12 @@ export async function startTeam(
     config.requested_name = displayName;
     config.identity_source = identityScope.source;
     config.worktree_mode = effectiveWorktreeMode;
+    await writePersistedApprovedTeamExecutionBinding(
+      sanitized,
+      leaderCwd,
+      approvedExecution,
+      teamStateRoot,
+    );
 
     // 4. Create tasks. Repo-aware DAG dependencies are symbolic until the
     // state layer returns concrete task IDs, so create those tasks dependency
@@ -2445,6 +2496,7 @@ export async function startTeam(
         worktreeRootAgentsCanonical: Boolean(workerWorkspace.worktreePath),
         taskHints: effectiveDecompositionMetadata?.task_hints,
         approvedContextSummary: effectiveDecompositionMetadata?.approved_context_summary,
+        workerGoalInstruction: buildTeamWorkerGoalInstruction(sanitized, workerName, workerTasks, { teamStateRoot }),
       });
       const triggerDirective = buildTriggerDirective(
         workerName,
@@ -3683,6 +3735,20 @@ export async function resumeTeam(teamName: string, cwd: string): Promise<TeamRun
   const config = await readTeamConfig(sanitized, cwd);
   if (!config) return null;
   config.lifecycle_profile = 'default';
+  const leaderCwd = config.leader_cwd ?? cwd;
+  const approvedExecutionState = await resolvePersistedApprovedTeamExecutionContinuityState(
+    sanitized,
+    leaderCwd,
+    config.team_state_root ?? resolveCanonicalTeamStateRoot(leaderCwd),
+  );
+  if (approvedExecutionState.status === 'malformed') {
+    throw new Error(`approved_execution_binding_malformed:${sanitized}`);
+  }
+  if (approvedExecutionState.status === 'stale') {
+    throw new Error(
+      `approved_execution_binding_stale:${approvedExecutionState.binding.prd_path}:${approvedExecutionState.binding.task}`,
+    );
+  }
 
   if (config.worker_launch_mode === 'prompt') {
     const handleTeamConfig = { ...config, name: sanitized };
@@ -3725,7 +3791,7 @@ export async function resumeTeam(teamName: string, cwd: string): Promise<TeamRun
 }
 
 async function findActiveTeams(cwd: string, leaderSessionId: string): Promise<string[]> {
-  const root = join(cwd, '.omx', 'state', 'team');
+  const root = teamRuntimeTeamsRoot(cwd);
   if (!existsSync(root)) return [];
   const sessions = new Set(listTeamSessions());
   const entries = await readdir(root, { withFileTypes: true });
@@ -3762,7 +3828,7 @@ async function detectAndCleanStaleTeam(
   workerCount: number,
   confirmFn?: (summary: StaleTeamSummary) => Promise<boolean>,
 ): Promise<void> {
-  const stateDir = join(leaderCwd, '.omx', 'state', 'team', teamName);
+  const stateDir = teamRuntimeTeamRoot(teamName, leaderCwd);
   if (!existsSync(stateDir)) return;
 
   const sessions = new Set(listTeamSessions());
@@ -3816,7 +3882,7 @@ async function resolveLeaderSessionId(cwd: string): Promise<string> {
   const fromEnv = process.env.OMX_SESSION_ID || process.env.CODEX_SESSION_ID || process.env.SESSION_ID;
   if (fromEnv && fromEnv.trim() !== '') return fromEnv.trim();
 
-  const p = join(cwd, '.omx', 'state', 'session.json');
+  const p = teamRuntimeSessionPath(cwd);
   if (!existsSync(p)) return '';
   try {
     const raw = await readFile(p, 'utf-8');

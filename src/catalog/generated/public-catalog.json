@@ -1,11 +1,11 @@
 {
-  "generatedAt": "2026-04-26T01:15:13.493Z",
+  "generatedAt": "2026-05-06T03:03:20.311Z",
   "version": "2026.02.28.1",
   "counts": {
-    "skillCount": 44,
+    "skillCount": 48,
     "promptCount": 30,
-    "activeSkillCount": 29,
-    "activeAgentCount": 18
+    "activeSkillCount": 26,
+    "activeAgentCount": 16
   },
   "coreSkills": [
     "autopilot",
@@ -13,6 +13,7 @@
     "ultrawork",
     "team",
     "mission",
+    "ultragoal",
     "ralplan"
   ],
   "skills": [
@@ -61,8 +62,7 @@
     {
       "name": "ecomode",
       "category": "execution",
-      "status": "merged",
-      "canonical": "ultrawork",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
@@ -81,6 +81,20 @@
       "internalRequired": false
     },
     {
+      "name": "autoresearch-goal",
+      "category": "execution",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "performance-goal",
+      "category": "execution",
+      "status": "active",
+      "core": false,
+      "internalRequired": false
+    },
+    {
       "name": "pipeline",
       "category": "execution",
       "status": "active",
@@ -88,10 +102,16 @@
       "internalRequired": false
     },
     {
+      "name": "ultragoal",
+      "category": "execution",
+      "status": "active",
+      "core": true,
+      "internalRequired": false
+    },
+    {
       "name": "swarm",
       "category": "execution",
-      "status": "alias",
-      "canonical": "team",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
@@ -127,24 +147,21 @@
     {
       "name": "deepsearch",
       "category": "shortcut",
-      "status": "alias",
-      "canonical": "explore",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "tdd",
       "category": "shortcut",
-      "status": "alias",
-      "canonical": "test-engineer",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "build-fix",
       "category": "shortcut",
-      "status": "alias",
-      "canonical": "build-fixer",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
@@ -166,24 +183,21 @@
     {
       "name": "security-review",
       "category": "shortcut",
-      "status": "active",
-      "canonical": "security-reviewer",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "visual-verdict",
       "category": "shortcut",
-      "status": "active",
-      "canonical": "vision",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "web-clone",
       "category": "shortcut",
-      "status": "merged",
-      "canonical": "visual-ralph",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
@@ -214,22 +228,28 @@
     {
       "name": "review",
       "category": "shortcut",
-      "status": "alias",
-      "canonical": "plan --review",
+      "status": "deprecated",
+      "core": false,
+      "internalRequired": false
+    },
+    {
+      "name": "ask",
+      "category": "shortcut",
+      "status": "active",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "ask-claude",
       "category": "shortcut",
-      "status": "active",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "ask-gemini",
       "category": "shortcut",
-      "status": "active",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
@@ -250,21 +270,21 @@
     {
       "name": "help",
       "category": "utility",
-      "status": "active",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "note",
       "category": "utility",
-      "status": "active",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
     {
       "name": "trace",
       "category": "utility",
-      "status": "active",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
@@ -331,8 +351,7 @@
     {
       "name": "ralph-init",
       "category": "utility",
-      "status": "merged",
-      "canonical": "plan",
+      "status": "deprecated",
       "core": false,
       "internalRequired": false
     },
@@ -406,7 +425,7 @@
     {
       "name": "security-reviewer",
       "category": "review",
-      "status": "active"
+      "status": "deprecated"
     },
     {
       "name": "performance-reviewer",
@@ -438,7 +457,7 @@
     {
       "name": "build-fixer",
       "category": "domain",
-      "status": "active"
+      "status": "deprecated"
     },
     {
       "name": "designer",
@@ -508,40 +527,12 @@
   ],
   "aliases": [
     {
-      "name": "ecomode",
-      "canonical": "ultrawork"
-    },
-    {
-      "name": "swarm",
-      "canonical": "team"
-    },
-    {
-      "name": "deepsearch",
-      "canonical": "explore"
-    },
-    {
-      "name": "tdd",
-      "canonical": "test-engineer"
-    },
-    {
-      "name": "build-fix",
-      "canonical": "build-fixer"
-    },
-    {
-      "name": "web-clone",
-      "canonical": "visual-ralph"
-    },
-    {
       "name": "frontend-ui-ux",
       "canonical": "designer"
     },
     {
       "name": "git-master",
       "canonical": "git-master"
-    },
-    {
-      "name": "review",
-      "canonical": "plan --review"
     },
     {
       "name": "configure-discord",
@@ -558,10 +549,6 @@
     {
       "name": "configure-openclaw",
       "canonical": "configure-notifications"
-    },
-    {
-      "name": "ralph-init",
-      "canonical": "plan"
     }
   ],
   "internalHidden": [

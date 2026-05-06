@@ -1,10 +1,11 @@
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
-import { EventEmitter } from 'events';
 import { loadNotificationConfig, notify, _buildDesktopArgs, _sendJsonHttpsRequest } from '../notifier.js';
 import type { NotificationConfig, NotificationPayload } from '../notifier.js';
 
@@ -210,42 +211,28 @@ describe('NotificationPayload type', () => {
 });
 
 describe('_sendJsonHttpsRequest', () => {
-  async function withMockedHttpsRequest(
-    mockRequest: (options: unknown, callback: (res: { statusCode?: number; resume(): void }) => void) => EventEmitter,
-    run: () => Promise<void>,
+  async function withServer(
+    handler: (req: IncomingMessage, res: ServerResponse) => void,
+    run: (baseUrl: string) => Promise<void>,
   ): Promise<void> {
-    const httpsModule = await import('https');
-    const originalRequest = httpsModule.default.request;
-    (httpsModule.default as { request: typeof originalRequest }).request = mockRequest as typeof originalRequest;
+    const server = createServer(handler);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     try {
-      await run();
+      const address = server.address() as AddressInfo;
+      await run(`http://127.0.0.1:${address.port}`);
     } finally {
-      (httpsModule.default as { request: typeof originalRequest }).request = originalRequest;
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
   }
 
   it('rejects non-2xx HTTP responses', async () => {
-    await withMockedHttpsRequest((_options, callback) => {
-      const req = new EventEmitter() as EventEmitter & {
-        write(chunk: string): void;
-        end(): void;
-        setTimeout(ms: number, cb: () => void): EventEmitter;
-        destroy(error?: Error): void;
-      };
-      req.write = () => {};
-      req.setTimeout = () => req;
-      req.destroy = (error?: Error) => {
-        if (error) req.emit('error', error);
-      };
-      req.end = () => {
-        callback({ statusCode: 500, resume: () => {} });
-      };
-      return req;
-    }, async () => {
+    await withServer((_req, res) => {
+      res.statusCode = 500;
+      res.end('failed');
+    }, async (baseUrl) => {
       await assert.rejects(
         _sendJsonHttpsRequest({
-          hostname: 'discord.com',
-          path: '/api/webhooks/test',
+          url: `${baseUrl}/api/webhooks/test`,
           body: '{}',
           errorPrefix: 'discord',
         }),
@@ -255,64 +242,28 @@ describe('_sendJsonHttpsRequest', () => {
   });
 
   it('configures request timeout and rejects on timeout', async () => {
-    let seenTimeoutMs = 0;
-    await withMockedHttpsRequest((_options, _callback) => {
-      const req = new EventEmitter() as EventEmitter & {
-        write(chunk: string): void;
-        end(): void;
-        setTimeout(ms: number, cb: () => void): EventEmitter;
-        destroy(error?: Error): void;
-      };
-      let onTimeout: (() => void) | undefined;
-      req.write = () => {};
-      req.setTimeout = (ms: number, cb: () => void) => {
-        seenTimeoutMs = ms;
-        onTimeout = cb;
-        return req;
-      };
-      req.destroy = (error?: Error) => {
-        if (error) req.emit('error', error);
-      };
-      req.end = () => {
-        onTimeout?.();
-      };
-      return req;
-    }, async () => {
+    await withServer((_req, _res) => {
+      // Leave the response open so the client timeout fires.
+    }, async (baseUrl) => {
       await assert.rejects(
         _sendJsonHttpsRequest({
-          hostname: 'api.telegram.org',
-          path: '/botabc/sendMessage',
+          url: `${baseUrl}/botabc/sendMessage`,
           body: '{}',
           errorPrefix: 'telegram',
-          timeoutMs: 1234,
+          timeoutMs: 50,
         }),
         /telegram_request_timeout/,
       );
-      assert.equal(seenTimeoutMs, 1234);
     });
   });
 
   it('resolves for 2xx responses', async () => {
-    await withMockedHttpsRequest((_options, callback) => {
-      const req = new EventEmitter() as EventEmitter & {
-        write(chunk: string): void;
-        end(): void;
-        setTimeout(ms: number, cb: () => void): EventEmitter;
-        destroy(error?: Error): void;
-      };
-      req.write = () => {};
-      req.setTimeout = () => req;
-      req.destroy = (error?: Error) => {
-        if (error) req.emit('error', error);
-      };
-      req.end = () => {
-        callback({ statusCode: 204, resume: () => {} });
-      };
-      return req;
-    }, async () => {
+    await withServer((_req, res) => {
+      res.statusCode = 204;
+      res.end();
+    }, async (baseUrl) => {
       await _sendJsonHttpsRequest({
-        hostname: 'discord.com',
-        path: '/api/webhooks/test',
+        url: `${baseUrl}/api/webhooks/test`,
         body: '{}',
         errorPrefix: 'discord',
       });

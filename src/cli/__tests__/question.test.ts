@@ -159,6 +159,15 @@ describe('omx question CLI', () => {
 
     assert.notEqual(recordFile, '', `expected batch question record file, stderr=${stderr}`);
     const recordPath = join(questionsDir, recordFile);
+
+    let record = null;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      record = await readQuestionRecord(recordPath);
+      if (record?.status === 'prompting') break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    assert.equal(record?.status, 'prompting', `expected prompting batch question record, stderr=${stderr}`);
     await markQuestionAnswered(recordPath, [
       { question_id: 'first', index: 0, answer: { kind: 'option', value: 'a', selected_labels: ['A'], selected_values: ['a'] } },
       { question_id: 'second', index: 1, answer: { kind: 'option', value: 'd', selected_labels: ['D'], selected_values: ['d'] } },
