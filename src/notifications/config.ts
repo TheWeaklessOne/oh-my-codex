@@ -1027,6 +1027,7 @@ function parseTelegramUserIds(
 const REPLY_POLL_INTERVAL_MIN_MS = 500;
 const REPLY_POLL_INTERVAL_MAX_MS = 60_000;
 const REPLY_POLL_INTERVAL_DEFAULT_MS = 3_000;
+const REPLY_PROGRESS_CALLBACK_POLL_INTERVAL_DEFAULT_MS = 500;
 const REPLY_RATE_LIMIT_MIN_PER_MINUTE = 1;
 const REPLY_RATE_LIMIT_DEFAULT_PER_MINUTE = 10;
 const REPLY_MAX_MESSAGE_LENGTH_MIN = 1;
@@ -1036,6 +1037,7 @@ const REPLY_ACK_MODE_DEFAULT = "minimal";
 const REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS_MIN = 1;
 const REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS_MAX = 60;
 const REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS_DEFAULT = 30;
+const REPLY_TELEGRAM_PROGRESS_CALLBACK_POLL_TIMEOUT_SECONDS_DEFAULT = 3;
 const REPLY_TELEGRAM_ALLOWED_UPDATES_DEFAULT = ["message"];
 const REPLY_TELEGRAM_STARTUP_BACKLOG_DEFAULT = "resume";
 const REPLY_ACK_MODES = new Set(["off", "minimal", "summary"]);
@@ -1452,13 +1454,24 @@ export function getReplyConfig(
     );
   }
 
-  const pollIntervalMs = normalizeInteger(
+  const progressCallbackUxEnabled = hasTelegramProgressCallbackUx(notifConfig);
+  const pollIntervalDefaultMs = progressCallbackUxEnabled
+    ? REPLY_PROGRESS_CALLBACK_POLL_INTERVAL_DEFAULT_MS
+    : REPLY_POLL_INTERVAL_DEFAULT_MS;
+  const telegramPollTimeoutSecondsDefault = progressCallbackUxEnabled
+    ? REPLY_TELEGRAM_PROGRESS_CALLBACK_POLL_TIMEOUT_SECONDS_DEFAULT
+    : REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS_DEFAULT;
+
+  const normalizedPollIntervalMs = normalizeInteger(
     parseIntegerInput(process.env.OMX_REPLY_POLL_INTERVAL_MS)
       ?? parseIntegerInput(replyRaw?.pollIntervalMs),
-    REPLY_POLL_INTERVAL_DEFAULT_MS,
+    pollIntervalDefaultMs,
     REPLY_POLL_INTERVAL_MIN_MS,
     REPLY_POLL_INTERVAL_MAX_MS,
   );
+  const pollIntervalMs = progressCallbackUxEnabled
+    ? Math.min(normalizedPollIntervalMs, REPLY_PROGRESS_CALLBACK_POLL_INTERVAL_DEFAULT_MS)
+    : normalizedPollIntervalMs;
   const rateLimitPerMinute = normalizeInteger(
     parseIntegerInput(process.env.OMX_REPLY_RATE_LIMIT)
       ?? parseIntegerInput(replyRaw?.rateLimitPerMinute),
@@ -1471,25 +1484,31 @@ export function getReplyConfig(
     REPLY_MAX_MESSAGE_LENGTH_MIN,
     REPLY_MAX_MESSAGE_LENGTH_MAX,
   );
-  const telegramPollTimeoutSeconds = normalizeInteger(
+  const normalizedTelegramPollTimeoutSeconds = normalizeInteger(
     parseIntegerInput(process.env.OMX_REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS)
       ?? parseIntegerInput(replyRaw?.telegramPollTimeoutSeconds),
-    REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS_DEFAULT,
+    telegramPollTimeoutSecondsDefault,
     REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS_MIN,
     REPLY_TELEGRAM_POLL_TIMEOUT_SECONDS_MAX,
   );
+  const telegramPollTimeoutSeconds = progressCallbackUxEnabled
+    ? Math.min(
+        normalizedTelegramPollTimeoutSeconds,
+        REPLY_TELEGRAM_PROGRESS_CALLBACK_POLL_TIMEOUT_SECONDS_DEFAULT,
+      )
+    : normalizedTelegramPollTimeoutSeconds;
   const telegramAllowedUpdates = parseStringList(
     process.env.OMX_REPLY_TELEGRAM_ALLOWED_UPDATES,
     replyRaw?.telegramAllowedUpdates,
   );
-  const defaultTelegramAllowedUpdates = hasTelegramProgressCallbackUx(notifConfig)
+  const defaultTelegramAllowedUpdates = progressCallbackUxEnabled
     ? [...REPLY_TELEGRAM_ALLOWED_UPDATES_DEFAULT, "callback_query"]
     : [...REPLY_TELEGRAM_ALLOWED_UPDATES_DEFAULT];
   const effectiveTelegramAllowedUpdates = telegramAllowedUpdates.length > 0
     ? telegramAllowedUpdates
     : defaultTelegramAllowedUpdates;
   if (
-    hasTelegramProgressCallbackUx(notifConfig)
+    progressCallbackUxEnabled
     && !effectiveTelegramAllowedUpdates.includes("callback_query")
   ) {
     effectiveTelegramAllowedUpdates.push("callback_query");

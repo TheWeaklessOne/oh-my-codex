@@ -163,6 +163,7 @@ const SECRET_FILE_PATH = join(DEFAULT_STATE_DIR, 'reply-listener-secrets.json');
 const MIN_REPLY_POLL_INTERVAL_MS = 500;
 const MAX_REPLY_POLL_INTERVAL_MS = 60_000;
 const DEFAULT_REPLY_POLL_INTERVAL_MS = 3_000;
+const DEFAULT_TELEGRAM_PROGRESS_CALLBACK_POLL_INTERVAL_MS = 500;
 const MIN_REPLY_RATE_LIMIT_PER_MINUTE = 1;
 const DEFAULT_REPLY_RATE_LIMIT_PER_MINUTE = 10;
 const MIN_REPLY_MAX_MESSAGE_LENGTH = 1;
@@ -171,7 +172,10 @@ const DEFAULT_REPLY_MAX_MESSAGE_LENGTH = 500;
 const MIN_TELEGRAM_POLL_TIMEOUT_SECONDS = 1;
 const MAX_TELEGRAM_POLL_TIMEOUT_SECONDS = 60;
 const DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS = 30;
+const DEFAULT_TELEGRAM_PROGRESS_CALLBACK_POLL_TIMEOUT_SECONDS = 3;
 const DEFAULT_TELEGRAM_ALLOWED_UPDATES = ['message'];
+const TELEGRAM_CALLBACK_UPDATE_TYPE = 'callback_query';
+const REPLY_LISTENER_CONFIG_REFRESH_ABORT_CODE = 'OMX_REPLY_LISTENER_CONFIG_REFRESH_REQUESTED';
 const DEFAULT_REPLY_ACK_MODE: ReplyAcknowledgementMode = 'minimal';
 const DEFAULT_TELEGRAM_STARTUP_BACKLOG_POLICY: TelegramStartupBacklogPolicy = 'resume';
 const REPLY_ACK_CAPTURE_LINES = 200;
@@ -607,17 +611,38 @@ function syncLegacyStateMirrors(
 export function normalizeReplyListenerConfig(config: ReplyListenerDaemonConfig): ReplyListenerDaemonConfig {
   const discordEnabled = config.discordEnabled ?? !!(config.discordBotToken && config.discordChannelId);
   const telegramEnabled = config.telegramEnabled ?? !!(config.telegramBotToken && config.telegramChatId);
+  const telegramAllowedUpdates = normalizeStringList(
+    config.telegramAllowedUpdates,
+    DEFAULT_TELEGRAM_ALLOWED_UPDATES,
+  );
+  const telegramCallbackPollingEnabled = telegramEnabled
+    && telegramAllowedUpdates.includes(TELEGRAM_CALLBACK_UPDATE_TYPE);
+  const pollIntervalDefaultMs = telegramCallbackPollingEnabled
+    ? DEFAULT_TELEGRAM_PROGRESS_CALLBACK_POLL_INTERVAL_MS
+    : DEFAULT_REPLY_POLL_INTERVAL_MS;
+  const telegramPollTimeoutDefaultSeconds = telegramCallbackPollingEnabled
+    ? DEFAULT_TELEGRAM_PROGRESS_CALLBACK_POLL_TIMEOUT_SECONDS
+    : DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS;
+  const normalizedPollIntervalMs = normalizeInteger(
+    config.pollIntervalMs,
+    pollIntervalDefaultMs,
+    MIN_REPLY_POLL_INTERVAL_MS,
+    MAX_REPLY_POLL_INTERVAL_MS,
+  );
+  const normalizedTelegramPollTimeoutSeconds = normalizeInteger(
+    config.telegramPollTimeoutSeconds,
+    telegramPollTimeoutDefaultSeconds,
+    MIN_TELEGRAM_POLL_TIMEOUT_SECONDS,
+    MAX_TELEGRAM_POLL_TIMEOUT_SECONDS,
+  );
 
   return {
     ...config,
     discordEnabled,
     telegramEnabled,
-    pollIntervalMs: normalizeInteger(
-      config.pollIntervalMs,
-      DEFAULT_REPLY_POLL_INTERVAL_MS,
-      MIN_REPLY_POLL_INTERVAL_MS,
-      MAX_REPLY_POLL_INTERVAL_MS,
-    ),
+    pollIntervalMs: telegramCallbackPollingEnabled
+      ? Math.min(normalizedPollIntervalMs, DEFAULT_TELEGRAM_PROGRESS_CALLBACK_POLL_INTERVAL_MS)
+      : normalizedPollIntervalMs,
     rateLimitPerMinute: normalizeInteger(
       config.rateLimitPerMinute,
       DEFAULT_REPLY_RATE_LIMIT_PER_MINUTE,
@@ -641,16 +666,10 @@ export function normalizeReplyListenerConfig(config: ReplyListenerDaemonConfig):
     authorizedTelegramUserIds: Array.isArray(config.authorizedTelegramUserIds)
       ? config.authorizedTelegramUserIds.filter((id): id is string => typeof id === 'string' && id.trim() !== '')
       : [],
-    telegramPollTimeoutSeconds: normalizeInteger(
-      config.telegramPollTimeoutSeconds,
-      DEFAULT_TELEGRAM_POLL_TIMEOUT_SECONDS,
-      MIN_TELEGRAM_POLL_TIMEOUT_SECONDS,
-      MAX_TELEGRAM_POLL_TIMEOUT_SECONDS,
-    ),
-    telegramAllowedUpdates: normalizeStringList(
-      config.telegramAllowedUpdates,
-      DEFAULT_TELEGRAM_ALLOWED_UPDATES,
-    ),
+    telegramPollTimeoutSeconds: telegramCallbackPollingEnabled
+      ? Math.min(normalizedTelegramPollTimeoutSeconds, DEFAULT_TELEGRAM_PROGRESS_CALLBACK_POLL_TIMEOUT_SECONDS)
+      : normalizedTelegramPollTimeoutSeconds,
+    telegramAllowedUpdates,
     telegramStartupBacklogPolicy: normalizeTelegramStartupBacklogPolicy(
       config.telegramStartupBacklogPolicy,
     ),
@@ -659,6 +678,32 @@ export function normalizeReplyListenerConfig(config: ReplyListenerDaemonConfig):
       process.env,
     ),
   };
+}
+
+function hasTelegramCallbackPolling(config: ReplyListenerDaemonConfig): boolean {
+  return config.telegramEnabled !== false
+    && !!config.telegramBotToken
+    && !!config.telegramChatId
+    && config.telegramAllowedUpdates.includes(TELEGRAM_CALLBACK_UPDATE_TYPE);
+}
+
+function sameStringList(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((value, index) => value === right[index]);
+}
+
+export function shouldInterruptReplyListenerForConfigChange(
+  previousConfig: ReplyListenerDaemonConfig,
+  nextConfig: ReplyListenerDaemonConfig,
+): boolean {
+  const previousCallbackPolling = hasTelegramCallbackPolling(previousConfig);
+  const nextCallbackPolling = hasTelegramCallbackPolling(nextConfig);
+  if (previousCallbackPolling !== nextCallbackPolling) return true;
+  if (!nextCallbackPolling) return false;
+
+  return previousConfig.telegramPollTimeoutSeconds !== nextConfig.telegramPollTimeoutSeconds
+    || previousConfig.pollIntervalMs !== nextConfig.pollIntervalMs
+    || !sameStringList(previousConfig.telegramAllowedUpdates, nextConfig.telegramAllowedUpdates);
 }
 
 function getTelegramSourceIdentity(config: ReplyListenerDaemonConfig): string | null {
@@ -1096,6 +1141,18 @@ export function isDaemonRunning(): boolean {
   return true;
 }
 
+function signalReplyListenerConfigRefresh(): boolean {
+  const pid = readPidFile();
+  if (pid === null) return false;
+  if (!isProcessRunning(pid) || !isReplyListenerProcess(pid)) return false;
+  try {
+    process.kill(pid, 'SIGCONT');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ============================================================================
 // Input Sanitization
 // ============================================================================
@@ -1228,6 +1285,7 @@ export interface ReplyListenerPollDeps {
   parseMentionAllowedMentionsImpl?: typeof parseMentionAllowedMentions;
   telegramTranscriptionProvider?: AudioTranscriptionProvider;
   telegramTranscriptionCacheRoot?: string;
+  abortSignal?: AbortSignal;
   logImpl?: typeof log;
 }
 
@@ -1669,6 +1727,17 @@ export async function pollDiscordOnce(
 // Telegram Polling
 // ============================================================================
 
+function createConfigRefreshAbortError(): Error {
+  const error = new Error('Reply listener config refresh requested');
+  (error as NodeJS.ErrnoException).code = REPLY_LISTENER_CONFIG_REFRESH_ABORT_CODE;
+  return error;
+}
+
+function isConfigRefreshAbortError(error: unknown): boolean {
+  return error instanceof Error
+    && (error as NodeJS.ErrnoException).code === REPLY_LISTENER_CONFIG_REFRESH_ABORT_CODE;
+}
+
 async function requestTelegramUpdates(
   config: ReplyListenerDaemonConfig,
   sourceState: ReplyListenerSourceState,
@@ -1676,6 +1745,7 @@ async function requestTelegramUpdates(
   options: {
     timeoutSeconds?: number;
     offset?: number;
+    abortSignal?: AbortSignal;
   } = {},
 ): Promise<TelegramUpdate[]> {
   const timeoutSeconds = options.timeoutSeconds ?? config.telegramPollTimeoutSeconds;
@@ -1685,7 +1755,40 @@ async function requestTelegramUpdates(
   });
 
   return await new Promise<TelegramUpdate[]>((resolve, reject) => {
-    const req = httpsRequestImpl(
+    if (options.abortSignal?.aborted) {
+      reject(createConfigRefreshAbortError());
+      return;
+    }
+
+    let settled = false;
+    let req: ReturnType<typeof httpsRequest> | null = null;
+    const cleanup = () => {
+      if (options.abortSignal) {
+        options.abortSignal.removeEventListener('abort', onAbort);
+      }
+    };
+    const finishResolve = (updates: TelegramUpdate[]) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(updates);
+    };
+    const finishReject = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const onAbort = () => {
+      const abortError = createConfigRefreshAbortError();
+      if (req) {
+        req.destroy(abortError);
+      } else {
+        finishReject(abortError);
+      }
+    };
+
+    req = httpsRequestImpl(
       {
         hostname: 'api.telegram.org',
         path,
@@ -1705,28 +1808,36 @@ async function requestTelegramUpdates(
             };
             if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
               if (body.ok === false) {
-                reject(new Error(typeof body.description === 'string' ? body.description : 'Telegram Bot API returned ok=false'));
+                finishReject(new Error(typeof body.description === 'string' ? body.description : 'Telegram Bot API returned ok=false'));
                 return;
               }
-              resolve(Array.isArray(body.result) ? body.result : []);
+              finishResolve(Array.isArray(body.result) ? body.result : []);
             } else {
               if (body.ok === false && typeof body.description === 'string') {
-                reject(new Error(body.description));
+                finishReject(new Error(body.description));
                 return;
               }
-              reject(new Error(`HTTP ${res.statusCode}`));
+              finishReject(new Error(`HTTP ${res.statusCode}`));
             }
           } catch (error) {
-            reject(error);
+            finishReject(error);
           }
         });
       }
     );
 
-    req.on('error', reject);
+    if (options.abortSignal) {
+      options.abortSignal.addEventListener('abort', onAbort, { once: true });
+      if (options.abortSignal.aborted) {
+        onAbort();
+      }
+    }
+
+    req.on('error', (error) => finishReject(error));
     req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('Request timeout'));
+      const timeoutError = new Error('Request timeout');
+      req?.destroy(timeoutError);
+      finishReject(timeoutError);
     });
 
     req.end();
@@ -1917,6 +2028,7 @@ async function handleTelegramProgressCallback(
 ): Promise<boolean> {
   const token = parseTelegramProgressCallbackToken(callback.data);
   if (!token) return false;
+  const startedAt = Date.now();
 
   if (String(callback.chatId) !== config.telegramChatId) {
     return true;
@@ -1931,6 +2043,7 @@ async function handleTelegramProgressCallback(
     });
     logSourceEvent(logImpl, source, 'telegram_progress_callback_unauthorized', {
       messageId: callback.messageId,
+      durationMs: Date.now() - startedAt,
     });
     return true;
   }
@@ -2004,6 +2117,7 @@ async function handleTelegramProgressCallback(
     logSourceEvent(logImpl, source, 'telegram_progress_callback_hide', {
       messageId: finalState.messageId,
       turnId: finalState.turnId,
+      durationMs: Date.now() - startedAt,
     });
     return true;
   }
@@ -2037,6 +2151,7 @@ async function handleTelegramProgressCallback(
     logSourceEvent(logImpl, source, 'telegram_progress_callback_show', {
       messageId: finalState.messageId,
       turnId: finalState.turnId,
+      durationMs: Date.now() - startedAt,
     });
     return true;
   }
@@ -2050,6 +2165,7 @@ async function handleTelegramProgressCallback(
       messageId: finalState.messageId,
       turnId: finalState.turnId,
       reason: 'full-trace-delivery-none',
+      durationMs: Date.now() - startedAt,
     });
     return true;
   }
@@ -2061,6 +2177,7 @@ async function handleTelegramProgressCallback(
     logSourceEvent(logImpl, source, 'telegram_progress_callback_fallback_deduped', {
       messageId: finalState.messageId,
       turnId: finalState.turnId,
+      durationMs: Date.now() - startedAt,
     });
     return true;
   }
@@ -2085,6 +2202,7 @@ async function handleTelegramProgressCallback(
     messageId: finalState.messageId,
     turnId: finalState.turnId,
     delivery: finalState.fullTraceDelivery ?? 'message',
+    durationMs: Date.now() - startedAt,
   });
   return true;
 }
@@ -2535,8 +2653,9 @@ async function pollTelegram(
   config: ReplyListenerDaemonConfig,
   state: ReplyListenerState,
   rateLimiter: ReplyListenerRateLimiter,
+  deps: ReplyListenerPollDeps = {},
 ): Promise<void> {
-  return pollTelegramOnce(config, state, rateLimiter);
+  return pollTelegramOnce(config, state, rateLimiter, deps);
 }
 
 export async function pollTelegramOnce(
@@ -2590,7 +2709,9 @@ export async function pollTelegramOnce(
     }
 
     const updates = startupPolicy.startupUpdates
-      ?? await requestTelegramUpdates(config, sourceState, httpsRequestImpl);
+      ?? await requestTelegramUpdates(config, sourceState, httpsRequestImpl, {
+        ...(deps.abortSignal ? { abortSignal: deps.abortSignal } : {}),
+      });
     sourceState.lastPollAt = new Date().toISOString();
     clearSourceFailure(state, source, 'poll-error');
 
@@ -2967,6 +3088,10 @@ export async function pollTelegramOnce(
       }
     }
   } catch (error) {
+    if (isConfigRefreshAbortError(error)) {
+      logImpl('Telegram polling interrupted for reply listener config refresh');
+      return;
+    }
     state.errors++;
     state.lastError = error instanceof Error ? error.message : String(error);
     recordSourceFailure(state, source, 'poll-error', state.lastError);
@@ -2982,6 +3107,43 @@ export async function pollTelegramOnce(
 // ============================================================================
 
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+
+let runtimeConfigRefreshRequested = false;
+let activeTelegramRefreshAbortController: AbortController | null = null;
+let activePollSleepWake: (() => void) | null = null;
+
+function requestRuntimeConfigRefresh(logImpl: typeof log = log): void {
+  runtimeConfigRefreshRequested = true;
+  activeTelegramRefreshAbortController?.abort();
+  activePollSleepWake?.();
+  logImpl('Reply listener config refresh requested');
+}
+
+function consumeRuntimeConfigRefreshRequest(): boolean {
+  if (!runtimeConfigRefreshRequested) return false;
+  runtimeConfigRefreshRequested = false;
+  return true;
+}
+
+async function sleepUntilNextReplyPoll(ms: number): Promise<boolean> {
+  if (runtimeConfigRefreshRequested) return true;
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const done = (interrupted: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (activePollSleepWake === wake) {
+        activePollSleepWake = null;
+      }
+      resolve(interrupted);
+    };
+    const wake = () => done(true);
+    timer = setTimeout(() => done(false), ms);
+    activePollSleepWake = wake;
+  });
+}
 
 async function pollLoop(): Promise<void> {
   log('Reply listener daemon starting poll loop');
@@ -3019,6 +3181,9 @@ async function pollLoop(): Promise<void> {
 
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
+  if (process.platform !== 'win32') {
+    process.on('SIGCONT', () => requestRuntimeConfigRefresh(log));
+  }
 
   try {
     pruneStale();
@@ -3040,10 +3205,14 @@ async function pollLoop(): Promise<void> {
 
   while (state.isRunning) {
     try {
+      const forcedRefresh = consumeRuntimeConfigRefreshRequest();
       const previousConfig = config;
       const refreshedRuntime = refreshReplyListenerRuntimeConfig(config, rateLimiter);
       config = refreshedRuntime.config;
       rateLimiter = refreshedRuntime.rateLimiter;
+      if (forcedRefresh) {
+        log('Reply listener runtime config reloaded after refresh signal');
+      }
       sourceRateLimiters = reconcileSourceRateLimiters(config, sourceRateLimiters, previousConfig);
       const reconciledState = reconcileReplyListenerStateWithConfigChange(
         previousConfig,
@@ -3070,12 +3239,30 @@ async function pollLoop(): Promise<void> {
         sourceRateLimiters.set(discordSource.key, discordRateLimiter);
         await pollDiscord(config, state, discordRateLimiter);
       }
+      if (runtimeConfigRefreshRequested) {
+        writeDaemonState(state);
+        continue;
+      }
 
       const telegramSource = getTelegramReplySource(config);
       if (telegramSource) {
         const telegramRateLimiter = sourceRateLimiters.get(telegramSource.key) ?? new RateLimiter(config.rateLimitPerMinute);
         sourceRateLimiters.set(telegramSource.key, telegramRateLimiter);
-        await pollTelegram(config, state, telegramRateLimiter);
+        const telegramAbortController = new AbortController();
+        activeTelegramRefreshAbortController = telegramAbortController;
+        try {
+          await pollTelegram(config, state, telegramRateLimiter, {
+            abortSignal: telegramAbortController.signal,
+          });
+        } finally {
+          if (activeTelegramRefreshAbortController === telegramAbortController) {
+            activeTelegramRefreshAbortController = null;
+          }
+        }
+      }
+      if (runtimeConfigRefreshRequested) {
+        writeDaemonState(state);
+        continue;
       }
 
       if (Date.now() - lastPruneAt > PRUNE_INTERVAL_MS) {
@@ -3096,13 +3283,13 @@ async function pollLoop(): Promise<void> {
       }
 
       writeDaemonState(state);
-      await new Promise((resolve) => setTimeout(resolve, config.pollIntervalMs));
+      await sleepUntilNextReplyPoll(config.pollIntervalMs);
     } catch (error) {
       state.errors++;
       state.lastError = error instanceof Error ? error.message : String(error);
       log(`Poll error: ${state.lastError}`);
       writeDaemonState(state);
-      await new Promise((resolve) => setTimeout(resolve, config.pollIntervalMs * 2));
+      await sleepUntilNextReplyPoll(config.pollIntervalMs * 2);
     }
   }
 
@@ -3123,6 +3310,7 @@ interface StartReplyListenerDeps {
   writeDaemonConfigImpl?: typeof writeDaemonConfig;
   writeDaemonStateImpl?: typeof writeDaemonState;
   writePidFileImpl?: typeof writePidFile;
+  signalDaemonConfigRefreshImpl?: typeof signalReplyListenerConfigRefresh;
   logImpl?: typeof log;
 }
 
@@ -3139,6 +3327,7 @@ export function startReplyListener(
   const writeDaemonConfigImpl = deps.writeDaemonConfigImpl ?? writeDaemonConfig;
   const writeDaemonStateImpl = deps.writeDaemonStateImpl ?? writeDaemonState;
   const writePidFileImpl = deps.writePidFileImpl ?? writePidFile;
+  const signalDaemonConfigRefreshImpl = deps.signalDaemonConfigRefreshImpl ?? signalReplyListenerConfigRefresh;
   const logImpl = deps.logImpl ?? log;
 
   const normalizedConfig = normalizeReplyListenerConfig(config);
@@ -3165,6 +3354,12 @@ export function startReplyListener(
     writeDaemonConfigImpl(normalizedConfig);
     if (refreshedState) {
       writeDaemonStateImpl(refreshedState);
+    }
+    if (shouldInterruptReplyListenerForConfigChange(previousConfig, normalizedConfig)) {
+      const signaled = signalDaemonConfigRefreshImpl();
+      logImpl(signaled
+        ? 'Reply listener daemon signaled for interactive Telegram config refresh'
+        : 'WARN: Reply listener daemon config refresh signal was not delivered');
     }
     return {
       success: true,

@@ -650,7 +650,10 @@ describe('getNotificationConfig', () => {
 
       const config = getNotificationConfig();
       assert.ok(config);
-      assert.deepEqual(getReplyConfig(config)?.telegramAllowedUpdates, [
+      const explicitAllowedUpdatesReplyConfig = getReplyConfig(config);
+      assert.equal(explicitAllowedUpdatesReplyConfig?.pollIntervalMs, 500);
+      assert.equal(explicitAllowedUpdatesReplyConfig?.telegramPollTimeoutSeconds, 3);
+      assert.deepEqual(explicitAllowedUpdatesReplyConfig?.telegramAllowedUpdates, [
         'message',
         'callback_query',
       ]);
@@ -678,7 +681,55 @@ describe('getNotificationConfig', () => {
 
       const defaultConfig = getNotificationConfig();
       assert.ok(defaultConfig);
-      assert.deepEqual(getReplyConfig(defaultConfig)?.telegramAllowedUpdates, [
+      const defaultReplyConfig = getReplyConfig(defaultConfig);
+      assert.equal(defaultReplyConfig?.pollIntervalMs, 500);
+      assert.equal(defaultReplyConfig?.telegramPollTimeoutSeconds, 3);
+      assert.deepEqual(defaultReplyConfig?.telegramAllowedUpdates, [
+        'message',
+        'callback_query',
+      ]);
+    } finally {
+      await rm(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('caps explicit Telegram reply polling values when progress buttons are enabled', async () => {
+    const tempHome = await mkdtemp(join(tmpdir(), 'omx-notification-config-'));
+    const codexHome = join(tempHome, '.codex');
+
+    try {
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, '.omx-config.json'), JSON.stringify({
+        notifications: {
+          enabled: true,
+          telegram: {
+            enabled: true,
+            botToken: '123456:telegram-token',
+            chatId: '777',
+            progress: {
+              enabled: true,
+              mode: 'peek',
+              transport: 'draft',
+              showButton: true,
+            },
+          },
+          reply: {
+            enabled: true,
+            pollIntervalMs: 2500,
+            telegramPollTimeoutSeconds: 12,
+            authorizedTelegramUserIds: ['telegram-user-1'],
+          },
+        },
+      }, null, 2));
+      process.env.HOME = tempHome;
+      process.env.CODEX_HOME = codexHome;
+
+      const config = getNotificationConfig();
+      assert.ok(config);
+      const replyConfig = getReplyConfig(config);
+      assert.equal(replyConfig?.pollIntervalMs, 500);
+      assert.equal(replyConfig?.telegramPollTimeoutSeconds, 3);
+      assert.deepEqual(replyConfig?.telegramAllowedUpdates, [
         'message',
         'callback_query',
       ]);

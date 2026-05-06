@@ -134,7 +134,11 @@ completed-turn delivery and fails closed for helper/subagent/internal turns.
 Reply listener note: when Telegram progress buttons are enabled, OMX adds
 `callback_query` to Telegram `allowed_updates` unless the configured list already
 contains it. If you override `notifications.reply.telegramAllowedUpdates`, keep
-`callback_query` included for the show/hide button to work.
+`callback_query` included for the show/hide button to work. Progress buttons also
+switch the reply listener's default Telegram polling profile from low-noise
+reply intake (`pollIntervalMs: 3000`, `telegramPollTimeoutSeconds: 30`) to an
+interactive profile that caps polling at `pollIntervalMs: 500` and
+`telegramPollTimeoutSeconds: 3` while the button UX is active.
 
 #### `notifications.reply.telegramVoiceTranscription`
 

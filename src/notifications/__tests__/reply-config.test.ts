@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 const ENV_KEYS = [
+  'HOME',
+  'USERPROFILE',
   'CODEX_HOME',
   'OMX_DISCORD_NOTIFIER_BOT_TOKEN',
   'OMX_DISCORD_NOTIFIER_CHANNEL',
@@ -51,6 +53,8 @@ describe('getReplyConfig validation', () => {
     codexHomeDir = await mkdtemp(join(tmpdir(), 'omx-reply-config-'));
     await mkdir(codexHomeDir, { recursive: true });
     process.env.CODEX_HOME = codexHomeDir;
+    process.env.HOME = codexHomeDir;
+    delete process.env.USERPROFILE;
   });
 
   afterEach(async () => {
@@ -161,6 +165,39 @@ describe('getReplyConfig validation', () => {
     assert.equal(config.telegramVoiceTranscription?.enabled, false);
     assert.equal(config.telegramVoiceTranscription?.provider, 'whisper-cpp');
     assert.deepEqual(config.telegramVoiceTranscription?.mediaKinds, ['voice']);
+  });
+
+  it('uses an interactive polling profile when Telegram progress buttons are enabled', async () => {
+    const configFile = join(codexHomeDir, '.omx-config.json');
+    await writeFile(configFile, JSON.stringify({
+      notifications: {
+        enabled: true,
+        reply: {
+          enabled: true,
+        },
+      },
+    }, null, 2));
+
+    const { getReplyConfig } = await importConfigFresh();
+    const config = getReplyConfig({
+      enabled: true,
+      telegram: {
+        enabled: true,
+        botToken: 'profile-token',
+        chatId: 'profile-chat',
+        progress: {
+          enabled: true,
+          mode: 'peek',
+          transport: 'draft',
+          showButton: true,
+        },
+      },
+    });
+
+    assert.ok(config);
+    assert.equal(config.pollIntervalMs, 500);
+    assert.equal(config.telegramPollTimeoutSeconds, 3);
+    assert.deepEqual(config.telegramAllowedUpdates, ['message', 'callback_query']);
   });
 
   it('parses Telegram voice transcription config and explicit env overrides', async () => {

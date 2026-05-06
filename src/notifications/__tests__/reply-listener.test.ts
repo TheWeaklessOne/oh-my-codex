@@ -23,6 +23,7 @@ import {
   pollTelegramOnce,
   refreshReplyListenerRuntimeConfig,
   resetReplyListenerTransientState,
+  shouldInterruptReplyListenerForConfigChange,
   startReplyListener,
 } from '../reply-listener.js';
 import type { ReplyListenerDaemonConfig, ReplyListenerRateLimiter, ReplyListenerState } from '../reply-listener.js';
@@ -459,6 +460,21 @@ describe('normalizeReplyListenerConfig', () => {
     assert.equal(normalized.telegramEnabled, true);
     assert.equal(normalized.discordEnabled, false);
   });
+
+  it('uses fast runtime defaults when Telegram callback updates are enabled', () => {
+    const normalized = normalizeReplyListenerConfig(createBaseConfig({
+      pollIntervalMs: undefined as unknown as number,
+      telegramPollTimeoutSeconds: undefined as unknown as number,
+      telegramAllowedUpdates: ['message', 'callback_query'],
+      discordEnabled: false,
+      discordBotToken: undefined,
+      discordChannelId: undefined,
+    }));
+
+    assert.equal(normalized.pollIntervalMs, 500);
+    assert.equal(normalized.telegramPollTimeoutSeconds, 3);
+    assert.deepEqual(normalized.telegramAllowedUpdates, ['message', 'callback_query']);
+  });
 });
 
 describe('refreshReplyListenerRuntimeConfig', () => {
@@ -522,6 +538,27 @@ describe('refreshReplyListenerRuntimeConfig', () => {
     );
 
     assert.equal(refreshed.shouldStopDaemon, true);
+  });
+});
+
+describe('shouldInterruptReplyListenerForConfigChange', () => {
+  it('interrupts only callback-relevant Telegram polling changes', () => {
+    const base = normalizeReplyListenerConfig(createBaseConfig());
+    const withCallbacks = normalizeReplyListenerConfig(createBaseConfig({
+      pollIntervalMs: undefined as unknown as number,
+      telegramPollTimeoutSeconds: undefined as unknown as number,
+      telegramAllowedUpdates: ['message', 'callback_query'],
+    }));
+
+    assert.equal(shouldInterruptReplyListenerForConfigChange(base, withCallbacks), true);
+    assert.equal(shouldInterruptReplyListenerForConfigChange(withCallbacks, {
+      ...withCallbacks,
+      pollIntervalMs: 1000,
+    }), true);
+    assert.equal(shouldInterruptReplyListenerForConfigChange(base, {
+      ...base,
+      pollIntervalMs: 5000,
+    }), false);
   });
 });
 
@@ -654,6 +691,32 @@ describe('startReplyListener', () => {
     assert.equal(persistedState.sourceStates[oldTelegramSource.key]?.telegramLastUpdateId, 44);
     assert.equal(response.state?.telegramLastUpdateId, null);
     assert.equal(response.state?.discordLastMessageId, 'discord-message-44');
+  });
+
+  it('signals a running daemon when Telegram callback polling becomes interactive', () => {
+    const previousConfig = normalizeReplyListenerConfig(createBaseConfig());
+    const nextConfig = normalizeReplyListenerConfig(createBaseConfig({
+      pollIntervalMs: undefined as unknown as number,
+      telegramPollTimeoutSeconds: undefined as unknown as number,
+      telegramAllowedUpdates: ['message', 'callback_query'],
+    }));
+    let signaled = 0;
+    const response = startReplyListener(nextConfig, {
+      ensureStateDirImpl: () => {},
+      isDaemonRunningImpl: () => true,
+      readDaemonConfigImpl: () => previousConfig,
+      readDaemonStateImpl: () => createBaseState(),
+      writeDaemonConfigImpl: () => {},
+      writeDaemonStateImpl: () => {},
+      signalDaemonConfigRefreshImpl: () => {
+        signaled++;
+        return true;
+      },
+      logImpl: () => {},
+    });
+
+    assert.equal(response.success, true);
+    assert.equal(signaled, 1);
   });
 
   it('preserves prior source cursors across a stopped-daemon restart before the new daemon boots', () => {
