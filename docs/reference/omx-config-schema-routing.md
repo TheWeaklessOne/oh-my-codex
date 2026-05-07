@@ -86,8 +86,14 @@ Explicit manifests use ordered `parts`; local `path` values may be absolute or r
 When enabled, OMX records only public progress commentary/high-level statuses,
 streams the live viewport through Telegram Bot API `sendMessageDraft`, and keeps
 the completed-turn final answer as the durable chat message. If a progress trace
-exists, the final text message gets a `Показать ход` inline button; the callback
-toggles UI only and never injects anything into Codex.
+exists and a budgeted collapsed public trace fits with the final answer inside
+Telegram's message limit, OMX prepends that collapsed trace to the final text
+and shows `Скрыть ход`; older entries may be hidden behind an `ещё N шагов`
+marker to preserve the final answer. If no safe trace viewport fits, or the
+final answer is split across multiple Telegram messages, OMX keeps the final
+answer clean and attaches `Показать ход` to the first text anchor; the callback
+then shows the trace inline when possible or via the configured fallback. The
+callback toggles UI only and never injects anything into Codex.
 
 ```jsonc
 {

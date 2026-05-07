@@ -424,6 +424,7 @@ export interface FullNotificationPayload {
     finalEntities?: TelegramMessageEntity[];
     finalParseMode?: "Markdown" | "HTML" | null;
     fullTraceDelivery?: TelegramProgressFullTraceDelivery;
+    shown?: boolean;
   };
   /** Agent name (populated by extensibility plugins, not set by core Codex CLI hooks) */
   agentName?: string;

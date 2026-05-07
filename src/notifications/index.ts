@@ -242,7 +242,9 @@ import {
   isTelegramProgressButtonEnabled,
   loadTelegramProgressTrace,
   registerTelegramProgressFinalMessage,
+  renderCollapsedTrace,
 } from "./telegram-progress.js";
+import { renderMarkdownToTelegramEntities } from "./telegram-markdown-renderer.js";
 
 // Suppress unused import — used by callers via re-export
 void getActiveProfileName;
@@ -358,6 +360,48 @@ function hasTelegramTextAnchor(payload: FullNotificationPayload): boolean {
   return firstDeliverablePart?.kind === "text";
 }
 
+function canInlineTelegramProgressIntoFinalPayload(payload: FullNotificationPayload): boolean {
+  return !(payload.richContent?.parts ?? []).some((part) => part.kind !== "text");
+}
+
+function renderTelegramProgressFinalForInline(
+  finalRender: {
+    text: string;
+    entities?: TelegramMessageEntity[];
+    parseMode?: "Markdown" | "HTML" | null;
+  },
+): {
+  text: string;
+  entities?: TelegramMessageEntity[];
+  canInline: boolean;
+} {
+  if (finalRender.entities?.length) {
+    return {
+      text: finalRender.text,
+      entities: finalRender.entities,
+      canInline: true,
+    };
+  }
+  if (finalRender.parseMode === "Markdown") {
+    const rendered = renderMarkdownToTelegramEntities(finalRender.text);
+    return {
+      text: rendered.text,
+      entities: rendered.entities,
+      canInline: true,
+    };
+  }
+  if (finalRender.parseMode === "HTML") {
+    return {
+      text: finalRender.text,
+      canInline: false,
+    };
+  }
+  return {
+    text: finalRender.text,
+    canInline: true,
+  };
+}
+
 async function maybeAttachTelegramProgressButton(
   config: FullNotificationConfig,
   decision: CompletedTurnNotificationDecision,
@@ -394,24 +438,46 @@ async function maybeAttachTelegramProgressButton(
   const token = createTelegramProgressToken();
   const telegramOverride = payload.transportOverrides?.telegram ?? {};
   const finalRender = resolveTelegramProgressFinalRender(telegramConfig, payload);
+  const inlineFinalRender = renderTelegramProgressFinalForInline(finalRender);
+  const inlineTrace = inlineFinalRender.canInline && canInlineTelegramProgressIntoFinalPayload(payload)
+    ? renderCollapsedTrace(trace, inlineFinalRender.text, {
+        ...(inlineFinalRender.entities?.length ? { finalEntities: inlineFinalRender.entities } : {}),
+      })
+    : null;
+  const shown = inlineTrace?.fits === true;
+  const persistedFinalRender = shown
+    ? {
+        text: inlineFinalRender.text,
+        ...(inlineFinalRender.entities?.length ? { entities: inlineFinalRender.entities } : {}),
+        parseMode: null,
+      }
+    : finalRender;
   payload.transportOverrides = {
     ...(payload.transportOverrides ?? {}),
     telegram: {
       ...telegramOverride,
-      replyMarkup: buildTelegramProgressToggleMarkup(token, false),
+      ...(shown
+        ? {
+            message: inlineTrace.text,
+            entities: inlineTrace.entities,
+            parseMode: null,
+          }
+        : {}),
+      replyMarkup: buildTelegramProgressToggleMarkup(token, shown),
     },
   };
   payload.telegramProgressFinal = {
     token,
     turnId: decision.turnId,
-    finalText: finalRender.text,
-    ...(finalRender.entities?.length ? { finalEntities: finalRender.entities } : {}),
-    ...(Object.prototype.hasOwnProperty.call(finalRender, "parseMode")
-      ? { finalParseMode: finalRender.parseMode }
+    finalText: persistedFinalRender.text,
+    ...(persistedFinalRender.entities?.length ? { finalEntities: persistedFinalRender.entities } : {}),
+    ...(Object.prototype.hasOwnProperty.call(persistedFinalRender, "parseMode")
+      ? { finalParseMode: persistedFinalRender.parseMode }
       : {}),
     ...(telegramConfig.progress?.fullTraceDelivery
       ? { fullTraceDelivery: telegramConfig.progress.fullTraceDelivery }
       : {}),
+    shown,
   };
 }
 
@@ -496,6 +562,7 @@ async function maybeRegisterReplyMappings(
           ...(payload.telegramProgressFinal.fullTraceDelivery
             ? { fullTraceDelivery: payload.telegramProgressFinal.fullTraceDelivery }
             : {}),
+          shown: payload.telegramProgressFinal.shown === true,
         });
       }
     }

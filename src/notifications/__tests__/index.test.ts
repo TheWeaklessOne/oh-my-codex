@@ -1013,7 +1013,7 @@ describe('notifyCompletedTurn transport override filtering', () => {
     });
   });
 
-  it('attaches Telegram progress show button only when a trace exists', async () => {
+  it('shows Telegram progress inline by default when the trace fits', async () => {
     const originalHome = process.env.HOME;
     const originalUserProfile = process.env.USERPROFILE;
     const tempHome = mkdtempSync(join(tmpdir(), 'omx-notify-index-progress-home-'));
@@ -1030,13 +1030,14 @@ describe('notifyCompletedTurn transport override filtering', () => {
         appendTelegramProgressEntry,
         loadTelegramProgressFinalState,
       } = await import(`../telegram-progress.js?completed-turn-progress=${Date.now()}`);
+      const assistantText = '**Final** answer';
       const decision = planCompletedTurnNotification({
         semanticOutcome: {
           kind: 'result-ready',
           summary: 'Done.',
           notificationEvent: 'result-ready',
         },
-        assistantText: 'Final answer',
+        assistantText,
         turnId: 'turn-progress-button',
       });
       assert.ok(decision);
@@ -1061,19 +1062,23 @@ describe('notifyCompletedTurn transport override filtering', () => {
         },
       };
       let capturedPayload: {
+        message?: string;
         transportOverrides?: {
           telegram?: {
+            message?: string;
+            entities?: Array<{ type: string; offset: number; length: number }>;
+            parseMode?: 'Markdown' | 'HTML' | null;
             replyMarkup?: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
           };
         };
-        telegramProgressFinal?: { token: string };
+        telegramProgressFinal?: { token: string; shown?: boolean };
       } | undefined;
 
       const result = await notifyCompletedTurn(
         decision,
         {
           sessionId: 'sess-progress-button',
-          assistantText: 'Final answer',
+          assistantText,
           projectPath,
           tmuxPaneId: '%42',
           tmuxSession: 'omx-test',
@@ -1101,17 +1106,128 @@ describe('notifyCompletedTurn transport override filtering', () => {
 
       assert.ok(result);
       const button = capturedPayload?.transportOverrides?.telegram?.replyMarkup?.inline_keyboard[0]?.[0];
-      assert.equal(button?.text, 'Показать ход');
+      assert.equal(button?.text, 'Скрыть ход');
       assert.match(button?.callback_data ?? '', /^omx:pg:/);
+      assert.match(capturedPayload?.transportOverrides?.telegram?.message ?? '', /Public progress update/);
+      assert.match(capturedPayload?.transportOverrides?.telegram?.message ?? '', /Final answer/);
+      assert.equal(capturedPayload?.transportOverrides?.telegram?.parseMode, null);
+      assert.equal(capturedPayload?.transportOverrides?.telegram?.entities?.[0]?.type, 'expandable_blockquote');
       assert.ok(capturedPayload?.telegramProgressFinal?.token);
+      assert.equal(capturedPayload?.telegramProgressFinal?.shown, true);
       const finalState = await loadTelegramProgressFinalState(
         projectPath,
         'sess-progress-button',
         capturedPayload.telegramProgressFinal.token,
       );
       assert.equal(finalState?.finalText, 'Final answer');
+      assert.equal(finalState?.finalParseMode, null);
+      assert.equal(finalState?.finalEntities?.[0]?.type, 'bold');
       assert.equal(finalState?.messageId, '501');
       assert.equal(finalState?.fullTraceDelivery, 'message');
+      assert.equal(finalState?.shown, true);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+      rmSync(projectPath, { recursive: true, force: true });
+      rmSync(tempHome, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps oversized Telegram finals clean and uses the progress button fallback', async () => {
+    const originalHome = process.env.HOME;
+    const originalUserProfile = process.env.USERPROFILE;
+    const tempHome = mkdtempSync(join(tmpdir(), 'omx-notify-index-progress-home-'));
+    const projectPath = mkdtempSync(join(tmpdir(), 'omx-notify-index-progress-project-'));
+
+    try {
+      process.env.HOME = tempHome;
+      process.env.USERPROFILE = tempHome;
+      const {
+        notifyCompletedTurn,
+        planCompletedTurnNotification,
+      } = await import(`../index.js?completed-turn-progress-overflow=${Date.now()}`);
+      const {
+        appendTelegramProgressEntry,
+      } = await import(`../telegram-progress.js?completed-turn-progress-overflow=${Date.now()}`);
+      const assistantText = 'Final answer '.repeat(500);
+      const decision = planCompletedTurnNotification({
+        semanticOutcome: {
+          kind: 'result-ready',
+          summary: 'Done.',
+          notificationEvent: 'result-ready',
+        },
+        assistantText,
+        turnId: 'turn-progress-overflow',
+      });
+      assert.ok(decision);
+      await appendTelegramProgressEntry(projectPath, 'sess-progress-overflow', 'turn-progress-overflow', {
+        kind: 'commentary',
+        text: 'Public progress update',
+      });
+
+      const config: FullNotificationConfig = {
+        enabled: true,
+        telegram: {
+          enabled: true,
+          botToken: '123456:abc',
+          chatId: '777',
+          progress: {
+            enabled: true,
+            mode: 'peek',
+            transport: 'draft',
+            showButton: true,
+            fullTraceDelivery: 'message',
+          },
+        },
+      };
+      let capturedPayload: {
+        transportOverrides?: {
+          telegram?: {
+            message?: string;
+            replyMarkup?: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+          };
+        };
+        telegramProgressFinal?: { token: string; shown?: boolean };
+      } | undefined;
+
+      await notifyCompletedTurn(
+        decision,
+        {
+          sessionId: 'sess-progress-overflow',
+          assistantText,
+          projectPath,
+          tmuxPaneId: '%42',
+          tmuxSession: 'omx-test',
+        },
+        undefined,
+        {
+          getNotificationConfigImpl: () => config,
+          isEventEnabledImpl: () => true,
+          ensureReplyListenerForConfigImpl: () => {},
+          dispatchNotificationsImpl: async (_config: FullNotificationConfig, event: string, payload: unknown) => {
+            capturedPayload = payload as typeof capturedPayload;
+            return {
+              event: event as never,
+              anySuccess: true,
+              results: [{
+                platform: 'telegram',
+                success: true,
+                messageId: '502',
+                messageIds: ['502', '503'],
+                messageThreadId: '9001',
+              }],
+            };
+          },
+        },
+      );
+
+      const button = capturedPayload?.transportOverrides?.telegram?.replyMarkup?.inline_keyboard[0]?.[0];
+      assert.equal(button?.text, 'Показать ход');
+      assert.equal(capturedPayload?.transportOverrides?.telegram?.message, assistantText.trim());
+      assert.doesNotMatch(capturedPayload?.transportOverrides?.telegram?.message ?? '', /Public progress update/);
+      assert.equal(capturedPayload?.telegramProgressFinal?.shown, false);
     } finally {
       if (originalHome === undefined) delete process.env.HOME;
       else process.env.HOME = originalHome;
